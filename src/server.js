@@ -994,6 +994,32 @@ function startHttpServer() {
             return;
           }
 
+          // CARD-04: wrapper detection. The new clawd-permission-hook.js
+          // wrapper (CARD-03) always supplies request_id; legacy direct-HTTP
+          // callers (and tests using raw curl) do not. We use request_id
+          // presence as the wrapper signal (rather than a separate
+          // hook_source/via flag) because it is already required for DELETE
+          // correlation — one signal, no risk of drift if a future
+          // hook_source string changes.
+          const incomingRequestId = typeof data.request_id === "string" && data.request_id
+            ? data.request_id
+            : null;
+          const viaCommandWrapper = !!incomingRequestId;
+          const requestId = incomingRequestId || crypto.randomUUID();
+
+          // Idempotency: if a duplicate request_id arrives while the original
+          // is still pending, refuse with 409. Wrappers never legitimately
+          // retry; this prevents ghost duplicate bubbles.
+          if (viaCommandWrapper) {
+            const dup = ctx.pendingPermissions.find((p) => p.requestId === requestId);
+            if (dup) {
+              ctx.permLog(`duplicate request_id=${requestId} → 409 (no second bubble)`);
+              res.writeHead(409, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "duplicate request_id" }));
+              return;
+            }
+          }
+
           const permEntry = {
             res,
             abortHandler: null,
@@ -1008,14 +1034,48 @@ function startHttpServer() {
             resolvedSuggestion: null,
             createdAt: Date.now(),
             agentId: permAgentId,
+            requestId,
+            viaCommandWrapper,
+            ttlTimer: null,
           };
           const abortHandler = () => {
             if (res.writableFinished) return;
-            ctx.permLog("abortHandler fired");
-            ctx.resolvePermissionEntry(permEntry, "deny", "Client disconnected");
+            // CARD-04: wrapper entries get no-decision on socket close
+            // (mirrors Codex branch lines 873-879). The wrapper holds the
+            // socket; closure means parent CC died (SIGTERM) and a DELETE
+            // is in flight — recording deny would be wrong. Legacy
+            // direct-HTTP entries keep the original deny-on-disconnect
+            // behaviour to avoid regression before CARD-05 migration.
+            // User-clicked deny does NOT come through here — that path
+            // calls resolvePermissionEntry directly with behavior:"deny"
+            // before the socket closes, so writableFinished is true and
+            // we early-return above.
+            if (permEntry.viaCommandWrapper) {
+              ctx.permLog(`abortHandler fired (wrapper entry, request_id=${permEntry.requestId}) → no-decision`);
+              ctx.resolvePermissionEntry(permEntry, "no-decision", "Client disconnected");
+            } else {
+              ctx.permLog("abortHandler fired");
+              ctx.resolvePermissionEntry(permEntry, "deny", "Client disconnected");
+            }
           };
           permEntry.abortHandler = abortHandler;
           res.on("close", abortHandler);
+
+          // CARD-04: TTL fallback. 65s = wrapper's 60s ceiling + buffer. If
+          // the wrapper crashes without DELETE-ing or completing, this
+          // prevents a ghost bubble. We never write a response on TTL fire
+          // — by then the wrapper has already been killed by CC's hook
+          // ceiling. Cleared implicitly when the entry leaves
+          // pendingPermissions via resolvePermissionEntry / DELETE.
+          const PERMISSION_TTL_MS = 65000;
+          permEntry.ttlTimer = setTimeout(() => {
+            if (ctx.pendingPermissions.indexOf(permEntry) === -1) return;
+            ctx.permLog(`TTL fired for request_id=${permEntry.requestId} → cleanup`);
+            ctx.resolvePermissionEntry(permEntry, "no-decision", "Client disconnected");
+          }, PERMISSION_TTL_MS);
+          if (permEntry.ttlTimer && typeof permEntry.ttlTimer.unref === "function") {
+            permEntry.ttlTimer.unref();
+          }
 
           ctx.pendingPermissions.push(permEntry);
 
@@ -1038,6 +1098,24 @@ function startHttpServer() {
           }
         }
       });
+    } else if (req.method === "DELETE" && typeof req.url === "string" && req.url.startsWith("/permission/")) {
+      // CARD-04: wrapper withdraws bubble on parent SIGTERM. Loopback-only
+      // (the listener already binds 127.0.0.1, no extra auth needed —
+      // see ADR §13 q5). Body-less. Idempotent: unknown id still 204.
+      const rawId = req.url.slice("/permission/".length);
+      const slash = rawId.indexOf("/");
+      const requestId = slash === -1 ? rawId : rawId.slice(0, slash);
+      ctx.permLog(`DELETE /permission/${requestId}`);
+      const idx = ctx.pendingPermissions.findIndex((p) => p.requestId === requestId);
+      if (idx !== -1) {
+        const entry = ctx.pendingPermissions[idx];
+        // resolvePermissionEntry handles bubble dismiss + listener cleanup.
+        // Use no-decision so the wrapper-handed-off response never records
+        // as a deny in HUD/dashboard.
+        ctx.resolvePermissionEntry(entry, "no-decision", "Client disconnected");
+      }
+      res.writeHead(204);
+      res.end();
     } else {
       res.writeHead(404);
       res.end();
