@@ -247,6 +247,7 @@ function getClaudeVersion(options = {}) {
 }
 
 const MARKER = "clawd-hook.js";
+const PERMISSION_WRAPPER_MARKER = "clawd-permission-hook.js";
 const AUTO_START_MARKER = "auto-start.js";
 const LEGACY_AUTO_START_MARKER = "auto-start.sh";
 const HTTP_MARKER = PERMISSION_PATH;
@@ -498,17 +499,38 @@ function getHookServerPort(explicitPort) {
   return Number.isInteger(explicitPort) ? explicitPort : (readRuntimePort() || DEFAULT_SERVER_PORT);
 }
 
-// HTTP hooks: PermissionRequest uses bidirectional HTTP hook for permission decisions.
-// Claude Code fires PermissionRequest for tools needing approval (primarily Bash).
-// Edit/Write permissions are handled by Claude Code's own permission mode — not our hook.
-const HTTP_HOOKS = {
+// HTTP hooks: Clawd no longer registers any HTTP-form hooks for Claude Code.
+// PermissionRequest used to live here as type:"http" but moved to the
+// command-wrapper form (see WRAPPER_COMMAND_HOOKS below) to fix
+// anthropics/claude-code#46193 — when Clawd was offline, the HTTP hook
+// returned ECONNREFUSED and CC silent-denied the tool call instead of
+// falling through to its native prompt. The command-wrapper script
+// hooks/clawd-permission-hook.js owns the failure semantics: any error
+// path → empty stdout → CC fall-through to native.
+//
+// The constant is kept as an empty registry (rather than removed) so the
+// HTTP-stale-cleanup loop and printout below remain structurally intact
+// and ready for any future HTTP hook addition without re-introducing
+// scaffolding.
+const HTTP_HOOKS = {};
+
+// WRAPPER_COMMAND_HOOKS: command-form hooks that wrap a long-poll HTTP call
+// to Clawd's /permission endpoint, with stdout-{} fall-through on failure.
+// Distinct from CORE_HOOKS (one-shot state pings) because:
+//   1. Different marker (PERMISSION_WRAPPER_MARKER) so reconcile/uninstall
+//      can target each independently.
+//   2. Different matcher — narrowed to "Bash" so Edit/Write/mcp__* go
+//      through CC's native permission mode (mirrors CARD-01 intent).
+//   3. Carries a CC-side timeout (60s ceiling) — the wrapper's internal
+//      decision-wait is 54s + 6s safety margin; this 60s is the OUTER
+//      ceiling CC enforces on the spawned process. Keep the relationship
+//      in sync if either side moves.
+const WRAPPER_COMMAND_HOOKS = {
   PermissionRequest: {
-    matcher: "",
-    hook: {
-      type: "http",
-      url: "http://127.0.0.1:23333/permission",
-      timeout: 600,
-    },
+    matcher: "Bash",
+    timeout: 60,
+    script: "clawd-permission-hook.js",
+    marker: PERMISSION_WRAPPER_MARKER,
   },
 };
 
@@ -712,9 +734,11 @@ function registerHooks(options = {}) {
     if (settings.hooks.SessionStart.length < beforeLen) changed = true;
   }
 
-  // Clean up stale command hooks for HTTP-only events (e.g. PermissionRequest).
-  // Old versions or manual edits may have registered a command hook alongside the
-  // HTTP hook, causing Claude Code to fire both and produce duplicate bubbles.
+  // Clean up stale command hooks for HTTP-only events.
+  // The MARKER predicate matches the core state hook (clawd-hook.js) only,
+  // so the new wrapper hook (clawd-permission-hook.js, registered below)
+  // is intentionally NOT matched here — its lifecycle is owned by
+  // WRAPPER_COMMAND_HOOKS reconcile.
   for (const event of Object.keys(HTTP_HOOKS)) {
     if (!Array.isArray(settings.hooks[event])) continue;
     const result = removeMatchingCommandHooks(
@@ -726,6 +750,23 @@ function registerHooks(options = {}) {
       removed += result.removed;
       changed = true;
     }
+  }
+
+  // Migrate legacy HTTP-form Clawd PermissionRequest entries to the new
+  // command-wrapper form. This runs every register so an upgrade picks
+  // up the new shape without user intervention.
+  for (const event of Object.keys(WRAPPER_COMMAND_HOOKS)) {
+    if (!Array.isArray(settings.hooks[event])) continue;
+    const httpRemoval = removeMatchingHttpHooks(
+      settings.hooks[event],
+      // predicate already constrained to Clawd-owned permission entries by
+      // isClawdPermissionHook upstream — accept all matches.
+      () => true
+    );
+    if (!httpRemoval.changed) continue;
+    settings.hooks[event] = httpRemoval.entries;
+    removed += httpRemoval.removed;
+    changed = true;
   }
 
   // Register HTTP hooks (permission decision collection)
@@ -749,6 +790,52 @@ function registerHooks(options = {}) {
 
     settings.hooks[event].push({
       matcher,
+      hooks: [desiredHook],
+    });
+    added++;
+  }
+
+  // Register wrapper command hooks (PermissionRequest via clawd-permission-hook.js).
+  // The wrapper handles long-poll to /permission and emits empty stdout on
+  // any failure path so CC falls through to its native prompt
+  // (anthropics/claude-code#46193 fix).
+  for (const [event, spec] of Object.entries(WRAPPER_COMMAND_HOOKS)) {
+    if (!Array.isArray(settings.hooks[event])) {
+      settings.hooks[event] = [];
+      changed = true;
+    }
+
+    const wrapperScript = asarUnpackedPath(
+      path.resolve(__dirname, spec.script).replace(/\\/g, "/")
+    );
+    const baseSpec = buildCommandHookSpec(nodeBin, wrapperScript, "", {
+      platform,
+      remote: options.remote,
+    });
+    const desiredHook = { ...baseSpec, timeout: spec.timeout };
+
+    const commandSync = syncCommandHook(settings.hooks[event], spec.marker, desiredHook);
+    if (commandSync.found) {
+      if (commandSync.changed) {
+        updated++;
+        changed = true;
+      } else {
+        skipped++;
+      }
+      // Also reconcile timeout drift on existing entries (syncCommandHook
+      // matches command + shell only).
+      forEachCommandHook(settings.hooks[event], (hook) => {
+        if (!hook.command.includes(spec.marker)) return;
+        if (hook.timeout !== spec.timeout) {
+          hook.timeout = spec.timeout;
+          changed = true;
+        }
+      });
+      continue;
+    }
+
+    settings.hooks[event].push({
+      matcher: spec.matcher,
       hooks: [desiredHook],
     });
     added++;
@@ -781,6 +868,9 @@ function registerHooks(options = {}) {
     console.log(`\nHook events: ${hookEvents.join(", ")}`);
     if (Object.keys(HTTP_HOOKS).length > 0) {
       console.log(`HTTP hooks: ${Object.keys(HTTP_HOOKS).join(", ")}`);
+    }
+    if (Object.keys(WRAPPER_COMMAND_HOOKS).length > 0) {
+      console.log(`Wrapper hooks: ${Object.keys(WRAPPER_COMMAND_HOOKS).join(", ")}`);
     }
   }
 
@@ -817,6 +907,7 @@ function unregisterHooks(options = {}) {
     const commandResult = removeMatchingCommandHooks(
       entries,
       (command) => command.includes(MARKER)
+        || command.includes(PERMISSION_WRAPPER_MARKER)
         || command.includes(AUTO_START_MARKER)
         || command.includes(LEGACY_AUTO_START_MARKER)
     );
@@ -925,6 +1016,8 @@ module.exports = {
     reconcileVersionedHooks,
     shouldReconcileVersionedHooks,
     buildCommandHookSpec,
+    PERMISSION_WRAPPER_MARKER,
+    WRAPPER_COMMAND_HOOKS,
   },
 };
 
