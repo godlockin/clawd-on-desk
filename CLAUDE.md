@@ -77,7 +77,7 @@ src/prefs.js → src/settings-controller.js → src/settings-store.js
 `settings-store.js` is the source of truth (immutable snapshots). `settings-controller.js` is the **only** module allowed to write. Never bypass the controller. `src/settings-renderer.js` is the UI on top.
 
 ### Permission flow per agent (each is different — get this wrong and approvals silently drop)
-- **Claude Code / CodeBuddy**: blocking approval over `POST /permission` HTTP hook; ordinary status events go through command hooks.
+- **Claude Code / CodeBuddy**: blocking approval via **command-wrapper** hook (`hooks/clawd-permission-hook.js`, `matcher:"Bash"`, `timeout:60`). Wrapper long-polls `POST /permission` with a `request_id` (uuid v4); on **any** failure (probe miss, ECONNREFUSED, 5xx, decision timeout, SIGTERM) it emits empty stdout `{}` and exits 0 so CC falls through to its native prompt — fix for [anthropics/claude-code#46193](https://github.com/anthropics/claude-code/issues/46193). The matcher narrow means `Edit/Write/MultiEdit/mcp__*` skip the wrapper entirely. Ordinary status events still go through command hooks.
 - **Codex** (official `PermissionRequest` command hook): hook script long-polls `POST /permission`; **only** sanitized `behavior` / `message` may be returned via stdout — `updatedInput`, `updatedPermissions`, `interrupt` MUST be omitted.
 - **opencode**: `permission.ask` is unavailable; uses event hook + reverse bridge.
 - **DND** never auto-decides for the user — opencode silent-drops, Claude/CodeBuddy disconnect to fall back to internal UI, Codex returns no-decision `{}`.
