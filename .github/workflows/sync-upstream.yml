@@ -1,0 +1,190 @@
+name: Sync from upstream
+
+# Watch the upstream repo and pull new commits into this fork's `main`.
+#
+# Strategy:
+#   1. Fast-forward `main` if upstream is strictly ahead → push directly.
+#   2. Otherwise create a `sync/upstream-YYYYMMDD-HHMM` branch, attempt a
+#      no-ff merge, and open a PR. If the merge has conflicts, the PR is
+#      still opened with conflict markers + a comment listing the files to
+#      resolve manually.
+#
+# Triggers:
+#   - schedule: every 6 hours (cron jitter via offset minute)
+#   - workflow_dispatch: manual run from Actions tab
+#
+# Permissions: contents:write (push branches), pull-requests:write (open PRs).
+
+on:
+  schedule:
+    # 07:17 / 13:17 / 19:17 / 01:17 UTC — off the :00/:30 marks to avoid
+    # GitHub Actions cron stampede.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream branch to sync from"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: rullerzhou-afk/clawd-on-desk
+  UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_ref || 'main' }}
+  LOCAL_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use the default GITHUB_TOKEN; permissions block above grants write.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}" --tags --prune
+
+      - name: Compare upstream vs fork
+        id: compare
+        run: |
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          LOCAL_SHA=$(git rev-parse "origin/${LOCAL_BRANCH}")
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "local_sha=${LOCAL_SHA}"     >> "$GITHUB_OUTPUT"
+
+          if [ "${UPSTREAM_SHA}" = "${LOCAL_SHA}" ]; then
+            echo "status=up_to_date" >> "$GITHUB_OUTPUT"
+            echo "Fork already at upstream HEAD (${UPSTREAM_SHA})."
+            exit 0
+          fi
+
+          # Is local an ancestor of upstream? Then a fast-forward is safe.
+          if git merge-base --is-ancestor "${LOCAL_SHA}" "${UPSTREAM_SHA}"; then
+            echo "status=ff" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=diverged" >> "$GITHUB_OUTPUT"
+          fi
+
+          AHEAD=$(git rev-list --count "${LOCAL_SHA}..${UPSTREAM_SHA}")
+          BEHIND=$(git rev-list --count "${UPSTREAM_SHA}..${LOCAL_SHA}")
+          echo "ahead=${AHEAD}"   >> "$GITHUB_OUTPUT"
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "Upstream is ${AHEAD} commit(s) ahead, fork has ${BEHIND} extra commit(s)."
+
+      - name: Fast-forward main
+        if: steps.compare.outputs.status == 'ff'
+        run: |
+          git checkout "${LOCAL_BRANCH}"
+          git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
+          git push origin "${LOCAL_BRANCH}"
+          echo "✅ Fast-forwarded ${LOCAL_BRANCH} by ${{ steps.compare.outputs.ahead }} commit(s)."
+
+      - name: Prepare merge branch
+        if: steps.compare.outputs.status == 'diverged'
+        id: merge
+        run: |
+          STAMP=$(date -u +%Y%m%d-%H%M)
+          BRANCH="sync/upstream-${STAMP}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+          git checkout -b "${BRANCH}" "origin/${LOCAL_BRANCH}"
+
+          # Attempt merge; capture status without failing the step.
+          set +e
+          git merge --no-ff --no-edit \
+            -m "Merge upstream/${UPSTREAM_BRANCH} (${{ steps.compare.outputs.upstream_sha }}) into ${LOCAL_BRANCH}" \
+            "upstream/${UPSTREAM_BRANCH}"
+          MERGE_EC=$?
+          set -e
+
+          if [ "${MERGE_EC}" -eq 0 ]; then
+            echo "merge_status=clean" >> "$GITHUB_OUTPUT"
+            git push origin "${BRANCH}"
+          else
+            echo "merge_status=conflict" >> "$GITHUB_OUTPUT"
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ',' | sed 's/,$//')
+            echo "conflicts=${CONFLICTS}" >> "$GITHUB_OUTPUT"
+            # Commit conflict markers so the PR diff is reviewable.
+            git add -A
+            git commit -m "Merge upstream/${UPSTREAM_BRANCH} into ${LOCAL_BRANCH} (CONFLICTS — manual resolve required)" \
+              || echo "no commit (nothing to merge)"
+            git push origin "${BRANCH}"
+          fi
+
+      - name: Open PR for clean merge
+        if: steps.compare.outputs.status == 'diverged' && steps.merge.outputs.merge_status == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base "${LOCAL_BRANCH}" \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "chore: sync from upstream (${{ steps.compare.outputs.ahead }} commit(s))" \
+            --body "Automated upstream sync.
+
+**Source:** \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`
+**Upstream HEAD:** \`${{ steps.compare.outputs.upstream_sha }}\`
+**Fork HEAD before sync:** \`${{ steps.compare.outputs.local_sha }}\`
+**Stats:** upstream is ${{ steps.compare.outputs.ahead }} ahead, fork is ${{ steps.compare.outputs.behind }} ahead.
+
+Merge succeeded cleanly. Review and merge when ready.
+
+🤖 Generated by \`.github/workflows/sync-upstream.yml\`"
+
+      - name: Open PR for conflicting merge
+        if: steps.compare.outputs.status == 'diverged' && steps.merge.outputs.merge_status == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base "${LOCAL_BRANCH}" \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "⚠️ chore: sync from upstream (CONFLICTS — manual resolve)" \
+            --body "Automated upstream sync **with merge conflicts**.
+
+**Source:** \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`
+**Upstream HEAD:** \`${{ steps.compare.outputs.upstream_sha }}\`
+**Fork HEAD before sync:** \`${{ steps.compare.outputs.local_sha }}\`
+**Stats:** upstream is ${{ steps.compare.outputs.ahead }} ahead, fork is ${{ steps.compare.outputs.behind }} ahead.
+
+### Conflicting files
+\`\`\`
+${{ steps.merge.outputs.conflicts }}
+\`\`\`
+
+The conflict markers are committed verbatim so you can review the diff. To resolve:
+\`\`\`bash
+git fetch origin ${{ steps.merge.outputs.branch }}
+git checkout ${{ steps.merge.outputs.branch }}
+# resolve conflicts in the files above
+git add -A && git commit --amend --no-edit
+git push --force-with-lease origin ${{ steps.merge.outputs.branch }}
+\`\`\`
+
+🤖 Generated by \`.github/workflows/sync-upstream.yml\`"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Upstream sync result" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Upstream:** \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Status:** \`${{ steps.compare.outputs.status }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Ahead / Behind:** ${{ steps.compare.outputs.ahead }} / ${{ steps.compare.outputs.behind }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ steps.merge.outputs.branch }}" ]; then
+            echo "- **Sync branch:** \`${{ steps.merge.outputs.branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Merge:** \`${{ steps.merge.outputs.merge_status }}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
