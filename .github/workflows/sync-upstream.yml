@@ -148,7 +148,13 @@ jobs:
             --base "${LOCAL_BRANCH}" \
             --head "${BRANCH}" \
             --title "chore: sync from upstream (${AHEAD} commit(s))" \
-            --body-file "$BODY_FILE"
+            --body-file "$BODY_FILE" \
+          || {
+            echo "::warning::gh pr create failed (likely 'Allow GitHub Actions to create PRs' is disabled in repo settings)."
+            echo "Sync branch \`${BRANCH}\` is pushed and ready; open a PR manually:"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/compare/${LOCAL_BRANCH}...${BRANCH}?expand=1"
+            exit 0
+          }
 
       - name: Open PR for conflicting merge
         if: steps.compare.outputs.status == 'diverged' && steps.merge.outputs.merge_status == 'conflict'
@@ -192,7 +198,13 @@ jobs:
             --base "${LOCAL_BRANCH}" \
             --head "${BRANCH}" \
             --title "chore: sync from upstream (CONFLICTS - manual resolve)" \
-            --body-file "$BODY_FILE"
+            --body-file "$BODY_FILE" \
+          || {
+            echo "::warning::gh pr create failed (likely 'Allow GitHub Actions to create PRs' is disabled in repo settings)."
+            echo "Sync branch \`${BRANCH}\` is pushed (with conflict markers) and ready; open a PR manually:"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/compare/${LOCAL_BRANCH}...${BRANCH}?expand=1"
+            exit 0
+          }
 
       - name: Summary
         if: always()
