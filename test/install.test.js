@@ -806,6 +806,190 @@ describe("Hook installer deprecated hook cleanup", () => {
   });
 });
 
+describe("Hook installer PermissionRequest wrapper", () => {
+  function getPermissionEntries(settings) {
+    const arr = settings.hooks?.PermissionRequest;
+    return Array.isArray(arr) ? arr : [];
+  }
+
+  function findWrapperHook(settings) {
+    for (const entry of getPermissionEntries(settings)) {
+      if (!entry || typeof entry !== "object" || !Array.isArray(entry.hooks)) continue;
+      for (const hook of entry.hooks) {
+        if (hook && typeof hook.command === "string" && hook.command.includes("clawd-permission-hook.js")) {
+          return { entry, hook };
+        }
+      }
+    }
+    return null;
+  }
+
+  it("registers a command-form PermissionRequest wrapper with matcher Bash and timeout 60 on fresh install", () => {
+    const settingsPath = makeTempSettings({});
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
+    });
+
+    const settings = readSettings(settingsPath);
+    const found = findWrapperHook(settings);
+    assert.ok(found, "wrapper hook should be registered");
+    assert.strictEqual(found.entry.matcher, "Bash");
+    assert.strictEqual(found.hook.type, "command");
+    assert.strictEqual(found.hook.timeout, 60);
+    assert.ok(found.hook.command.includes("clawd-permission-hook.js"));
+    // No HTTP-form Clawd PermissionRequest entry should be created on fresh install.
+    const httpUrls = getHttpUrls(settings, "PermissionRequest")
+      .filter((url) => url.includes("127.0.0.1") && url.endsWith("/permission"));
+    assert.deepStrictEqual(httpUrls, []);
+  });
+
+  it("migrates an existing legacy HTTP-form Clawd PermissionRequest entry to the command-wrapper form", () => {
+    const settingsPath = makeTempSettings({
+      hooks: {
+        PermissionRequest: [
+          {
+            matcher: "",
+            hooks: [{ type: "http", url: "http://127.0.0.1:23335/permission", timeout: 600 }],
+          },
+        ],
+      },
+    });
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
+    });
+
+    const settings = readSettings(settingsPath);
+    const clawdHttp = getHttpUrls(settings, "PermissionRequest")
+      .filter((url) => url.includes("127.0.0.1") && url.endsWith("/permission"));
+    assert.deepStrictEqual(clawdHttp, [], "legacy Clawd HTTP entry should be removed");
+    const found = findWrapperHook(settings);
+    assert.ok(found, "wrapper hook should replace the legacy HTTP entry");
+    assert.strictEqual(found.entry.matcher, "Bash");
+    assert.strictEqual(found.hook.timeout, 60);
+  });
+
+  it("preserves user-authored PermissionRequest entries (HTTP and command) untouched during migration", () => {
+    const settingsPath = makeTempSettings({
+      hooks: {
+        PermissionRequest: [
+          {
+            matcher: "",
+            hooks: [{ type: "http", url: "http://localhost:8080/permission", timeout: 100 }],
+          },
+          {
+            matcher: "Edit",
+            hooks: [{ type: "command", command: 'node "/tmp/third-party.js" PermissionRequest' }],
+          },
+        ],
+      },
+    });
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
+    });
+
+    const settings = readSettings(settingsPath);
+    const httpUrls = getHttpUrls(settings, "PermissionRequest");
+    assert.ok(httpUrls.includes("http://localhost:8080/permission"), "third-party HTTP entry preserved");
+    const thirdPartyCommands = getCommandHookEntries(settings, "PermissionRequest", "third-party.js");
+    assert.strictEqual(thirdPartyCommands.length, 1, "third-party command entry preserved");
+    assert.ok(findWrapperHook(settings), "wrapper still registered alongside user-authored entries");
+  });
+
+  it("uses PowerShell command form for the wrapper on Windows", () => {
+    const settingsPath = makeTempSettings({});
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "win32",
+      nodeBin: "node",
+      claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
+    });
+
+    const settings = readSettings(settingsPath);
+    const found = findWrapperHook(settings);
+    assert.ok(found, "wrapper hook should be registered on Windows");
+    assert.strictEqual(found.hook.shell, "powershell");
+    assert.ok(found.hook.command.startsWith('& "node" "'), found.hook.command);
+    assert.ok(found.hook.command.includes("clawd-permission-hook.js"));
+    assert.strictEqual(found.hook.timeout, 60);
+  });
+
+  it("is idempotent across repeated registrations (no duplicates, no churn)", () => {
+    const settingsPath = makeTempSettings({});
+    const opts = {
+      silent: true,
+      settingsPath,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
+    };
+
+    registerHooks(opts);
+    const second = registerHooks(opts);
+    const third = registerHooks(opts);
+
+    const settings = readSettings(settingsPath);
+    const wrapperEntries = getCommandHookEntries(settings, "PermissionRequest", "clawd-permission-hook.js");
+    assert.strictEqual(wrapperEntries.length, 1, "exactly one wrapper hook after repeated registers");
+    assert.strictEqual(second.added, 0);
+    assert.strictEqual(third.added, 0);
+    assert.strictEqual(second.updated, 0);
+    assert.strictEqual(third.updated, 0);
+  });
+
+  it("reconciles timeout drift on an existing wrapper entry", () => {
+    // Pre-seed a wrapper entry with a wrong timeout; a subsequent register should fix it.
+    const settingsPath = makeTempSettings({});
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
+    });
+
+    // Mutate the seeded entry's timeout to a stale value.
+    const seeded = readSettings(settingsPath);
+    const entries = seeded.hooks.PermissionRequest;
+    for (const entry of entries) {
+      if (!Array.isArray(entry.hooks)) continue;
+      for (const hook of entry.hooks) {
+        if (typeof hook.command === "string" && hook.command.includes("clawd-permission-hook.js")) {
+          hook.timeout = 5;
+        }
+      }
+    }
+    fs.writeFileSync(settingsPath, JSON.stringify(seeded, null, 2), "utf8");
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
+    });
+
+    const after = readSettings(settingsPath);
+    const found = findWrapperHook(after);
+    assert.ok(found);
+    assert.strictEqual(found.hook.timeout, 60);
+  });
+});
+
 describe("Hook installer unregisterHooks", () => {
   it("removes Clawd command hooks, HTTP hook, and auto-start while preserving third-party hooks", () => {
     const settingsPath = makeTempSettings({
@@ -930,5 +1114,52 @@ describe("Hook installer unregisterHooks", () => {
     const settings = readSettings(settingsPath);
 
     assert.deepStrictEqual(settings.hooks, {});
+  });
+
+  it("removes both wrapper command form and legacy HTTP form, preserving third-party entries", () => {
+    const settingsPath = makeTempSettings({
+      hooks: {
+        PermissionRequest: [
+          {
+            matcher: "Bash",
+            hooks: [{
+              type: "command",
+              command: '"/usr/bin/node" "/opt/clawd/hooks/clawd-permission-hook.js"',
+              timeout: 60,
+            }],
+          },
+          {
+            matcher: "",
+            hooks: [{ type: "http", url: "http://127.0.0.1:23335/permission", timeout: 600 }],
+          },
+          {
+            matcher: "",
+            hooks: [{ type: "http", url: "http://localhost:9000/permission", timeout: 100 }],
+          },
+          {
+            matcher: "Edit",
+            hooks: [{ type: "command", command: 'node "/tmp/third-party.js" PermissionRequest' }],
+          },
+        ],
+      },
+    });
+
+    const result = unregisterHooks({ settingsPath });
+    const settings = readSettings(settingsPath);
+
+    assert.ok(result.changed);
+    assert.deepStrictEqual(
+      getCommandHookEntries(settings, "PermissionRequest", "clawd-permission-hook.js"),
+      [],
+      "wrapper command form removed"
+    );
+    const httpUrls = getHttpUrls(settings, "PermissionRequest");
+    assert.ok(!httpUrls.some((url) => url.startsWith("http://127.0.0.1")), "Clawd HTTP form removed");
+    assert.ok(httpUrls.includes("http://localhost:9000/permission"), "third-party HTTP preserved");
+    assert.strictEqual(
+      getCommandHookEntries(settings, "PermissionRequest", "third-party.js").length,
+      1,
+      "third-party command entry preserved"
+    );
   });
 });

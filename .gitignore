@@ -33,6 +33,7 @@ docs/**
 !docs/project/
 !docs/project/agent-runtime-architecture.md
 !docs/project/theme-state-ui.md
+!docs/project/adr-permission-command-wrapper.md
 !docs/releases/
 !docs/releases/release-v0.5.5.md
 !docs/releases/release-v0.6.0.md

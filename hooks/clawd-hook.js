@@ -218,4 +218,9 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { buildStateBody, extractSessionTitleFromTranscript };
+module.exports = {
+  buildStateBody,
+  buildToolInputFingerprint,
+  extractSessionTitleFromTranscript,
+  normalizeToolUseId,
+};
