@@ -824,7 +824,7 @@ describe("Hook installer PermissionRequest wrapper", () => {
     return null;
   }
 
-  it("registers a command-form PermissionRequest wrapper with matcher Bash and timeout 60 on fresh install", () => {
+  it("registers a command-form PermissionRequest wrapper with match-all matcher and timeout 60 on fresh install", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
       silent: true,
@@ -837,7 +837,7 @@ describe("Hook installer PermissionRequest wrapper", () => {
     const settings = readSettings(settingsPath);
     const found = findWrapperHook(settings);
     assert.ok(found, "wrapper hook should be registered");
-    assert.strictEqual(found.entry.matcher, "Bash");
+    assert.strictEqual(found.entry.matcher, "");
     assert.strictEqual(found.hook.type, "command");
     assert.strictEqual(found.hook.timeout, 60);
     assert.ok(found.hook.command.includes("clawd-permission-hook.js"));
@@ -873,7 +873,7 @@ describe("Hook installer PermissionRequest wrapper", () => {
     assert.deepStrictEqual(clawdHttp, [], "legacy Clawd HTTP entry should be removed");
     const found = findWrapperHook(settings);
     assert.ok(found, "wrapper hook should replace the legacy HTTP entry");
-    assert.strictEqual(found.entry.matcher, "Bash");
+    assert.strictEqual(found.entry.matcher, "");
     assert.strictEqual(found.hook.timeout, 60);
   });
 

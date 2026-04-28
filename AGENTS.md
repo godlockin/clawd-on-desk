@@ -107,7 +107,7 @@ Copilot CLI 是唯一仍需手动配置 hooks 的受支持 agent；见 `docs/gui
 
 ## Constraints
 
-- Claude Code / CodeBuddy 的阻塞式权限审批走 command-wrapper hook：`hooks/clawd-permission-hook.js` 注册为 `type:"command"` + `matcher:"Bash"` + `timeout:60`，wrapper 自身长连接 `POST /permission`（带 `request_id` uuid v4），任何失败路径（probe 失败 / ECONNREFUSED / 5xx / 超时 / SIGTERM）都输出空 stdout `{}` exit 0，触发 CC 原生 fall-through —— 修复 [anthropics/claude-code#46193](https://github.com/anthropics/claude-code/issues/46193)。matcher 收窄到 `Bash` 后 `Edit/Write/MultiEdit/mcp__*` 直接走 CC 原生权限。普通状态事件仍走 command hook
+- Claude Code / CodeBuddy 的阻塞式权限审批走 command-wrapper hook：`hooks/clawd-permission-hook.js` 注册为 `type:"command"` + `matcher:""`（match-all，覆盖 Bash / Edit / Write / MultiEdit / mcp__* 等所有工具）+ `timeout:60`，wrapper 自身长连接 `POST /permission`（带 `request_id` uuid v4），任何失败路径（probe 失败 / ECONNREFUSED / 5xx / 超时 / SIGTERM）都输出空 stdout `{}` exit 0，触发 CC 原生 fall-through —— 修复 [anthropics/claude-code#46193](https://github.com/anthropics/claude-code/issues/46193)。普通状态事件仍走 command hook
 - Codex 的阻塞式权限审批走 official `PermissionRequest` command hook：hook 脚本长连接 `POST /permission`，只允许 stdout 返回 sanitized `behavior/message`，`updatedInput` / `updatedPermissions` / `interrupt` 必须 omit
 - hook 脚本只允许依赖 Node 内置模块，以及同目录的 `server-config.js`、`shared-process.js`、`json-utils.js`
 - hook 脚本需要稳定终端 PID 时，必须走 `getStablePid()` 进程树解析；不要用 `process.ppid` 做简化替代
