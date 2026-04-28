@@ -81,40 +81,57 @@ function formatNodeHookCommand(nodeBin, scriptPath, options = {}) {
  * @returns {string|null}
  */
 function extractExistingNodeBin(settings, marker, options) {
-  if (!settings || !settings.hooks) return null;
+  const commands = findHookCommands(settings, marker, options);
+  for (const cmd of commands) {
+    const matches = cmd.matchAll(/"([^"]+)"/g);
+    for (const match of matches) {
+      const token = match && match[1];
+      if (!token || token.includes(marker)) continue;
+      if (isAbsoluteCommandToken(token)) return token;
+    }
+  }
+  return null;
+}
+
+/**
+ * Find every command hook string containing `marker` in a parsed settings
+ * object. Supports flat entries (`{ command }`) and, when requested, Claude
+ * compatible nested entries (`{ hooks: [{ command }] }`).
+ *
+ * @param {object} settings - Parsed JSON settings/config object
+ * @param {string} marker   - Hook script filename to search for
+ * @param {object} [options]
+ * @param {boolean} [options.nested] - Also check entry.hooks[].command
+ * @returns {string[]}
+ */
+function findHookCommands(settings, marker, options) {
+  if (!settings || !settings.hooks || typeof marker !== "string" || !marker) return [];
   const nested = options && options.nested;
+  const commands = [];
 
   for (const entries of Object.values(settings.hooks)) {
     if (!Array.isArray(entries)) continue;
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
-
-      // Collect candidate command strings
-      const cmds = [];
       if (nested && Array.isArray(entry.hooks)) {
         for (const h of entry.hooks) {
-          if (h && typeof h.command === "string") cmds.push(h.command);
+          if (h && typeof h.command === "string" && h.command.includes(marker)) {
+            commands.push(h.command);
+          }
         }
       }
-      if (typeof entry.command === "string") cmds.push(entry.command);
-
-      for (const cmd of cmds) {
-        if (!cmd.includes(marker)) continue;
-        const matches = cmd.matchAll(/"([^"]+)"/g);
-        for (const match of matches) {
-          const token = match && match[1];
-          if (!token || token.includes(marker)) continue;
-          if (isAbsoluteCommandToken(token)) return token;
-        }
+      if (typeof entry.command === "string" && entry.command.includes(marker)) {
+        commands.push(entry.command);
       }
     }
   }
-  return null;
+  return commands;
 }
 
 module.exports = {
   writeJsonAtomic,
   asarUnpackedPath,
   extractExistingNodeBin,
+  findHookCommands,
   formatNodeHookCommand,
 };

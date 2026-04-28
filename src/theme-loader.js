@@ -399,6 +399,10 @@ function _resolveExternalAssetsDir(themeId, themeDir) {
   return cacheDir; // SVGs from cache, non-SVGs resolved at getAssetPath() time
 }
 
+function _externalAssetsSourceDir(themeDir) {
+  return path.join(themeDir, "assets");
+}
+
 // ── SVG Sanitization ──
 
 /**
@@ -571,22 +575,26 @@ function resolveHint(hookFilename) {
  * @returns {string} absolute file path
  */
 function getAssetPath(filename) {
-  filename = path.basename(filename);
-  if (!activeTheme) return path.join(assetsSvgDir, filename);
+  return _resolveAssetPath(activeTheme, filename);
+}
 
-  if (activeTheme._builtin) {
+function _resolveAssetPath(theme, filename) {
+  const safeFilename = path.basename(filename);
+  if (!theme) return path.join(assetsSvgDir, safeFilename);
+
+  if (theme._builtin) {
     // Built-in theme with own assets dir (e.g., calico with APNGs + SVGs)
-    const themeAsset = path.join(activeTheme._themeDir, "assets", filename);
+    const themeAsset = path.join(theme._themeDir, "assets", safeFilename);
     if (fs.existsSync(themeAsset)) return themeAsset;
-    return path.join(assetsSvgDir, filename);
+    return path.join(assetsSvgDir, safeFilename);
   }
 
   // External theme: SVGs from cache, everything else from source
-  if (filename.endsWith(".svg")) {
-    return path.join(activeTheme._assetsDir, filename);
+  if (safeFilename.endsWith(".svg")) {
+    return path.join(theme._assetsDir || _externalAssetsSourceDir(theme._themeDir), safeFilename);
   }
   // Non-SVG: direct from theme's assets dir (no sanitization needed)
-  return path.join(activeTheme._themeDir, "assets", filename);
+  return path.join(theme._themeDir, "assets", safeFilename);
 }
 
 /**
@@ -837,6 +845,44 @@ function validateTheme(cfg) {
   return errors;
 }
 
+function validateThemeShape(themeId, opts = {}) {
+  const variant = typeof opts.variant === "string" && opts.variant ? opts.variant : "default";
+  const overrides = _isPlainObject(opts.overrides) ? opts.overrides : null;
+  const { raw, isBuiltin, themeDir } = _readThemeJson(themeId);
+  if (!raw) {
+    return {
+      ok: false,
+      errors: [`Theme "${themeId}" not found`],
+      themeId,
+      variant,
+      resolvedVariant: null,
+    };
+  }
+
+  const rawErrors = validateTheme(raw);
+  const { resolvedId, spec } = _resolveVariant(raw, variant);
+  const afterVariant = spec ? _applyVariantPatch(raw, spec, themeId, resolvedId) : raw;
+  const patched = overrides ? _applyUserOverridesPatch(afterVariant, overrides) : afterVariant;
+  const effective = mergeDefaults(patched, themeId, isBuiltin);
+
+  effective._builtin = isBuiltin;
+  effective._themeDir = themeDir;
+  effective._variantId = resolvedId;
+  effective._assetsDir = isBuiltin ? assetsSvgDir : _externalAssetsSourceDir(themeDir);
+
+  const effectiveErrors = validateTheme(patched);
+  const resourceErrors = _validateRequiredAssets(effective);
+  const errors = [...rawErrors, ...effectiveErrors, ...resourceErrors];
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    themeId,
+    variant,
+    resolvedVariant: resolvedId,
+  };
+}
+
 // ── Internal helpers ──
 
 function _isPlainObject(v) {
@@ -932,6 +978,67 @@ function _buildCapabilities(cfg) {
     idleMode: _deriveIdleMode(cfg),
     sleepMode: _deriveSleepMode(cfg),
   };
+}
+
+function _addThemeAssetFile(out, filename) {
+  const safe = _basenameOnly(filename);
+  if (safe) out.add(safe);
+}
+
+function _collectRequiredAssetFiles(theme) {
+  const files = new Set();
+  if (theme && theme.states) {
+    for (const stateFiles of Object.values(theme.states)) {
+      if (!Array.isArray(stateFiles)) continue;
+      for (const file of stateFiles) _addThemeAssetFile(files, file);
+    }
+  }
+  if (theme && theme.miniMode && theme.miniMode.states) {
+    for (const stateFiles of Object.values(theme.miniMode.states)) {
+      if (!Array.isArray(stateFiles)) continue;
+      for (const file of stateFiles) _addThemeAssetFile(files, file);
+    }
+  }
+  for (const group of [theme && theme.workingTiers, theme && theme.jugglingTiers]) {
+    if (!Array.isArray(group)) continue;
+    for (const entry of group) {
+      if (entry && typeof entry.file === "string") _addThemeAssetFile(files, entry.file);
+    }
+  }
+  if (Array.isArray(theme && theme.idleAnimations)) {
+    for (const entry of theme.idleAnimations) {
+      if (entry && typeof entry.file === "string") _addThemeAssetFile(files, entry.file);
+    }
+  }
+  if (_isPlainObject(theme && theme.reactions)) {
+    for (const entry of Object.values(theme.reactions)) {
+      if (!entry || typeof entry !== "object") continue;
+      if (typeof entry.file === "string") _addThemeAssetFile(files, entry.file);
+      if (Array.isArray(entry.files)) {
+        for (const file of entry.files) _addThemeAssetFile(files, file);
+      }
+    }
+  }
+  if (_isPlainObject(theme && theme.displayHintMap)) {
+    for (const file of Object.values(theme.displayHintMap)) {
+      if (typeof file === "string") _addThemeAssetFile(files, file);
+    }
+  }
+  if (_isPlainObject(theme && theme.updateVisuals) && typeof theme.updateVisuals.checking === "string") {
+    _addThemeAssetFile(files, theme.updateVisuals.checking);
+  }
+  return [...files];
+}
+
+function _validateRequiredAssets(theme) {
+  const errors = [];
+  for (const filename of _collectRequiredAssetFiles(theme)) {
+    const absPath = _resolveAssetPath(theme, filename);
+    if (!fs.existsSync(absPath)) {
+      errors.push(`missing asset: ${filename} (${absPath})`);
+    }
+  }
+  return errors;
 }
 
 /**
@@ -1618,6 +1725,7 @@ module.exports = {
   init,
   discoverThemes,
   loadTheme,
+  validateThemeShape,
   getActiveTheme,
   getThemeMetadata,
   listThemesWithMetadata,
@@ -1631,6 +1739,9 @@ module.exports = {
   getSoundUrl,
   getPreviewSoundUrl,
   getSoundOverridesDir,
+  _resolveAssetPath,
+  _externalAssetsSourceDir,
+  _validateRequiredAssets,
   // Schema constants + helpers — shared with scripts/validate-theme.js to
   // keep validator and runtime loader from drifting on the same invariants.
   REQUIRED_STATES,

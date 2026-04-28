@@ -9,6 +9,10 @@ const {
   formatNodeHookCommand,
 } = require("./json-utils");
 
+const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".codex");
+const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, "hooks.json");
+const DEFAULT_FEATURES_CONFIG = path.join(DEFAULT_PARENT_DIR, "config.toml");
+
 const CODEX_HOOK_EVENTS = [
   "SessionStart",
   "UserPromptSubmit",
@@ -119,7 +123,8 @@ function isFeaturesTableHeader(header) {
   return !!header && !header.array && header.name.replace(/\s+/g, "") === "features";
 }
 
-function ensureCodexHooksFeature(configPath) {
+function ensureCodexHooksFeature(configPath, options = {}) {
+  const force = !!options.force;
   let text = "";
   let existed = true;
   try {
@@ -154,6 +159,13 @@ function ensureCodexHooksFeature(configPath) {
       const match = lines[i].match(/^\s*codex_hooks\s*=\s*(true|false)\s*(?:#.*)?$/i);
       if (!match) continue;
       if (match[1].toLowerCase() === "false") {
+        if (force) {
+          lines[i] = lines[i].replace(/=\s*false/i, "= true");
+          const nextText = `${lines.join(newline).replace(/\s*$/, "")}${newline}`;
+          fs.mkdirSync(path.dirname(configPath), { recursive: true });
+          fs.writeFileSync(configPath, nextText, "utf-8");
+          return { changed: true, warning: null };
+        }
         return {
           changed: false,
           warning: "config.toml already has [features].codex_hooks = false; leaving it unchanged.",
@@ -198,7 +210,9 @@ function registerCodexCommandHooks(options = {}) {
   }
 
   const warnings = [];
-  const feature = ensureCodexHooksFeature(configPath);
+  const feature = ensureCodexHooksFeature(configPath, {
+    force: options.forceCodexHooksFeature === true,
+  });
   if (feature.warning) warnings.push(feature.warning);
 
   const hookScript = asarUnpackedPath(path.resolve(__dirname, scriptName).replace(/\\/g, "/"));
@@ -323,6 +337,9 @@ function unregisterCodexCommandHooks(options = {}) {
 }
 
 module.exports = {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_CONFIG_PATH,
+  DEFAULT_FEATURES_CONFIG,
   CODEX_HOOK_EVENTS,
   buildCodexHookCommand,
   ensureCodexHooksFeature,

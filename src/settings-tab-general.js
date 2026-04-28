@@ -120,12 +120,9 @@
 
   function confirmDisableClaudeHookManagement(nextRaw) {
     if (nextRaw) return window.settingsAPI.update("manageClaudeHooksAutomatically", true);
-    if (!window.settingsAPI || typeof window.settingsAPI.confirmDisableClaudeHooks !== "function") {
-      return window.settingsAPI.update("manageClaudeHooksAutomatically", false);
-    }
-    return window.settingsAPI.confirmDisableClaudeHooks().then((result) => {
-      if (!result || result.choice === "cancel") return { status: "ok", noop: true };
-      if (result.choice === "disconnect") return window.settingsAPI.command("uninstallHooks");
+    return showClaudeHooksDisableConfirmModal().then((actionId) => {
+      if (!actionId || actionId === "keep") return { status: "ok", noop: true };
+      if (actionId === "disconnect") return window.settingsAPI.command("uninstallHooks");
       return window.settingsAPI.update("manageClaudeHooksAutomatically", false);
     });
   }
@@ -134,11 +131,8 @@
     if (!window.settingsAPI || typeof window.settingsAPI.command !== "function") {
       return Promise.resolve({ status: "error", message: "settings API unavailable" });
     }
-    if (typeof window.settingsAPI.confirmDisconnectClaudeHooks !== "function") {
-      return window.settingsAPI.command("uninstallHooks");
-    }
-    return window.settingsAPI.confirmDisconnectClaudeHooks().then((result) => {
-      if (!result || !result.confirmed) return { status: "ok", noop: true };
+    return showClaudeHooksDisconnectConfirmModal().then((actionId) => {
+      if (actionId !== "disconnect") return { status: "ok", noop: true };
       return window.settingsAPI.command("uninstallHooks");
     });
   }
@@ -401,8 +395,8 @@
       const nextEnabled = !currentEnabled();
       if (category === "update" && !nextEnabled) {
         setVisual(nextEnabled, true);
-        confirmDisableUpdateBubbles().then((confirmed) => {
-          if (confirmed) runToggleCommit(nextEnabled);
+        confirmDisableUpdateBubbles().then((actionId) => {
+          if (actionId === "confirm") runToggleCommit(nextEnabled);
           else setVisual(currentEnabled(), false);
         });
         return;
@@ -491,14 +485,39 @@
     return showSettingsConfirmModal({
       title: t("updateBubbleDisableConfirmTitle"),
       detail: t("updateBubbleDisableConfirmDetail"),
-      confirmLabel: t("updateBubbleDisableConfirmAction"),
-      cancelLabel: t("updateBubbleDisableConfirmCancel"),
+      actions: [
+        { id: "confirm", label: t("updateBubbleDisableConfirmAction"), tone: "danger" },
+        { id: "cancel", label: t("updateBubbleDisableConfirmCancel"), tone: "accent", defaultFocus: true },
+      ],
     });
   }
 
-  function showSettingsConfirmModal({ title, detail, confirmLabel, cancelLabel }) {
+  function showClaudeHooksDisableConfirmModal() {
+    return showSettingsConfirmModal({
+      title: t("claudeHooksDisableConfirmTitle"),
+      detail: t("claudeHooksDisableConfirmDetail"),
+      actions: [
+        { id: "disconnect", label: t("claudeHooksDisableConfirmDisconnect"), tone: "danger" },
+        { id: "disable", label: t("claudeHooksDisableConfirmDisableOnly"), tone: "neutral" },
+        { id: "keep", label: t("claudeHooksDisableConfirmKeep"), tone: "accent", defaultFocus: true },
+      ],
+    });
+  }
+
+  function showClaudeHooksDisconnectConfirmModal() {
+    return showSettingsConfirmModal({
+      title: t("claudeHooksDisconnectConfirmTitle"),
+      detail: t("claudeHooksDisconnectConfirmDetail"),
+      actions: [
+        { id: "disconnect", label: t("claudeHooksDisconnectConfirmAction"), tone: "danger" },
+        { id: "keep", label: t("claudeHooksDisconnectConfirmKeep"), tone: "accent", defaultFocus: true },
+      ],
+    });
+  }
+
+  function showSettingsConfirmModal({ title, detail, actions }) {
     const rootNode = document.getElementById("modalRoot");
-    if (!rootNode) return Promise.resolve(false);
+    if (!rootNode) return Promise.resolve(null);
     return new Promise((resolve) => {
       let settled = false;
       const overlay = document.createElement("div");
@@ -519,48 +538,50 @@
       const detailNode = document.createElement("p");
       detailNode.textContent = detail;
 
-      const actions = document.createElement("div");
-      actions.className = "settings-confirm-actions";
+      const actionsNode = document.createElement("div");
+      actionsNode.className = "settings-confirm-actions";
 
-      const cancelBtn = document.createElement("button");
-      cancelBtn.type = "button";
-      cancelBtn.className = "soft-btn accent";
-      cancelBtn.textContent = cancelLabel;
-
-      const confirmBtn = document.createElement("button");
-      confirmBtn.type = "button";
-      confirmBtn.className = "soft-btn";
-      confirmBtn.textContent = confirmLabel;
-
-      function close(confirmed) {
+      function close(actionId) {
         if (settled) return;
         settled = true;
         document.removeEventListener("keydown", onKeyDown, true);
         rootNode.innerHTML = "";
-        resolve(confirmed);
+        resolve(actionId);
       }
 
       function onKeyDown(ev) {
-        if (ev.key === "Escape") close(false);
+        if (ev.key === "Escape") close(null);
       }
 
       overlay.addEventListener("click", (ev) => {
-        if (ev.target === overlay) close(false);
+        if (ev.target === overlay) close(null);
       });
-      cancelBtn.addEventListener("click", () => close(false));
-      confirmBtn.addEventListener("click", () => close(true));
+      const buttons = (Array.isArray(actions) ? actions : []).map((action) => {
+        const button = document.createElement("button");
+        const tone = action && typeof action.tone === "string" ? action.tone : "neutral";
+        const toneClass = tone === "accent"
+          ? "accent"
+          : (tone === "danger" ? "settings-confirm-danger" : "");
+        button.type = "button";
+        button.className = `soft-btn${toneClass ? ` ${toneClass}` : ""}`;
+        button.textContent = action && action.label ? action.label : "";
+        button.addEventListener("click", () => close(action && action.id ? action.id : null));
+        actionsNode.appendChild(button);
+        return { action, button };
+      });
       document.addEventListener("keydown", onKeyDown, true);
-
-      actions.appendChild(confirmBtn);
-      actions.appendChild(cancelBtn);
       modal.appendChild(icon);
       modal.appendChild(titleNode);
       modal.appendChild(detailNode);
-      modal.appendChild(actions);
+      modal.appendChild(actionsNode);
       overlay.appendChild(modal);
       rootNode.innerHTML = "";
       rootNode.appendChild(overlay);
-      cancelBtn.focus();
+      const focusTarget =
+        buttons.find((action) => action.action && action.action.defaultFocus)
+        || buttons[buttons.length - 1]
+        || null;
+      if (focusTarget) focusTarget.button.focus();
     });
   }
 
@@ -582,8 +603,8 @@
       });
     };
     if (category === "update" && next === 0 && previous !== 0) {
-      return confirmDisableUpdateBubbles().then((confirmed) => {
-        if (confirmed) return doCommit();
+      return confirmDisableUpdateBubbles().then((actionId) => {
+        if (actionId === "confirm") return doCommit();
         input.value = String(previous);
         return false;
       });

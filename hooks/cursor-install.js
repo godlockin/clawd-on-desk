@@ -12,6 +12,8 @@ const {
   formatNodeHookCommand,
 } = require("./json-utils");
 const MARKER = "cursor-hook.js";
+const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".cursor");
+const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, "hooks.json");
 
 const CURSOR_HOOK_EVENTS = [
   "sessionStart",
@@ -133,7 +135,13 @@ function registerCursorHooks(options = {}) {
   return { added, skipped, updated };
 }
 
-module.exports = { registerCursorHooks, CURSOR_HOOK_EVENTS, buildCursorHookCommand };
+module.exports = {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_CONFIG_PATH,
+  registerCursorHooks,
+  CURSOR_HOOK_EVENTS,
+  buildCursorHookCommand,
+};
 
 if (require.main === module) {
   try {

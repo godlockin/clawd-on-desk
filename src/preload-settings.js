@@ -66,10 +66,6 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   listThemes: () => ipcRenderer.invoke("settings:list-themes"),
   confirmRemoveTheme: (themeId) =>
     ipcRenderer.invoke("settings:confirm-remove-theme", themeId),
-  confirmDisableClaudeHooks: () =>
-    ipcRenderer.invoke("settings:confirm-disable-claude-hooks"),
-  confirmDisconnectClaudeHooks: () =>
-    ipcRenderer.invoke("settings:confirm-disconnect-claude-hooks"),
   onChanged: (cb) => {
     if (typeof cb === "function") listeners.add(cb);
   },
@@ -83,4 +79,11 @@ contextBridge.exposeInMainWorld("settingsAPI", {
     shortcutRecordKeyListeners.add(cb);
     return () => shortcutRecordKeyListeners.delete(cb);
   },
+});
+
+contextBridge.exposeInMainWorld("doctor", {
+  runChecks: () => ipcRenderer.invoke("doctor:run-checks"),
+  getReport: () => ipcRenderer.invoke("doctor:get-report"),
+  testConnection: (durationMs) => ipcRenderer.invoke("doctor:test-connection", { durationMs }),
+  openClawdLog: () => ipcRenderer.invoke("doctor:open-clawd-log"),
 });

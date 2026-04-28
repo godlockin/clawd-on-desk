@@ -295,6 +295,25 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
     assert.strictEqual(stopCalls, 0);
   });
 
+  it("manageClaudeHooksAutomatically effect skips side effects on true when Claude Code is disabled", () => {
+    let syncCalls = 0;
+    let startCalls = 0;
+    let stopCalls = 0;
+    const snapshot = prefs.getDefaults();
+    snapshot.agents["claude-code"].enabled = false;
+    const deps = {
+      snapshot,
+      syncClaudeHooksNow: () => syncCalls++,
+      startClaudeSettingsWatcher: () => startCalls++,
+      stopClaudeSettingsWatcher: () => stopCalls++,
+    };
+    const r = updateRegistry.manageClaudeHooksAutomatically.effect(true, deps);
+    assert.deepStrictEqual(r, { status: "ok" });
+    assert.strictEqual(syncCalls, 0);
+    assert.strictEqual(startCalls, 0);
+    assert.strictEqual(stopCalls, 0);
+  });
+
   it("manageClaudeHooksAutomatically effect stops watcher on false", () => {
     let syncCalls = 0;
     let startCalls = 0;
@@ -456,6 +475,137 @@ describe("hook commands", () => {
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /disk locked/);
     assert.deepStrictEqual(calls, ["stop", "uninstall", "start"]);
+  });
+});
+
+describe("doctor repair commands", () => {
+  it("repairs an enabled auto-managed agent through repairIntegrationForAgent without committing prefs", async () => {
+    const calls = [];
+    const r = await commandRegistry.repairAgentIntegration({ agentId: "codex" }, {
+      snapshot: prefs.getDefaults(),
+      repairIntegrationForAgent: (agentId, options) => calls.push({ agentId, options }),
+    });
+
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(calls, [{ agentId: "codex", options: { forceCodexHooksFeature: false } }]);
+    assert.strictEqual(r.commit, undefined);
+  });
+
+  it("passes explicit Codex feature-force consent and surfaces repair failures", async () => {
+    const calls = [];
+    const r = await commandRegistry.repairAgentIntegration({
+      agentId: "codex",
+      forceCodexHooksFeature: true,
+    }, {
+      snapshot: prefs.getDefaults(),
+      repairIntegrationForAgent: (agentId, options) => {
+        calls.push({ agentId, options });
+        return { status: "error", message: "codex_hooks is still false" };
+      },
+    });
+
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /codex_hooks/);
+    assert.deepStrictEqual(calls, [{ agentId: "codex", options: { forceCodexHooksFeature: true } }]);
+  });
+
+  it("rejects Copilot CLI because it is manual-only", async () => {
+    const calls = [];
+    const r = await commandRegistry.repairAgentIntegration({ agentId: "copilot-cli" }, {
+      snapshot: prefs.getDefaults(),
+      repairIntegrationForAgent: (agentId) => calls.push(agentId),
+    });
+
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /manual/i);
+    assert.deepStrictEqual(calls, []);
+  });
+
+  it("does not repair disabled agents", async () => {
+    const snapshot = prefs.getDefaults();
+    snapshot.agents.codex = { ...snapshot.agents.codex, enabled: false };
+    const calls = [];
+
+    const r = await commandRegistry.repairAgentIntegration({ agentId: "codex" }, {
+      snapshot,
+      repairIntegrationForAgent: (agentId) => calls.push(agentId),
+    });
+
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /disabled/i);
+    assert.deepStrictEqual(calls, []);
+  });
+
+  it("does not repair Claude hooks while automatic management is disabled", async () => {
+    const calls = [];
+    const r = await commandRegistry.repairAgentIntegration({ agentId: "claude-code" }, {
+      snapshot: { ...prefs.getDefaults(), manageClaudeHooksAutomatically: false },
+      repairIntegrationForAgent: (agentId) => calls.push(agentId),
+    });
+
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /disabled/i);
+    assert.deepStrictEqual(calls, []);
+  });
+
+  it("routes Doctor permission-bubble repair through a validated commit", async () => {
+    const r = await commandRegistry.repairDoctorIssue({ type: "permission-bubble-policy" }, {
+      snapshot: {
+        ...prefs.getDefaults(),
+        hideBubbles: true,
+        permissionBubblesEnabled: false,
+      },
+    });
+
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.commit.hideBubbles, false);
+    assert.strictEqual(r.commit.permissionBubblesEnabled, true);
+  });
+
+  it("routes Doctor restart-clawd repair through deps.restartClawd", async () => {
+    const calls = [];
+    const r = await commandRegistry.repairDoctorIssue(
+      { type: "restart-clawd", confirmed: true },
+      { restartClawd: () => calls.push("restart") }
+    );
+
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(calls, ["restart"]);
+  });
+
+  it("does not run Doctor restart-clawd repair without confirmation", async () => {
+    const calls = [];
+    const r = await commandRegistry.repairDoctorIssue(
+      { type: "restart-clawd" },
+      { restartClawd: () => calls.push("restart") }
+    );
+
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /confirmation/i);
+    assert.deepStrictEqual(calls, []);
+  });
+
+  it("returns an error when restart-clawd is dispatched without deps.restartClawd", async () => {
+    const r = await commandRegistry.repairDoctorIssue({ type: "restart-clawd", confirmed: true }, {});
+
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /restartClawd/);
+  });
+
+  it("rejects Doctor theme repair so Doctor does not reset user themes", async () => {
+    const calls = [];
+    const r = await commandRegistry.repairDoctorIssue({ type: "theme-health" }, {
+      snapshot: { ...prefs.getDefaults(), theme: "broken", themeVariant: {}, themeOverrides: {} },
+      activateTheme: (themeId, variantId, overrideMap) => {
+        calls.push({ themeId, variantId, overrideMap });
+        return { themeId, variantId: "default" };
+      },
+    });
+
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /manually/i);
+    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(r.commit, undefined);
   });
 });
 

@@ -18,6 +18,8 @@ const MARKER = "kiro-hook.js";
 const CLAWD_AGENT_NAME = "clawd";
 const CLAWD_AGENT_DESCRIPTION = "Clawd desktop pet hook integration";
 const BUILTIN_DEFAULT_AGENT = "kiro_default";
+const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".kiro");
+const DEFAULT_AGENTS_DIR = path.join(DEFAULT_PARENT_DIR, "agents");
 
 const KIRO_HOOK_EVENTS = [
   "agentSpawn",
@@ -339,6 +341,8 @@ function registerKiroHooks(options = {}) {
 }
 
 module.exports = {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_AGENTS_DIR,
   registerKiroHooks,
   KIRO_HOOK_EVENTS,
   __test: {

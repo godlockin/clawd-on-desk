@@ -263,8 +263,12 @@ function refreshUpdateVisualOverride() {
     : null;
 }
 
+function shouldDropForDnd() {
+  return !!ctx.doNotDisturb;
+}
+
 function setState(newState, svgOverride) {
-  if (ctx.doNotDisturb) return;
+  if (shouldDropForDnd()) return;
 
   if (newState === "yawning" && SLEEP_SEQUENCE.has(currentState)) return;
 
@@ -1588,6 +1592,7 @@ function cleanup() {
 
 return {
   setState, applyState, updateSession, resolveDisplayState, resolveVisualBinding, setUpdateVisualState,
+  shouldDropForDnd,
   enableDoNotDisturb, disableDoNotDisturb,
   startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
   getSvgOverride, cleanStaleSessions, startStartupRecovery, refreshTheme,

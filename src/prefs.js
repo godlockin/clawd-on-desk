@@ -128,6 +128,7 @@ const SCHEMA = {
       "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "codebuddy": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "kiro-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "kimi-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "opencode": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,

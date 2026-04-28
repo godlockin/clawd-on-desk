@@ -400,6 +400,39 @@ describe("CodexLogMonitor", () => {
     assert.strictEqual(monitor._tracked.size, 0);
   });
 
+  it("emits SessionEnd on stale cleanup so state.js deletes the session", (_, done) => {
+    // Codex desktop is a long-lived process: every conversation reuses the
+    // same agentPid/sourcePid, so cleanStaleSessions in state.js can never
+    // observe the source dying. The log monitor's stale cleanup is the only
+    // signal that triggers actual deletion — and it must be SessionEnd, not
+    // a regular state event, because only SessionEnd takes the delete path.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+      if (events.length === 2) {
+        for (const tracked of monitor._tracked.values()) {
+          tracked.lastEventTime = Date.now() - 301000;
+        }
+        monitor._cleanStaleFiles();
+
+        const last = events[events.length - 1];
+        assert.strictEqual(last.event, "SessionEnd");
+        assert.strictEqual(last.state, "sleeping");
+        assert.strictEqual(last.sid, EXPECTED_SID);
+        assert.strictEqual(monitor._tracked.size, 0);
+        done();
+      }
+    });
+    monitor.start();
+  });
+
   it("should handle corrupted JSON lines gracefully", (_, done) => {
     const testFile = path.join(dateDir, TEST_FILENAME);
     fs.writeFileSync(testFile, [
@@ -467,6 +500,50 @@ describe("CodexLogMonitor", () => {
       assert.ok(states.includes("working"));
       done();
     }, 3000);
+  });
+
+  it("should NOT emit codex-permission if guardian assessment starts before command end", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\\"command\\":\\"npm run build\\"}"}}',
+      '{"type":"event_msg","payload":{"type":"guardian_assessment","status":"in_progress"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const states = [];
+    monitor = new CodexLogMonitor(config, (sid, state) => {
+      states.push(state);
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.ok(!states.includes("codex-permission"), "should not emit permission while auto-review is active");
+      assert.ok(states.includes("working"));
+      done();
+    }, 3000);
+  });
+
+  it("should return to working when guardian approves after an explicit permission signal", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"needs local build\\"}"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const states = [];
+    monitor = new CodexLogMonitor(config, (sid, state) => {
+      states.push(state);
+      if (state === "codex-permission") {
+        fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"guardian_assessment","status":"approved"}}\n');
+      }
+      if (state === "working" && states.includes("codex-permission")) {
+        assert.deepStrictEqual(states, ["idle", "codex-permission", "working"]);
+        done();
+      }
+    });
+    monitor.start();
   });
 
   it("should NOT emit codex-permission for non-shell function calls", (_, done) => {

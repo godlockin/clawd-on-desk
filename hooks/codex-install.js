@@ -6,6 +6,9 @@
 // decision fields.
 
 const {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_CONFIG_PATH,
+  DEFAULT_FEATURES_CONFIG,
   CODEX_HOOK_EVENTS,
   buildCodexHookCommand,
   registerCodexCommandHooks,
@@ -38,6 +41,9 @@ function unregisterCodexHooks(options = {}) {
 }
 
 module.exports = {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_CONFIG_PATH,
+  DEFAULT_FEATURES_CONFIG,
   CODEX_OFFICIAL_HOOK_EVENTS,
   CODEX_STATE_HOOK_EVENTS: CODEX_OFFICIAL_HOOK_EVENTS,
   buildCodexStateHookCommand,

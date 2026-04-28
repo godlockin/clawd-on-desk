@@ -7,6 +7,8 @@ const os = require("os");
 const { resolveNodeBin } = require("./server-config");
 const { writeJsonAtomic, asarUnpackedPath, extractExistingNodeBin } = require("./json-utils");
 const MARKER = "gemini-hook.js";
+const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".gemini");
+const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, "settings.json");
 
 const GEMINI_HOOK_EVENTS = [
   "SessionStart",
@@ -109,7 +111,12 @@ function registerGeminiHooks(options = {}) {
   return { added, skipped, updated };
 }
 
-module.exports = { registerGeminiHooks, GEMINI_HOOK_EVENTS };
+module.exports = {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_CONFIG_PATH,
+  registerGeminiHooks,
+  GEMINI_HOOK_EVENTS,
+};
 
 if (require.main === module) {
   try {

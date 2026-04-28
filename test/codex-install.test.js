@@ -121,6 +121,24 @@ describe("Codex official hook installer", () => {
     );
   });
 
+  it("can force codex_hooks=true during an explicit repair", () => {
+    const codexDir = makeTempCodexDir({}, "[features]\ncodex_hooks = false\n");
+    const result = registerCodexHooks({
+      silent: true,
+      codexDir,
+      nodeBin: "/usr/local/bin/node",
+      platform: "linux",
+      forceCodexHooksFeature: true,
+    });
+
+    assert.strictEqual(result.configChanged, true);
+    assert.deepStrictEqual(result.warnings, []);
+    assert.strictEqual(
+      fs.readFileSync(path.join(codexDir, "config.toml"), "utf8"),
+      "[features]\ncodex_hooks = true\n"
+    );
+  });
+
   it("formats Windows commands for PowerShell execution", () => {
     const command = buildCodexStateHookCommand(
       "C:\\Program Files\\nodejs\\node.exe",

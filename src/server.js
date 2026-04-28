@@ -10,6 +10,7 @@ const {
   CLAWD_SERVER_HEADER,
   CLAWD_SERVER_ID,
   DEFAULT_SERVER_PORT,
+  RUNTIME_CONFIG_PATH,
   buildPermissionUrl,
   clearRuntimeConfig,
   getPortCandidates,
@@ -53,6 +54,91 @@ function arePermissionBubblesEnabled(ctx) {
     } catch {}
   }
   return !ctx.hideBubbles;
+}
+
+const HOOK_EVENT_RING_SIZE_PER_AGENT = 50;
+const HOOK_EVENT_OUTCOMES = new Set([
+  "accepted",
+  "dropped-by-disabled",
+  "dropped-by-dnd",
+]);
+const HOOK_EVENT_ROUTES = new Set(["state", "permission"]);
+
+function normalizeHookEventAgentId(data) {
+  return data && typeof data.agent_id === "string" && data.agent_id
+    ? data.agent_id
+    : "claude-code";
+}
+
+function normalizeHookEventType(data, route) {
+  if (route === "permission") return "PermissionRequest";
+  return data && typeof data.event === "string" && data.event
+    ? data.event
+    : null;
+}
+
+function recordHookEventInBuffer(buffer, data, route, outcome, options = {}) {
+  try {
+    if (!buffer || !HOOK_EVENT_ROUTES.has(route) || !HOOK_EVENT_OUTCOMES.has(outcome)) return null;
+    const agentId = normalizeHookEventAgentId(data);
+    const timestamp = typeof options.now === "function" ? options.now() : Date.now();
+    const event = {
+      timestamp,
+      agentId,
+      eventType: normalizeHookEventType(data, route),
+      route,
+      outcome,
+    };
+    const ringSize = Number.isInteger(options.ringSize) && options.ringSize > 0
+      ? options.ringSize
+      : HOOK_EVENT_RING_SIZE_PER_AGENT;
+    const list = buffer.get(agentId) || [];
+    list.push(event);
+    while (list.length > ringSize) list.shift();
+    buffer.set(agentId, list);
+    return event;
+  } catch {
+    return null;
+  }
+}
+
+function getRecentHookEventsFromBuffer(buffer, options = {}) {
+  if (!buffer) return [];
+  const since = Number.isFinite(options.since) ? options.since : null;
+  const agentId = typeof options.agentId === "string" && options.agentId ? options.agentId : null;
+  const source = agentId ? [buffer.get(agentId) || []] : [...buffer.values()];
+  return source
+    .flatMap((events) => Array.isArray(events) ? events : [])
+    .filter((event) => !since || event.timestamp >= since)
+    .map((event) => ({ ...event }))
+    .sort((a, b) => a.timestamp - b.timestamp);
+}
+
+function createSingleRequestHookEventRecorder(recordFn, data, defaultRoute) {
+  let recorded = false;
+  function record(route, outcome) {
+    const routeToUse = route || defaultRoute;
+    if (
+      recorded
+      || typeof recordFn !== "function"
+      || !HOOK_EVENT_ROUTES.has(routeToUse)
+      || !HOOK_EVENT_OUTCOMES.has(outcome)
+    ) {
+      // Invalid route/outcome values stay no-op without consuming the single-flight slot.
+      return null;
+    }
+    recorded = true;
+    return recordFn(data, routeToUse, outcome);
+  }
+  return {
+    record,
+    accepted: (route) => record(route, "accepted"),
+    droppedByDisabled: (route) => record(route, "dropped-by-disabled"),
+    droppedByDnd: (route) => record(route, "dropped-by-dnd"),
+    acceptedUnlessDnd: (dropForDnd, route) => (
+      dropForDnd ? record(route, "dropped-by-dnd") : record(route, "accepted")
+    ),
+  };
 }
 
 // Truncate large string values in objects (recursive) — bubble only needs a preview
@@ -363,9 +449,41 @@ let settingsWatcher = null;
 let settingsWatchDebounceTimer = null;
 let settingsWatchLastSyncTime = 0;
 const codexOfficialTurns = new Map();
+const recentHookEvents = new Map();
+
+function shouldDropForDnd() {
+  if (typeof ctx.shouldDropForDnd === "function") {
+    try {
+      return !!ctx.shouldDropForDnd();
+    } catch {}
+  }
+  return !!ctx.doNotDisturb;
+}
+
+function recordHookEvent(data, route, outcome) {
+  return recordHookEventInBuffer(recentHookEvents, data, route, outcome, { now: nowFn });
+}
+
+function createRequestHookRecorder(data, defaultRoute) {
+  return createSingleRequestHookEventRecorder(recordHookEvent, data, defaultRoute);
+}
+
+function getRecentHookEvents(options = {}) {
+  return getRecentHookEventsFromBuffer(recentHookEvents, options);
+}
+
+function clearRecentHookEvents(agentId) {
+  if (typeof agentId === "string" && agentId) recentHookEvents.delete(agentId);
+  else recentHookEvents.clear();
+}
 
 function shouldManageClaudeHooks() {
   return ctx.manageClaudeHooksAutomatically !== false;
+}
+
+function isAgentEnabled(agentId) {
+  if (typeof ctx.isAgentEnabled !== "function") return true;
+  return ctx.isAgentEnabled(agentId) !== false;
 }
 
 function getClaudeSettingsDir() {
@@ -382,6 +500,28 @@ function getClaudeSettingsPath() {
 
 function getHookServerPort() {
   return activeServerPort || readRuntimePortFn() || DEFAULT_SERVER_PORT;
+}
+
+function getRuntimeStatus() {
+  let address = null;
+  try {
+    address = httpServer && typeof httpServer.address === "function" ? httpServer.address() : null;
+  } catch {
+    address = null;
+  }
+  const addressPort = address && typeof address === "object" && Number.isInteger(address.port)
+    ? address.port
+    : null;
+  const port = activeServerPort || addressPort || null;
+  const runtimePort = readRuntimePortFn();
+  return {
+    listening: !!port && (!httpServer || httpServer.listening !== false),
+    port,
+    runtimePath: typeof ctx.runtimeConfigPath === "string" ? ctx.runtimeConfigPath : RUNTIME_CONFIG_PATH,
+    runtimePort,
+    runtimeFileExists: Number.isInteger(runtimePort),
+    runtimeMatches: Number.isInteger(port) && runtimePort === port,
+  };
 }
 
 function syncClawdHooks() {
@@ -401,8 +541,10 @@ function syncClawdHooks() {
     if (added > 0 || updated > 0 || removed > 0) {
       console.log(`Clawd: synced hooks (added ${added}, updated ${updated}, removed ${removed})`);
     }
+    return { status: "ok", added, updated, removed };
   } catch (err) {
     console.warn("Clawd: failed to sync hooks:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync Claude hooks" };
   }
 }
 
@@ -414,8 +556,10 @@ function syncGeminiHooks() {
     if (added > 0 || updated > 0) {
       console.log(`Clawd: synced Gemini hooks (added ${added}, updated ${updated})`);
     }
+    return { status: "ok", added, updated };
   } catch (err) {
     console.warn("Clawd: failed to sync Gemini hooks:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync Gemini hooks" };
   }
 }
 
@@ -427,8 +571,10 @@ function syncCodeBuddyHooks() {
     if (added > 0 || updated > 0) {
       console.log(`Clawd: synced CodeBuddy hooks (added ${added}, updated ${updated})`);
     }
+    return { status: "ok", added, updated };
   } catch (err) {
     console.warn("Clawd: failed to sync CodeBuddy hooks:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync CodeBuddy hooks" };
   }
 }
 
@@ -440,8 +586,10 @@ function syncKiroHooks() {
     if (added > 0 || updated > 0) {
       console.log(`Clawd: synced Kiro hooks (added ${added}, updated ${updated})`);
     }
+    return { status: "ok", added, updated };
   } catch (err) {
     console.warn("Clawd: failed to sync Kiro hooks:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync Kiro hooks" };
   }
 }
 
@@ -453,8 +601,10 @@ function syncKimiHooks() {
     if (added > 0 || updated > 0) {
       console.log(`Clawd: synced Kimi hooks (added ${added}, updated ${updated})`);
     }
+    return { status: "ok", added, updated };
   } catch (err) {
     console.warn("Clawd: failed to sync Kimi hooks:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync Kimi hooks" };
   }
 }
 
@@ -469,8 +619,45 @@ function syncCodexHooks() {
     if (Array.isArray(warnings)) {
       for (const warning of warnings) console.warn(`Clawd: Codex hook sync warning: ${warning}`);
     }
+    return { status: "ok", added, updated, warnings };
   } catch (err) {
     console.warn("Clawd: failed to sync Codex hooks:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync Codex hooks" };
+  }
+}
+
+function repairCodexHooks(options = {}) {
+  try {
+    if (typeof ctx.repairCodexHooksImpl === "function") return ctx.repairCodexHooksImpl(options);
+    const { registerCodexHooks } = require("../hooks/codex-install.js");
+    const { added, updated, configChanged, warnings } = registerCodexHooks({
+      silent: true,
+      forceCodexHooksFeature: options && options.forceCodexHooksFeature === true,
+    });
+    if (added > 0 || updated > 0 || configChanged) {
+      console.log(`Clawd: repaired Codex hooks (added ${added}, updated ${updated}, configChanged=${!!configChanged})`);
+    }
+    if (Array.isArray(warnings)) {
+      for (const warning of warnings) console.warn(`Clawd: Codex hook repair warning: ${warning}`);
+      if (warnings.length > 0) {
+        return {
+          status: "error",
+          message: `Codex hooks were repaired, but ${warnings.join("; ")}`,
+        };
+      }
+    }
+    return {
+      status: "ok",
+      added,
+      updated,
+      configChanged,
+      message: configChanged
+        ? "Codex hooks repaired and [features].codex_hooks enabled"
+        : "Codex hooks repaired",
+    };
+  } catch (err) {
+    console.warn("Clawd: failed to repair Codex hooks:", err.message);
+    return { status: "error", message: err && err.message };
   }
 }
 
@@ -482,8 +669,10 @@ function syncCursorHooks() {
     if (added > 0 || updated > 0) {
       console.log(`Clawd: synced Cursor hooks (added ${added}, updated ${updated})`);
     }
+    return { status: "ok", added, updated };
   } catch (err) {
     console.warn("Clawd: failed to sync Cursor hooks:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync Cursor hooks" };
   }
 }
 
@@ -495,8 +684,83 @@ function syncOpencodePlugin() {
     if (added || created) {
       console.log(`Clawd: synced opencode plugin (added=${added}, created=${created})`);
     }
+    return { status: "ok", added, created };
   } catch (err) {
     console.warn("Clawd: failed to sync opencode plugin:", err.message);
+    return { status: "error", message: err && err.message ? err.message : "Failed to sync opencode plugin" };
+  }
+}
+
+const AGENT_INTEGRATION_SYNCERS = Object.freeze({
+  "gemini-cli": syncGeminiHooks,
+  "cursor-agent": syncCursorHooks,
+  codebuddy: syncCodeBuddyHooks,
+  "kiro-cli": syncKiroHooks,
+  "kimi-cli": syncKimiHooks,
+  codex: syncCodexHooks,
+  opencode: syncOpencodePlugin,
+});
+
+const AGENT_INTEGRATION_REPAIRERS = Object.freeze({
+  ...AGENT_INTEGRATION_SYNCERS,
+  codex: repairCodexHooks,
+});
+
+function syncIntegrationForAgent(agentId) {
+  if (agentId === "claude-code") {
+    if (!shouldManageClaudeHooks()) return false;
+    const result = syncClawdHooks();
+    startClaudeSettingsWatcher();
+    return result && typeof result === "object" ? result : true;
+  }
+  const sync = AGENT_INTEGRATION_SYNCERS[agentId];
+  if (typeof sync !== "function") return false;
+  const result = sync();
+  return result && typeof result === "object" ? result : true;
+}
+
+function repairIntegrationForAgent(agentId, options = {}) {
+  if (agentId === "claude-code") {
+    return syncIntegrationForAgent(agentId);
+  }
+  const repair = AGENT_INTEGRATION_REPAIRERS[agentId];
+  if (typeof repair !== "function") return false;
+  const result = repair(options);
+  if (result && typeof result === "object" && result.status === "error") return result;
+  if (result && typeof result === "object" && result.status === "ok") return result;
+  return true;
+}
+
+function stopIntegrationForAgent(agentId) {
+  if (agentId !== "claude-code") return false;
+  return stopClaudeSettingsWatcher();
+}
+
+function repairRuntimeStatus() {
+  const status = getRuntimeStatus();
+  if (status && status.listening && Number.isInteger(status.port)) {
+    const written = writeRuntimeConfigFn(status.port);
+    return written
+      ? { status: "ok" }
+      : { status: "error", message: "Failed to write runtime config" };
+  }
+  if (!httpServer) {
+    startHttpServer();
+    return { status: "ok" };
+  }
+  return {
+    status: "error",
+    message: "Local server is not listening; restart Clawd",
+  };
+}
+
+function syncEnabledStartupIntegrations() {
+  if (shouldManageClaudeHooks() && isAgentEnabled("claude-code")) {
+    syncClawdHooks();
+    startClaudeSettingsWatcher();
+  }
+  for (const [agentId, sync] of Object.entries(AGENT_INTEGRATION_SYNCERS)) {
+    if (isAgentEnabled(agentId)) sync();
   }
 }
 
@@ -537,6 +801,7 @@ function startClaudeSettingsWatcher() {
       if (settingsWatchDebounceTimer) return;
       settingsWatchDebounceTimer = setTimeoutFn(() => {
         settingsWatchDebounceTimer = null;
+        if (!shouldManageClaudeHooks() || !isAgentEnabled("claude-code")) return;
         // Rate-limit: don't re-sync within 5s to avoid write wars with CC-Switch
         if (nowFn() - settingsWatchLastSyncTime < settingsWatchRateLimitMs) return;
         try {
@@ -588,6 +853,7 @@ function startHttpServer() {
         }
         try {
           const data = JSON.parse(body);
+          const recordRequestHookEvent = createRequestHookRecorder(data, "state");
           let { state, svg, session_id, event } = data;
           let display_svg;
           if (data.display_svg === null) display_svg = null;
@@ -621,6 +887,7 @@ function startHttpServer() {
           // hanging on our HTTP connection. Still surfaces as a success code
           // so hook exit behavior is unchanged.
           if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled(agentId)) {
+            recordRequestHookEvent.droppedByDisabled();
             res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
             res.end();
             return;
@@ -649,6 +916,7 @@ function startHttpServer() {
               });
               if (perm) ctx.resolvePermissionEntry(perm, "deny", "User answered in terminal");
             }
+            recordRequestHookEvent.acceptedUnlessDnd(shouldDropForDnd());
             if (svg) {
               const safeSvg = path.basename(svg);
               ctx.setState(state, safeSvg);
@@ -705,6 +973,7 @@ function startHttpServer() {
           res.end("bad json");
           return;
         }
+        const recordRequestHookEvent = createRequestHookRecorder(data, "permission");
 
         try {
           // ── opencode branch ──
@@ -727,6 +996,7 @@ function startHttpServer() {
             // fire-and-forget, so 200 ACK satisfies it; skipping the bridge
             // reply lets the opencode TUI fall back to its built-in prompt.
             if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled("opencode")) {
+              recordRequestHookEvent.droppedByDisabled();
               ctx.permLog("opencode disabled → silent drop, TUI fallback");
               return;
             }
@@ -749,6 +1019,7 @@ function startHttpServer() {
             // we have no way to resolve the pending permission.
             if (!requestId || !bridgeUrl || !bridgeToken) {
               const missing = !requestId ? "request_id" : (!bridgeUrl ? "bridge_url" : "bridge_token");
+              recordRequestHookEvent.accepted();
               ctx.permLog(`SKIPPED opencode perm: missing ${missing}`);
               return;
             }
@@ -758,6 +1029,7 @@ function startHttpServer() {
             // can confirm in the terminal themselves. Spike 2026-04-06
             // confirmed this works: TUI shows Allow/Reject without hanging.
             if (ctx.doNotDisturb) {
+              recordRequestHookEvent.droppedByDnd();
               ctx.permLog(`opencode DND → silent drop, TUI fallback — request=${requestId}`);
               return;
             }
@@ -766,6 +1038,7 @@ function startHttpServer() {
             // not render a bubble and let the TUI prompt handle it.
             const opencodeSubGateBypass = shouldBypassOpencodeBubble(ctx);
             if (!arePermissionBubblesEnabled(ctx) || opencodeSubGateBypass) {
+              recordRequestHookEvent.accepted();
               ctx.permLog(`opencode bubble hidden: tool=${toolName} — TUI fallback (permissionBubblesEnabled=${arePermissionBubblesEnabled(ctx)} subGateBypass=${opencodeSubGateBypass})`);
               return;
             }
@@ -797,6 +1070,7 @@ function startHttpServer() {
             // mutating session state — so working/thinking is preserved for resolve.
             ctx.updateSession(sessionId, "notification", "PermissionRequest", { agentId: "opencode" });
             ctx.permLog(`opencode showing bubble: tool=${toolName} session=${sessionId}`);
+            recordRequestHookEvent.accepted();
             try {
               ctx.showPermissionBubble(permEntry);
             } catch (bubbleErr) {
@@ -834,18 +1108,21 @@ function startHttpServer() {
               : buildToolInputFingerprint(rawInput);
 
             if (ctx.doNotDisturb) {
+              recordRequestHookEvent.droppedByDnd();
               ctx.permLog(`codex DND -> no decision, native prompt fallback (tool=${toolName})`);
               sendCodexPermissionNoDecision(res);
               return;
             }
 
             if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled("codex")) {
+              recordRequestHookEvent.droppedByDisabled();
               ctx.permLog(`codex disabled -> no decision, native prompt fallback (tool=${toolName})`);
               sendCodexPermissionNoDecision(res);
               return;
             }
 
             if (shouldBypassCodexBubble(ctx)) {
+              recordRequestHookEvent.accepted();
               const reason = !arePermissionBubblesEnabled(ctx)
                 ? "permission bubbles disabled"
                 : "codex bubbles disabled";
@@ -885,6 +1162,7 @@ function startHttpServer() {
             });
 
             ctx.permLog(`codex showing bubble: tool=${toolName} session=${sessionId} stack=${ctx.pendingPermissions.length}`);
+            recordRequestHookEvent.accepted();
             try {
               ctx.showPermissionBubble(permEntry);
             } catch (bubbleErr) {
@@ -904,6 +1182,7 @@ function startHttpServer() {
           // Deny in chat, no hang, no timeout. Same pattern as opencode
           // silent drop (95cbfc7).
           if (ctx.doNotDisturb) {
+            recordRequestHookEvent.droppedByDnd();
             ctx.permLog("CC DND → destroy connection, CC chat fallback");
             res.destroy();
             return;
@@ -915,6 +1194,7 @@ function startHttpServer() {
           // gets the same treatment.
           const ccAgentId = typeof data.agent_id === "string" && data.agent_id ? data.agent_id : "claude-code";
           if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled(ccAgentId)) {
+            recordRequestHookEvent.droppedByDisabled();
             ctx.permLog(`${ccAgentId} disabled → destroy connection, chat fallback`);
             res.destroy();
             return;
@@ -939,18 +1219,21 @@ function startHttpServer() {
 
           const existingSession = ctx.sessions.get(sessionId);
           if (existingSession && existingSession.headless) {
+            recordRequestHookEvent.accepted();
             ctx.permLog(`SKIPPED: headless session=${sessionId}`);
             ctx.sendPermissionResponse(res, "deny", "Non-interactive session; auto-denied");
             return;
           }
 
           if (ctx.PASSTHROUGH_TOOLS.has(toolName)) {
+            recordRequestHookEvent.accepted();
             ctx.permLog(`PASSTHROUGH: tool=${toolName} session=${sessionId}`);
             ctx.sendPermissionResponse(res, "allow");
             return;
           }
 
           if (shouldBypassCCBubble(ctx, toolName, permAgentId)) {
+            recordRequestHookEvent.accepted();
             const reason = !arePermissionBubblesEnabled(ctx)
               ? "permission bubbles disabled"
               : `${permAgentId} bubbles disabled`;
@@ -990,6 +1273,7 @@ function startHttpServer() {
             permEntry.abortHandler = abortHandler;
             res.on("close", abortHandler);
             ctx.pendingPermissions.push(permEntry);
+            recordRequestHookEvent.accepted();
             ctx.showPermissionBubble(permEntry);
             return;
           }
@@ -1087,6 +1371,7 @@ function startHttpServer() {
           ctx.updateSession(sessionId, "notification", "PermissionRequest", { agentId: permAgentId });
 
           ctx.permLog(`showing bubble: tool=${toolName} session=${sessionId} suggestions=${suggestions.length} stack=${ctx.pendingPermissions.length}`);
+          recordRequestHookEvent.accepted();
           ctx.showPermissionBubble(permEntry);
         } catch (err) {
           ctx.permLog(`/permission handler error: ${err && err.message}`);
@@ -1148,17 +1433,7 @@ function startHttpServer() {
     // and they operate on independent files for independent agents, so
     // none of them need to block the HTTP server from accepting traffic.
     setImmediateFn(() => {
-      if (shouldManageClaudeHooks()) {
-        syncClawdHooks();
-        startClaudeSettingsWatcher();
-      }
-      syncGeminiHooks();
-      syncCursorHooks();
-      syncCodeBuddyHooks();
-      syncKiroHooks();
-      syncKimiHooks();
-      syncCodexHooks();
-      syncOpencodePlugin();
+      syncEnabledStartupIntegrations();
     });
   });
 
@@ -1174,6 +1449,9 @@ function cleanup() {
 return {
   startHttpServer,
   getHookServerPort,
+  getRuntimeStatus,
+  getRecentHookEvents,
+  clearRecentHookEvents,
   syncClawdHooks,
   syncGeminiHooks,
   syncCursorHooks,
@@ -1182,6 +1460,10 @@ return {
   syncKimiHooks,
   syncCodexHooks,
   syncOpencodePlugin,
+  syncIntegrationForAgent,
+  repairIntegrationForAgent,
+  repairRuntimeStatus,
+  stopIntegrationForAgent,
   startClaudeSettingsWatcher,
   stopClaudeSettingsWatcher,
   cleanup,
@@ -1203,4 +1485,8 @@ module.exports.__test = {
   buildToolInputFingerprint,
   findPendingPermissionForStateEvent,
   resolveCodexOfficialHookState,
+  recordHookEventInBuffer,
+  getRecentHookEventsFromBuffer,
+  createSingleRequestHookEventRecorder,
+  HOOK_EVENT_RING_SIZE_PER_AGENT,
 };

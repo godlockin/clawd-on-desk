@@ -16,6 +16,12 @@ function renderSidebar() {
   const sidebar = document.getElementById("sidebar");
   if (!sidebar) return;
   sidebar.innerHTML = "";
+  if (
+    globalThis.ClawdSettingsDoctorModal
+    && typeof globalThis.ClawdSettingsDoctorModal.renderSidebarIndicator === "function"
+  ) {
+    globalThis.ClawdSettingsDoctorModal.renderSidebarIndicator(sidebar, core);
+  }
   for (const tab of SIDEBAR_TABS) {
     const item = document.createElement("div");
     item.className = "sidebar-item";

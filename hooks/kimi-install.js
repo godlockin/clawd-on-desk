@@ -9,6 +9,8 @@ const { asarUnpackedPath } = require("./json-utils");
 const MARKER = "kimi-hook.js";
 const MODE_EXPLICIT = "explicit";
 const MODE_SUSPECT = "suspect";
+const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".kimi");
+const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, "config.toml");
 
 const KIMI_HOOK_EVENTS = [
   "SessionStart",
@@ -29,6 +31,13 @@ const KIMI_HOOK_EVENTS = [
 const COMMAND_WITH_MARKER_REGEX = new RegExp(
   `command\\s*=\\s*"(?:\\\\.|[^"\\\\])*${MARKER}(?:\\\\.|[^"\\\\])*"|command\\s*=\\s*'[^']*${MARKER}[^']*'`
 );
+const COMMAND_LINE_REGEX = /command\s*=\s*(?:"((?:\\.|[^"\\])*)"|'([^']*)')/g;
+
+function unescapeTomlDoubleQuotedCommand(value) {
+  return String(value)
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+}
 
 function normalizePermissionMode(value) {
   if (typeof value !== "string") return null;
@@ -49,10 +58,12 @@ function extractExistingPermissionMode(content) {
   // A naive `[^"]*` truncates at the first `\"`, drops MARKER, and silently
   // returns null — which is exactly the regression that erased the user's
   // suspect-mode prefix on startup auto-sync.
-  const lineRegex = /command\s*=\s*(?:"((?:\\.|[^"\\])*)"|'([^']*)')/g;
   let match;
-  while ((match = lineRegex.exec(content)) !== null) {
-    const value = match[1] || match[2] || "";
+  COMMAND_LINE_REGEX.lastIndex = 0;
+  while ((match = COMMAND_LINE_REGEX.exec(content)) !== null) {
+    const value = match[1] !== undefined
+      ? unescapeTomlDoubleQuotedCommand(match[1])
+      : (match[2] || "");
     if (!value.includes(MARKER)) continue;
     const modeMatch = value.match(/CLAWD_KIMI_PERMISSION_MODE=([A-Za-z]+)/);
     if (modeMatch) {
@@ -61,6 +72,22 @@ function extractExistingPermissionMode(content) {
     }
   }
   return null;
+}
+
+function findKimiHookCommands(content, marker = MARKER) {
+  if (typeof content !== "string" || !content || typeof marker !== "string" || !marker) {
+    return [];
+  }
+  const commands = [];
+  let match;
+  COMMAND_LINE_REGEX.lastIndex = 0;
+  while ((match = COMMAND_LINE_REGEX.exec(content)) !== null) {
+    const value = match[1] !== undefined
+      ? unescapeTomlDoubleQuotedCommand(match[1])
+      : (match[2] || "");
+    if (value.includes(marker)) commands.push(value);
+  }
+  return commands;
 }
 
 // Remove every [[hooks]] block whose command references Clawd's kimi-hook.js.
@@ -209,10 +236,13 @@ timeout = 30
 }
 
 module.exports = {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_CONFIG_PATH,
   registerKimiHooks,
   KIMI_HOOK_EVENTS,
   normalizePermissionMode,
   extractExistingPermissionMode,
+  findKimiHookCommands,
   stripClawdKimiHookBlocks,
   MODE_EXPLICIT,
   MODE_SUSPECT,

@@ -10,6 +10,7 @@ const SETTINGS_HTML = path.join(SRC_DIR, "settings.html");
 const SETTINGS_RENDERER = path.join(SRC_DIR, "settings-renderer.js");
 const SETTINGS_UI_CORE = path.join(SRC_DIR, "settings-ui-core.js");
 const SETTINGS_I18N = path.join(SRC_DIR, "settings-i18n.js");
+const SETTINGS_DOCTOR_MODAL = path.join(SRC_DIR, "settings-doctor-modal.js");
 const PRELOAD_SETTINGS = path.join(SRC_DIR, "preload-settings.js");
 const MAIN_PROCESS = path.join(SRC_DIR, "main.js");
 const TAB_MODULES = [
@@ -38,6 +39,7 @@ describe("settings renderer browser environment", () => {
       "settings-tab-anim-overrides.js",
       "settings-tab-shortcuts.js",
       "settings-tab-about.js",
+      "settings-doctor-modal.js",
       "settings-renderer.js",
     ];
 
@@ -60,15 +62,18 @@ describe("settings renderer browser environment", () => {
     const rendererSource = fs.readFileSync(SETTINGS_RENDERER, "utf8");
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+    const doctorModalSource = fs.readFileSync(SETTINGS_DOCTOR_MODAL, "utf8");
     const agentOrderSource = fs.readFileSync(path.join(SRC_DIR, "settings-agent-order.js"), "utf8");
 
     assert.ok(rendererSource.includes("globalThis.ClawdSettingsCore"));
     assert.ok(coreSource.includes("ClawdSettingsSizeSlider"));
     assert.ok(i18nSource.includes("globalThis"));
+    assert.ok(doctorModalSource.includes("globalThis"));
+    assert.ok(doctorModalSource.includes("ClawdSettingsDoctorModal"));
     assert.ok(agentOrderSource.includes("globalThis"));
     assert.ok(agentOrderSource.includes("module.exports"));
 
-    for (const source of [rendererSource, coreSource, i18nSource]) {
+    for (const source of [rendererSource, coreSource, i18nSource, doctorModalSource]) {
       assert.ok(!source.includes("require("));
       assert.ok(!source.includes("module.exports"));
     }
@@ -82,6 +87,77 @@ describe("settings renderer browser environment", () => {
       assert.ok(!source.includes("settingsAPI.onShortcutRecordKey"), `${path.basename(file)} must not subscribe to settingsAPI.onShortcutRecordKey`);
       assert.ok(!source.includes("settingsAPI.onShortcutFailuresChanged"), `${path.basename(file)} must not subscribe to settingsAPI.onShortcutFailuresChanged`);
     }
+  });
+
+  it("wires Clawd Doctor through Settings with Step 2 connection actions", () => {
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+    const rendererSource = fs.readFileSync(SETTINGS_RENDERER, "utf8");
+    const doctorModalSource = fs.readFileSync(SETTINGS_DOCTOR_MODAL, "utf8");
+    const preloadSource = fs.readFileSync(PRELOAD_SETTINGS, "utf8");
+    const mainSource = fs.readFileSync(MAIN_PROCESS, "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+
+    assert.ok(html.includes('<script src="settings-doctor-modal.js"></script>'));
+    assert.ok(html.includes(".doctor-indicator"));
+    assert.ok(html.includes(".doctor-modal"));
+    assert.ok(rendererSource.includes("ClawdSettingsDoctorModal.renderSidebarIndicator"));
+    assert.ok(doctorModalSource.includes("initialRunStarted"));
+    assert.ok(doctorModalSource.includes("runningPromise"));
+    assert.ok(doctorModalSource.includes("root.doctor.runChecks"));
+    assert.ok(doctorModalSource.includes("root.doctor.getReport"));
+    assert.ok(doctorModalSource.includes("root.doctor.testConnection"));
+    assert.ok(doctorModalSource.includes("root.doctor.openClawdLog"));
+    assert.ok(doctorModalSource.includes('root.settingsAPI.command("repairDoctorIssue"'));
+    assert.ok(doctorModalSource.includes("requiresFixConfirmation"));
+    assert.ok(doctorModalSource.includes("renderFixConfirm"));
+    assert.ok(doctorModalSource.includes("doctorFixConfirmCodexDetail"));
+    assert.ok(doctorModalSource.includes("doctorRestartConfirmDetail"));
+    assert.ok(doctorModalSource.includes("doctorRestartButton"));
+    assert.ok(doctorModalSource.includes('commandAction.type !== "restart-clawd"'));
+    assert.ok(doctorModalSource.includes("repairFeedback"));
+    assert.ok(doctorModalSource.includes("lastRepairFeedback"));
+    assert.ok(doctorModalSource.includes("core.ops.showToast"));
+    assert.ok(!doctorModalSource.includes("core.helpers.showToast"));
+    assert.ok(doctorModalSource.includes("agentDetailText"));
+    assert.ok(doctorModalSource.includes("startConnectionTest"));
+    assert.ok(html.includes(".doctor-agent-detail"));
+    assert.ok(html.includes(".doctor-connection-panel"));
+    assert.ok(html.includes(".doctor-fix-button"));
+    assert.ok(html.includes(".doctor-fix-confirm"));
+    assert.ok(html.includes(".doctor-privacy-inline"));
+    assert.ok(doctorModalSource.includes("doctorPrivacyShort"));
+    assert.ok(html.includes(".doctor-repair-feedback"));
+    assert.ok(html.includes(".doctor-repair-summary"));
+    // Regression guard: agent list must not introduce its own scroll viewport.
+    // The outer .doctor-check-list owns scrolling so users get a single scrollbar.
+    // [^}]*? keeps the match scoped to this rule body so unrelated max-height
+    // declarations elsewhere in settings.html don't trip the assertion.
+    assert.ok(!/\.doctor-agent-list\s*\{[^}]*?max-height:/.test(html));
+    assert.ok(!/\.doctor-agent-list\s*\{[^}]*?overflow-y:\s*auto/.test(html));
+    assert.ok(/\.doctor-agent-item \+ \.doctor-agent-item\s*\{[\s\S]*border-top:\s*1px solid var\(--row-border\);/.test(html));
+    assert.ok(preloadSource.includes('contextBridge.exposeInMainWorld("doctor"'));
+    assert.ok(preloadSource.includes('ipcRenderer.invoke("doctor:run-checks")'));
+    assert.ok(preloadSource.includes('ipcRenderer.invoke("doctor:get-report")'));
+    assert.ok(preloadSource.includes('ipcRenderer.invoke("doctor:test-connection"'));
+    assert.ok(preloadSource.includes('ipcRenderer.invoke("doctor:open-clawd-log"'));
+    assert.ok(mainSource.includes('ipcMain.handle("doctor:run-checks"'));
+    assert.ok(mainSource.includes('ipcMain.handle("doctor:get-report"'));
+    assert.ok(mainSource.includes('ipcMain.handle("doctor:test-connection"'));
+    assert.ok(mainSource.includes('ipcMain.handle("doctor:open-clawd-log"'));
+    assert.ok(mainSource.includes("createConnectionTestDeduper"));
+    assert.ok(mainSource.includes("runDedupedDoctorConnectionTest"));
+    assert.ok(mainSource.includes("runConnectionTest"));
+    assert.ok(mainSource.includes("openClawdLog"));
+    assert.ok(mainSource.includes("formatDiagnosticReport"));
+    assert.ok(mainSource.includes("getDoctorRedactionOptions"));
+    assert.ok(mainSource.includes("redactDoctorResult(buildDoctorResult(), getDoctorRedactionOptions())"));
+    assert.ok(i18nSource.includes("doctorRunFailed"));
+    assert.ok(i18nSource.includes("doctorFixApplied"));
+    assert.ok(i18nSource.includes("doctorFixConfirmCodexDetail"));
+    assert.ok(i18nSource.includes("doctorRestartConfirmDetail"));
+    assert.ok(i18nSource.includes("doctorPrivacyShort"));
+    assert.ok(i18nSource.includes("doctorConnectionHttpVerified"));
+    assert.ok(i18nSource.includes("doctorOpenLog"));
   });
 
   it("does not animate the size bubble's horizontal position", () => {
@@ -178,10 +254,44 @@ describe("settings renderer browser environment", () => {
     assert.ok(!mainSource.includes('ipcMain.handle("settings:confirm-disable-update-bubbles"'));
     assert.ok(i18nSource.includes("Hide update bubbles"));
     assert.ok(i18nSource.includes("隐藏更新气泡"));
-    assert.ok(generalSource.includes('confirmBtn.className = "soft-btn";'));
-    assert.ok(generalSource.includes('cancelBtn.className = "soft-btn accent";'));
-    assert.ok(generalSource.indexOf("actions.appendChild(confirmBtn);") < generalSource.indexOf("actions.appendChild(cancelBtn);"));
-    assert.ok(generalSource.includes("cancelBtn.focus();"));
+    assert.ok(generalSource.includes('{ id: "confirm", label: t("updateBubbleDisableConfirmAction"), tone: "danger" }'));
+    assert.ok(generalSource.includes('{ id: "cancel", label: t("updateBubbleDisableConfirmCancel"), tone: "accent", defaultFocus: true }'));
+    assert.ok(generalSource.includes('if (actionId === "confirm") runToggleCommit(nextEnabled);'));
+    assert.ok(generalSource.includes('tone === "accent"'));
+    assert.ok(generalSource.includes('tone === "danger"'));
+  });
+
+  it("keeps Claude hooks confirmations inside the Settings renderer", () => {
+    const preloadSource = fs.readFileSync(PRELOAD_SETTINGS, "utf8");
+    const mainSource = fs.readFileSync(MAIN_PROCESS, "utf8");
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+    assert.ok(generalSource.includes("confirmDisableClaudeHookManagement"));
+    assert.ok(generalSource.includes("runDisconnectClaudeHooks"));
+    assert.ok(generalSource.includes("showSettingsConfirmModal({"));
+    assert.ok(generalSource.includes("claudeHooksDisableConfirmTitle"));
+    assert.ok(generalSource.includes("claudeHooksDisconnectConfirmTitle"));
+    assert.ok(generalSource.includes("buttons.find((action) => action.action && action.action.defaultFocus)"));
+    assert.ok(generalSource.includes('button.className = `soft-btn${toneClass ? ` ${toneClass}` : ""}`;'));
+    assert.ok(generalSource.includes('tone === "accent"'));
+    assert.ok(generalSource.includes('tone === "danger"'));
+    assert.ok(html.includes(".settings-confirm-danger"));
+    assert.ok(!preloadSource.includes("confirmDisableClaudeHooks"));
+    assert.ok(!preloadSource.includes("confirmDisconnectClaudeHooks"));
+    assert.ok(!mainSource.includes('ipcMain.handle("settings:confirm-disable-claude-hooks"'));
+    assert.ok(!mainSource.includes('ipcMain.handle("settings:confirm-disconnect-claude-hooks"'));
+    assert.ok(!mainSource.includes("CLAUDE_HOOKS_DIALOG_STRINGS"));
+    assert.ok(i18nSource.includes("claudeHooksDisableConfirmTitle"));
+    assert.ok(i18nSource.includes("claudeHooksDisableConfirmKeep"));
+    assert.ok(i18nSource.includes("claudeHooksDisconnectConfirmKeep"));
+  });
+
+  it("uses a roomier grid layout for Settings confirmation buttons", () => {
+    const html = fs.readFileSync(SETTINGS_HTML, "utf8");
+    assert.ok(/\.settings-confirm-modal\s*\{[\s\S]*width:\s*min\(480px,\s*100%\);/.test(html));
+    assert.ok(/\.settings-confirm-actions\s*\{[\s\S]*display:\s*grid;[\s\S]*grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(136px,\s*1fr\)\);[\s\S]*gap:\s*9px;/.test(html));
+    assert.ok(/\.settings-confirm-actions\s+\.soft-btn\s*\{[\s\S]*min-height:\s*42px;[\s\S]*padding:\s*6px 10px;[\s\S]*white-space:\s*normal;[\s\S]*text-align:\s*center;/.test(html));
   });
 
   it("provides a persisted collapsible Settings group helper with smart default collapse", () => {

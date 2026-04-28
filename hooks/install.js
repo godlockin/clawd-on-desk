@@ -9,6 +9,9 @@ const os = require("os");
 const { buildPermissionUrl, DEFAULT_SERVER_PORT, PERMISSION_PATH, readRuntimePort, resolveNodeBin } = require("./server-config");
 const { writeJsonAtomic, asarUnpackedPath } = require("./json-utils");
 
+const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".claude");
+const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, "settings.json");
+
 // Hooks supported by all Claude Code versions
 const CORE_HOOKS = [
   "SessionStart",
@@ -996,6 +999,8 @@ function isAutoStartRegistered() {
 
 // Export for use by main.js
 module.exports = {
+  DEFAULT_PARENT_DIR,
+  DEFAULT_CONFIG_PATH,
   registerHooks,
   unregisterHooks,
   unregisterAutoStart,

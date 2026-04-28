@@ -24,13 +24,16 @@ const { postStateToRunningServer, readHostPrefix } = require("./server-config");
 const SESSION_DIR = path.join(os.homedir(), ".codex", "sessions");
 const POLL_INTERVAL_MS = 1500;
 
-// JSONL record type[:subtype] → pet state
-// ⚠️ Duplicated from agents/codex.js logEventMap (zero-dep requirement) — keep in sync
+// JSONL record type[:subtype] → pet state. This standalone remote monitor keeps
+// a zero-dep subset of agents/codex.js because it posts final states directly
+// and does not carry the full local monitor's turn-end/approval heuristics.
+// Keep shared Codex JSONL event additions in sync where they affect both paths.
 const LOG_EVENT_MAP = {
   "session_meta": "idle",
   "event_msg:task_started": "thinking",
   "event_msg:user_message": "thinking",
   "event_msg:agent_message": "working",
+  "event_msg:guardian_assessment": "working",
   "response_item:function_call": "working",
   "response_item:custom_tool_call": "working",
   "response_item:web_search_call": "working",
