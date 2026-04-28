@@ -522,15 +522,17 @@ const HTTP_HOOKS = {};
 // Distinct from CORE_HOOKS (one-shot state pings) because:
 //   1. Different marker (PERMISSION_WRAPPER_MARKER) so reconcile/uninstall
 //      can target each independently.
-//   2. Different matcher — narrowed to "Bash" so Edit/Write/mcp__* go
-//      through CC's native permission mode (mirrors CARD-01 intent).
+//   2. Matcher is "" (match-all) so every PermissionRequest — Bash, Edit,
+//      Write, MultiEdit, mcp__*, etc. — flows through Clawd's bubble.
+//      Earlier revisions narrowed to "Bash" only; user request 2026-04-28
+//      reverted that to "" so the desktop pet handles all yes/no prompts.
 //   3. Carries a CC-side timeout (60s ceiling) — the wrapper's internal
 //      decision-wait is 54s + 6s safety margin; this 60s is the OUTER
 //      ceiling CC enforces on the spawned process. Keep the relationship
 //      in sync if either side moves.
 const WRAPPER_COMMAND_HOOKS = {
   PermissionRequest: {
-    matcher: "Bash",
+    matcher: "",
     timeout: 60,
     script: "clawd-permission-hook.js",
     marker: PERMISSION_WRAPPER_MARKER,
@@ -834,6 +836,23 @@ function registerHooks(options = {}) {
           changed = true;
         }
       });
+      // Reconcile matcher drift: locate the entry containing the wrapper
+      // hook and update its matcher when it diverges from spec.matcher.
+      // Necessary because earlier installs registered matcher:"Bash" and
+      // we need to widen to "" without forcing users to manually edit
+      // settings.json.
+      for (const entry of settings.hooks[event]) {
+        if (!entry || !Array.isArray(entry.hooks)) continue;
+        const hasWrapper = entry.hooks.some(
+          (h) => h && typeof h.command === "string" && h.command.includes(spec.marker)
+        );
+        if (!hasWrapper) continue;
+        const desiredMatcher = spec.matcher || "";
+        if ((entry.matcher || "") !== desiredMatcher) {
+          entry.matcher = desiredMatcher;
+          changed = true;
+        }
+      }
       continue;
     }
 

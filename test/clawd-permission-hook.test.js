@@ -159,6 +159,41 @@ describe("clawd-permission-hook pure helpers", () => {
     assert.deepStrictEqual(JSON.parse(buildDenyOutput("x")).hookSpecificOutput.permissionDecision, "deny");
     assert.deepStrictEqual(JSON.parse(buildAskOutput("ask reason")).hookSpecificOutput.permissionDecision, "ask");
   });
+
+  it("translateServerResponse forwards updatedPermissions on allow/deny/ask", () => {
+    const ups = [
+      { type: "addRules", destination: "localSettings", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "ls *" }] },
+    ];
+    const allowBody = JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "allow", updatedPermissions: ups },
+      },
+    });
+    const out = JSON.parse(translateServerResponse(allowBody, 200));
+    assert.strictEqual(out.hookSpecificOutput.permissionDecision, "allow");
+    assert.deepStrictEqual(out.hookSpecificOutput.updatedPermissions, ups);
+
+    const denyBody = JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "deny", message: "nope", updatedPermissions: ups },
+      },
+    });
+    const denyOut = JSON.parse(translateServerResponse(denyBody, 200));
+    assert.strictEqual(denyOut.hookSpecificOutput.permissionDecision, "deny");
+    assert.deepStrictEqual(denyOut.hookSpecificOutput.updatedPermissions, ups);
+
+    // Empty / non-array updatedPermissions must NOT appear in output.
+    const allowNoUps = JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "allow", updatedPermissions: [] },
+      },
+    });
+    const noUpsOut = JSON.parse(translateServerResponse(allowNoUps, 200));
+    assert.strictEqual("updatedPermissions" in noUpsOut.hookSpecificOutput, false);
+  });
 });
 
 // ── Spawn-based tests against a stub server ─────────────────────────────────

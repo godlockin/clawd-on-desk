@@ -124,29 +124,46 @@ function buildNoDecisionOutput() {
   return "{}";
 }
 
-function buildAllowOutput() {
-  return JSON.stringify({
+function sanitizeUpdatedPermissions(value) {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  // Pass through as-is; server already shaped it (src/permission.js:642).
+  // CC's PermissionRequest stdout schema accepts updatedPermissions at
+  // hookSpecificOutput level, same as the prior direct-HTTP response path.
+  return value;
+}
+
+function buildAllowOutput(message, updatedPermissions) {
+  const out = {
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
       permissionDecision: "allow",
     },
-  });
+  };
+  if (typeof message === "string" && message) {
+    out.hookSpecificOutput.permissionDecisionReason = message.slice(0, DENY_REASON_MAX);
+  }
+  const ups = sanitizeUpdatedPermissions(updatedPermissions);
+  if (ups) out.hookSpecificOutput.updatedPermissions = ups;
+  return JSON.stringify(out);
 }
 
-function buildDenyOutput(message) {
+function buildDenyOutput(message, updatedPermissions) {
   let reason =
     typeof message === "string" && message ? message : "Denied by Clawd bubble";
   if (reason.length > DENY_REASON_MAX) reason = reason.slice(0, DENY_REASON_MAX);
-  return JSON.stringify({
+  const out = {
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
       permissionDecision: "deny",
       permissionDecisionReason: reason,
     },
-  });
+  };
+  const ups = sanitizeUpdatedPermissions(updatedPermissions);
+  if (ups) out.hookSpecificOutput.updatedPermissions = ups;
+  return JSON.stringify(out);
 }
 
-function buildAskOutput(message) {
+function buildAskOutput(message, updatedPermissions) {
   const out = {
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
@@ -156,6 +173,8 @@ function buildAskOutput(message) {
   if (typeof message === "string" && message) {
     out.hookSpecificOutput.permissionDecisionReason = message.slice(0, DENY_REASON_MAX);
   }
+  const ups = sanitizeUpdatedPermissions(updatedPermissions);
+  if (ups) out.hookSpecificOutput.updatedPermissions = ups;
   return JSON.stringify(out);
 }
 
@@ -179,9 +198,10 @@ function translateServerResponse(rawBody, statusCode) {
       ? parsed.hookSpecificOutput.decision
       : null;
   if (!decision || typeof decision !== "object") return buildNoDecisionOutput();
-  if (decision.behavior === "allow") return buildAllowOutput();
-  if (decision.behavior === "deny") return buildDenyOutput(decision.message);
-  if (decision.behavior === "ask") return buildAskOutput(decision.message);
+  const ups = decision.updatedPermissions;
+  if (decision.behavior === "allow") return buildAllowOutput(decision.message, ups);
+  if (decision.behavior === "deny") return buildDenyOutput(decision.message, ups);
+  if (decision.behavior === "ask") return buildAskOutput(decision.message, ups);
   return buildNoDecisionOutput();
 }
 
