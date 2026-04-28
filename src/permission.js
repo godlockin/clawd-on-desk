@@ -821,6 +821,22 @@ function handleDecide(event, behavior) {
         mode: suggestion.mode,
         destination: suggestion.destination || "localSettings",
       };
+    } else if (suggestion.type === "addDirectories") {
+      const directories = Array.isArray(suggestion.directories)
+        ? suggestion.directories.filter((d) => typeof d === "string" && d)
+        : [];
+      perm.resolvedSuggestion = {
+        type: "addDirectories",
+        destination: suggestion.destination || "localSettings",
+        directories,
+      };
+    } else if (suggestion && typeof suggestion === "object" && typeof suggestion.type === "string") {
+      // Forward unknown future suggestion shapes verbatim — better than
+      // silently dropping them and leaving CC with a bare allow that
+      // never persists. CC will reject malformed updatedPermissions
+      // entries on its side; that's a louder failure than silent drop.
+      permLog(`suggestion forward-as-is type=${suggestion.type}`);
+      perm.resolvedSuggestion = suggestion;
     }
     resolvePermissionEntry(perm, "allow");
   } else if (behavior === "deny-and-focus") {
