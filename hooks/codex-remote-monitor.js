@@ -3,7 +3,7 @@
 // Polls ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl for state changes
 // and POSTs them via HTTP to the local Clawd desktop pet (through SSH tunnel).
 //
-// Zero external dependencies — Node.js built-ins + ./server-config.js only.
+// Zero external dependencies — Node.js built-ins + same-directory hook helpers only.
 //
 // Usage:
 //   node codex-remote-monitor.js            # run as long-lived daemon
@@ -18,11 +18,17 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { postStateToRunningServer, readHostPrefix } = require("./server-config");
+const { classifySessionMeta } = require("./codex-subagent-fields");
+const {
+  clampAssistantOutputText,
+  extractAssistantTextFromRecord,
+} = require("./codex-assistant-output");
 
 // ── Inline config from agents/codex.js (zero-dependency requirement) ──
 
 const SESSION_DIR = path.join(os.homedir(), ".codex", "sessions");
 const POLL_INTERVAL_MS = 1500;
+const STALE_MS = 300000;
 
 // JSONL record type[:subtype] → pet state. This standalone remote monitor keeps
 // a zero-dep subset of agents/codex.js because it posts final states directly
@@ -80,23 +86,33 @@ function extractSessionId(fileName) {
   return parts.slice(-5).join("-");
 }
 
-function postState(sessionId, state, event, cwd) {
-  const body = JSON.stringify({
+function buildPostStateBody(sessionId, state, event, cwd, isSubagent, host, extra = null) {
+  const body = {
     state,
     session_id: sessionId,
     event,
     agent_id: "codex",
     cwd: cwd || "",
-    host: hostPrefix,
-  });
+    host: host || hostPrefix,
+    headless: isSubagent === true,
+  };
+  if (extra && typeof extra.assistantLastOutput === "string" && extra.assistantLastOutput) {
+    body.assistant_last_output = extra.assistantLastOutput;
+    if (extra.assistantLastOutputTruncated === true) body.assistant_last_output_truncated = true;
+  }
+  return JSON.stringify(body);
+}
+
+function postState(sessionId, state, event, cwd, isSubagent, extra = null) {
+  const body = buildPostStateBody(sessionId, state, event, cwd, isSubagent, undefined, extra);
   postStateToRunningServer(
     body,
-    { timeoutMs: 100, preferredPort },
+    { timeoutMs: 100, preferredPort, remote: true },
     () => {} // fire and forget — tunnel may be down
   );
 }
 
-function processLine(line, entry) {
+function processLine(line, entry, options = {}) {
   let obj;
   try {
     obj = JSON.parse(line);
@@ -113,20 +129,47 @@ function processLine(line, entry) {
   // Extract CWD from session_meta
   if (type === "session_meta" && payload) {
     entry.cwd = payload.cwd || "";
+    entry.isSubagent = classifySessionMeta(payload) === "subagent";
+  }
+
+  const assistantText = extractAssistantTextFromRecord(obj);
+  if (assistantText) {
+    const assistantOutput = clampAssistantOutputText(assistantText);
+    entry.assistantLastOutput = assistantOutput ? assistantOutput.text : null;
+    entry.assistantLastOutputTruncated = !!(assistantOutput && assistantOutput.truncated);
   }
 
   const state = LOG_EVENT_MAP[key];
   if (state === undefined || state === null) return;
+  const finalState = entry.isSubagent && state === "attention" ? "idle" : state;
+  if (key === "event_msg:task_started") {
+    entry.assistantLastOutput = null;
+    entry.assistantLastOutputTruncated = false;
+  }
 
-  // Avoid spamming same state
-  if (state === entry.lastState && state === "working") return;
-  entry.lastState = state;
+  // Avoid spamming same state — but never swallow the event when the session
+  // is stale: after a "sleeping" post, the next working event must wake the pet
+  // back up (post working, refresh lastEventTime, clear stale). Without the
+  // `!entry.stale` guard a session whose last state was "working" would stay
+  // asleep through every subsequent working event until a state change.
+  if (finalState === entry.lastState && finalState === "working" && !entry.stale) return;
+  entry.lastState = finalState;
   entry.lastEventTime = Date.now();
+  // A real event re-activates the session, so a later idle window re-arms the
+  // one-shot "sleeping" post in cleanStaleFiles.
+  entry.stale = false;
 
-  postState(entry.sessionId, state, key, entry.cwd);
+  const postStateFn = typeof options.postState === "function" ? options.postState : postState;
+  const extra = key === "event_msg:task_complete" && entry.assistantLastOutput
+    ? {
+      assistantLastOutput: entry.assistantLastOutput,
+      assistantLastOutputTruncated: entry.assistantLastOutputTruncated === true,
+    }
+    : null;
+  postStateFn(entry.sessionId, finalState, key, entry.cwd, entry.isSubagent, extra);
 }
 
-function pollFile(filePath, fileName) {
+function pollFile(filePath, fileName, options = {}) {
   let stat;
   try {
     stat = fs.statSync(filePath);
@@ -142,11 +185,33 @@ function pollFile(filePath, fileName) {
       offset: 0,
       sessionId: "codex:" + sessionId,
       cwd: "",
+      isSubagent: false,
       lastEventTime: Date.now(),
       lastState: null,
+      assistantLastOutput: null,
+      assistantLastOutputTruncated: false,
       partial: "",
+      stale: false,
     };
     tracked.set(filePath, entry);
+  }
+
+  // Truncation guard: a retained offset can outlive the bytes it points into.
+  // If the file is now smaller than our offset the offset is meaningless —
+  // restart from 0 and drop any buffered partial, otherwise we'd skip the whole
+  // file forever (and splice a stale partial onto fresh bytes). Mirrors the
+  // local monitor's `stat.size >= retired.offset ? retired.offset : 0` guard.
+  //
+  // Known limitation (size-only): this does NOT catch a same-size or larger
+  // in-place replacement of a same-named file — only file-identity tracking
+  // (dev/ino, + a Windows ctime fallback) would. We deliberately don't do that:
+  // Codex rollout files are append-only and uniquely named
+  // (rollout-<ISO ts>-<uuid>.jsonl), never rewritten/recreated in place, so the
+  // uncaught cases can't occur in practice and aren't worth the cross-platform
+  // identity bookkeeping on an already-large monitor.
+  if (stat.size < entry.offset) {
+    entry.offset = 0;
+    entry.partial = "";
   }
 
   if (stat.size <= entry.offset) return;
@@ -169,17 +234,37 @@ function pollFile(filePath, fileName) {
 
   for (const line of lines) {
     if (!line.trim()) continue;
-    processLine(line, entry);
+    processLine(line, entry, options);
   }
 }
 
-function cleanStaleFiles() {
-  const now = Date.now();
-  for (const [filePath, entry] of tracked) {
-    if (now - entry.lastEventTime > 300000) {
-      postState(entry.sessionId, "sleeping", "stale-cleanup", entry.cwd);
-      tracked.delete(filePath);
+// Post a one-shot "sleeping" after a session goes idle, but KEEP the tracked
+// entry (and its byte offset). Deleting it used to drop the offset, so a later
+// resume of the same rollout file re-attached at offset 0 and re-read the whole
+// JSONL — re-emitting historical terminal events (task_complete) as fresh ones,
+// which double-fired completion notifications and dashboard state. Retaining the
+// offset means a resume only ever processes newly appended lines.
+function cleanStaleFiles(options = {}) {
+  const now = typeof options.now === "function" ? options.now() : Date.now();
+  const postStateFn = typeof options.postState === "function" ? options.postState : postState;
+  for (const [, entry] of tracked) {
+    if (!entry.stale && now - entry.lastEventTime > STALE_MS) {
+      postStateFn(entry.sessionId, "sleeping", "stale-cleanup", entry.cwd, entry.isSubagent);
+      entry.stale = true;
     }
+  }
+}
+
+// Memory bound: poll() only ever reads files under today/yesterday dirs, so a
+// rollout file outside that window can never be re-attached and its retained
+// entry is dead weight. Drop entries whose directory left the scan window
+// (e.g. once the day rolls over). Directory membership is race-free, unlike a
+// readdir listing, so an in-window file is never wrongly pruned mid-flight.
+function pruneTrackedOutOfWindow(options = {}) {
+  const dirs = (typeof options.getSessionDirs === "function" ? options.getSessionDirs : getSessionDirs)();
+  const inWindow = new Set(dirs);
+  for (const filePath of Array.from(tracked.keys())) {
+    if (!inWindow.has(path.dirname(filePath))) tracked.delete(filePath);
   }
 }
 
@@ -206,28 +291,41 @@ function poll() {
     }
   }
   cleanStaleFiles();
+  pruneTrackedOutOfWindow();
 }
 
-// ── Main ──
+function main() {
+  console.log(`Clawd Codex remote monitor started`);
+  console.log(`  Session dir: ${SESSION_DIR}`);
+  console.log(`  Poll interval: ${POLL_INTERVAL_MS}ms`);
+  if (preferredPort) console.log(`  Preferred port: ${preferredPort}`);
+  console.log(`  Press Ctrl+C to stop\n`);
 
-console.log(`Clawd Codex remote monitor started`);
-console.log(`  Session dir: ${SESSION_DIR}`);
-console.log(`  Poll interval: ${POLL_INTERVAL_MS}ms`);
-if (preferredPort) console.log(`  Preferred port: ${preferredPort}`);
-console.log(`  Press Ctrl+C to stop\n`);
+  poll();
 
-poll();
+  if (!onceMode) {
+    const interval = setInterval(poll, POLL_INTERVAL_MS);
 
-if (!onceMode) {
-  const interval = setInterval(poll, POLL_INTERVAL_MS);
-
-  process.on("SIGINT", () => {
-    clearInterval(interval);
-    console.log("\nStopped.");
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    clearInterval(interval);
-    process.exit(0);
-  });
+    process.on("SIGINT", () => {
+      clearInterval(interval);
+      console.log("\nStopped.");
+      process.exit(0);
+    });
+    process.on("SIGTERM", () => {
+      clearInterval(interval);
+      process.exit(0);
+    });
+  }
 }
+
+if (require.main === module) main();
+
+module.exports.__test = {
+  buildPostStateBody,
+  processLine,
+  pollFile,
+  cleanStaleFiles,
+  pruneTrackedOutOfWindow,
+  tracked,
+  STALE_MS,
+};

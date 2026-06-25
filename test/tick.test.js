@@ -171,6 +171,26 @@ describe("tick mini hover", () => {
     assert.deepStrictEqual(statesSeen, ["mini-peek"]);
   });
 
+  it("does not enter mini-peek when the cursor is outside the seam-clipped hit rect", () => {
+    const theme = cloneTheme(_defaultTheme);
+    let peekInCalls = 0;
+
+    cursor = { x: 130, y: 40 };
+    ctx = makeCtx(theme, statesSeen);
+    ctx.miniMode = true;
+    ctx.currentState = "mini-idle";
+    ctx.getHitRectScreen = () => ({ left: 0, top: 0, right: 100, bottom: 120 });
+    ctx.miniPeekIn = () => { peekInCalls++; };
+
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+    mock.timers.tick(60);
+
+    assert.equal(peekInCalls, 0);
+    assert.equal(ctx.mouseOverPet, false);
+    assert.deepStrictEqual(statesSeen, []);
+  });
+
   it("returns to mini-idle when the cursor leaves mini-peek", () => {
     const theme = cloneTheme(_defaultTheme);
     let peekOutCalls = 0;
@@ -189,6 +209,75 @@ describe("tick mini hover", () => {
     assert.equal(peekOutCalls, 1);
     assert.equal(ctx.miniPeeked, false);
     assert.deepStrictEqual(statesSeen, ["mini-idle"]);
+  });
+});
+
+describe("tick Cloudling pointer bridge", () => {
+  let cursor;
+  let loader;
+  let tickApi;
+  let ctx;
+  let statesSeen;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    cursor = { x: 40, y: 50 };
+    loader = loadTickWithScreen(() => ({ ...cursor }));
+    statesSeen = [];
+  });
+
+  afterEach(() => {
+    if (tickApi) tickApi.cleanup();
+    if (loader) loader.restore();
+    mock.timers.reset();
+    tickApi = null;
+    ctx = null;
+  });
+
+  it("sends viewBox pointer payloads for idle", () => {
+    const theme = cloneTheme(_defaultTheme);
+    const pointers = [];
+
+    ctx = makeCtx(theme, statesSeen);
+    ctx.getAssetPointerPayload = (_bounds, point) => ({
+      x: point.x / 10,
+      y: point.y / 10,
+      inside: true,
+    });
+    ctx.sendToRenderer = (channel, payload) => {
+      if (channel === "cloudling-pointer") pointers.push(payload);
+    };
+
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+    mock.timers.tick(1);
+
+    assert.deepStrictEqual(pointers, [{ x: 4, y: 5, inside: true }]);
+  });
+
+  it("keeps pointer bridge active outside the asset rect", () => {
+    const theme = cloneTheme(_defaultTheme);
+    const pointers = [];
+
+    ctx = makeCtx(theme, statesSeen);
+    ctx.miniMode = true;
+    ctx.currentState = "mini-peek";
+    ctx.currentSvg = "cloudling-mini-idle.svg";
+    ctx.isAnimating = true;
+    ctx.getAssetPointerPayload = (_bounds, point) => ({
+      x: point.x,
+      y: point.y,
+      inside: false,
+    });
+    ctx.sendToRenderer = (channel, payload) => {
+      if (channel === "cloudling-pointer") pointers.push(payload);
+    };
+
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+    mock.timers.tick(60);
+
+    assert.deepStrictEqual(pointers, [{ x: 40, y: 50, inside: true }]);
   });
 });
 
@@ -230,6 +319,131 @@ describe("tick adaptive polling", () => {
 
     assert.ok(cursorCalls > 0);
     assert.ok(cursorCalls < 45, `expected fewer than 45 polls, got ${cursorCalls}`);
+  });
+
+  it("uses a very low cursor polling rate while normal idle is low-power paused", () => {
+    const theme = cloneTheme(_defaultTheme);
+
+    ctx = makeCtx(theme, statesSeen);
+    ctx.lowPowerIdlePaused = true;
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+
+    mock.timers.tick(10000);
+
+    assert.ok(cursorCalls > 0);
+    assert.ok(cursorCalls <= 3, `expected at most 3 polls in 10s while paused, got ${cursorCalls}`);
+  });
+
+  it("keeps non-paused idle polling materially above the low-power paused rate", () => {
+    const theme = cloneTheme(_defaultTheme);
+
+    ctx = makeCtx(theme, statesSeen);
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+
+    for (let elapsed = 0; elapsed < 10000; elapsed += 100) mock.timers.tick(100);
+
+    assert.ok(cursorCalls > 30, `expected more than 30 polls in 10s while not paused, got ${cursorCalls}`);
+  });
+
+  it("uses a bounded low-power polling rate for mini-idle", () => {
+    const theme = cloneTheme(_defaultTheme);
+
+    ctx = makeCtx(theme, statesSeen);
+    ctx.currentState = "mini-idle";
+    ctx.currentSvg = "clawd-mini-idle.svg";
+    ctx.miniMode = true;
+    ctx.lowPowerIdlePaused = true;
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+
+    mock.timers.tick(10000);
+
+    assert.ok(cursorCalls > 0);
+    assert.ok(cursorCalls <= 6, `expected at most 6 polls in 10s while mini-idle paused, got ${cursorCalls}`);
+  });
+
+  it("does not throttle mini-peek with the low-power paused idle delay", () => {
+    const theme = cloneTheme(_defaultTheme);
+
+    ctx = makeCtx(theme, statesSeen);
+    ctx.currentState = "mini-peek";
+    ctx.currentSvg = "clawd-mini-idle.svg";
+    ctx.miniMode = true;
+    ctx.lowPowerIdlePaused = true;
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+
+    for (let elapsed = 0; elapsed < 500; elapsed += 50) mock.timers.tick(50);
+
+    assert.ok(cursorCalls >= 8, `expected fast mini-peek polling, got ${cursorCalls}`);
+  });
+
+  it("does not throttle drag, menu-open, or mini-transition paths while low-power paused", () => {
+    const theme = cloneTheme(_defaultTheme);
+    const cases = [
+      ["drag", { dragLocked: true }],
+      ["menu", { menuOpen: true }],
+      ["transition", { miniTransitioning: true }],
+    ];
+
+    for (const [name, patch] of cases) {
+      if (tickApi) tickApi.cleanup();
+      cursorCalls = 0;
+      ctx = makeCtx(theme, statesSeen);
+      Object.assign(ctx, patch);
+      ctx.lowPowerIdlePaused = true;
+      tickApi = loader.initTick(ctx);
+      tickApi.startMainTick();
+
+      for (let elapsed = 0; elapsed < 500; elapsed += 50) mock.timers.tick(50);
+
+      assert.ok(cursorCalls >= 8, `expected fast polling for ${name}, got ${cursorCalls}`);
+    }
+  });
+
+  it("suppresses passive eye-move IPC while low-power paused", () => {
+    const theme = cloneTheme(_defaultTheme);
+    const eyeMoves = [];
+
+    ctx = makeCtx(theme, statesSeen);
+    ctx.lowPowerIdlePaused = true;
+    ctx.sendToRenderer = (channel, ...args) => {
+      if (channel === "eye-move") eyeMoves.push(args);
+    };
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+
+    mock.timers.tick(1);
+    cursor = { x: 95, y: 70 };
+    mock.timers.tick(5000);
+
+    assert.deepStrictEqual(eyeMoves, []);
+  });
+
+  it("suppresses passive Cloudling pointer IPC while low-power paused", () => {
+    const theme = cloneTheme(_defaultTheme);
+    const pointers = [];
+
+    ctx = makeCtx(theme, statesSeen);
+    ctx.lowPowerIdlePaused = true;
+    ctx.getAssetPointerPayload = (_bounds, point) => ({
+      x: point.x,
+      y: point.y,
+      inside: true,
+    });
+    ctx.sendToRenderer = (channel, payload) => {
+      if (channel === "cloudling-pointer") pointers.push(payload);
+    };
+    tickApi = loader.initTick(ctx);
+    tickApi.startMainTick();
+
+    mock.timers.tick(1);
+    cursor = { x: 95, y: 70 };
+    mock.timers.tick(5000);
+
+    assert.deepStrictEqual(pointers, []);
   });
 
   it("cleanup clears the pending adaptive tick", () => {

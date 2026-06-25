@@ -21,24 +21,26 @@ This document holds the state machine, theme system, UI runtime, and platform ca
 - 一次性状态：`attention/error/sweeping/notification/carrying` 显示后自动回退（`AUTO_RETURN_MS`）
 - 睡眠序列：20s 鼠标静止 → idle-look → 60s → yawning(3s) → dozing → 10min → collapsing(0.8s) → sleeping；鼠标移动触发 waking(1.5s) → 恢复
 - DND 模式：跳过 dozing，直接 yawning → collapsing → sleeping；同时屏蔽 hook 事件
-- working 子动画：1 个会话 → typing，2 个 → juggling，3+ → building
+- 隐藏桌宠（petHidden，入口：托盘 / 右键菜单 / 快捷键）：语义是「看不见宠物」而非免打扰——隐藏时收起宠物、Session HUD、update bubble 和当时 pending 的权限气泡（恢复显示时回来），但隐藏期间新到的权限请求仍照常弹气泡，这是有意设计、不要当 bug 修；要连权限气泡都静默是 DND 的职责（它有回终端确认的 fallback）。petHidden 不持久化，重启恢复显示
+- working 子动画：Clawd 主题为 1 个会话 → typing，2 个 → headphones groove，3+ → building；Calico / Cloudling 仍为 typing / juggling / building
 - juggling 子动画：1 个 subagent → juggling，2+ → conducting
 
 ## Theme System
 
 Clawd 是主题化桌宠：动画资源、计时、hitbox、眼球追踪参数都来自主题配置。
 
-- 内置主题目录：`themes/clawd/`、`themes/calico/`、`themes/template/`、`themes/static-test/`、`themes/pr4-*`
+- 内置主题目录：`themes/clawd/`、`themes/calico/`、`themes/cloudling/`；`themes/template/` 是脚手架模板
 - 用户主题目录：`<userData>/themes/<id>/theme.json`
 - `theme.json` 必需状态：`idle`、`working`、`thinking`
 - 若启用 `eyeTracking.enabled`，idle 资源必须是 SVG 且包含 `#eyes-js`
-- 若声明 `fullSleep`，需提供 `yawning / dozing / collapsing / waking`
-- 若声明 `miniMode`，需提供 mini 状态资源
+- 若 `sleepSequence.mode` 为 `full`（默认），需提供 `yawning / dozing / collapsing / waking`；`direct` 可直接进入 `sleeping`
+- 若 `miniMode.supported` 为 true，需提供 8 个基础 mini 状态；`mini-working` 是可选增强，缺失时优雅跳过
 - 能力缺失时走 `VISUAL_FALLBACK_STATES` 回退链
 - 默认配置集中在 `theme-loader.js` 顶部的 `DEFAULT_*` 常量
 - 变体是白名单 deep-merge；数组和特定字段会整体替换
 - Animation override 是用户 per-slot 覆盖，和作者定义的 variants 正交
 - SVG 会经过白名单消毒，阻断脚本、事件属性、外部资源、`javascript:` 和路径穿越
+- `trustedRuntime.scriptedSvgFiles` 只对 loader 判定为内置的主题生效；外部主题声明该字段会被忽略
 - 支持 SVG / GIF / APNG / WebP / PNG / JPG；动画周期由 `src/animation-cycle.js` 探测
 - 更新视觉遵循主题绑定：`checking` 可选走 `theme.updateVisuals.checking`，未声明时回退到当前主题的 `thinking`；发现新版本时会进入 `available -> notification`；`downloading / success / error` 继续分别走 `carrying / attention / error`
 
@@ -98,7 +100,7 @@ Mini 状态映射：
 
 权威表格见 `docs/guides/state-mapping.md`。这里只保留实现层面的补充：
 
-- working 子动画：1 会话 → typing，2 → juggling，3+ → building
+- working 子动画：Clawd 主题为 1 会话 → typing，2 → headphones groove，3+ → building；Calico / Cloudling 仍为 typing / juggling / building
 - juggling 子动画：1 subagent → juggling，2+ → conducting
 - mini 状态有独立动画槽；`mini-working` 是可选能力
 - 睡眠序列和 DND 行为见上面的 State Machine
@@ -165,9 +167,9 @@ Mini 状态映射：
 - hook 脚本依赖 Node.js
 - Windows 终端聚焦依赖 `koffi`；macOS 依赖 `osascript`
 - Codex CLI 以 official hooks 为主、JSONL 轮询为 fallback；WebSearch / compaction / abort 等 hook 未覆盖事件仍可能有轮询延迟
-- Copilot CLI 需要手动创建 `~/.copilot/hooks/hooks.json`
-- Gemini 无权限气泡；Cursor 权限走 stdout；Kiro 没有 global hooks；opencode 权限只能走 event hook + bridge
-- opencode 子会话会短暂出现在 Sessions 菜单里
+- Copilot CLI 自动同步 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json`；`disableAllHooks: true` 时 doctor warning 且不挂 Fix 按钮
+- Gemini 无权限气泡，除非未来提供兼容的阻塞式审批协议；Cursor 权限走 stdout；Kiro 没有 global hooks；opencode 权限只能走 event hook + bridge
+- opencode child / subtask session 只有在 `session.created` 明确带 `event.properties.info.parentID` 时才会被标记为 headless；这类后台 child 不进入 HUD / focus / 多会话 fanout
 - 进程存活检测依赖进程名匹配，非标准进程名可能漏检
 
 ## Do Not Fix This Again

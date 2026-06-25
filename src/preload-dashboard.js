@@ -21,7 +21,9 @@ contextBridge.exposeInMainWorld("dashboardAPI", {
   getSnapshot: () => ipcRenderer.invoke("dashboard:get-snapshot"),
   getI18n: () => ipcRenderer.invoke("dashboard:get-i18n"),
   focusSession: (sessionId) => ipcRenderer.send("dashboard:focus-session", sessionId),
+  hideSession: (sessionId) => ipcRenderer.invoke("dashboard:hide-session", sessionId),
   setSessionAlias: (payload) => ipcRenderer.invoke("dashboard:set-session-alias", payload),
+  ackCompletion: (sessionId) => ipcRenderer.invoke("session:ack-completion", sessionId),
   onSessionSnapshot: (cb) => {
     if (typeof cb !== "function") return () => {};
     snapshotListeners.add(cb);

@@ -1,6 +1,6 @@
 // Codex CLI JSONL log monitor
 // Polls ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl for state changes
-// Zero dependencies (node built-ins only)
+// Zero external dependencies (node built-ins + local Codex helpers only)
 //
 // Replay protection is two layers — change one, consider the other:
 //   1. Line-level: _processLine skips entries whose `timestamp` field is
@@ -17,9 +17,16 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const CodexSubagentClassifier = require("./codex-subagent-classifier");
+const { readCodexThreadName } = require("../hooks/codex-session-index");
+const {
+  clampAssistantOutputText,
+  extractAssistantTextFromRecord,
+} = require("../hooks/codex-assistant-output");
 
 const APPROVAL_HEURISTIC_MS = 2000;
 const MAX_TRACKED_FILES = 50;
+const MAX_RETIRED_TRACKED_FILES = 100;
 const MAX_PARTIAL_BYTES = 65536;
 const RECENT_DAY_DIR_CACHE_MS = 60 * 60 * 1000; // 1 hour
 // A rollout file is considered "active" if written within this window. Used by
@@ -34,18 +41,62 @@ const ACTIVE_SESSION_WINDOW_MS = 5 * 60 * 1000;
 const BACKFILL_GRACE_MS = 5 * 1000;
 const BACKFILL_SNAPSHOT_STATES = new Set(["thinking", "working", "codex-permission"]);
 
+function finiteNonnegativeNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function positiveNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function extractCodexContextUsage(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const info = payload.info && typeof payload.info === "object" ? payload.info : null;
+  const lastUsage = info && info.last_token_usage && typeof info.last_token_usage === "object"
+    ? info.last_token_usage
+    : null;
+  const used = finiteNonnegativeNumber(
+    (lastUsage && lastUsage.total_tokens)
+    ?? payload.total_tokens
+    ?? payload.tokens_used
+    ?? payload.input_tokens
+    ?? payload.context_tokens
+  );
+  if (used === null) return null;
+
+  const limit = positiveNumber(
+    (info && info.model_context_window)
+    ?? payload.model_context_window
+    ?? payload.context_window
+    ?? payload.limit
+    ?? payload.max_tokens
+  );
+  const out = { used, source: "codex" };
+  if (limit !== null) {
+    out.limit = limit;
+    out.percent = Math.max(0, Math.min(100, Math.round((used / limit) * 100)));
+  }
+  return out;
+}
+
 class CodexLogMonitor {
   /**
    * @param {object} agentConfig - codex.js config (logConfig + logEventMap)
    * @param {function} onStateChange - (sessionId, state, event, extra) => void
+   * @param {object} options
    */
-  constructor(agentConfig, onStateChange) {
+  constructor(agentConfig, onStateChange, options = {}) {
     this._config = agentConfig;
     this._onStateChange = onStateChange;
+    this._classifier = options.classifier || new CodexSubagentClassifier();
     this._interval = null;
     // Map<filePath, { offset, sessionId, cwd, lastEventTime, lastState, partial }>
     this._tracked = new Map();
+    this._retiredTracked = new Map();
     this._baseDir = this._resolveBaseDir();
+    this._codexDir = options.codexDir || null;
     this._recentDayDirsCache = [];
     this._recentDayDirsCacheAt = 0;
     this._recentDayDirsDateKey = "";
@@ -82,6 +133,7 @@ class CodexLogMonitor {
       if (tracked.approvalTimer) clearTimeout(tracked.approvalTimer);
     }
     this._tracked.clear();
+    this._retiredTracked.clear();
   }
 
   _poll() {
@@ -107,7 +159,7 @@ class CodexLogMonitor {
         this._pollFile(filePath, file);
       }
     }
-    this._cleanStaleFiles();
+    this._pruneTrackedFilesIfNeeded();
   }
 
   _getSessionDirs() {
@@ -271,23 +323,32 @@ class CodexLogMonitor {
       if (!sessionId) return;
       // Cap tracked files to prevent unbounded Map growth
       if (this._tracked.size >= MAX_TRACKED_FILES) {
-        this._cleanStaleFiles();
+        this._pruneTrackedFilesIfNeeded();
         if (this._tracked.size >= MAX_TRACKED_FILES) return;
       }
+      const retired = this._retiredTracked.get(filePath) || null;
+      const resumeOffset = retired && stat.size >= retired.offset ? retired.offset : 0;
+      if (retired) this._retiredTracked.delete(filePath);
       tracked = {
-        offset: 0,
+        offset: resumeOffset,
         sessionId: "codex:" + sessionId,
         filePath,
-        cwd: "",
-        sessionTitle: null,
+        cwd: retired ? retired.cwd : "",
+        sessionTitle: retired ? retired.sessionTitle : null,
+        codexOriginator: retired ? retired.codexOriginator : null,
+        codexSource: retired ? retired.codexSource : null,
         lastEventTime: Date.now(),
-        lastState: null,
-        lastStateEvent: null,
-        hasEmittedState: false,
+        lastState: retired ? retired.lastState : null,
+        lastStateEvent: retired ? retired.lastStateEvent : null,
+        hasEmittedState: retired ? retired.hasEmittedState === true : false,
         partial: "",
-        hadToolUse: false,
-        agentPid: null,
+        hadToolUse: retired ? retired.hadToolUse === true : false,
+        isSubagent: retired ? retired.isSubagent === true : false,
+        agentPid: retired ? retired.agentPid : null,
         pendingApprovalDetail: null,
+        assistantLastOutput: retired ? retired.assistantLastOutput || null : null,
+        assistantLastOutputTruncated: retired ? retired.assistantLastOutputTruncated === true : false,
+        contextUsage: retired ? retired.contextUsage || null : null,
         // Backfill mode: only a file whose last write predates monitor
         // start (by more than BACKFILL_GRACE_MS) is treated as stale
         // history — we replay it silently to advance offset + pick up
@@ -295,6 +356,7 @@ class CodexLogMonitor {
         // inside the grace window are live sessions and emit normally.
         // Empty files have nothing to replay.
         backfilling:
+          !retired &&
           stat.size > 0 &&
           stat.mtimeMs < this._startedAtMs - BACKFILL_GRACE_MS,
       };
@@ -348,13 +410,6 @@ class CodexLogMonitor {
       return; // corrupted line, skip
     }
 
-    // Skip historical events that predate monitor start — prevents replay
-    // storms on app restart from driving stale state transitions
-    if (obj && typeof obj.timestamp === "string") {
-      const ts = Date.parse(obj.timestamp);
-      if (Number.isFinite(ts) && ts < this._startedAtMs - 1500) return;
-    }
-
     const type = obj.type;
     const payload = obj.payload;
     const subtype =
@@ -363,9 +418,35 @@ class CodexLogMonitor {
     // Build lookup key
     const key = subtype ? type + ":" + subtype : type;
 
-    // Extract CWD from session_meta
-    if (type === "session_meta" && payload) {
-      tracked.cwd = payload.cwd || "";
+    // Metadata is needed for future live writes even when the session_meta
+    // record itself predates monitor start.
+    if (type === "session_meta") {
+      this._applySessionMeta(payload, tracked);
+    }
+
+    // Skip historical events that predate monitor start — prevents replay
+    // storms on app restart from driving stale state transitions.
+    if (obj && typeof obj.timestamp === "string") {
+      const ts = Date.parse(obj.timestamp);
+      if (!tracked.backfilling && Number.isFinite(ts) && ts < this._startedAtMs - 1500) return;
+    }
+
+    const assistantText = extractAssistantTextFromRecord(obj);
+    if (assistantText) {
+      const assistantOutput = clampAssistantOutputText(assistantText);
+      tracked.assistantLastOutput = assistantOutput ? assistantOutput.text : null;
+      tracked.assistantLastOutputTruncated = !!(assistantOutput && assistantOutput.truncated);
+    }
+
+    if (key === "event_msg:token_count") {
+      const contextUsage = extractCodexContextUsage(payload);
+      if (contextUsage) {
+        tracked.contextUsage = contextUsage;
+        if (!tracked.backfilling) {
+          this._emitStateChange(tracked, tracked.lastState || "idle", key);
+        }
+      }
+      return;
     }
 
     // Extract Codex-authored session summary (turn_context.summary).
@@ -375,6 +456,10 @@ class CodexLogMonitor {
     const extractedTitle = this._extractSessionTitle(obj);
     if (extractedTitle && extractedTitle !== tracked.sessionTitle) {
       tracked.sessionTitle = extractedTitle;
+    }
+    const threadName = readCodexThreadName(tracked.sessionId, { codexDir: this._codexDir });
+    if (threadName && threadName !== tracked.sessionTitle) {
+      tracked.sessionTitle = threadName;
     }
 
     // Approval heuristic: exec_command_end / function_call_output means command finished.
@@ -406,23 +491,28 @@ class CodexLogMonitor {
     // Track tool use per turn — reset on task_started, set on function_call
     if (key === "event_msg:task_started") {
       tracked.hadToolUse = false;
+      tracked.assistantLastOutput = null;
+      tracked.assistantLastOutputTruncated = false;
     }
     if (key === "response_item:function_call") {
       tracked.hadToolUse = true;
     }
 
-    // Turn-end: happy if tools were used this turn, idle otherwise
+    // Turn-end: happy if tools were used or the turn produced assistant text;
+    // metadata-only completions stay idle to avoid noisy fallback animation.
     if (state === "codex-turn-end") {
       if (tracked.approvalTimer) {
         clearTimeout(tracked.approvalTimer);
         tracked.approvalTimer = null;
       }
       tracked.pendingApprovalDetail = null;
-      const resolved = tracked.hadToolUse ? "attention" : "idle";
+      const resolved = this._isTrackedSubagent(tracked)
+        ? "idle"
+        : (tracked.hadToolUse || !!tracked.assistantLastOutput ? "attention" : "idle");
       tracked.hadToolUse = false;
       tracked.lastState = resolved;
       if (tracked.backfilling) return;
-      this._emitStateChange(tracked, resolved, key);
+      this._emitStateChange(tracked, resolved, key, this._assistantOutputExtra(tracked));
       return;
     }
 
@@ -472,6 +562,20 @@ class CodexLogMonitor {
     if (state === tracked.lastState && state === "working") return;
     tracked.lastState = state;
     this._emitStateChange(tracked, state, key);
+  }
+
+  _applySessionMeta(payload, tracked) {
+    if (!payload || typeof payload !== "object") return;
+    tracked.cwd = payload.cwd || "";
+    tracked.codexOriginator = typeof payload.originator === "string" && payload.originator.trim()
+      ? payload.originator.trim()
+      : tracked.codexOriginator;
+    tracked.codexSource = typeof payload.source === "string" && payload.source.trim()
+      ? payload.source.trim()
+      : tracked.codexSource;
+    const role = this._classifier.registerSession(tracked.sessionId, { sessionMeta: payload });
+    if (role === "subagent") tracked.isSubagent = true;
+    else if (role === "root") tracked.isSubagent = false;
   }
 
   // Codex-authored session summary, extracted from turn_context.summary.
@@ -583,34 +687,56 @@ class CodexLogMonitor {
     return null;
   }
 
-  // Remove files not updated for 5 minutes
-  _cleanStaleFiles() {
-    const now = Date.now();
-    for (const [filePath, tracked] of this._tracked) {
-      const age = now - tracked.lastEventTime;
-      if (age > 300000) {
-        // Pure history-only backfills were never visible in the UI, so drop
-        // them silently instead of synthesizing a fake "sleeping" event.
-        if (tracked.approvalTimer) clearTimeout(tracked.approvalTimer);
-        if (tracked.hasEmittedState) {
-          // Use SessionEnd so state.js actually deletes the session entry.
-          // Codex desktop runs as a long-lived process — every conversation
-          // shares the same agentPid/sourcePid, so the timeout-based cleanup
-          // in cleanStaleSessions can never observe the source dying and
-          // would otherwise leave idle zombie sessions piling up forever.
-          this._emitStateChange(tracked, "sleeping", "SessionEnd", {
-            sourcePid: tracked.agentPid,
-            agentPid: tracked.agentPid,
-          });
-        }
-        this._tracked.delete(filePath);
-      }
+  _pruneTrackedFilesIfNeeded() {
+    if (this._tracked.size < MAX_TRACKED_FILES) return;
+    const byAge = (a, b) => (a[1].lastEventTime || 0) - (b[1].lastEventTime || 0);
+    const neverEmitted = [...this._tracked.entries()]
+      .filter(([, tracked]) => tracked && !tracked.hasEmittedState)
+      .sort(byAge);
+    const emitted = [...this._tracked.entries()]
+      .filter(([, tracked]) => tracked && tracked.hasEmittedState)
+      .sort(byAge);
+    for (const [filePath, tracked] of [...neverEmitted, ...emitted]) {
+      if (this._tracked.size < MAX_TRACKED_FILES) break;
+      this._retireTrackedFile(filePath, tracked);
+    }
+  }
+
+  _retireTrackedFile(filePath, tracked) {
+    if (tracked && tracked.approvalTimer) clearTimeout(tracked.approvalTimer);
+    this._tracked.delete(filePath);
+    if (!filePath || !tracked) return;
+    this._retiredTracked.delete(filePath);
+    this._retiredTracked.set(filePath, {
+      offset: Number.isFinite(tracked.offset) ? tracked.offset : 0,
+      cwd: tracked.cwd || "",
+      sessionTitle: tracked.sessionTitle || null,
+      codexOriginator: tracked.codexOriginator || null,
+      codexSource: tracked.codexSource || null,
+      lastState: tracked.lastState || null,
+      lastStateEvent: tracked.lastStateEvent || null,
+      hasEmittedState: tracked.hasEmittedState === true,
+      hadToolUse: tracked.hadToolUse === true,
+      isSubagent: tracked.isSubagent === true,
+      agentPid: tracked.agentPid || null,
+      assistantLastOutput: tracked.assistantLastOutput || null,
+      assistantLastOutputTruncated: tracked.assistantLastOutputTruncated === true,
+      contextUsage: tracked.contextUsage || null,
+    });
+    while (this._retiredTracked.size > MAX_RETIRED_TRACKED_FILES) {
+      const oldest = this._retiredTracked.keys().next().value;
+      this._retiredTracked.delete(oldest);
     }
   }
 
   _emitBackfillSnapshot(tracked) {
     const snapshotState = tracked.lastState;
-    if (!BACKFILL_SNAPSHOT_STATES.has(snapshotState)) return;
+    if (!BACKFILL_SNAPSHOT_STATES.has(snapshotState)) {
+      if (tracked.contextUsage) {
+        this._emitStateChange(tracked, "idle", "event_msg:token_count");
+      }
+      return;
+    }
     const extra = snapshotState === "codex-permission" && tracked.pendingApprovalDetail
       ? { permissionDetail: tracked.pendingApprovalDetail }
       : null;
@@ -620,6 +746,37 @@ class CodexLogMonitor {
       tracked.lastStateEvent || "session_meta",
       extra
     );
+  }
+
+  _assistantOutputExtra(tracked) {
+    if (!tracked || typeof tracked.assistantLastOutput !== "string" || !tracked.assistantLastOutput) {
+      return null;
+    }
+    return {
+      assistantLastOutput: tracked.assistantLastOutput,
+      assistantLastOutputTruncated: tracked.assistantLastOutputTruncated === true,
+    };
+  }
+
+  _withTrackedContextUsage(tracked, extra = null) {
+    if (!tracked || !tracked.contextUsage) return extra;
+    return { ...(extra || {}), contextUsage: tracked.contextUsage };
+  }
+
+  _isTrackedSubagent(tracked) {
+    if (!tracked) return false;
+    const role = this._classifier && typeof this._classifier.classify === "function"
+      ? this._classifier.classify(tracked.sessionId)
+      : "unknown";
+    if (role === "subagent") {
+      tracked.isSubagent = true;
+      return true;
+    }
+    if (role === "root") {
+      tracked.isSubagent = false;
+      return false;
+    }
+    return tracked.isSubagent === true;
   }
 
   _emitStateChange(tracked, state, event, extra = null) {
@@ -636,7 +793,12 @@ class CodexLogMonitor {
         ? extra.agentPid
         : agentPid,
       sessionTitle: tracked.sessionTitle,
-      ...(extra || {}),
+      codexOriginator: tracked.codexOriginator || null,
+      codexSource: tracked.codexSource || null,
+      ...this._withTrackedContextUsage(tracked, extra),
+      headless: this._isTrackedSubagent(tracked)
+        ? true
+        : (extra && Object.prototype.hasOwnProperty.call(extra, "headless") ? extra.headless : undefined),
     });
   }
 }

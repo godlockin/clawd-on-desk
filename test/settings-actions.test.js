@@ -6,6 +6,7 @@ const assert = require("node:assert");
 const {
   updateRegistry,
   commandRegistry,
+  MANAGED_CLEANUP_AGENT_IDS,
   requireBoolean,
   requireFiniteNumber,
   requireEnum,
@@ -77,9 +78,11 @@ describe("updateRegistry pure-data validators", () => {
   it("function-form boolean fields reject non-booleans", () => {
     const deps = { snapshot: baseSnapshot };
     for (const key of [
-      "sessionHudEnabled", "miniMode", "openAtLoginHydrated",
-      "soundMuted", "bubbleFollowPet", "sessionHudEnabled", "hideBubbles", "permissionBubblesEnabled",
-      "lowPowerIdleMode", "allowEdgePinning", "keepSizeAcrossDisplays", "miniMode", "openAtLoginHydrated",
+      "sessionHudEnabled", "sessionHudShowElapsed", "sessionHudShowContextUsage", "sessionHudCleanupDetached",
+      "sessionHudShowStateLabels", "sessionHudPinned",
+      "miniMode", "openAtLoginHydrated", "soundMuted", "bubbleFollowPet",
+      "hideBubbles", "permissionBubblesEnabled", "lowPowerIdleMode",
+      "allowEdgePinning", "disableMiniMode", "keepSizeAcrossDisplays",
     ]) {
       assert.strictEqual(updateRegistry[key](true, deps).status, "ok", `${key}(true)`);
       assert.strictEqual(updateRegistry[key](false, deps).status, "ok", `${key}(false)`);
@@ -89,7 +92,11 @@ describe("updateRegistry pure-data validators", () => {
 
   it("bubble auto-close seconds require integers in range", () => {
     const deps = { snapshot: baseSnapshot };
-    for (const key of ["notificationBubbleAutoCloseSeconds", "updateBubbleAutoCloseSeconds"]) {
+    for (const key of [
+      "notificationBubbleAutoCloseSeconds",
+      "permissionBubbleAutoCloseSeconds",
+      "updateBubbleAutoCloseSeconds",
+    ]) {
       assert.strictEqual(updateRegistry[key](0, deps).status, "ok", `${key}(0)`);
       assert.strictEqual(updateRegistry[key](30, deps).status, "ok", `${key}(30)`);
       assert.strictEqual(updateRegistry[key](3600, deps).status, "ok", `${key}(3600)`);
@@ -191,8 +198,69 @@ describe("updateRegistry pure-data validators", () => {
     const deps = { snapshot: baseSnapshot };
     assert.strictEqual(updateRegistry.agents({}, deps).status, "ok");
     assert.strictEqual(updateRegistry.agents([], deps).status, "error");
+    assert.strictEqual(updateRegistry.dismissedAgentInstallHints({ "qwen-code": true }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.dismissedAgentInstallHints({ "qwen-code": false }, deps).status, "error");
+    assert.strictEqual(updateRegistry.dismissedAgentCleanupHints({ "qwen-code": true }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.dismissedAgentCleanupHints({ "qwen-code": false }, deps).status, "error");
     assert.strictEqual(updateRegistry.themeOverrides({}, deps).status, "ok");
     assert.strictEqual(updateRegistry.themeOverrides("nope", deps).status, "error");
+  });
+
+  it("tgApproval validates the settings object while allowing incomplete saved config", () => {
+    const deps = { snapshot: baseSnapshot };
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: false,
+      allowedTgUserId: "",
+      targetSessionKey: "",
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "",
+      targetSessionKey: "telegram:987654321",
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:0",
+    }, deps).status, "error");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+      completionOutputMode: "full",
+      r3DirectSendEnabled: true,
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+      completionOutputMode: "summary",
+    }, deps).status, "error");
+  });
+
+  it("hardwareBuddy accepts only the normalized product settings shape", () => {
+    assert.strictEqual(updateRegistry.hardwareBuddy({
+      enabled: true,
+      backend: "bleak",
+      address: "00:4B:12:A1:9E:A6",
+      namePrefix: "Claude",
+      permissionsEnabled: false,
+      quickCommandsEnabled: true,
+    }).status, "ok");
+    assert.strictEqual(updateRegistry.hardwareBuddy({ enabled: true }).status, "error");
+    assert.strictEqual(updateRegistry.hardwareBuddy({
+      enabled: true,
+      backend: "serial",
+      address: "",
+      namePrefix: "Claude",
+      permissionsEnabled: false,
+      quickCommandsEnabled: false,
+    }).status, "error");
   });
 
   it("sessionAliases requires a plain object of valid alias entries", () => {
@@ -279,23 +347,33 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
     assert.strictEqual(uninstallCalls, 0);
   });
 
-  it("manageClaudeHooksAutomatically effect syncs hooks and starts watcher on true", () => {
+  it("manageClaudeHooksAutomatically effect waits for async sync before starting watcher on true", async () => {
     let syncCalls = 0;
     let startCalls = 0;
     let stopCalls = 0;
+    const calls = [];
     const deps = {
-      syncClaudeHooksNow: () => syncCalls++,
-      startClaudeSettingsWatcher: () => startCalls++,
+      syncClaudeHooksNow: async () => {
+        syncCalls++;
+        calls.push("sync:start");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        calls.push("sync:end");
+      },
+      startClaudeSettingsWatcher: () => {
+        startCalls++;
+        calls.push("watcher:start");
+      },
       stopClaudeSettingsWatcher: () => stopCalls++,
     };
-    const r = updateRegistry.manageClaudeHooksAutomatically.effect(true, deps);
+    const r = await updateRegistry.manageClaudeHooksAutomatically.effect(true, deps);
     assert.strictEqual(r.status, "ok");
     assert.strictEqual(syncCalls, 1);
     assert.strictEqual(startCalls, 1);
     assert.strictEqual(stopCalls, 0);
+    assert.deepStrictEqual(calls, ["sync:start", "sync:end", "watcher:start"]);
   });
 
-  it("manageClaudeHooksAutomatically effect skips side effects on true when Claude Code is disabled", () => {
+  it("manageClaudeHooksAutomatically effect skips side effects on true when Claude Code is disabled", async () => {
     let syncCalls = 0;
     let startCalls = 0;
     let stopCalls = 0;
@@ -307,14 +385,14 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
       startClaudeSettingsWatcher: () => startCalls++,
       stopClaudeSettingsWatcher: () => stopCalls++,
     };
-    const r = updateRegistry.manageClaudeHooksAutomatically.effect(true, deps);
+    const r = await updateRegistry.manageClaudeHooksAutomatically.effect(true, deps);
     assert.deepStrictEqual(r, { status: "ok" });
     assert.strictEqual(syncCalls, 0);
     assert.strictEqual(startCalls, 0);
     assert.strictEqual(stopCalls, 0);
   });
 
-  it("manageClaudeHooksAutomatically effect stops watcher on false", () => {
+  it("manageClaudeHooksAutomatically effect stops watcher on false", async () => {
     let syncCalls = 0;
     let startCalls = 0;
     let stopCalls = 0;
@@ -323,7 +401,7 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
       startClaudeSettingsWatcher: () => startCalls++,
       stopClaudeSettingsWatcher: () => stopCalls++,
     };
-    const r = updateRegistry.manageClaudeHooksAutomatically.effect(false, deps);
+    const r = await updateRegistry.manageClaudeHooksAutomatically.effect(false, deps);
     assert.strictEqual(r.status, "ok");
     assert.strictEqual(syncCalls, 0);
     assert.strictEqual(startCalls, 0);
@@ -334,6 +412,22 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
     const r = updateRegistry.manageClaudeHooksAutomatically.effect(true, {});
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /syncClaudeHooksNow/);
+  });
+
+  it("manageClaudeHooksAutomatically effect returns error and does not start watcher when async sync fails", async () => {
+    let startCalls = 0;
+    const deps = {
+      syncClaudeHooksNow: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        throw new Error("spawn failed");
+      },
+      startClaudeSettingsWatcher: () => { startCalls++; },
+      stopClaudeSettingsWatcher: () => {},
+    };
+    const r = await updateRegistry.manageClaudeHooksAutomatically.effect(true, deps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /spawn failed/);
+    assert.strictEqual(startCalls, 0);
   });
 
   it("openAtLogin effect calls setOpenAtLogin with the value", () => {
@@ -358,6 +452,112 @@ describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatica
     const r = updateRegistry.openAtLogin.effect(true, deps);
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /permission denied/);
+  });
+});
+
+describe("telegram approval commands", () => {
+  it("telegramApproval.setToken validates token and delegates storage", async () => {
+    const calls = [];
+    const token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi_jklmnop";
+    const result = await commandRegistry["telegramApproval.setToken"]({ token }, {
+      writeTelegramApprovalToken: (value) => {
+        calls.push(value);
+        return { status: "ok", tokenStored: true };
+      },
+    });
+    assert.deepStrictEqual(calls, [token]);
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(result.tokenStored, true);
+
+    const bad = await commandRegistry["telegramApproval.setToken"]({ token: "nope" }, {
+      writeTelegramApprovalToken: () => {
+        throw new Error("should not write invalid token");
+      },
+    });
+    assert.strictEqual(bad.status, "error");
+  });
+
+  it("telegramApproval.status and .test proxy injected runtime helpers", async () => {
+    const status = await commandRegistry["telegramApproval.status"](null, {
+      getTelegramApprovalStatus: () => ({ status: "running", tokenStored: true }),
+    });
+    assert.deepStrictEqual(status, {
+      status: "ok",
+      state: { status: "running", tokenStored: true },
+    });
+
+    const testResult = await commandRegistry["telegramApproval.test"](null, {
+      sendTelegramApprovalTest: async () => ({ status: "ok", decision: "allow" }),
+    });
+    assert.deepStrictEqual(testResult, { status: "ok", decision: "allow" });
+  });
+
+  it("telegramApproval.tokenInfo returns the masked preview without the raw token", async () => {
+    const result = await commandRegistry["telegramApproval.tokenInfo"](null, {
+      getTelegramApprovalTokenInfo: () => ({ configured: true, masked: "1234……wXyZ" }),
+    });
+    assert.deepStrictEqual(result, { status: "ok", configured: true, masked: "1234……wXyZ" });
+
+    const empty = await commandRegistry["telegramApproval.tokenInfo"](null, {
+      getTelegramApprovalTokenInfo: () => ({ configured: false, masked: "" }),
+    });
+    assert.deepStrictEqual(empty, { status: "ok", configured: false, masked: "" });
+
+    const missing = await commandRegistry["telegramApproval.tokenInfo"](null, {});
+    assert.equal(missing.status, "error");
+  });
+
+  it("telegramApproval.deleteTokenFile proxies the guarded main-process helper", async () => {
+    const calls = [];
+    const result = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
+      deleteTelegramApprovalTokenFile: async () => {
+        calls.push(true);
+        return { status: "ok", deleted: true };
+      },
+    });
+    assert.deepStrictEqual(result, { status: "ok", deleted: true });
+    assert.deepStrictEqual(calls, [true]);
+
+    const guarded = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
+      deleteTelegramApprovalTokenFile: async () => ({
+        status: "error",
+        code: "TOKEN_FILE_IN_USE",
+        message: "Native Telegram currently uses the shared token file.",
+      }),
+    });
+    assert.strictEqual(guarded.status, "error");
+    assert.strictEqual(guarded.code, "TOKEN_FILE_IN_USE");
+
+    const missing = await commandRegistry["telegramApproval.deleteTokenFile"](null, {});
+    assert.equal(missing.status, "error");
+  });
+
+  it("telegramMigration.dispatch only accepts renderer-callable user events", async () => {
+    const calls = [];
+    const deps = {
+      telegramMigration: {
+        getSnapshot: () => ({ state: "TESTING_NATIVE" }),
+        dispatch: async (event) => {
+          calls.push(event);
+          return { ok: true, state: "TESTING_NATIVE" };
+        },
+      },
+    };
+
+    const allowed = await commandRegistry["telegramMigration.dispatch"](
+      { type: "USER_TEST_NATIVE" },
+      deps,
+    );
+    assert.strictEqual(allowed.status, "ok");
+    assert.deepStrictEqual(calls, [{ type: "USER_TEST_NATIVE" }]);
+
+    const blocked = await commandRegistry["telegramMigration.dispatch"](
+      { type: "TEST_SUCCESS", at: 123 },
+      deps,
+    );
+    assert.strictEqual(blocked.status, "error");
+    assert.strictEqual(blocked.errorCode, "EVENT_NOT_ALLOWED");
+    assert.deepStrictEqual(calls, [{ type: "USER_TEST_NATIVE" }]);
   });
 });
 
@@ -429,9 +629,204 @@ describe("bubble policy commands", () => {
     assert.deepStrictEqual(shown.commit, {
       hideBubbles: false,
       permissionBubblesEnabled: true,
-      notificationBubbleAutoCloseSeconds: 3,
+      notificationBubbleAutoCloseSeconds: 6,
       updateBubbleAutoCloseSeconds: 9,
     });
+  });
+});
+
+describe("setAutoApproveAll danger gate", () => {
+  it("refuses to enable without confirmed:true (dialog is a real boundary)", async () => {
+    const r = await commandRegistry.setAutoApproveAll({ enabled: true }, {});
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /confirmed:true/);
+  });
+
+  it("refuses to enable when confirmed is falsy", async () => {
+    for (const bad of [false, "true", 1, null, undefined]) {
+      const r = await commandRegistry.setAutoApproveAll({ enabled: true, confirmed: bad }, {});
+      assert.strictEqual(r.status, "error", `confirmed=${JSON.stringify(bad)} must be rejected`);
+    }
+  });
+
+  it("enables only with explicit confirmed:true", async () => {
+    const r = await commandRegistry.setAutoApproveAll({ enabled: true, confirmed: true }, {});
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit, { autoApproveAllPermissions: true });
+  });
+
+  it("disables immediately with no confirmation required", async () => {
+    const r = await commandRegistry.setAutoApproveAll({ enabled: false }, {});
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit, { autoApproveAllPermissions: false });
+  });
+
+  it("rejects a non-boolean enabled", async () => {
+    const r = await commandRegistry.setAutoApproveAll({ enabled: "yes", confirmed: true }, {});
+    assert.strictEqual(r.status, "error");
+  });
+});
+
+describe("session cleanup interval validators", () => {
+  const snapshot = prefs.getDefaults();
+
+  it("sessionStaleMs accepts 0 (disabled) regardless of workingStaleMs", () => {
+    const result = updateRegistry.sessionStaleMs(0, { snapshot });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("sessionStaleMs accepts non-zero values >= current workingStaleMs", () => {
+    const result = updateRegistry.sessionStaleMs(600_000, { snapshot });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("sessionStaleMs rejects values below the workingStaleMs floor", () => {
+    const result = updateRegistry.sessionStaleMs(60_000, {
+      snapshot: { ...snapshot, workingStaleMs: 300_000 },
+    });
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /workingStaleMs/);
+  });
+
+  it("sessionStaleMs rejects non-integers / out-of-range", () => {
+    assert.strictEqual(updateRegistry.sessionStaleMs("nope", { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.sessionStaleMs(1.5, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.sessionStaleMs(30_000, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.sessionStaleMs(90_000_000, { snapshot }).status, "error");
+  });
+
+  it("workingStaleMs rejects values above sessionStaleMs when the latter is non-zero", () => {
+    const result = updateRegistry.workingStaleMs(700_000, {
+      snapshot: { ...snapshot, sessionStaleMs: 600_000 },
+    });
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /sessionStaleMs/);
+  });
+
+  it("workingStaleMs accepts any in-range value when sessionStaleMs is 0", () => {
+    const result = updateRegistry.workingStaleMs(700_000, {
+      snapshot: { ...snapshot, sessionStaleMs: 0 },
+    });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("workingStaleMs accepts equal to sessionStaleMs", () => {
+    const result = updateRegistry.workingStaleMs(600_000, {
+      snapshot: { ...snapshot, sessionStaleMs: 600_000 },
+    });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("workingStaleMs rejects below floor / above ceiling", () => {
+    assert.strictEqual(updateRegistry.workingStaleMs(0, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.workingStaleMs(20_000, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.workingStaleMs(90_000_000, { snapshot }).status, "error");
+  });
+
+  it("detachedIdleStaleMs enforces 5s-300s integer range", () => {
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(5_000, { snapshot }).status, "ok");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(300_000, { snapshot }).status, "ok");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(0, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(1_000, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(400_000, { snapshot }).status, "error");
+  });
+});
+
+describe("sessionCleanup.setTriple command", () => {
+  const cmd = commandRegistry["sessionCleanup.setTriple"];
+  const baseSnapshot = prefs.getDefaults();
+
+  it("commits a full valid triple", async () => {
+    const result = await cmd(
+      {
+        sessionStaleMs: 600_000,
+        workingStaleMs: 300_000,
+        detachedIdleStaleMs: 30_000,
+      },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "ok");
+    assert.deepStrictEqual(result.commit, {
+      sessionStaleMs: 600_000,
+      workingStaleMs: 300_000,
+      detachedIdleStaleMs: 30_000,
+    });
+  });
+
+  it("rejects an inverted triple (workingStaleMs > sessionStaleMs)", async () => {
+    const result = await cmd(
+      {
+        sessionStaleMs: 120_000,
+        workingStaleMs: 300_000,
+        detachedIdleStaleMs: 30_000,
+      },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /workingStaleMs.*must be <= sessionStaleMs/);
+  });
+
+  it("accepts sessionStaleMs=0 with any in-range workingStaleMs", async () => {
+    const result = await cmd(
+      {
+        sessionStaleMs: 0,
+        workingStaleMs: 86_400_000,
+        detachedIdleStaleMs: 30_000,
+      },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "ok");
+    assert.deepStrictEqual(result.commit, {
+      sessionStaleMs: 0,
+      workingStaleMs: 86_400_000,
+      detachedIdleStaleMs: 30_000,
+    });
+  });
+
+  it("defaults absent fields from the snapshot", async () => {
+    const snapshot = {
+      ...baseSnapshot,
+      sessionStaleMs: 900_000,
+      workingStaleMs: 450_000,
+      detachedIdleStaleMs: 45_000,
+    };
+    const result = await cmd({ sessionStaleMs: 600_000 }, { snapshot });
+    assert.strictEqual(result.status, "ok");
+    assert.deepStrictEqual(result.commit, {
+      sessionStaleMs: 600_000,
+      workingStaleMs: 450_000,
+      detachedIdleStaleMs: 45_000,
+    });
+  });
+
+  it("rejects payload with non-integer present value (no silent snapshot fallback)", async () => {
+    const result = await cmd(
+      { sessionStaleMs: "600000" },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /sessionStaleMs.*must be an integer/);
+  });
+
+  it("rejects out-of-range fields without committing", async () => {
+    const tooSmall = await cmd(
+      { sessionStaleMs: 600_000, workingStaleMs: 1_000, detachedIdleStaleMs: 30_000 },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(tooSmall.status, "error");
+    assert.strictEqual(tooSmall.commit, undefined);
+
+    const detTooBig = await cmd(
+      { sessionStaleMs: 600_000, workingStaleMs: 300_000, detachedIdleStaleMs: 999_999 },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(detTooBig.status, "error");
+    assert.strictEqual(detTooBig.commit, undefined);
+  });
+
+  it("rejects non-object payload", async () => {
+    const r = await cmd(null, { snapshot: baseSnapshot });
+    assert.strictEqual(r.status, "error");
   });
 });
 
@@ -440,7 +835,10 @@ describe("hook commands", () => {
     let syncCalls = 0;
     const r = await commandRegistry.installHooks(null, {
       snapshot: prefs.getDefaults(),
-      syncClaudeHooksNow: () => syncCalls++,
+      syncClaudeHooksNow: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        syncCalls++;
+      },
     });
     assert.strictEqual(r.status, "ok");
     assert.strictEqual(syncCalls, 1);
@@ -452,7 +850,10 @@ describe("hook commands", () => {
     const r = await commandRegistry.uninstallHooks(null, {
       snapshot: { ...prefs.getDefaults(), manageClaudeHooksAutomatically: true, autoStartWithClaude: true },
       stopClaudeSettingsWatcher: () => calls.push("stop"),
-      uninstallClaudeHooksNow: () => calls.push("uninstall"),
+      uninstallClaudeHooksNow: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        calls.push("uninstall");
+      },
       startClaudeSettingsWatcher: () => calls.push("start"),
     });
     assert.strictEqual(r.status, "ok");
@@ -466,8 +867,9 @@ describe("hook commands", () => {
     const r = await commandRegistry.uninstallHooks(null, {
       snapshot: { ...prefs.getDefaults(), manageClaudeHooksAutomatically: true },
       stopClaudeSettingsWatcher: () => calls.push("stop"),
-      uninstallClaudeHooksNow: () => {
+      uninstallClaudeHooksNow: async () => {
         calls.push("uninstall");
+        await new Promise((resolve) => setTimeout(resolve, 1));
         throw new Error("disk locked");
       },
       startClaudeSettingsWatcher: () => calls.push("start"),
@@ -475,6 +877,47 @@ describe("hook commands", () => {
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /disk locked/);
     assert.deepStrictEqual(calls, ["stop", "uninstall", "start"]);
+  });
+
+  it("cleanupIntegrations disables all managed agents before running cleanup", async () => {
+    const calls = [];
+    const snapshot = prefs.getDefaults();
+    snapshot.dismissedAgentInstallHints = { hermes: true };
+    snapshot.dismissedAgentCleanupHints = { "qwen-code": true, hermes: true };
+    assert.ok(
+      MANAGED_CLEANUP_AGENT_IDS.includes("reasonix"),
+      "bulk cleanup should include Reasonix hooks"
+    );
+    const result = await commandRegistry.cleanupIntegrations(null, {
+      snapshot,
+      stopIntegrationForAgent: (agentId) => calls.push(["stopIntegration", agentId]),
+      stopMonitorForAgent: (agentId) => calls.push(["stopMonitor", agentId]),
+      clearSessionsByAgent: (agentId) => calls.push(["clearSessions", agentId]),
+      dismissPermissionsByAgent: (agentId) => calls.push(["dismissPermissions", agentId]),
+      cleanupIntegrations: (options) => {
+        calls.push(["cleanup", options.source]);
+        return {
+          mode: "apply",
+          summary: { agentsChecked: 15, agentsAffected: 2, entriesRemoved: 3, skipped: 13, failed: 0 },
+        };
+      },
+    });
+
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(commandRegistry.cleanupIntegrations.lockKey, "agentIntegration");
+    assert.strictEqual(result.cleanup.summary.entriesRemoved, 3);
+    for (const agentId of MANAGED_CLEANUP_AGENT_IDS) {
+      assert.strictEqual(result.commit.agents[agentId].enabled, false, `${agentId} should be disabled`);
+      assert.strictEqual(result.commit.agents[agentId].integrationInstalled, false, `${agentId} should be uninstalled`);
+      assert.strictEqual(
+        result.commit.dismissedAgentInstallHints[agentId],
+        true,
+        `${agentId} install hint should be dismissed after bulk cleanup`
+      );
+    }
+    assert.deepStrictEqual(result.commit.dismissedAgentCleanupHints, {});
+    assert.deepStrictEqual(calls.at(-1), ["cleanup", "about"]);
+    assert.deepStrictEqual(calls[0], ["stopIntegration", "claude-code"]);
   });
 });
 
@@ -500,25 +943,30 @@ describe("doctor repair commands", () => {
       snapshot: prefs.getDefaults(),
       repairIntegrationForAgent: (agentId, options) => {
         calls.push({ agentId, options });
-        return { status: "error", message: "codex_hooks is still false" };
+        return { status: "error", message: "hooks is still false" };
       },
     });
 
     assert.strictEqual(r.status, "error");
-    assert.match(r.message, /codex_hooks/);
+    assert.match(r.message, /hooks/);
     assert.deepStrictEqual(calls, [{ agentId: "codex", options: { forceCodexHooksFeature: true } }]);
   });
 
-  it("rejects Copilot CLI because it is manual-only", async () => {
+  it("accepts Copilot CLI through the standard auto-repair path", async () => {
     const calls = [];
+    const snapshot = prefs.getDefaults();
+    snapshot.agents["copilot-cli"].integrationInstalled = true;
+    snapshot.agents["copilot-cli"].enabled = true;
     const r = await commandRegistry.repairAgentIntegration({ agentId: "copilot-cli" }, {
-      snapshot: prefs.getDefaults(),
-      repairIntegrationForAgent: (agentId) => calls.push(agentId),
+      snapshot,
+      repairIntegrationForAgent: (agentId) => {
+        calls.push(agentId);
+        return { status: "ok", added: 10, updated: 0 };
+      },
     });
 
-    assert.strictEqual(r.status, "error");
-    assert.match(r.message, /manual/i);
-    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(calls, ["copilot-cli"]);
   });
 
   it("does not repair disabled agents", async () => {
@@ -1011,6 +1459,22 @@ describe("removeTheme command", () => {
     const r = await commandRegistry.removeTheme("activeUser", deps);
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /active/);
+    assert.deepStrictEqual(calls.removeThemeDir, []);
+  });
+
+  it("rejects managed Codex Pet themes", async () => {
+    const { deps, calls } = makeDeps({
+      getThemeInfo: (id) => {
+        calls.getThemeInfo.push(id);
+        if (id === "codex-pet-yoimiya") {
+          return { builtin: false, active: false, managedCodexPet: true };
+        }
+        return { builtin: false, active: false };
+      },
+    });
+    const r = await commandRegistry.removeTheme("codex-pet-yoimiya", deps);
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /managed Codex Pet/);
     assert.deepStrictEqual(calls.removeThemeDir, []);
   });
 
@@ -1546,6 +2010,32 @@ describe("setWideHitboxOverride command", () => {
       hitbox: { wide: { "foo.svg": true } },
     });
   });
+
+  it("prefers refreshActiveThemeHitboxOverrides over activateTheme for active theme changes", () => {
+    let refreshedWith = null;
+    let activated = false;
+    const snapshot = { theme: "clawd", themeOverrides: {} };
+    const r = commandRegistry.setWideHitboxOverride(
+      { themeId: "clawd", file: "foo.svg", enabled: true },
+      {
+        snapshot,
+        refreshActiveThemeHitboxOverrides: (id, overrideMap) => {
+          refreshedWith = { id, overrideMap };
+        },
+        activateTheme: () => {
+          activated = true;
+        },
+      }
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(refreshedWith, {
+      id: "clawd",
+      overrideMap: {
+        hitbox: { wide: { "foo.svg": true } },
+      },
+    });
+    assert.strictEqual(activated, false);
+  });
 });
 
 describe("theme override subtree preservation", () => {
@@ -1706,6 +2196,68 @@ describe("importAnimationOverrides command", () => {
     const r = commandRegistry.importAnimationOverrides(validPayload, { snapshot });
     assert.strictEqual(r.status, "ok");
     assert.ok(r.commit.themeOverrides.clawd);
+  });
+});
+
+describe("textScaleByDisplay validator", () => {
+  it("has a registry entry so command commits pass controller validation", () => {
+    // Regression: the controller rejects command commits whose keys lack a
+    // registry validator ("unknown settings key textScaleByDisplay").
+    assert.strictEqual(typeof updateRegistry.textScaleByDisplay, "function");
+  });
+
+  it("accepts a valid display map and rejects junk entries", () => {
+    assert.strictEqual(updateRegistry.textScaleByDisplay({ "1": 1.35, "2": 0.8 }).status, "ok");
+    assert.strictEqual(updateRegistry.textScaleByDisplay({}).status, "ok");
+    assert.strictEqual(updateRegistry.textScaleByDisplay(null).status, "error");
+    assert.strictEqual(updateRegistry.textScaleByDisplay([1.2]).status, "error");
+    assert.strictEqual(updateRegistry.textScaleByDisplay({ "1": 99 }).status, "error");
+    assert.strictEqual(updateRegistry.textScaleByDisplay({ "1": "1.2" }).status, "error");
+    assert.strictEqual(updateRegistry.textScaleByDisplay({ " ": 1.2 }).status, "error");
+  });
+});
+
+describe("setTextScaleForDisplay command", () => {
+  it("writes the entry for the resolved display and keeps other displays", () => {
+    const r = commandRegistry.setTextScaleForDisplay({ value: 1.35 }, {
+      snapshot: { textScaleByDisplay: { "2": 1.2 } },
+      resolveTextScaleDisplayKey: () => "1",
+    });
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit, { textScaleByDisplay: { "1": 1.35, "2": 1.2 } });
+  });
+
+  it("overwrites an existing entry for the same display", () => {
+    const r = commandRegistry.setTextScaleForDisplay({ value: 1 }, {
+      snapshot: { textScaleByDisplay: { "1": 1.35 } },
+      resolveTextScaleDisplayKey: () => "1",
+    });
+    assert.deepStrictEqual(r.commit, { textScaleByDisplay: { "1": 1 } });
+  });
+
+  it("falls back to the legacy global without display context", () => {
+    const r = commandRegistry.setTextScaleForDisplay({ value: 1.25 }, { snapshot: {} });
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit, { textScale: 1.25 });
+  });
+
+  it("never evicts the entry being written when the map is at capacity", () => {
+    const full = {};
+    for (let i = 0; i < 16; i++) full[`d${i}`] = 1.2;
+    const r = commandRegistry.setTextScaleForDisplay({ value: 1.4 }, {
+      snapshot: { textScaleByDisplay: full },
+      resolveTextScaleDisplayKey: () => "fresh",
+    });
+    assert.strictEqual(r.commit.textScaleByDisplay.fresh, 1.4);
+    assert.strictEqual(Object.keys(r.commit.textScaleByDisplay).length, 16);
+  });
+
+  it("rejects out-of-range and non-numeric values", () => {
+    const deps = { snapshot: {}, resolveTextScaleDisplayKey: () => "1" };
+    assert.strictEqual(commandRegistry.setTextScaleForDisplay({ value: 0.5 }, deps).status, "error");
+    assert.strictEqual(commandRegistry.setTextScaleForDisplay({ value: 2 }, deps).status, "error");
+    assert.strictEqual(commandRegistry.setTextScaleForDisplay({ value: "abc" }, deps).status, "error");
+    assert.strictEqual(commandRegistry.setTextScaleForDisplay(null, deps).status, "error");
   });
 });
 

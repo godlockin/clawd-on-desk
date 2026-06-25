@@ -148,6 +148,23 @@ describe("animation-cycle SVG probe", () => {
       source: "svg",
     });
   });
+
+  it("reads finite duration probes from CDATA style blocks", () => {
+    const svg = `
+      <svg xmlns="http://www.w3.org/2000/svg">
+        <style><![CDATA[
+          .duration-probe {
+            animation: mini-enter-duration-probe 1.25s linear 1 both;
+          }
+        ]]></style>
+      </svg>
+    `;
+    assert.deepStrictEqual(probeSvgCycle(svg), {
+      ms: 1250,
+      status: CYCLE_STATUS.EXACT,
+      source: "svg",
+    });
+  });
 });
 
 describe("animation-cycle raster probes", () => {

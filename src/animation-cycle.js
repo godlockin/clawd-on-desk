@@ -258,6 +258,13 @@ function collectCssTimingEntries(cssText) {
   return entries;
 }
 
+function collectNodeText(node) {
+  if (!node) return "";
+  if (node.type === "text") return node.data || "";
+  if (!Array.isArray(node.children)) return "";
+  return node.children.map(collectNodeText).join("");
+}
+
 function parseSmilBeginDelay(beginRaw, isLoop) {
   if (typeof beginRaw !== "string" || !beginRaw.trim()) return { delayMs: 0, complex: false };
   const normalized = beginRaw.trim().toLowerCase();
@@ -326,9 +333,7 @@ function walkSvgNode(node, entries) {
     }
     if (tagName === "style" && Array.isArray(node.children)) {
       for (const child of node.children) {
-        if (child && child.type === "text" && child.data) {
-          entries.push(...collectCssTimingEntries(child.data));
-        }
+        entries.push(...collectCssTimingEntries(collectNodeText(child)));
       }
     }
     if (node.attribs && typeof node.attribs.style === "string") {

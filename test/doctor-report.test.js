@@ -102,9 +102,14 @@ describe("formatDiagnosticReport", () => {
       detail: "hook registered",
       permissionBubbleDetail: "permission bubbles disabled for this agent",
       supplementary: {
-        key: "codex_hooks",
+        key: "hooks",
         value: "uncertain",
         detail: "config missing",
+      },
+      codexHookTrust: {
+        key: "codex_hook_trust",
+        value: "needs-review",
+        detail: "2/2 Clawd Codex hook(s) need Codex /hooks review: PermissionRequest, Stop",
       },
       kiroScan: {
         fullyValidFiles: ["clawd.json"],
@@ -117,13 +122,29 @@ describe("formatDiagnosticReport", () => {
     });
 
     assert.match(detail, /permission bubbles disabled/);
-    assert.match(detail, /codex_hooks=uncertain/);
+    assert.match(detail, /hooks=uncertain/);
+    assert.match(detail, /codex_hook_trust=needs-review/);
+    assert.match(detail, /PermissionRequest, Stop/);
     assert.match(detail, /valid=clawd\.json/);
     assert.match(detail, /broken=custom\.json/);
     assert.match(detail, /corrupt=bad\.json/);
     assert.match(detail, /no-marker=1/);
     assert.match(detail, /opencode issue: directory-missing/);
     assert.match(detail, /opencode entry:/);
+  });
+
+  it("formats Gemini supplementary diagnostics into visible detail text", () => {
+    const detail = formatAgentDetail({
+      detail: "Gemini hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events",
+      supplementary: {
+        key: "gemini_hooks",
+        value: "disabled-global",
+        detail: "hooksConfig.enabled is false",
+      },
+    });
+
+    assert.match(detail, /gemini_hooks=disabled-global/);
+    assert.match(detail, /hooksConfig\.enabled is false/);
   });
 
   it("formats summary and agent integration details", () => {
@@ -146,7 +167,7 @@ describe("formatDiagnosticReport", () => {
               detail: "C:\\Users\\Alice\\.cursor\\hooks.json missing",
               permissionBubbleDetail: "permission bubbles disabled for this agent",
               supplementary: {
-                key: "codex_hooks",
+                key: "hooks",
                 value: "uncertain",
                 detail: "config missing",
               },
@@ -173,7 +194,7 @@ describe("formatDiagnosticReport", () => {
           eventType: "PermissionRequest",
         }],
         fileActivity: [{
-          agentId: "gemini-cli",
+          agentId: "codex",
           source: "file-mtime",
           count: 1,
         }],
@@ -191,14 +212,14 @@ describe("formatDiagnosticReport", () => {
     assert.match(report, /Overall: WARNING/);
     assert.match(report, /Cursor Agent/);
     assert.match(report, /permission bubbles disabled/);
-    assert.match(report, /codex_hooks=uncertain/);
+    assert.match(report, /hooks=uncertain/);
     assert.match(report, /valid=clawd\.json/);
     assert.match(report, /opencode issue: directory-missing/);
     assert.match(report, /\[APP\]\/hooks\/opencode-plugin/);
     assert.match(report, /## Connection Test/);
     assert.match(report, /HTTP works but events were dropped/);
     assert.match(report, /dropped-by-dnd/);
-    assert.match(report, /Fallback file activity also observed: gemini-cli \(1\)\./);
+    assert.match(report, /Fallback file activity also observed: codex \(1\)\./);
     assert.doesNotMatch(report, /\| gemini-cli \| file-mtime \| 1 \|/);
     assert.ok(!report.includes("Alice"));
     assert.ok(!report.includes("D:/animation"));

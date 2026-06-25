@@ -5,7 +5,10 @@ const assert = require("node:assert");
 const { EventEmitter } = require("node:events");
 
 const initServer = require("../src/server");
-const { resolveCodexOfficialHookState } = require("../src/server").__test;
+const {
+  MAX_CODEX_OFFICIAL_TURNS,
+  resolveCodexOfficialHookState,
+} = require("../src/server-codex-official-turns");
 
 class FakeWatcher extends EventEmitter {
   constructor(callback) {
@@ -96,6 +99,7 @@ function makeServer(overrides = {}) {
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
     getPortCandidates: () => [23333],
+    readRuntimePort: () => null,
     writeRuntimeConfig: () => true,
     clearRuntimeConfig: () => true,
     fs: {
@@ -109,13 +113,23 @@ function makeServer(overrides = {}) {
     },
     syncClawdHooksImpl: () => syncCalls.push("claude"),
     syncGeminiHooksImpl: () => syncCalls.push("gemini"),
+    syncAntigravityHooksImpl: () => syncCalls.push("antigravity"),
     syncCursorHooksImpl: () => syncCalls.push("cursor"),
+    syncCopilotHooksImpl: () => syncCalls.push("copilot"),
     syncCodeBuddyHooksImpl: () => syncCalls.push("codebuddy"),
     syncKiroHooksImpl: () => syncCalls.push("kiro"),
     syncKimiHooksImpl: () => syncCalls.push("kimi"),
+    syncQwenHooksImpl: () => syncCalls.push("qwen"),
     syncCodexHooksImpl: () => syncCalls.push("codex"),
     repairCodexHooksImpl: () => syncCalls.push("codex-repair"),
     syncOpencodePluginImpl: () => syncCalls.push("opencode"),
+    syncPiExtensionImpl: () => syncCalls.push("pi"),
+    syncOpenClawPluginImpl: () => syncCalls.push("openclaw"),
+    repairOpenClawPluginImpl: () => syncCalls.push("openclaw-repair"),
+    syncHermesPluginImpl: () => syncCalls.push("hermes"),
+    syncCodewhaleHooksImpl: () => syncCalls.push("codewhale"),
+    syncQoderHooksImpl: () => syncCalls.push("qoder"),
+    syncReasonixHooksImpl: () => syncCalls.push("reasonix"),
     ...overrides,
   };
 
@@ -129,6 +143,28 @@ function makeServer(overrides = {}) {
   };
 }
 
+function healthyClaudeSettingsWithThirdPartyHook() {
+  return {
+    env: { FOO: "bar" },
+    permissions: { allow: ["*"], deny: [] },
+    enabledPlugins: { a: true },
+    skillOverrides: { sk1: true },
+    hooks: {
+      Stop: [{
+        matcher: "",
+        hooks: [
+          { type: "command", command: 'node "/tmp/clawd-hook.js" Stop' },
+          { type: "command", command: "node /home/u/.claude/hooks/third-party.js" },
+        ],
+      }],
+      PermissionRequest: [{
+        matcher: "",
+        hooks: [{ type: "http", url: "http://127.0.0.1:23333/permission", timeout: 600 }],
+      }],
+    },
+  };
+}
+
 describe("server Claude hook management", () => {
   it("startup syncs Claude hooks and starts watcher when automatic management is enabled", () => {
     const { api, syncCalls, getWatcher } = makeServer({
@@ -137,8 +173,29 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["claude", "gemini", "cursor", "codebuddy", "kiro", "kimi", "codex", "opencode"]);
+    assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "pi", "openclaw", "hermes", "qoder","reasonix"]);
     assert.ok(getWatcher(), "watcher should start when management is enabled");
+  });
+
+  it("startup skips Hermes plugin sync quietly when Hermes is not installed", () => {
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      const { api, syncCalls, getWatcher } = makeServer({
+        manageClaudeHooksAutomatically: true,
+        syncHermesPluginImpl: undefined,
+        isHermesInstalledImpl: () => false,
+      });
+
+      api.startHttpServer();
+
+      assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "pi", "openclaw", "qoder","reasonix"]);
+      assert.ok(getWatcher(), "watcher should start when management is enabled");
+      assert.strictEqual(warnings.some((line) => /Hermes/i.test(line)), false);
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 
   it("startup skips Claude sync/watcher but still syncs other agents when automatic management is disabled", () => {
@@ -148,19 +205,19 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["gemini", "cursor", "codebuddy", "kiro", "kimi", "codex", "opencode"]);
+    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "pi", "openclaw", "hermes", "qoder","reasonix"]);
     assert.strictEqual(getWatcher(), null);
   });
 
   it("startup skips automatic hook/plugin sync for disabled agents", () => {
-    const disabled = new Set(["gemini-cli", "cursor-agent", "kiro-cli", "opencode"]);
+    const disabled = new Set(["gemini-cli", "antigravity-cli", "cursor-agent", "kiro-cli", "opencode", "pi", "openclaw"]);
     const { api, syncCalls, getWatcher } = makeServer({
       isAgentEnabled: (agentId) => !disabled.has(agentId),
     });
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["claude", "codebuddy", "kimi", "codex"]);
+    assert.deepStrictEqual(syncCalls, ["claude", "copilot", "codebuddy", "kimi", "qwen", "codewhale", "codex", "hermes", "qoder","reasonix"]);
     assert.ok(getWatcher(), "Claude watcher should still start when Claude is enabled");
   });
 
@@ -171,7 +228,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["gemini", "cursor", "codebuddy", "kiro", "kimi", "codex", "opencode"]);
+    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "pi", "openclaw", "hermes", "qoder","reasonix"]);
     assert.strictEqual(getWatcher(), null);
   });
 
@@ -248,6 +305,58 @@ describe("server Claude hook management", () => {
     assert.deepStrictEqual(syncCalls, ["claude"]);
   });
 
+  it("records suspicious-shrink guard status when watcher skips automatic Claude repair", () => {
+    const notices = [];
+    let now = 10_000;
+    const { api, syncCalls, timers, getWatcher, setSettingsRaw } = makeServer({
+      now: () => now,
+      notifySuspiciousShrink: (before, after, notice) => notices.push({ before, after, notice }),
+    });
+    setSettingsRaw(JSON.stringify(healthyClaudeSettingsWithThirdPartyHook()));
+
+    api.startClaudeSettingsWatcher();
+    setSettingsRaw(JSON.stringify({ skipDangerousModePermissionPrompt: true }));
+    getWatcher().emitChange("settings.json");
+    timers.flush();
+
+    assert.deepStrictEqual(syncCalls, []);
+    assert.strictEqual(notices.length, 1);
+    assert.strictEqual(notices[0].notice.type, "suspicious-shrink");
+    assert.strictEqual(notices[0].before.keyCount, 5);
+    assert.strictEqual(notices[0].after.keyCount, 1);
+    assert.deepStrictEqual(api.getClaudeHookGuardStatus(), notices[0].notice);
+
+    api.repairIntegrationForAgent("claude-code");
+    assert.strictEqual(api.getClaudeHookGuardStatus(), null);
+
+    setSettingsRaw(JSON.stringify({ skipDangerousModePermissionPrompt: true }));
+    getWatcher().emitChange("settings.json");
+    timers.flush();
+    now += 31 * 60 * 1000;
+    assert.strictEqual(api.getClaudeHookGuardStatus(), null);
+  });
+
+  it("keeps suspicious-shrink guard status when Claude repair fails and clears it on cleanup", () => {
+    const { api, timers, getWatcher, setSettingsRaw } = makeServer({
+      syncClawdHooksImpl: () => ({ status: "error", message: "write failed" }),
+    });
+    setSettingsRaw(JSON.stringify(healthyClaudeSettingsWithThirdPartyHook()));
+
+    api.startClaudeSettingsWatcher();
+    setSettingsRaw(JSON.stringify({ skipDangerousModePermissionPrompt: true }));
+    getWatcher().emitChange("settings.json");
+    timers.flush();
+    const guard = api.getClaudeHookGuardStatus();
+    assert.ok(guard);
+
+    const repairResult = api.repairIntegrationForAgent("claude-code");
+    assert.deepStrictEqual(repairResult, { status: "error", message: "write failed" });
+    assert.deepStrictEqual(api.getClaudeHookGuardStatus(), guard);
+
+    api.cleanup();
+    assert.strictEqual(api.getClaudeHookGuardStatus(), null);
+  });
+
   it("watcher ignores settings changes when both command and PermissionRequest hooks are intact", () => {
     const { api, syncCalls, timers, getWatcher } = makeServer();
 
@@ -273,6 +382,23 @@ describe("server Claude hook management", () => {
     assert.deepStrictEqual(syncCalls, []);
   });
 
+  it("watcher does not re-sync missing Claude hooks after Claude integration is uninstalled", () => {
+    let shouldSyncClaude = true;
+    const { api, syncCalls, timers, getWatcher, setSettingsRaw } = makeServer({
+      shouldSyncAgentIntegration: (agentId) => (
+        agentId !== "claude-code" || shouldSyncClaude
+      ),
+    });
+
+    api.startClaudeSettingsWatcher();
+    shouldSyncClaude = false;
+    setSettingsRaw('{"hooks":{}}');
+    getWatcher().emitChange("settings.json");
+    timers.flush();
+
+    assert.deepStrictEqual(syncCalls, []);
+  });
+
   it("disconnect-style restart does not reinstall Claude hooks when management stays disabled", () => {
     const first = makeServer({ manageClaudeHooksAutomatically: false });
     first.api.startHttpServer();
@@ -281,19 +407,26 @@ describe("server Claude hook management", () => {
     const second = makeServer({ manageClaudeHooksAutomatically: false });
     second.api.startHttpServer();
 
-    assert.deepStrictEqual(first.syncCalls, ["gemini", "cursor", "codebuddy", "kiro", "kimi", "codex", "opencode"]);
-    assert.deepStrictEqual(second.syncCalls, ["gemini", "cursor", "codebuddy", "kiro", "kimi", "codex", "opencode"]);
+    assert.deepStrictEqual(first.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "pi", "openclaw", "hermes", "qoder","reasonix"]);
+    assert.deepStrictEqual(second.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "pi", "openclaw", "hermes", "qoder","reasonix"]);
   });
 
   it("repairIntegrationForAgent uses the Codex official hook repair path", () => {
     const { api, syncCalls } = makeServer();
 
     const repaired = api.repairIntegrationForAgent("codex");
-    const unsupported = api.repairIntegrationForAgent("copilot-cli");
 
     assert.strictEqual(repaired, true);
-    assert.strictEqual(unsupported, false);
     assert.deepStrictEqual(syncCalls, ["codex-repair"]);
+  });
+
+  it("repairIntegrationForAgent('copilot-cli') routes through the standard sync path", () => {
+    const { api, syncCalls } = makeServer();
+
+    const repaired = api.repairIntegrationForAgent("copilot-cli");
+
+    assert.strictEqual(repaired, true);
+    assert.deepStrictEqual(syncCalls, ["copilot"]);
   });
 
   it("passes Codex repair options through to the repair implementation", () => {
@@ -352,10 +485,10 @@ describe("Codex official hook turn tracking", () => {
     }, "idle", turns);
 
     assert.deepStrictEqual(result, { state: "attention", drop: false });
-    assert.strictEqual(turns.has("turn-1"), false);
+    assert.strictEqual(turns.size, 0);
   });
 
-  it("resolves Stop to idle when no tool was seen", () => {
+  it("resolves Stop to idle when no tool or assistant output was seen", () => {
     const turns = new Map();
     resolveCodexOfficialHookState({
       agent_id: "codex",
@@ -376,8 +509,43 @@ describe("Codex official hook turn tracking", () => {
     assert.deepStrictEqual(result, { state: "idle", drop: false });
   });
 
+  it("resolves Stop to attention when a no-tool turn has assistant output", () => {
+    const turns = new Map();
+    resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "UserPromptSubmit",
+      session_id: "codex:s1",
+      turn_id: "turn-1",
+    }, "thinking", turns);
+
+    const result = resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "Stop",
+      session_id: "codex:s1",
+      turn_id: "turn-1",
+      assistant_last_output: "Short answer.",
+    }, "idle", turns);
+
+    assert.deepStrictEqual(result, { state: "attention", drop: false });
+    assert.strictEqual(turns.size, 0);
+  });
+
+  it("resolves Stop without a turn id to attention when assistant output is present", () => {
+    const result = resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "Stop",
+      session_id: "codex:s1",
+      assistant_last_output: "Done.",
+    }, "idle", new Map());
+
+    assert.deepStrictEqual(result, { state: "attention", drop: false });
+  });
+
   it("drops stop_hook_active continuations without updating state", () => {
-    const turns = new Map([["turn-1", { sessionId: "codex:s1", hadToolUse: true }]]);
+    const turns = new Map([["codex:s1|turn-1", { sessionId: "codex:s1", hadToolUse: true }]]);
 
     const result = resolveCodexOfficialHookState({
       agent_id: "codex",
@@ -389,6 +557,106 @@ describe("Codex official hook turn tracking", () => {
     }, "idle", turns);
 
     assert.deepStrictEqual(result, { state: "idle", drop: true });
-    assert.strictEqual(turns.has("turn-1"), false);
+    assert.strictEqual(turns.size, 0);
+  });
+
+  it("resolves subagent Stop to idle and marks it headless", () => {
+    const turns = new Map();
+    const classifier = {
+      registerSession: () => "subagent",
+    };
+
+    resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "UserPromptSubmit",
+      session_id: "codex:sub",
+      turn_id: "turn-1",
+      codex_session_role: "subagent",
+    }, "thinking", turns, classifier);
+    resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "PreToolUse",
+      session_id: "codex:sub",
+      turn_id: "turn-1",
+      codex_session_role: "subagent",
+    }, "working", turns, classifier);
+
+    const result = resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "Stop",
+      session_id: "codex:sub",
+      turn_id: "turn-1",
+      codex_session_role: "subagent",
+    }, "idle", turns, classifier);
+
+    assert.deepStrictEqual(result, { state: "idle", drop: false, headless: true });
+    assert.strictEqual(turns.size, 0);
+  });
+
+  it("keeps turns scoped by session id when turn_id overlaps", () => {
+    const turns = new Map();
+
+    resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "UserPromptSubmit",
+      session_id: "codex:root",
+      turn_id: "same-turn",
+    }, "thinking", turns);
+    resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "PreToolUse",
+      session_id: "codex:root",
+      turn_id: "same-turn",
+    }, "working", turns);
+    resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "UserPromptSubmit",
+      session_id: "codex:sub",
+      turn_id: "same-turn",
+    }, "thinking", turns);
+
+    const subStop = resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "Stop",
+      session_id: "codex:sub",
+      turn_id: "same-turn",
+    }, "idle", turns);
+    const rootStop = resolveCodexOfficialHookState({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      event: "Stop",
+      session_id: "codex:root",
+      turn_id: "same-turn",
+    }, "idle", turns);
+
+    assert.deepStrictEqual(subStop, { state: "idle", drop: false });
+    assert.deepStrictEqual(rootStop, { state: "attention", drop: false });
+    assert.strictEqual(turns.size, 0);
+  });
+
+  it("prunes the oldest tracked turns when the cap is exceeded", () => {
+    const turns = new Map();
+    for (let i = 0; i < MAX_CODEX_OFFICIAL_TURNS + 3; i++) {
+      resolveCodexOfficialHookState({
+        agent_id: "codex",
+        hook_source: "codex-official",
+        event: "UserPromptSubmit",
+        session_id: "codex:s1",
+        turn_id: `turn-${i}`,
+      }, "thinking", turns);
+    }
+
+    assert.strictEqual(turns.size, MAX_CODEX_OFFICIAL_TURNS);
+    assert.strictEqual(turns.has("codex:s1|turn-0"), false);
+    assert.strictEqual(turns.has("codex:s1|turn-1"), false);
+    assert.strictEqual(turns.has("codex:s1|turn-2"), false);
+    assert.strictEqual(turns.has(`codex:s1|turn-${MAX_CODEX_OFFICIAL_TURNS + 2}`), true);
   });
 });

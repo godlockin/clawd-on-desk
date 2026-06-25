@@ -3,20 +3,20 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const bubbleHtml = fs.readFileSync(path.join(__dirname, "..", "src", "bubble.html"), "utf8");
+const bubbleRenderer = fs.readFileSync(path.join(__dirname, "..", "src", "bubble-renderer.js"), "utf8");
 
 function functionBody(name) {
-  const start = bubbleHtml.indexOf(`function ${name}(`);
+  const start = bubbleRenderer.indexOf(`function ${name}(`);
   assert.notStrictEqual(start, -1, `missing function ${name}`);
-  const next = bubbleHtml.indexOf("\nfunction ", start + 1);
-  return next === -1 ? bubbleHtml.slice(start) : bubbleHtml.slice(start, next);
+  const next = bubbleRenderer.indexOf("\nfunction ", start + 1);
+  return next === -1 ? bubbleRenderer.slice(start) : bubbleRenderer.slice(start, next);
 }
 
 describe("AskUserQuestion bubble stepper", () => {
   it("tracks active question and answers in local renderer state", () => {
-    assert.match(bubbleHtml, /let elicitationAnswers = \{\};/);
-    assert.match(bubbleHtml, /let activeQuestionIndex = 0;/);
-    assert.match(bubbleHtml, /function renderElicitationStep\(\)/);
+    assert.match(bubbleRenderer, /let elicitationAnswers = \{\};/);
+    assert.match(bubbleRenderer, /let activeQuestionIndex = 0;/);
+    assert.match(bubbleRenderer, /function renderElicitationStep\(\)/);
   });
 
   it("renders only the active full question and compact summaries for answered questions", () => {
@@ -26,6 +26,20 @@ describe("AskUserQuestion bubble stepper", () => {
     assert.match(body, /else if \(isElicitationAnswerComplete\(i\)\) \{/);
     assert.match(body, /createQuestionSummary\(question, i\)/);
     assert.doesNotMatch(body, /forEach\(\(question, questionIndex\)/);
+  });
+
+  it("does not auto-select the first option on initial focus (form-like elicitation)", () => {
+    const body = functionBody("renderElicitationStep");
+
+    // B route: form-like elicitation for both single-choice and multi-select.
+    // Initial focus puts the cursor on the first preset so arrow keys / Tab work
+    // immediately, but it must not call .click() and must not pre-select.
+    //
+    // Source guard only. If first.click() appears in any rewritten form
+    // (first.click({preventScroll:true}), first?.click(), inputs[0].click(), …)
+    // update the guard or replace it with a renderer behavior test.
+    assert.doesNotMatch(body, /first\.click\(/);
+    assert.match(body, /if \(first\) first\.focus\(\);/);
   });
 
   it("lets answered summary rows reopen their question", () => {

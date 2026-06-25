@@ -2,13 +2,30 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert");
 
 const {
+  truncateDeep,
   normalizePermissionSuggestions,
   normalizeElicitationToolInput,
+  normalizeHookToolUseId,
+  normalizeCodexPermissionToolInput,
   normalizeToolMatchValue,
   buildToolInputFingerprint,
-} = require("../src/server").__test;
+} = require("../src/server-permission-utils");
 
 describe("permission input normalization", () => {
+  it("truncates deeply nested preview values without mutating the source", () => {
+    const source = {
+      command: "x".repeat(600),
+      nested: { message: "y".repeat(600) },
+    };
+
+    const normalized = truncateDeep(source);
+
+    assert.strictEqual(normalized.command.length, 501);
+    assert.strictEqual(normalized.command.endsWith("…"), true);
+    assert.strictEqual(normalized.nested.message.length, 501);
+    assert.strictEqual(source.command.length, 600);
+  });
+
   it("caps suggestions at 20 and preserves a merged addRules entry", () => {
     const rawSuggestions = [
       ...Array.from({ length: 24 }, (_, index) => ({ type: "setMode", mode: `mode-${index}` })),
@@ -45,6 +62,25 @@ describe("permission input normalization", () => {
     assert.strictEqual(normalized.questions[0].question.endsWith("…"), true);
     assert.strictEqual(normalized.questions[0].options[0].label.length, 80);
     assert.strictEqual(normalized.questions[0].options[0].description.length, 160);
+  });
+
+  it("normalizes hook tool_use_id values", () => {
+    assert.strictEqual(normalizeHookToolUseId("  toolu_123  "), "toolu_123");
+    assert.strictEqual(normalizeHookToolUseId("   "), null);
+    assert.strictEqual(normalizeHookToolUseId(123), null);
+  });
+
+  it("normalizes Codex permission tool input with optional description", () => {
+    assert.deepStrictEqual(
+      normalizeCodexPermissionToolInput({ command: "npm test" }, "  Run tests  "),
+      { command: "npm test", description: "Run tests" }
+    );
+    assert.deepStrictEqual(normalizeCodexPermissionToolInput(null, "Describe only"), {
+      description: "Describe only",
+    });
+    assert.deepStrictEqual(normalizeCodexPermissionToolInput({ command: "npm test" }, "   "), {
+      command: "npm test",
+    });
   });
 });
 

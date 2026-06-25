@@ -43,6 +43,20 @@ describe("doctor log opener", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  it("includes focus-debug.log in default log discovery", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-doctor-focus-log-"));
+    const userDataDir = path.join(tmp, "userData");
+    fs.mkdirSync(userDataDir, { recursive: true });
+    const focusLog = path.join(userDataDir, "focus-debug.log");
+    fs.writeFileSync(focusLog, "focus");
+
+    const target = resolveClawdLogTarget({ homeDir: tmp, userDataDir });
+
+    assert.strictEqual(target.status, "file");
+    assert.strictEqual(target.path, focusLog);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
   it("rejects path traversal requests", () => {
     const target = resolveClawdLogTarget({
       requested: "../permission-debug.log",

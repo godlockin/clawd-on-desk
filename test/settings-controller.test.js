@@ -47,6 +47,31 @@ describe("createSettingsController construction", () => {
   });
 });
 
+describe("setTextScaleForDisplay end-to-end commit", () => {
+  it("commits the per-display map through the controller and persists it", async () => {
+    // Regression: the command's commit key must pass the controller's
+    // registry validation ("unknown settings key textScaleByDisplay").
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      injectedDeps: { resolveTextScaleDisplayKey: () => "69992868" },
+    });
+    const r = await ctrl.applyCommand("setTextScaleForDisplay", { value: 1.35 });
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(ctrl.get("textScaleByDisplay"), { "69992868": 1.35 });
+
+    const again = await ctrl.applyCommand("setTextScaleForDisplay", { value: 1 });
+    assert.strictEqual(again.status, "ok");
+    assert.deepStrictEqual(ctrl.get("textScaleByDisplay"), { "69992868": 1 });
+  });
+
+  it("falls back to the legacy global key without display context", async () => {
+    const ctrl = createSettingsController({ prefsPath: makeTempPath() });
+    const r = await ctrl.applyCommand("setTextScaleForDisplay", { value: 1.25 });
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(ctrl.get("textScale"), 1.25);
+  });
+});
+
 describe("applyUpdate sync invariant", () => {
   it("sync action: returns a plain object, NOT a Promise, and the next sync read sees the new value", () => {
     // This is the contract that lets `ctx.lang = "zh"` work in sync menu setters
@@ -104,6 +129,69 @@ describe("applyUpdate sync invariant", () => {
     assert.deepStrictEqual(order, ["start:1:S", "end:1:S", "start:2:M", "end:2:M"]);
     assert.strictEqual(ctrl.get("size"), "M");
   });
+
+  it("manageClaudeHooksAutomatically uses the async effect path without changing controller semantics", async () => {
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      loadResult: {
+        snapshot: { ...prefs.getDefaults(), manageClaudeHooksAutomatically: false },
+        locked: false,
+      },
+      injectedDeps: {
+        syncClaudeHooksNow: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        },
+        startClaudeSettingsWatcher: () => {},
+        stopClaudeSettingsWatcher: () => {},
+      },
+    });
+    const ret = ctrl.applyUpdate("manageClaudeHooksAutomatically", true);
+    assert.strictEqual(typeof ret.then, "function");
+    const result = await ret;
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(ctrl.get("manageClaudeHooksAutomatically"), true);
+  });
+
+  it("serializes Claude hook update and command work on one shared lock", async () => {
+    const calls = [];
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      loadResult: {
+        snapshot: { ...prefs.getDefaults(), manageClaudeHooksAutomatically: false },
+        locked: false,
+      },
+      injectedDeps: {
+        syncClaudeHooksNow: async () => {
+          calls.push("sync:start");
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          calls.push("sync:end");
+        },
+        startClaudeSettingsWatcher: () => calls.push("watcher:start"),
+        stopClaudeSettingsWatcher: () => calls.push("watcher:stop"),
+        uninstallClaudeHooksNow: async () => {
+          calls.push("uninstall:start");
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          calls.push("uninstall:end");
+        },
+      },
+    });
+
+    const enable = ctrl.applyUpdate("manageClaudeHooksAutomatically", true);
+    const disconnect = ctrl.applyCommand("uninstallHooks");
+    const results = await Promise.all([enable, disconnect]);
+
+    assert.strictEqual(results[0].status, "ok");
+    assert.strictEqual(results[1].status, "ok");
+    assert.deepStrictEqual(calls, [
+      "sync:start",
+      "sync:end",
+      "watcher:start",
+      "watcher:stop",
+      "uninstall:start",
+      "uninstall:end",
+    ]);
+    assert.strictEqual(ctrl.get("manageClaudeHooksAutomatically"), false);
+  });
 });
 
 // Tiny helper — must be sync because controller's applyUpdate stays sync
@@ -153,9 +241,23 @@ describe("applyUpdate", () => {
     assert.match(r.message, /unknown settings key/);
   });
 
+  it("persists tutorialSeen through the normal update path", async () => {
+    const p = makeTempPath();
+    const ctrl = createSettingsController({ prefsPath: p });
+    const r = await ctrl.applyUpdate("tutorialSeen", true);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(ctrl.get("tutorialSeen"), true);
+    assert.strictEqual(prefs.load(p).snapshot.tutorialSeen, true);
+  });
+
   it("enforces cross-field constraints (showTray/showDock)", async () => {
-    const ctrl = createSettingsController({ prefsPath: makeTempPath() });
-    // Both default true; turning one off is allowed
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      // Seed both on explicitly — this guards the cross-field constraint, not
+      // the showDock default (which is off for fresh installs).
+      loadResult: { snapshot: { ...prefs.getDefaults(), showTray: true, showDock: true }, locked: false },
+    });
+    // Both seeded on; turning one off is allowed
     const r1 = await ctrl.applyUpdate("showTray", false);
     assert.strictEqual(r1.status, "ok");
     // Now showTray=false, showDock=true. Turning showDock off should fail.
@@ -226,8 +328,12 @@ describe("applyBulk", () => {
   });
 
   it("rejects bulk that would violate cross-field constraints (showTray + showDock)", async () => {
-    const ctrl = createSettingsController({ prefsPath: makeTempPath() });
-    // Both start true. Trying to set both false in a single bulk should be
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      // Seed both on explicitly (showDock now defaults off for fresh installs).
+      loadResult: { snapshot: { ...prefs.getDefaults(), showTray: true, showDock: true }, locked: false },
+    });
+    // Both seeded on. Trying to set both false in a single bulk should be
     // caught by post-validation even though each individual validator only
     // sees the pre-bulk snapshot.
     const r = await ctrl.applyBulk({ showTray: false, showDock: false });
@@ -238,7 +344,11 @@ describe("applyBulk", () => {
   });
 
   it("allows bulk with only one of showTray/showDock set to false", async () => {
-    const ctrl = createSettingsController({ prefsPath: makeTempPath() });
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      // Seed both on explicitly (showDock now defaults off for fresh installs).
+      loadResult: { snapshot: { ...prefs.getDefaults(), showTray: true, showDock: true }, locked: false },
+    });
     const r = await ctrl.applyBulk({ showTray: false });
     assert.strictEqual(r.status, "ok");
     assert.strictEqual(ctrl.get("showTray"), false);
@@ -352,6 +462,58 @@ describe("applyCommand", () => {
     const b = ctrl.applyCommand("slow", { tag: "b" });
     await Promise.all([a, b]);
     assert.deepStrictEqual(order, ["start:a", "end:a", "start:b", "end:b"]);
+  });
+
+  it("serializes commands sharing a domain lockKey (cross-command race fix)", async () => {
+    // Codex review #9 high finding: remoteSsh.update / .markDeployed /
+    // .delete all write the same prefs field. Without a shared lockKey
+    // they execute concurrently — markDeployed can compute its commit
+    // from a stale snapshot taken before update committed, and stomp
+    // the user's edit. Domain lockKey forces serialization.
+    const order = [];
+    const slowFast = async (payload) => {
+      order.push(`start:${payload.tag}`);
+      await new Promise((r) => setTimeout(r, payload.tag === "a" ? 20 : 1));
+      order.push(`end:${payload.tag}`);
+      return { status: "ok" };
+    };
+    const cmdA = (payload) => slowFast(payload);
+    const cmdB = (payload) => slowFast(payload);
+    cmdA.lockKey = "shared";
+    cmdB.lockKey = "shared";
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      commands: { cmdA, cmdB },
+    });
+    const a = ctrl.applyCommand("cmdA", { tag: "a" });
+    const b = ctrl.applyCommand("cmdB", { tag: "b" });
+    await Promise.all([a, b]);
+    // Without shared lock they'd interleave start:a, start:b, end:b, end:a.
+    assert.deepStrictEqual(order, ["start:a", "end:a", "start:b", "end:b"],
+      "commands sharing a domain lockKey must serialize even across different names");
+  });
+
+  it("commands without shared lockKey can interleave (control: distinct lockKeys are independent)", async () => {
+    const order = [];
+    const slowFast = async (payload) => {
+      order.push(`start:${payload.tag}`);
+      await new Promise((r) => setTimeout(r, payload.tag === "a" ? 20 : 1));
+      order.push(`end:${payload.tag}`);
+      return { status: "ok" };
+    };
+    const cmdA = (payload) => slowFast(payload);
+    const cmdB = (payload) => slowFast(payload);
+    // No lockKey on either — controller defaults to per-name lock; different
+    // names → no cross-command serialization.
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      commands: { cmdA, cmdB },
+    });
+    const a = ctrl.applyCommand("cmdA", { tag: "a" });
+    const b = ctrl.applyCommand("cmdB", { tag: "b" });
+    await Promise.all([a, b]);
+    // b finishes first (1ms vs 20ms) without serialization.
+    assert.deepStrictEqual(order, ["start:a", "start:b", "end:b", "end:a"]);
   });
 
   it("applies uninstallHooks commit without clearing latent autoStartWithClaude preference", async () => {
@@ -632,5 +794,54 @@ describe("locked controller (future-version files)", () => {
     const onDisk = JSON.parse(fs.readFileSync(p, "utf8"));
     assert.strictEqual(onDisk.version, 999);
     assert.strictEqual(onDisk.lang, "en");
+  });
+});
+
+describe("sessionCleanup.setTriple via applyCommand", () => {
+  // This is the regression for v4 — applyCommand must accept a triple that
+  // would have been rejected if each key were applied separately via
+  // applyUpdate, because lowering both knobs simultaneously would otherwise
+  // hit the single-key cross-field validator with the pre-change snapshot.
+  it("commits an atomic triple that drops both stale intervals together", async () => {
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      loadResult: {
+        snapshot: {
+          ...prefs.getDefaults(),
+          sessionStaleMs: 600_000,
+          workingStaleMs: 300_000,
+          detachedIdleStaleMs: 30_000,
+        },
+        locked: false,
+      },
+    });
+    const result = await ctrl.applyCommand("sessionCleanup.setTriple", {
+      sessionStaleMs: 120_000,
+      workingStaleMs: 60_000,
+      detachedIdleStaleMs: 30_000,
+    });
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(ctrl.get("sessionStaleMs"), 120_000);
+    assert.strictEqual(ctrl.get("workingStaleMs"), 60_000);
+    assert.strictEqual(ctrl.get("detachedIdleStaleMs"), 30_000);
+  });
+
+  it("rejects an inverted triple without partial commit", async () => {
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      loadResult: {
+        snapshot: { ...prefs.getDefaults() },
+        locked: false,
+      },
+    });
+    const result = await ctrl.applyCommand("sessionCleanup.setTriple", {
+      sessionStaleMs: 120_000,
+      workingStaleMs: 300_000,
+      detachedIdleStaleMs: 30_000,
+    });
+    assert.strictEqual(result.status, "error");
+    // Original defaults intact.
+    assert.strictEqual(ctrl.get("sessionStaleMs"), 600_000);
+    assert.strictEqual(ctrl.get("workingStaleMs"), 300_000);
   });
 });

@@ -5,10 +5,14 @@
 <p align="center">
   <a href="README.zh-CN.md">中文版</a>
   ·
+  <a href="README.zh-TW.md">繁體中文</a>
+  ·
   <a href="README.ko-KR.md">한국어</a>
+  ·
+  <a href="README.ja-JP.md">日本語</a>
 </p>
 <p align="center">
-  <sub>🌏 Don't see your language? <a href="https://github.com/rullerzhou-afk/clawd-on-desk/pulls">Open a PR</a> to add one — 日本語, Español, Français, etc. all welcome.</sub>
+  <sub>🌏 Don't see your language? <a href="https://github.com/rullerzhou-afk/clawd-on-desk/pulls">Open a PR</a> to add one — Español, Français, Deutsch, etc. all welcome.</sub>
 </p>
 <p align="center">
   <a href="https://github.com/rullerzhou-afk/clawd-on-desk/releases"><img src="https://img.shields.io/github/v/release/rullerzhou-afk/clawd-on-desk" alt="Version"></a>
@@ -20,32 +24,41 @@
 </p>
 
 <p align="center">
-  <img src="assets/hero.gif" alt="Clawd on Desk — a pixel desktop pet that reacts to your AI coding agent in real time. Animated demo: the crab cycles through sleeping, thinking while the model reads the codebase, typing as edit/bash tools run, juggling 3 parallel subagents, raising a permission bubble, and celebrating when 14 files / 312 tests are complete. Works with Claude Code, Codex, Cursor, Copilot, Gemini and more.">
+  <img src="assets/hero.gif" alt="Clawd on Desk — a pixel desktop pet that reacts to your AI coding agent in real time. Animated demo: the crab cycles through sleeping, thinking while the model reads the codebase, typing as edit/bash tools run, grooving for one subagent, juggling when multiple subagents run, raising a permission bubble, and celebrating when 14 files / 312 tests are complete. Works with Claude Code, Codex, Cursor, Copilot, Gemini, Antigravity, Qwen, CodeWhale, Pi, OpenClaw and more.">
 </p>
 
 Clawd lives on your desktop and reacts to what your AI coding agent is doing — in real time. Start a long task, walk away, come back when the crab tells you it's done.
 
-Thinking when you prompt, typing when tools run, juggling subagents, reviewing permissions, celebrating when tasks complete, sleeping when you step away. Ships with two built-in themes: **Clawd** (pixel crab) and **Calico** (三花猫), with full support for custom themes.
+Thinking when you prompt, typing when tools run, grooving or juggling for subagents, reviewing permissions, celebrating when tasks complete, sleeping when you step away. Ships with three built-in themes: **Clawd** (pixel crab), **Calico** (三花猫), and **Cloudling** (云宝), with full support for custom themes and imported Codex Pet animation packs.
 
-> Supports Windows 11, macOS, and Ubuntu/Linux. Windows releases provide separate x64 and ARM64 installers. Source builds require Node.js. Works with **Claude Code**, **Codex CLI**, **Copilot CLI**, **Gemini CLI**, **Cursor Agent**, **CodeBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, and **opencode**.
+> Supports Windows 11, macOS, and Ubuntu/Linux. Windows releases provide separate x64 and ARM64 installers. Source builds require Node.js. Works with **Claude Code**, **Codex CLI**, **Copilot CLI**, **Gemini CLI**, **Antigravity CLI (agy)**, **Cursor Agent**, **CodeBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, **Qwen Code**, **CodeWhale**, **opencode**, **Pi**, **OpenClaw**, **Hermes Agent**, **Qoder**, and **Reasonix CLI**.
 
 ## Features
 
 ### Multi-Agent Support
 - **Claude Code** — full integration via command hooks + HTTP permission hooks
-- **Codex CLI** — official hooks with JSONL fallback (`~/.codex/sessions/`), registered automatically with real permission bubbles
-- **Copilot CLI** — command hooks via `~/.copilot/hooks/hooks.json`
-- **Gemini CLI** — command hooks via `~/.gemini/settings.json` (registered automatically when Clawd starts, or run `npm run install:gemini-hooks`)
-- **Cursor Agent** — [Cursor IDE hooks](https://cursor.com/docs/agent/hooks) in `~/.cursor/hooks.json` (registered automatically when Clawd starts, or run `npm run install:cursor-hooks`)
-- **CodeBuddy** — Claude Code-compatible command hooks + HTTP permission hooks via `~/.codebuddy/settings.json` (registered automatically when Clawd starts, or run `node hooks/codebuddy-install.js`)
-- **Kiro CLI** — command hooks injected into custom agent configs under `~/.kiro/agents/`, plus an auto-created `clawd` agent that is re-synced from Kiro's built-in `kiro_default` whenever Clawd starts, so you can opt into hooks with minimal behavior drift via `kiro-cli --agent clawd` or `/agent swap clawd` (registered automatically when Clawd starts, or run `npm run install:kiro-hooks`). State hooks are verified on macOS and Windows.
-- **Kimi Code CLI (Kimi-CLI)** — command hooks via `~/.kimi/config.toml` (`[[hooks]]` entries) (registered automatically when Clawd starts, or run `npm run install:kimi-hooks`)
-- **opencode** — [plugin integration](https://opencode.ai/docs/plugins) via `~/.config/opencode/opencode.json` (registered automatically when Clawd starts); zero-latency event streaming, permission bubbles with Allow/Always/Deny, and building animations when parallel subagents are spawned via the `task` tool
+- **Codex CLI** — official hooks with JSONL fallback (`~/.codex/sessions/`), auto-synced by default with real permission bubbles
+- **Copilot CLI** — optional command hooks via `~/.copilot/hooks/hooks.json` (install from Settings → Agents; see the Copilot guide for manual JSON fallback)
+- **Gemini CLI** — optional command hooks via `~/.gemini/settings.json` (install from Settings → Agents or run `npm run install:gemini-hooks`)
+- **Antigravity CLI (agy)** — optional command hooks via `~/.gemini/config/hooks.json` (install from Settings → Agents or run `npm run install:antigravity-hooks`); **state-only**: Clawd never pops a permission bubble for agy. Every Allow / Deny / Always-allow choice happens in agy's own terminal menu
+- **Cursor Agent** — optional [Cursor IDE hooks](https://cursor.com/docs/agent/hooks) in `~/.cursor/hooks.json` (install from Settings → Agents or run `npm run install:cursor-hooks`)
+- **CodeBuddy** — optional Claude Code-compatible command hooks + HTTP permission hooks via `~/.codebuddy/settings.json` (install from Settings → Agents or run `node hooks/codebuddy-install.js`)
+- **Kiro CLI** — optional command hooks injected into custom agent configs under `~/.kiro/agents/`, plus an auto-created `clawd` agent that is re-synced from Kiro's built-in `kiro_default` after you install the integration, so you can opt into hooks with minimal behavior drift via `kiro-cli --agent clawd` or `/agent swap clawd`. State hooks are verified on macOS and Windows.
+- **Kimi Code CLI (Kimi-CLI)** — optional command hooks via `~/.kimi/config.toml` (`[[hooks]]` entries) (install from Settings → Agents or run `npm run install:kimi-hooks`)
+- **Qwen Code** — optional command hooks via `~/.qwen/settings.json` (install from Settings → Agents or run `npm run install:qwen-hooks`); state tracking and Qwen `PermissionRequest` desktop approval bubbles are supported
+- **CodeWhale** — optional state-only lifecycle hooks via `~/.codewhale/config.toml` (`[[hooks.hooks]]` entries) (install from Settings → Agents or run `npm run install:codewhale-hooks`); Phase 1 drives idle, thinking, working, sleeping, error, attention, and sweeping animations only, without permission bubbles or subagent tracking
+- **Reasonix CLI** — optional state-only command hooks via `~/.reasonix/settings.json` (install from Settings → Agents or run `npm run install:reasonix-hooks`); Phase 1 drives lifecycle, tool, notification, compaction, and subagent-stop animations while leaving permission decisions in Reasonix's own terminal flow
+- **opencode** — optional [plugin integration](https://opencode.ai/docs/plugins) via `~/.config/opencode/opencode.json` (install from Settings → Agents or run `node hooks/opencode-install.js`); zero-latency event streaming, permission bubbles with Allow/Always/Deny, and building animations when parallel subagents are spawned via the `task` tool
+- **Pi** — optional global extension via `~/.pi/agent/extensions/clawd-on-desk` (install from Settings → Agents or run `npm run install:pi-extension`); state-only interactive lifecycle and tool activity updates while preserving Pi's default YOLO behavior
+- **OpenClaw** — optional state-only plugin integration via `~/.openclaw/openclaw.json` (install from Settings → Agents or run `npm run install:openclaw-plugin`; OpenClaw also needs an initialized config); local `openclaw tui --local` sessions drive Clawd animations, without permission bubbles or terminal focus in Phase 1
+- **Hermes Agent** — optional [plugin integration](https://hermes-agent.org/) via Hermes' managed plugin directory (install from Settings → Agents or run `npm run install:hermes-plugin`); state, sessions, SessionEnd, and terminal focus are supported
+- **Qoder** — optional state-only command hooks via `~/.qoder/settings.json` (install from Settings → Agents or run `npm run install:qoder-hooks`); Phase 1 drives Clawd animations only — Qoder permission prompts are observed as notifications, and every Allow / Deny choice stays in Qoder's own flow
 - **Multi-agent coexistence** — run all agents simultaneously; Clawd tracks each session independently
 
 ### Animations & Interaction
 - **Real-time state awareness** — agent hooks and log polling drive Clawd's animations automatically
-- **12 animated states** — idle, thinking, typing, building, juggling, conducting, error, happy, notification, sweeping, carrying, sleeping
+- **12 animated states** — idle, thinking, typing, building, subagent groove, multi-subagent juggling, error, happy, notification, sweeping, carrying, sleeping
+- **Codex Pet imports** — import Codex Pet zip packages from `Settings…` → `Theme`; Clawd adapts their atlas animations into managed themes
 - **Eye tracking** — Clawd follows your cursor in idle state, with body lean and shadow stretch
 - **Sleep sequence** — yawning, dozing, collapsing, sleeping after 60s idle; mouse movement triggers a startled wake-up animation
 - **Click reactions** — double-click for a poke, 4 clicks for a flail
@@ -53,7 +66,7 @@ Thinking when you prompt, typing when tools run, juggling subagents, reviewing p
 - **Mini mode** — drag to right edge or right-click "Mini Mode"; Clawd hides at screen edge with peek-on-hover, mini alerts/celebrations, and parabolic jump transitions
 
 ### Permission Bubble
-- **In-app permission review** — when Claude Code, CodeBuddy, or opencode request tool permissions, Clawd pops a floating bubble card instead of waiting in the terminal
+- **In-app permission review** — when Claude Code, Codex CLI, CodeBuddy, or opencode request supported tool permissions, Clawd pops a floating bubble card instead of waiting in the terminal
 - **Allow / deny / agent-native extras** — one-click approve or reject, plus permission rules / `Always` actions when the source agent supports them
 - **Global hotkeys** — `Ctrl+Shift+Y` to Allow, `Ctrl+Shift+N` to Deny the latest permission bubble (only registered while bubbles are visible)
 - **Stacking layout** — multiple permission requests stack upward from the bottom-right corner
@@ -62,21 +75,28 @@ Thinking when you prompt, typing when tools run, juggling subagents, reviewing p
 
 ### Session Intelligence
 - **Multi-session tracking** — sessions across all agents resolve to the highest-priority state
-- **Subagent awareness** — juggling for 1 subagent, conducting for 2+
+- **Subagent awareness** — headphones groove for 1 subagent, three-ball juggling for 2+
 - **Sessions dashboard + HUD** — right-click or tray → `Open Dashboard` to inspect live sessions, recent events, aliases, and jump to a terminal; a compact HUD near Clawd keeps current live sessions visible
 - **Terminal focus** — Dashboard/HUD actions jump to a specific session's terminal window; notification/attention states auto-focus the relevant terminal
 - **Process liveness detection** — detects crashed/exited supported agent processes and cleans up orphan sessions
 - **Startup recovery** — if Clawd restarts while any supported agent is still running, it stays awake instead of falling asleep
+
+### Mobile Companion (PWA)
+- **Live mirror on your phone** — enable `Settings…` → `Mobile / PWA` and open the pairing URL on your phone; the Clawd Mobile web app shows your agent sessions and their live states in real time
+- **Read-only by design** — the LAN bridge only broadcasts state; nothing on the phone can touch your machine (remote approval is on the roadmap)
+- **LAN-only + token-gated** — pairing requires a token, tokens rotate automatically with a grace window, and access can be regenerated or reset in one click
+- **Installable** — it's a PWA: add it to your home screen for an app-like experience
+> The mobile companion line — from the first prototype to token rotation — is built and led by core contributor [@Bynlk](https://github.com/Bynlk), who also maintains [clawd-on-mobile](https://github.com/Bynlk/clawd-on-mobile), a sister fork with a native Android app.
 
 ### System
 - **Click-through** — transparent areas pass clicks to windows below; only Clawd's body is interactive
 - **Position memory** — Clawd remembers where you left it across restarts (including mini mode)
 - **Single instance lock** — prevents duplicate Clawd windows
 - **Auto-start** — Claude Code's SessionStart hook can launch Clawd automatically if it's not running
-- **Do Not Disturb** — right-click or tray menu to enter sleep mode; all hook events are silenced until you wake Clawd. Permission bubbles are suppressed during DND — Codex and opencode fall back to their native prompts, while Claude Code and CodeBuddy fall back to their built-in permission flow
+- **Do Not Disturb** — right-click or tray menu to enter sleep mode; all hook events are silenced until you wake Clawd. Permission bubbles are suppressed during DND — Codex and opencode fall back to their native prompts, while Claude Code and CodeBuddy fall back to their built-in permission flow. Antigravity and Pi are state-only integrations.
 - **Sound effects** — short audio cues on task completion and permission requests (toggle via right-click menu; 10s cooldown, auto-muted during DND)
 - **System tray** — resize (S/M/L), DND mode, language switch, auto-start, check for updates
-- **i18n** — English, Chinese, and Korean UI; switch via right-click menu or tray
+- **i18n** — English, Simplified Chinese, Traditional Chinese, Korean, and Japanese UI; switch via right-click menu or tray
 - **Auto-update** — checks GitHub releases; Windows installs NSIS updates on quit, macOS/Linux `git pull` + restart when running from a cloned repo
 
 ## Animations
@@ -84,19 +104,11 @@ Thinking when you prompt, typing when tools run, juggling subagents, reviewing p
 <table>
   <tr>
     <td align="center"><img src="assets/gif/clawd-idle.gif" width="100"><br><sub>Idle</sub></td>
-    <td align="center"><img src="assets/gif/clawd-thinking.gif" width="100"><br><sub>Thinking</sub></td>
+    <td align="center"><img src="assets/gif/clawd-thinking.gif" width="100"><br><sub>Thought Bubble</sub></td>
     <td align="center"><img src="assets/gif/clawd-typing.gif" width="100"><br><sub>Typing</sub></td>
     <td align="center"><img src="assets/gif/clawd-building.gif" width="100"><br><sub>Building</sub></td>
-    <td align="center"><img src="assets/gif/clawd-juggling.gif" width="100"><br><sub>Juggling</sub></td>
-    <td align="center"><img src="assets/gif/clawd-conducting.gif" width="100"><br><sub>Conducting</sub></td>
-  </tr>
-  <tr>
-    <td align="center"><img src="assets/gif/clawd-error.gif" width="100"><br><sub>Error</sub></td>
-    <td align="center"><img src="assets/gif/clawd-happy.gif" width="100"><br><sub>Happy</sub></td>
-    <td align="center"><img src="assets/gif/clawd-notification.gif" width="100"><br><sub>Notification</sub></td>
-    <td align="center"><img src="assets/gif/clawd-sweeping.gif" width="100"><br><sub>Sweeping</sub></td>
-    <td align="center"><img src="assets/gif/clawd-carrying.gif" width="100"><br><sub>Carrying</sub></td>
-    <td align="center"><img src="assets/gif/clawd-sleeping.gif" width="100"><br><sub>Sleeping</sub></td>
+    <td align="center"><img src="assets/gif/clawd-headphones-groove.gif" width="100"><br><sub>1 Subagent</sub></td>
+    <td align="center"><img src="assets/gif/clawd-juggling.gif" width="100"><br><sub>2+ Subagents</sub></td>
   </tr>
   <tr>
     <td align="center"><img src="assets/gif/calico-idle.gif" width="80"><br><sub>Calico Idle</sub></td>
@@ -106,6 +118,14 @@ Thinking when you prompt, typing when tools run, juggling subagents, reviewing p
     <td align="center"><img src="assets/gif/calico-juggling.gif" width="80"><br><sub>Calico Juggling</sub></td>
     <td align="center"><img src="assets/gif/calico-conducting.gif" width="80"><br><sub>Calico Conducting</sub></td>
   </tr>
+  <tr>
+    <td align="center"><img src="assets/gif/cloudling-idle.gif" width="120"><br><sub>Cloudling Idle</sub></td>
+    <td align="center"><img src="assets/gif/cloudling-thinking.gif" width="120"><br><sub>Cloudling Thinking</sub></td>
+    <td align="center"><img src="assets/gif/cloudling-typing.gif" width="120"><br><sub>Cloudling Typing</sub></td>
+    <td align="center"><img src="assets/gif/cloudling-building.gif" width="120"><br><sub>Cloudling Building</sub></td>
+    <td align="center"><img src="assets/gif/cloudling-juggling.gif" width="120"><br><sub>Cloudling Juggling</sub></td>
+    <td align="center"><img src="assets/gif/cloudling-conducting.gif" width="120"><br><sub>Cloudling Conducting</sub></td>
+  </tr>
 </table>
 
 Full event-to-state mapping, mini mode, and click reactions: **[docs/guides/state-mapping.md](docs/guides/state-mapping.md)**
@@ -114,10 +134,7 @@ Full event-to-state mapping, mini mode, and click reactions: **[docs/guides/stat
 
 Clawd adapts to multi-monitor setups: proportional sizing uses the display Clawd launches on, portrait monitors get a bounded boost so the pet stays readable on tall narrow screens, and you can drag Clawd across displays.
 
-<p align="center">
-  <video src="https://github.com/user-attachments/assets/dc5041a8-a952-4f97-b78d-c7f82b863b23" width="480" controls muted playsinline></video>
-</p>
-<p align="center"><sub>Demo video contributed alongside <a href="https://github.com/rullerzhou-afk/clawd-on-desk/pull/103">PR #103</a>.</sub></p>
+<p align="center"><sub>Want to see the real multi-monitor behavior? <a href="assets/videos/clawd-multi-monitor-demo.mp4">Watch the demo video in this repository</a>.</sub></p>
 
 ## Quick Start
 
@@ -127,7 +144,7 @@ For normal use, download the latest prebuilt installer from **[GitHub Releases](
 - **macOS**: `.dmg`
 - **Linux**: `.AppImage` or `.deb`
 
-Launch Clawd after installing it; supported agent hooks/plugins are synced automatically on startup.
+Launch Clawd after installing it. Fresh installs auto-sync Claude Code and Codex only; install other local agent integrations from **Settings → Agents** when you need them.
 
 Run from source only if you're contributing, testing unreleased code, or debugging integrations. Source installs download Electron/build tooling and can create a large `node_modules` tree.
 
@@ -139,11 +156,13 @@ cd clawd-on-desk
 # Install dependencies
 npm install
 
-# Start Clawd (auto-registers Claude Code hooks on launch)
+# Start Clawd (auto-registers Claude Code and Codex hooks on launch)
 npm start
 ```
 
-**Claude Code** and **Codex CLI** work out of the box with auto-registered hooks. **Gemini CLI**, **Cursor Agent**, **CodeBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, and **opencode** auto-register when Clawd launches (if they're installed). **Copilot CLI** still needs one-time hook setup. Also covers remote SSH, WSL, and platform-specific notes (macOS / Linux): **[docs/guides/setup-guide.md](docs/guides/setup-guide.md)**
+**Claude Code** and **Codex CLI** work out of the box with auto-registered hooks. For **Copilot CLI**, **Gemini CLI**, **Antigravity CLI (agy)**, **Cursor Agent**, **CodeBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, **Qwen Code**, **CodeWhale**, **opencode**, **Pi**, **OpenClaw**, **Hermes Agent**, and **Qoder**, install the integration from **Settings → Agents** first; Clawd then keeps it synced while it remains enabled. Also covers remote SSH, WSL, and platform-specific notes (macOS / Linux): **[docs/guides/setup-guide.md](docs/guides/setup-guide.md)**
+
+Want to run Claude Code / Codex CLI on a remote server and surface state plus permission bubbles in your local Clawd? Use the in-app **Settings → Remote SSH → One-click deploy**. Full walkthrough, Doctor boundary, and FAQ: **[docs/guides/guide-remote-ssh.md](docs/guides/guide-remote-ssh.md)**
 
 For the official `Codex + WSL` status, Clawd's current implementation boundary, and why this is easy to misread, see: **[docs/guides/codex-wsl-clarification.md](docs/guides/codex-wsl-clarification.md)**
 
@@ -153,7 +172,7 @@ Some agents have feature gaps (no permission bubble, polling latency, no termina
 
 ## Custom Themes
 
-Clawd supports custom themes — replace the default crab with your own character and animations.
+Clawd supports custom themes — replace the default crab with your own character and animations. If you already have a Codex Pet package, import its zip from `Settings…` → `Theme` → `Import pet zip`; Clawd turns the atlas into a managed theme automatically.
 
 **Quick start:**
 1. Scaffold a theme:
@@ -184,9 +203,9 @@ See [docs/guides/guide-theme-creation.md](docs/guides/guide-theme-creation.md) f
 Some things we'd like to explore in the future:
 
 - Codex terminal focus via process tree lookup from `codex.exe` PID
-- Auto-registration of Copilot CLI hooks (like we do for Claude Code)
 - Theme registry and in-app download
 - Hook uninstall script for clean app removal
+- Mobile companion: remote permission approval from your phone (in progress, led by [@Bynlk](https://github.com/Bynlk))
 
 ## Contributing
 
@@ -198,6 +217,7 @@ Clawd on Desk is a community-driven project. Bug reports, feature ideas, and pul
   <tr>
     <td align="center" valign="top" width="140"><a href="https://github.com/rullerzhou-afk"><img src="https://github.com/rullerzhou-afk.png" width="72" style="border-radius:50%" /><br /><sub><b>@rullerzhou-afk</b><br />鹿鹿 · creator</sub></a></td>
     <td align="center" valign="top" width="140"><a href="https://github.com/YOIMIYA66"><img src="https://github.com/YOIMIYA66.png" width="72" style="border-radius:50%" /><br /><sub><b>@YOIMIYA66</b><br />maintainer</sub></a></td>
+    <td align="center" valign="top" width="140"><a href="https://github.com/Bynlk"><img src="https://github.com/Bynlk.png" width="72" style="border-radius:50%" /><br /><sub><b>@Bynlk</b><br />core contributor · Mobile / PWA</sub></a></td>
   </tr>
 </table>
 
@@ -251,6 +271,45 @@ Thanks to everyone who has helped make Clawd better:
     <td align="center" valign="top" width="110"><a href="https://github.com/livlign"><img src="https://github.com/livlign.png" width="50" style="border-radius:50%" /><br /><sub>livlign</sub></a></td>
     <td align="center" valign="top" width="110"><a href="https://github.com/tongguang2"><img src="https://github.com/tongguang2.png" width="50" style="border-radius:50%" /><br /><sub>tongguang2</sub></a></td>
   </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/Ziy1-Tan"><img src="https://github.com/Ziy1-Tan.png" width="50" style="border-radius:50%" /><br /><sub>Ziy1-Tan</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/tatsuyanakanogaroinc"><img src="https://github.com/tatsuyanakanogaroinc.png" width="50" style="border-radius:50%" /><br /><sub>tatsuyanakanogaroinc</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/yeonhub"><img src="https://github.com/yeonhub.png" width="50" style="border-radius:50%" /><br /><sub>yeonhub</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/joshua-wu"><img src="https://github.com/joshua-wu.png" width="50" style="border-radius:50%" /><br /><sub>joshua-wu</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/nmsn"><img src="https://github.com/nmsn.png" width="50" style="border-radius:50%" /><br /><sub>nmsn</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/sunnysonx"><img src="https://github.com/sunnysonx.png" width="50" style="border-radius:50%" /><br /><sub>sunnysonx</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/YuChenYunn"><img src="https://github.com/YuChenYunn.png" width="50" style="border-radius:50%" /><br /><sub>YuChenYunn</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/jhseo-b"><img src="https://github.com/jhseo-b.png" width="50" style="border-radius:50%" /><br /><sub>jhseo-b</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/Hwasowl"><img src="https://github.com/Hwasowl.png" width="50" style="border-radius:50%" /><br /><sub>Hwasowl</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/XiangZheng2002"><img src="https://github.com/XiangZheng2002.png" width="50" style="border-radius:50%" /><br /><sub>XiangZheng2002</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/keiyo118"><img src="https://github.com/keiyo118.png" width="50" style="border-radius:50%" /><br /><sub>keiyo118</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/pan93412"><img src="https://github.com/pan93412.png" width="50" style="border-radius:50%" /><br /><sub>pan93412</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/taehwanis"><img src="https://github.com/taehwanis.png" width="50" style="border-radius:50%" /><br /><sub>taehwanis</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/linnin233"><img src="https://github.com/linnin233.png" width="50" style="border-radius:50%" /><br /><sub>linnin233</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/xiyouMc"><img src="https://github.com/xiyouMc.png" width="50" style="border-radius:50%" /><br /><sub>xiyouMc</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/Bynlk"><img src="https://github.com/Bynlk.png" width="50" style="border-radius:50%" /><br /><sub>Bynlk</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/zxypro1"><img src="https://github.com/zxypro1.png" width="50" style="border-radius:50%" /><br /><sub>zxypro1</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/NeroAyase"><img src="https://github.com/NeroAyase.png" width="50" style="border-radius:50%" /><br /><sub>NeroAyase</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/divergentD"><img src="https://github.com/divergentD.png" width="50" style="border-radius:50%" /><br /><sub>divergentD</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/Ne9roni"><img src="https://github.com/Ne9roni.png" width="50" style="border-radius:50%" /><br /><sub>Ne9roni</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/QingXB"><img src="https://github.com/QingXB.png" width="50" style="border-radius:50%" /><br /><sub>QingXB</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/29206394"><img src="https://github.com/29206394.png" width="50" style="border-radius:50%" /><br /><sub>藤知</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/Tsdsj"><img src="https://github.com/Tsdsj.png" width="50" style="border-radius:50%" /><br /><sub>Tsdsj</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/godlockin"><img src="https://github.com/godlockin.png" width="50" style="border-radius:50%" /><br /><sub>godlockin</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/sLingli"><img src="https://github.com/sLingli.png" width="50" style="border-radius:50%" /><br /><sub>sLingli</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/ustin-star"><img src="https://github.com/ustin-star.png" width="50" style="border-radius:50%" /><br /><sub>ustin-star</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/cod3hulk"><img src="https://github.com/cod3hulk.png" width="50" style="border-radius:50%" /><br /><sub>cod3hulk</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/lxgxhsy"><img src="https://github.com/lxgxhsy.png" width="50" style="border-radius:50%" /><br /><sub>lxgxhsy</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/rebootcrab-blip"><img src="https://github.com/rebootcrab-blip.png" width="50" style="border-radius:50%" /><br /><sub>rebootcrab-blip</sub></a></td>
+  </tr>
 </table>
 
 ## Acknowledgments
@@ -262,8 +321,11 @@ Thanks to everyone who has helped make Clawd better:
 
 Source code is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
 
-**Artwork (assets/) is NOT covered by AGPL-3.0.** All rights reserved by their respective copyright holders. See [assets/LICENSE](assets/LICENSE) for details.
+**Artwork and bundled theme assets (including `assets/` and `themes/*/assets/`) are NOT covered by AGPL-3.0.** All rights reserved by their respective copyright holders. See [assets/LICENSE](assets/LICENSE) and the notices below for details.
 
 - **Clawd** character is the property of [Anthropic](https://www.anthropic.com). This is an unofficial fan project, not affiliated with or endorsed by Anthropic.
 - **Calico cat (三花猫)** artwork by 鹿鹿 ([@rullerzhou-afk](https://github.com/rullerzhou-afk)). All rights reserved.
+- **Cloudling (云宝)** artwork by 鹿鹿 ([@rullerzhou-afk](https://github.com/rullerzhou-afk)). All rights reserved. Cloudling's visual direction includes an homage to the OpenAI Codex logo; Codex/OpenAI marks remain the property of OpenAI, and this project is not affiliated with or endorsed by OpenAI.
 - **Third-party contributions**: copyright retained by respective artists.
+
+**No cryptocurrency.** This project has no token, coin, NFT, or airdrop, and is not affiliated with any cryptocurrency project.

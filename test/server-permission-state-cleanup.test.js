@@ -9,7 +9,7 @@ const initServer = require("../src/server");
 const {
   buildToolInputFingerprint,
   findPendingPermissionForStateEvent,
-} = initServer.__test;
+} = require("../src/server-permission-utils");
 
 function makeFakeHttp() {
   let capturedHandler = null;
@@ -67,6 +67,7 @@ function makeCtx(overrides = {}) {
     syncCursorHooksImpl: () => {},
     syncCodeBuddyHooksImpl: () => {},
     syncKiroHooksImpl: () => {},
+    syncQwenHooksImpl: () => {},
     syncOpencodePluginImpl: () => {},
     STATE_SVGS: {
       working: "x.svg",
@@ -245,6 +246,35 @@ describe("/state permission cleanup", () => {
     assert.deepStrictEqual(resolved.map((entry) => entry.message), ["User answered in terminal"]);
   });
 
+  it("clears matching Qwen pending entries as no-decision instead of deny", async () => {
+    const pendingPermissions = [
+      {
+        id: "qwen",
+        sessionId: "qwen-code:sid",
+        toolUseId: "toolu_qwen",
+        toolName: "Bash",
+        toolInputFingerprint: buildToolInputFingerprint({ command: "npm test" }),
+        isQwenCode: true,
+        res: {},
+      },
+    ];
+    const { handler, resolved } = startServer({ pendingPermissions });
+
+    const res = await callHandler(handler, makeReq("POST", "/state", JSON.stringify({
+      state: "working",
+      session_id: "qwen-code:sid",
+      event: "PostToolUse",
+      tool_name: "Bash",
+      tool_use_id: "toolu_qwen",
+      tool_input_fingerprint: buildToolInputFingerprint({ command: "npm test" }),
+    })));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(resolved.map((entry) => entry.perm.id), ["qwen"]);
+    assert.deepStrictEqual(resolved.map((entry) => entry.behavior), ["no-decision"]);
+    assert.deepStrictEqual(resolved.map((entry) => entry.message), ["User answered in terminal"]);
+  });
+
   it("keeps concurrent pending requests untouched when Stop is ambiguous", async () => {
     const pendingPermissions = [
       { id: "a", sessionId: "sid", toolName: "Bash", res: {} },
@@ -325,6 +355,66 @@ describe("/state permission cleanup", () => {
       tool_name: "Bash",
       tool_use_id: "toolu_other",
       tool_input_fingerprint: buildToolInputFingerprint({ command: "find /tmp -name '*clawd*'" }),
+    })));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(resolved, []);
+  });
+
+  it("sweeps stale elicitation bubble when any PostToolUse fires for the same session", async () => {
+    const pendingPermissions = [
+      {
+        id: "elicit",
+        sessionId: "sid",
+        toolName: "AskUserQuestion",
+        toolUseId: "toolu_elicit",
+        toolInputFingerprint: buildToolInputFingerprint({ questions: [{ question: "Pick one" }] }),
+        isElicitation: true,
+        res: {},
+      },
+    ];
+    const { handler, resolved } = startServer({ pendingPermissions });
+
+    const res = await callHandler(handler, makeReq("POST", "/state", JSON.stringify({
+      state: "working",
+      session_id: "sid",
+      event: "PostToolUse",
+      tool_name: "Bash",
+      tool_use_id: "toolu_bash_after",
+      tool_input_fingerprint: buildToolInputFingerprint({ command: "echo hi" }),
+    })));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(resolved.map((e) => e.perm.id), ["elicit"]);
+    assert.deepStrictEqual(resolved.map((e) => e.message), ["User answered in terminal"]);
+  });
+
+  it("does not sweep non-elicitation bubbles from other sessions", async () => {
+    const pendingPermissions = [
+      {
+        id: "elicit",
+        sessionId: "other-sid",
+        toolName: "AskUserQuestion",
+        toolUseId: "toolu_elicit",
+        isElicitation: true,
+        res: {},
+      },
+      {
+        id: "bash-perm",
+        sessionId: "sid",
+        toolUseId: "toolu_bash_perm",
+        toolName: "Bash",
+        res: {},
+      },
+    ];
+    const { handler, resolved } = startServer({ pendingPermissions });
+
+    const res = await callHandler(handler, makeReq("POST", "/state", JSON.stringify({
+      state: "working",
+      session_id: "sid",
+      event: "PostToolUse",
+      tool_name: "Read",
+      tool_use_id: "toolu_read",
     })));
 
     assert.strictEqual(res.statusCode, 200);

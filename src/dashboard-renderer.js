@@ -6,10 +6,13 @@ const AGENT_LABELS = {
   "copilot-cli": "Copilot",
   "cursor-agent": "Cursor Agent",
   "gemini-cli": "Gemini",
+  "antigravity-cli": "Antigravity",
   "kiro-cli": "Kiro",
   "kimi-cli": "Kimi",
   opencode: "opencode",
   codebuddy: "CodeBuddy",
+  pi: "Pi",
+  openclaw: "OpenClaw",
 };
 
 let snapshot = { sessions: [], groups: [], orderedIds: [] };
@@ -33,6 +36,30 @@ function formatElapsed(ms) {
   if (min < 60) return t("sessionMinAgo").replace("{n}", min);
   const hr = Math.floor(min / 60);
   return t("sessionHrAgo").replace("{n}", hr);
+}
+
+function formatTokenCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return "";
+  try {
+    return new Intl.NumberFormat(i18nPayload.lang || "en").format(Math.round(n));
+  } catch (_err) {
+    return String(Math.round(n));
+  }
+}
+
+function contextUsageText(session) {
+  const usage = session && session.contextUsage;
+  if (!usage || !Number.isFinite(Number(usage.used))) return "";
+  const used = formatTokenCount(usage.used);
+  if (Number.isFinite(Number(usage.limit))) {
+    const limit = formatTokenCount(usage.limit);
+    const percent = Number.isFinite(Number(usage.percent))
+      ? ` (${Math.max(0, Math.min(100, Math.round(Number(usage.percent))))}%)`
+      : "";
+    return `${t("dashboardContextUsage")}: ${used} / ${limit}${percent}`;
+  }
+  return t("dashboardContextUsageUnknownLimit").replace("{used}", used);
 }
 
 function badgeLabel(badge) {
@@ -208,6 +235,12 @@ function appendEvent(main, session, now) {
   ));
 }
 
+function appendContextUsage(main, session) {
+  const text = contextUsageText(session);
+  if (!text) return;
+  main.appendChild(createText("div", "context-usage-row", text));
+}
+
 function createIcon(session) {
   if (session.iconUrl) {
     const img = document.createElement("img");
@@ -223,6 +256,31 @@ function createIcon(session) {
   return createText("span", "agent-fallback", agentFallback(session.agentId));
 }
 
+function createHideButton(session) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "hide-session-button";
+  button.textContent = "\u00d7";
+  button.title = t("dashboardHideSessionTitle");
+  button.setAttribute("aria-label", t("dashboardHideSessionTitle"));
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    if (!session || !session.id || !window.dashboardAPI.hideSession) return;
+    button.disabled = true;
+    try {
+      const result = await window.dashboardAPI.hideSession(session.id);
+      if (!result || (result.status !== "ok" && result.status !== "not-found")) {
+        button.disabled = false;
+        console.warn("hide session failed:", result && result.message);
+      }
+    } catch (err) {
+      button.disabled = false;
+      console.warn("hide session threw:", err);
+    }
+  });
+  return button;
+}
+
 function createCard(session, now) {
   const card = document.createElement("article");
   card.className = "card";
@@ -230,6 +288,7 @@ function createCard(session, now) {
   if (session.id) {
     const idTail = String(session.id).slice(-3);
     card.appendChild(createText("span", "session-id-badge", `#${idTail}`));
+    card.appendChild(createHideButton(session));
   }
 
   card.appendChild(createIcon(session));
@@ -240,21 +299,67 @@ function createCard(session, now) {
   appendMeta(main, session, now);
   appendPath(main, session);
   appendEvent(main, session, now);
+  appendContextUsage(main, session);
   card.appendChild(main);
 
   const actions = document.createElement("div");
   actions.className = "actions";
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = t("dashboardJumpTerminal");
-  button.disabled = !session.sourcePid;
-  button.addEventListener("click", () => {
+  const focusTargetType = session.focusTarget && session.focusTarget.type;
+  button.textContent = focusTargetType === "codex-thread"
+    ? t("dashboardOpenCodexSession")
+    : t("dashboardJumpTerminal");
+  button.disabled = session.canFocus !== true;
+  button.addEventListener("click", async () => {
     window.dashboardAPI.focusSession(session.id);
+    // Best-effort ack alongside focus. Most remote-Codex sessions have
+    // canFocus=false (no terminal-jump target) and reach ack through the
+    // Mark-read button instead, but local Codex Stop sessions can land
+    // here so we ack on focus too.
+    if (window.dashboardAPI && typeof window.dashboardAPI.ackCompletion === "function") {
+      try { await window.dashboardAPI.ackCompletion(session.id); }
+      catch (err) { console.warn("ack completion threw:", err); }
+    }
   });
   actions.appendChild(button);
+
+  if (session.requiresCompletionAck === true) {
+    actions.appendChild(createMarkReadButton(session));
+  }
+
   card.appendChild(actions);
 
   return card;
+}
+
+function createMarkReadButton(session) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "mark-read-button";
+  button.textContent = t("dashboardMarkRead");
+  button.title = t("dashboardMarkReadTitle");
+  button.setAttribute("aria-label", t("dashboardMarkReadTitle"));
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    if (!session || !session.id || !window.dashboardAPI || typeof window.dashboardAPI.ackCompletion !== "function") return;
+    button.disabled = true;
+    try {
+      const result = await window.dashboardAPI.ackCompletion(session.id);
+      if (!result || (result.status !== "ok" && result.status !== "noop")) {
+        // Failure path: re-enable so the user can try again. Successful
+        // ack keeps the button disabled — the next forced snapshot will
+        // strip requiresCompletionAck and the button disappears on
+        // re-render.
+        button.disabled = false;
+        console.warn("ack completion failed:", result && result.message);
+      }
+    } catch (err) {
+      button.disabled = false;
+      console.warn("ack completion threw:", err);
+    }
+  });
+  return button;
 }
 
 function deriveGroups(currentSnapshot) {

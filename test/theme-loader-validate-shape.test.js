@@ -83,21 +83,20 @@ afterEach(() => {
 });
 
 describe("validateThemeShape", () => {
-  it("validates a built-in theme using central clawd assets without mutating activeTheme", () => {
+  it("validates a built-in theme using central clawd assets without activating a theme", () => {
     makeFixture({
       builtinThemes: [
         { id: "clawd", json: validThemeJson({ name: "Clawd" }) },
         { id: "other", json: validThemeJson({ name: "Other" }) },
       ],
     });
-    themeLoader.loadTheme("clawd", { strict: true });
-    const before = themeLoader.getActiveTheme();
+    const loaded = themeLoader.loadTheme("clawd", { strict: true });
 
     const result = themeLoader.validateThemeShape("other");
 
     assert.strictEqual(result.ok, true);
-    assert.strictEqual(themeLoader.getActiveTheme(), before);
-    assert.strictEqual(themeLoader.getActiveTheme()._id, "clawd");
+    assert.strictEqual(loaded._id, "clawd");
+    assert.strictEqual(themeLoader.getActiveTheme(), null);
   });
 
   it("validates external theme assets from source without creating theme cache", () => {

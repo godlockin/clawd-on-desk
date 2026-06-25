@@ -10,8 +10,11 @@
 //   listAgents()                        Promise<Array<{id, name, ...}>>
 //   onChanged(cb)                       cb({ changes, snapshot? }) — fires for
 //                                       every settings-changed broadcast
+//   onAnimationPreviewPosterReady(cb)   cb({ themeId, filename, previewImageUrl,
+//                                       previewPosterCacheKey }) — incremental
+//                                       animation override preview poster
 //
-// All writes go through ipcMain.handle("settings:update") in main.js, which
+// All writes go through the main-process "settings:update" handler, which
 // routes through the controller. The renderer never owns state — it always
 // re-renders from the snapshot delivered via onChanged broadcasts (or the
 // initial getSnapshot() call). This is the unidirectional flow contract from
@@ -22,6 +25,10 @@ const { contextBridge, ipcRenderer } = require("electron");
 const listeners = new Set();
 const shortcutFailureListeners = new Set();
 const shortcutRecordKeyListeners = new Set();
+const remoteSshStatusListeners = new Set();
+const remoteSshProgressListeners = new Set();
+const hardwareBuddyStatusListeners = new Set();
+const textScaleContextListeners = new Set();
 ipcRenderer.on("settings-changed", (_event, payload) => {
   for (const cb of listeners) {
     try { cb(payload); } catch (err) { console.warn("settings onChanged listener threw:", err); }
@@ -35,6 +42,29 @@ ipcRenderer.on("shortcut-failures-changed", (_event, payload) => {
 ipcRenderer.on("shortcut-record-key", (_event, payload) => {
   for (const cb of shortcutRecordKeyListeners) {
     try { cb(payload); } catch (err) { console.warn("shortcut record listener threw:", err); }
+  }
+});
+ipcRenderer.on("remoteSsh:status-changed", (_event, payload) => {
+  for (const cb of remoteSshStatusListeners) {
+    try { cb(payload); } catch (err) { console.warn("remoteSsh status listener threw:", err); }
+  }
+});
+ipcRenderer.on("remoteSsh:progress", (_event, payload) => {
+  for (const cb of remoteSshProgressListeners) {
+    try { cb(payload); } catch (err) { console.warn("remoteSsh progress listener threw:", err); }
+  }
+});
+ipcRenderer.on("hardwareBuddy:status-changed", (_event, payload) => {
+  for (const cb of hardwareBuddyStatusListeners) {
+    try { cb(payload); } catch (err) { console.warn("hardwareBuddy status listener threw:", err); }
+  }
+});
+// Fired by the settings-window runtime whenever the window's effective text
+// scale was re-resolved (display move, topology change, commit) — the
+// committed percent lives main-side, so the slider must re-pull it.
+ipcRenderer.on("settings:text-scale-context-changed", () => {
+  for (const cb of textScaleContextListeners) {
+    try { cb(); } catch (err) { console.warn("text scale context listener threw:", err); }
   }
 });
 
@@ -51,6 +81,14 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   beginSizePreview: () => ipcRenderer.invoke("settings:begin-size-preview"),
   previewSize: (value) => ipcRenderer.invoke("settings:preview-size", value),
   endSizePreview: (value) => ipcRenderer.invoke("settings:end-size-preview", value),
+  previewTextScale: (value) => ipcRenderer.invoke("settings:preview-text-scale", value),
+  endTextScalePreview: () => ipcRenderer.invoke("settings:end-text-scale-preview"),
+  getTextScaleContext: () => ipcRenderer.invoke("settings:get-text-scale-context"),
+  onTextScaleContextChanged: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    textScaleContextListeners.add(cb);
+    return () => textScaleContextListeners.delete(cb);
+  },
   exportAnimationOverrides: () => ipcRenderer.invoke("settings:export-animation-overrides"),
   importAnimationOverrides: () => ipcRenderer.invoke("settings:import-animation-overrides"),
   enterShortcutRecording: (actionId) => ipcRenderer.invoke("settings:enterShortcutRecording", actionId),
@@ -60,14 +98,37 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   command: (action, payload) => ipcRenderer.invoke("settings:command", { action, payload }),
   openDashboard: () => ipcRenderer.send("settings:open-dashboard"),
   listAgents: () => ipcRenderer.invoke("settings:list-agents"),
+  detectAgentInstallations: () => ipcRenderer.invoke("settings:detect-agent-installations"),
   getAboutInfo: () => ipcRenderer.invoke("settings:get-about-info"),
   checkForUpdates: () => ipcRenderer.invoke("settings:check-for-updates"),
+  showTutorial: () => ipcRenderer.invoke("settings:show-tutorial"),
+  getHardwareBuddyStatus: () => ipcRenderer.invoke("settings:get-hardware-buddy-status"),
+  testHardwareBuddyApproval: () => ipcRenderer.invoke("settings:test-hardware-buddy-approval"),
+  getQuickCommandPresets: () => ipcRenderer.invoke("settings:get-quick-command-presets"),
+  sendQuickCommand: (payload) => ipcRenderer.invoke("settings:send-quick-command", payload),
   openExternal: (url) => ipcRenderer.invoke("settings:open-external", url),
   listThemes: () => ipcRenderer.invoke("settings:list-themes"),
+  openUserThemesDir: () => ipcRenderer.invoke("settings:open-user-themes-dir"),
+  importUserThemeZip: () => ipcRenderer.invoke("settings:import-user-theme-zip"),
+  refreshCodexPets: () => ipcRenderer.invoke("settings:refresh-codex-pets"),
+  openCodexPetsDir: () => ipcRenderer.invoke("settings:open-codex-pets-dir"),
+  importCodexPetZip: () => ipcRenderer.invoke("settings:import-codex-pet-zip"),
+  removeCodexPet: (themeId) => ipcRenderer.invoke("settings:remove-codex-pet", themeId),
   confirmRemoveTheme: (themeId) =>
     ipcRenderer.invoke("settings:confirm-remove-theme", themeId),
+  getMobileConnectionInfo: () => ipcRenderer.invoke("settings:mobile-connection-info"),
+  regenerateMobileToken: () => ipcRenderer.invoke("settings:regenerate-mobile-token"),
+  resetMobileAccess: () => ipcRenderer.invoke("settings:reset-mobile-access"),
   onChanged: (cb) => {
     if (typeof cb === "function") listeners.add(cb);
+  },
+  onAnimationPreviewPosterReady: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    const listener = (_event, payload) => {
+      try { cb(payload); } catch (err) { console.warn("animation preview poster listener threw:", err); }
+    };
+    ipcRenderer.on("settings:animation-preview-poster-ready", listener);
+    return () => ipcRenderer.removeListener("settings:animation-preview-poster-ready", listener);
   },
   onShortcutFailuresChanged: (cb) => {
     if (typeof cb !== "function") return () => {};
@@ -79,6 +140,11 @@ contextBridge.exposeInMainWorld("settingsAPI", {
     shortcutRecordKeyListeners.add(cb);
     return () => shortcutRecordKeyListeners.delete(cb);
   },
+  onHardwareBuddyStatusChanged: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    hardwareBuddyStatusListeners.add(cb);
+    return () => hardwareBuddyStatusListeners.delete(cb);
+  },
 });
 
 contextBridge.exposeInMainWorld("doctor", {
@@ -86,4 +152,41 @@ contextBridge.exposeInMainWorld("doctor", {
   getReport: () => ipcRenderer.invoke("doctor:get-report"),
   testConnection: (durationMs) => ipcRenderer.invoke("doctor:test-connection", { durationMs }),
   openClawdLog: () => ipcRenderer.invoke("doctor:open-clawd-log"),
+});
+
+// ── Remote SSH (Phase 2) ──
+//
+// Surface: window.remoteSsh
+//
+//   listStatuses()                 Promise<{ status, statuses: Array<state> }>
+//   status(profileId)              Promise<{ status, state }>
+//   connect(profileId)             Promise<{ status, state? }>
+//   disconnect(profileId)          Promise<{ status, state? }>
+//   deploy(profileId)              Promise<{ status, message?, step? }>
+//   authenticate(profileId)        Promise<{ status, terminal?, message? }>
+//   openTerminal(profileId)        Promise<{ status, terminal?, message? }>
+//   onStatusChanged(cb)            cb({ profileId, status, ... })
+//   onProgress(cb)                 cb({ profileId, step, status, message? })
+//
+// Profile CRUD goes through the existing settingsAPI.command pathway
+// (action: "remoteSsh.add" | "remoteSsh.update" | "remoteSsh.delete") so all
+// writes flow through settings-controller as the single source of truth.
+contextBridge.exposeInMainWorld("remoteSsh", {
+  listStatuses: () => ipcRenderer.invoke("remoteSsh:list-statuses"),
+  status: (profileId) => ipcRenderer.invoke("remoteSsh:status", profileId),
+  connect: (profileId) => ipcRenderer.invoke("remoteSsh:connect", profileId),
+  disconnect: (profileId) => ipcRenderer.invoke("remoteSsh:disconnect", profileId),
+  deploy: (profileId) => ipcRenderer.invoke("remoteSsh:deploy", profileId),
+  authenticate: (profileId) => ipcRenderer.invoke("remoteSsh:authenticate", profileId),
+  openTerminal: (profileId) => ipcRenderer.invoke("remoteSsh:open-terminal", profileId),
+  onStatusChanged: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    remoteSshStatusListeners.add(cb);
+    return () => remoteSshStatusListeners.delete(cb);
+  },
+  onProgress: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    remoteSshProgressListeners.add(cb);
+    return () => remoteSshProgressListeners.delete(cb);
+  },
 });

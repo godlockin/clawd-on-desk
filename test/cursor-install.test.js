@@ -144,18 +144,16 @@ describe("Cursor hook installer", () => {
   });
 
   it("skips when ~/.cursor/ does not exist", () => {
-    // Without hooksPath override, it checks ~/.cursor/ existence
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-cursor-home-"));
+    tempDirs.push(fakeHome);
     const result = registerCursorHooks({
       silent: true,
       nodeBin: "/usr/local/bin/node",
-      // no hooksPath — will check if ~/.cursor/ exists
+      homeDir: fakeHome,
     });
 
-    // On CI/test machines without Cursor, this should return zeros
-    // (or succeed if Cursor is installed — either way, no crash)
-    assert.strictEqual(typeof result.added, "number");
-    assert.strictEqual(typeof result.skipped, "number");
-    assert.strictEqual(typeof result.updated, "number");
+    assert.deepStrictEqual(result, { added: 0, skipped: 0, updated: 0 });
+    assert.strictEqual(fs.existsSync(path.join(fakeHome, ".cursor", "hooks.json")), false);
   });
 
   it("wraps Windows commands in cmd /c", () => {

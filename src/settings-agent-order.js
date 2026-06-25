@@ -4,16 +4,24 @@ function buildSettingsAgentOrderExports() {
   const COLLAPSIBLE_AGENT_PRIORITY = [
     "claude-code",
     "codex",
+    "gemini-cli",
     "kimi-cli",
+    "qwen-code",
+    "codewhale",
     "opencode",
     "codebuddy",
+    "qoder",
   ];
 
   const NON_COLLAPSIBLE_AGENT_PRIORITY = [
+    "antigravity-cli",
     "cursor-agent",
-    "gemini-cli",
     "copilot-cli",
     "kiro-cli",
+    "pi",
+    "openclaw",
+    "hermes",
+    "reasonix",
   ];
 
   const COLLAPSIBLE_AGENT_PRIORITY_MAP = new Map(
@@ -37,6 +45,7 @@ function buildSettingsAgentOrderExports() {
     const eventSource = agent && typeof agent.eventSource === "string" ? agent.eventSource : "";
     if (eventSource === "log-poll") return "eventSourceLogPoll";
     if (eventSource === "plugin-event") return "eventSourcePlugin";
+    if (eventSource === "extension") return "eventSourceExtension";
     return "eventSourceHook";
   }
 

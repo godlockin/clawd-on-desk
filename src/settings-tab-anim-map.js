@@ -25,6 +25,14 @@
     return !!(entry && entry.disabled === true);
   }
 
+  function animMapSwitchId(themeId, stateKey) {
+    return `${themeId}:${stateKey}`;
+  }
+
+  function readAnimMapVisualOn(themeId, stateKey) {
+    return !isStateDisabled(themeId, stateKey);
+  }
+
   function buildAnimMapRow(spec, themeId) {
     const row = document.createElement("div");
     row.className = "row";
@@ -38,27 +46,37 @@
     row.querySelector(".row-desc").textContent = t(spec.descKey);
     const sw = row.querySelector(".switch");
 
-    const disabled = isStateDisabled(themeId, spec.stateKey);
-    const visualOn = !disabled;
-    if (visualOn) sw.classList.add("on");
-    sw.setAttribute("aria-checked", visualOn ? "true" : "false");
+    const switchId = animMapSwitchId(themeId, spec.stateKey);
+    const override = state.transientUiState.animMapSwitches.get(switchId);
+    const visualOn = override ? override.visualOn : readAnimMapVisualOn(themeId, spec.stateKey);
+    helpers.setSwitchVisual(sw, visualOn, { pending: override ? override.pending : false });
+    state.mountedControls.animMapSwitches.set(switchId, {
+      element: sw,
+      themeId,
+      stateKey: spec.stateKey,
+    });
 
-    helpers.attachActivation(sw, () => {
-      const nextDisabled = !isStateDisabled(themeId, spec.stateKey);
-      return window.settingsAPI.command("setThemeOverrideDisabled", {
+    helpers.attachAnimatedSwitch(sw, {
+      getCommittedVisual: () => readAnimMapVisualOn(themeId, spec.stateKey),
+      getTransientState: () => state.transientUiState.animMapSwitches.get(switchId) || null,
+      setTransientState: (value) => state.transientUiState.animMapSwitches.set(switchId, value),
+      clearTransientState: (seq) => {
+        const current = state.transientUiState.animMapSwitches.get(switchId);
+        if (!current || (seq !== undefined && current.seq !== seq)) return;
+        state.transientUiState.animMapSwitches.delete(switchId);
+      },
+      invoke: () => window.settingsAPI.command("setThemeOverrideDisabled", {
         themeId,
         stateKey: spec.stateKey,
-        disabled: nextDisabled,
-      });
+        disabled: readAnimMapVisualOn(themeId, spec.stateKey),
+      }),
     });
     return row;
   }
 
-  function render(parent) {
-    const h1 = document.createElement("h1");
-    h1.textContent = t("animMapTitle");
-    parent.appendChild(h1);
-
+  // Rendered as the "on / off" subtab of the Animation & Sound Overrides tab,
+  // so the parent tab already supplies the <h1> — we start at the subtitle.
+  function renderMapSubtab(parent) {
     const subtitle = document.createElement("p");
     subtitle.className = "subtitle";
     subtitle.textContent = t("animMapSubtitle");
@@ -81,6 +99,13 @@
     resetBtn.className = "theme-delete-btn anim-map-reset-btn";
     resetBtn.textContent = t("animMapResetAll");
     if (!hasAny) resetBtn.disabled = true;
+    state.mountedControls.animMapReset = {
+      element: resetBtn,
+      themeId,
+      syncFromSnapshot: () => {
+        resetBtn.disabled = readers.readThemeOverrideMap(themeId) === null;
+      },
+    };
     helpers.attachActivation(resetBtn, () =>
       window.settingsAPI.command("resetThemeOverrides", { themeId })
         .then((result) => {
@@ -94,15 +119,39 @@
     parent.appendChild(resetWrap);
   }
 
+  function patchMapInPlace(changes) {
+    if (!changes || !Object.prototype.hasOwnProperty.call(changes, "themeOverrides")) return false;
+    if (Object.prototype.hasOwnProperty.call(changes, "theme")) {
+      // Theme switched: the mounted switch ids (themeId:stateKey) are now stale,
+      // so rebuild the subtab. The map reads themeOverrides straight from the
+      // snapshot, so a synchronous content re-render is enough — no need to
+      // refetch the (unrelated) animation-override asset data.
+      ops.requestRender({ content: true });
+      return true;
+    }
+    if (state.mountedControls.animMapSwitches.size === 0) return false;
+    for (const [, meta] of state.mountedControls.animMapSwitches) {
+      if (!meta || !document.body.contains(meta.element)) return false;
+    }
+    for (const [id, meta] of state.mountedControls.animMapSwitches) {
+      state.transientUiState.animMapSwitches.delete(id);
+      helpers.setSwitchVisual(meta.element, readAnimMapVisualOn(meta.themeId, meta.stateKey), { pending: false });
+    }
+    const reset = state.mountedControls.animMapReset;
+    if (reset && document.body.contains(reset.element)) {
+      reset.syncFromSnapshot();
+    }
+    return true;
+  }
+
   function init(core) {
     state = core.state;
     helpers = core.helpers;
     ops = core.ops;
     readers = core.readers;
-    core.tabs.animMap = {
-      render,
-    };
   }
 
-  root.ClawdSettingsTabAnimMap = { init };
+  // The map is no longer a top-level tab — the Animation & Sound Overrides tab
+  // renders it as its "on / off" subtab via these two entry points.
+  root.ClawdSettingsTabAnimMap = { init, renderMapSubtab, patchMapInPlace };
 })(globalThis);

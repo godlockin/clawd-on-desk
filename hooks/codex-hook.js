@@ -3,19 +3,32 @@
 // Registered in ~/.codex/hooks.json by hooks/codex-install.js
 
 const crypto = require("crypto");
+const fs = require("fs");
 const path = require("path");
+const { StringDecoder } = require("string_decoder");
 const {
   postPermissionToRunningServer,
   postStateToRunningServer,
   readHostPrefix,
 } = require("./server-config");
 const { createPidResolver, readStdinJson, getPlatformConfig } = require("./shared-process");
+const {
+  ROLE_UNKNOWN,
+  classifyHookPayload,
+  classifySessionMeta,
+} = require("./codex-subagent-fields");
+const {
+  extractLastAssistantTextFromTranscript,
+} = require("./codex-assistant-output");
+const { readCodexThreadName } = require("./codex-session-index");
 
 const TOOL_MATCH_STRING_MAX = 240;
 const TOOL_MATCH_ARRAY_MAX = 16;
 const TOOL_MATCH_OBJECT_KEYS_MAX = 32;
 const TOOL_MATCH_DEPTH_MAX = 6;
 const CODEX_PERMISSION_TIMEOUT_MS = 590000;
+const SESSION_META_READ_CHUNK_BYTES = 8192;
+const SESSION_META_READ_MAX_BYTES = 256 * 1024;
 
 const EVENT_TO_STATE = {
   SessionStart: "idle",
@@ -86,6 +99,122 @@ function buildToolInputFingerprint(toolInput) {
     .digest("hex");
 }
 
+function parseSessionMetaLine(line) {
+  if (typeof line !== "string" || !line.trim()) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(line.replace(/\r$/, ""));
+  } catch {
+    return null;
+  }
+  if (parsed && parsed.type === "session_meta" && parsed.payload && typeof parsed.payload === "object") {
+    return parsed.payload;
+  }
+  return null;
+}
+
+function readFirstSessionMeta(transcriptPath) {
+  if (typeof transcriptPath !== "string" || !transcriptPath.trim()) return null;
+  let fd;
+  try {
+    fd = fs.openSync(transcriptPath, "r");
+    const decoder = new StringDecoder("utf8");
+    let buffered = "";
+    let offset = 0;
+
+    while (offset < SESSION_META_READ_MAX_BYTES) {
+      const readLen = Math.min(SESSION_META_READ_CHUNK_BYTES, SESSION_META_READ_MAX_BYTES - offset);
+      const buf = Buffer.allocUnsafe(readLen);
+      const bytesRead = fs.readSync(fd, buf, 0, readLen, offset);
+      if (bytesRead <= 0) break;
+
+      const slice = buf.subarray(0, bytesRead);
+      offset += bytesRead;
+      buffered += decoder.write(slice);
+
+      let newlineIndex = buffered.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const meta = parseSessionMetaLine(buffered.slice(0, newlineIndex));
+        if (meta) return meta;
+        buffered = buffered.slice(newlineIndex + 1);
+        newlineIndex = buffered.indexOf("\n");
+      }
+
+      if (bytesRead < readLen) break;
+    }
+
+    buffered += decoder.end();
+    return parseSessionMetaLine(buffered);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+  return null;
+}
+
+function applyCodexUpstreamFields(body, payload, sessionMeta) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
+  const upstreamAgentId = typeof source.agent_id === "string" && source.agent_id
+    ? source.agent_id
+    : (typeof meta.agent_id === "string" && meta.agent_id ? meta.agent_id : null);
+  const upstreamAgentType = typeof source.agent_type === "string" && source.agent_type
+    ? source.agent_type
+    : (typeof meta.agent_type === "string" && meta.agent_type ? meta.agent_type : null);
+
+  if (upstreamAgentId) body.codex_subagent_id = upstreamAgentId;
+  if (upstreamAgentType) body.codex_agent_type = upstreamAgentType;
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function applyCodexSessionMetaFields(body, payload, sessionMeta) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
+  const originator = firstString(meta.originator, source.originator);
+  const codexSource = firstString(meta.source, source.source);
+  if (originator) body.codex_originator = originator;
+  if (codexSource) body.codex_source = codexSource;
+}
+
+function isCodexDesktopSession(payload, sessionMeta) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
+  return firstString(meta.originator, source.originator).toLowerCase() === "codex desktop";
+}
+
+function shouldReportForegroundWtHwnd(event) {
+  return event === "SessionStart" || event === "UserPromptSubmit";
+}
+
+function applyLocalProcessFields(body, resolve, options = {}) {
+  const { stablePid, agentPid, detectedEditor, pidChain, foregroundWtHwnd, tmuxSocket, tmuxClient } = resolve();
+  const sourcePid = options.preferAgentPid && agentPid ? agentPid : stablePid;
+  body.source_pid = sourcePid;
+  if (detectedEditor) body.editor = detectedEditor;
+  if (agentPid) body.agent_pid = agentPid;
+  if (pidChain.length) body.pid_chain = pidChain;
+  if (tmuxSocket) body.tmux_socket = tmuxSocket;
+  if (tmuxClient) body.tmux_client = tmuxClient;
+  if (shouldReportForegroundWtHwnd(options.event, foregroundWtHwnd) && foregroundWtHwnd) {
+    body.wt_hwnd = String(foregroundWtHwnd);
+  }
+}
+
+function resolveCodexSessionRole(payload, sessionMeta) {
+  const hookRole = classifyHookPayload(payload);
+  if (hookRole !== ROLE_UNKNOWN) return hookRole;
+  return classifySessionMeta(sessionMeta);
+}
+
 function sanitizeCodexPermissionDecision(decision) {
   if (!decision || typeof decision !== "object") return null;
   const behavior = decision.behavior === "deny" ? "deny"
@@ -145,6 +274,7 @@ function buildPermissionBody(payload, resolve) {
   const toolName = typeof payload.tool_name === "string" && payload.tool_name
     ? payload.tool_name
     : "Unknown";
+  const sessionMeta = readFirstSessionMeta(payload.transcript_path);
 
   const body = {
     agent_id: "codex",
@@ -164,6 +294,13 @@ function buildPermissionBody(payload, resolve) {
     body.transcript_path = payload.transcript_path;
   }
   if (typeof payload.model === "string" && payload.model) body.model = payload.model;
+  // Carry the session role so the /permission route's headless gate
+  // (isHeadlessPermissionRequest) can identify subagent requests even when
+  // no state event has populated the sessions map yet. Before PR #448
+  // subagent permissions deliberately bubbled, so the role was state-only.
+  const codexRole = resolveCodexSessionRole(payload, sessionMeta);
+  if (codexRole !== ROLE_UNKNOWN) body.codex_session_role = codexRole;
+  applyCodexSessionMetaFields(body, payload, sessionMeta);
 
   const toolUseId = normalizeToolUseId(payload.tool_use_id ?? payload.toolUseId ?? payload.toolUseID);
   const toolInputFingerprint = buildToolInputFingerprint(rawToolInput);
@@ -173,11 +310,10 @@ function buildPermissionBody(payload, resolve) {
   if (process.env.CLAWD_REMOTE) {
     body.host = readHostPrefix();
   } else {
-    const { stablePid, agentPid, detectedEditor, pidChain } = resolve();
-    body.source_pid = stablePid;
-    if (detectedEditor) body.editor = detectedEditor;
-    if (agentPid) body.agent_pid = agentPid;
-    if (pidChain.length) body.pid_chain = pidChain;
+    applyLocalProcessFields(body, resolve, {
+      preferAgentPid: isCodexDesktopSession(payload, sessionMeta),
+      event,
+    });
   }
 
   return body;
@@ -191,9 +327,10 @@ function buildStateBody(payload, resolve) {
   if (!state) return null;
   if (event === "Stop" && payload.stop_hook_active === true) return null;
 
+  const sessionId = normalizeCodexSessionId(payload.session_id, payload.transcript_path);
   const body = {
     state,
-    session_id: normalizeCodexSessionId(payload.session_id, payload.transcript_path),
+    session_id: sessionId,
     event,
     agent_id: "codex",
     hook_source: "codex-official",
@@ -212,6 +349,21 @@ function buildStateBody(payload, resolve) {
   if (payload.stop_hook_active === true || payload.stop_hook_active === false) {
     body.stop_hook_active = payload.stop_hook_active;
   }
+  if (event === "Stop") {
+    const assistantOutput = extractLastAssistantTextFromTranscript(payload.transcript_path);
+    if (assistantOutput && assistantOutput.text) {
+      body.assistant_last_output = assistantOutput.text;
+      if (assistantOutput.truncated) body.assistant_last_output_truncated = true;
+    }
+  }
+
+  const sessionMeta = readFirstSessionMeta(payload.transcript_path);
+  const threadName = readCodexThreadName(sessionId);
+  if (threadName) body.session_title = threadName;
+  const codexRole = resolveCodexSessionRole(payload, sessionMeta);
+  if (codexRole !== ROLE_UNKNOWN) body.codex_session_role = codexRole;
+  applyCodexSessionMetaFields(body, payload, sessionMeta);
+  applyCodexUpstreamFields(body, payload, sessionMeta);
 
   const toolName = typeof payload.tool_name === "string" && payload.tool_name ? payload.tool_name : null;
   const toolUseId = normalizeToolUseId(payload.tool_use_id ?? payload.toolUseId ?? payload.toolUseID);
@@ -224,11 +376,10 @@ function buildStateBody(payload, resolve) {
   if (process.env.CLAWD_REMOTE) {
     body.host = readHostPrefix();
   } else {
-    const { stablePid, agentPid, detectedEditor, pidChain } = resolve();
-    body.source_pid = stablePid;
-    if (detectedEditor) body.editor = detectedEditor;
-    if (agentPid) body.agent_pid = agentPid;
-    if (pidChain.length) body.pid_chain = pidChain;
+    applyLocalProcessFields(body, resolve, {
+      preferAgentPid: isCodexDesktopSession(payload, sessionMeta),
+      event,
+    });
   }
 
   return body;
@@ -254,33 +405,40 @@ function main() {
     platformConfig: config,
   });
 
-  readStdinJson().then((payload) => {
-    const permissionBody = buildPermissionBody(payload || {}, resolve);
-    if (permissionBody) {
-      requestCodexPermission(permissionBody, (output) => {
-        process.stdout.write(`${output}\n`);
-        process.exit(0);
-      });
-      return;
-    }
+  readStdinJson()
+    .then((payload) => {
+      const permissionBody = buildPermissionBody(payload || {}, resolve);
+      if (permissionBody) {
+        requestCodexPermission(permissionBody, (output) => {
+          process.stdout.write(`${output}\n`);
+          process.exit(0);
+        });
+        return;
+      }
 
-    const body = buildStateBody(payload || {}, resolve);
-    if (!body) process.exit(0);
-    postStateToRunningServer(JSON.stringify(body), { timeoutMs: 100 }, () => process.exit(0));
-  });
+      const body = buildStateBody(payload || {}, resolve);
+      if (!body) process.exit(0);
+      postStateToRunningServer(JSON.stringify(body), { timeoutMs: 100 }, () => process.exit(0));
+    })
+    .catch(() => process.exit(0));
 }
 
 if (require.main === module) main();
 
 module.exports = {
   EVENT_TO_STATE,
+  applyCodexSessionMetaFields,
+  applyLocalProcessFields,
   buildCodexNoDecisionOutput,
   buildCodexPermissionOutput,
   buildPermissionBody,
   buildStateBody,
   buildToolInputFingerprint,
+  extractLastAssistantTextFromTranscript,
   extractCodexSessionIdFromTranscriptPath,
+  isCodexDesktopSession,
   normalizeCodexSessionId,
+  readFirstSessionMeta,
   sanitizeCodexPermissionDecision,
   sanitizeCodexPermissionOutput,
 };

@@ -1,12 +1,16 @@
 "use strict";
 
-const { describe, it, before, after } = require("node:test");
+const { describe, it, before, after, afterEach, mock } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
 const themeLoader = require("../src/theme-loader");
+
+afterEach(() => {
+  mock.restoreAll();
+});
 
 // Scratch dir layout the loader expects:
 //   <tmp>/src/           (appDir)
@@ -36,7 +40,9 @@ function makeFixture(themes) {
       const assetsDir = path.join(base, "assets");
       fs.mkdirSync(assetsDir, { recursive: true });
       for (const [filename, content] of Object.entries(assets)) {
-        fs.writeFileSync(path.join(assetsDir, filename), content, "utf8");
+        const assetPath = path.join(assetsDir, filename);
+        fs.mkdirSync(path.dirname(assetPath), { recursive: true });
+        fs.writeFileSync(assetPath, content, "utf8");
       }
     }
   }
@@ -62,6 +68,10 @@ function validThemeJson(overrides = {}) {
     },
     ...overrides,
   };
+}
+
+function contextFor(theme) {
+  return themeLoader.createThemeContext(theme);
 }
 
 function fullMiniMode(overrides = {}) {
@@ -117,6 +127,14 @@ describe("theme-loader strict mode", () => {
         json: validThemeJson({
           name: "Bad Update Bubble Anchor",
           updateBubbleAnchorBox: { x: 10, y: "bad", width: 30, height: 40 },
+        }),
+      },
+      {
+        id: "badrendering",
+        builtin: true,
+        json: validThemeJson({
+          name: "Bad Rendering",
+          rendering: { svgChannel: "img" },
         }),
       },
       // Missing required fields (no schemaVersion, no viewBox) → validateTheme fails.
@@ -175,6 +193,170 @@ describe("theme-loader strict mode", () => {
     assert.throws(
       () => themeLoader.loadTheme("badupdatebubbleanchor", { strict: true }),
       /updateBubbleAnchorBox/
+    );
+  });
+
+  it("strict load rejects malformed rendering config", () => {
+    assert.throws(
+      () => themeLoader.loadTheme("badrendering", { strict: true }),
+      /rendering\.svgChannel/
+    );
+  });
+});
+
+describe("theme-loader trusted runtime and schema v1 defaults", () => {
+  let fixture;
+  before(() => {
+    fixture = makeFixture([
+      { id: "clawd", builtin: true, json: validThemeJson({ name: "Clawd" }) },
+      { id: "old-schema", builtin: true, json: validThemeJson({ name: "Old Schema" }) },
+      {
+        id: "trusted",
+        builtin: true,
+        json: validThemeJson({
+          name: "Trusted",
+          trustedRuntime: {
+            scriptedSvgFiles: [
+              "scripted.svg",
+              "../nested/also-scripted.svg",
+              "not-svg.png",
+              "scripted.svg",
+            ],
+            scriptedSvgCycleMs: {
+              "scripted.svg": 2400.4,
+              "../nested/also-scripted.svg": 3600,
+              "not-svg.png": 1200,
+              "unlisted.svg": 1800,
+              "bad.svg": -1,
+            },
+          },
+          fileViewBoxes: {
+            "../nested/mini-special.svg": { x: -12, y: -12, width: 48, height: 48 },
+          },
+          miniMode: fullMiniMode({
+            viewBox: { x: -12, y: -12, width: 48, height: 48 },
+          }),
+        }),
+      },
+      {
+        id: "forged",
+        builtin: false,
+        json: validThemeJson({
+          name: "Forged",
+          trustedRuntime: {
+            scriptedSvgFiles: ["forged-script.svg"],
+            scriptedSvgCycleMs: { "forged-script.svg": 3200 },
+          },
+          fileViewBoxes: {
+            "mini-special.svg": { x: -10, y: -10, width: 40, height: 40 },
+          },
+          miniMode: fullMiniMode({
+            viewBox: { x: -10, y: -10, width: 40, height: 40 },
+          }),
+        }),
+        assets: {},
+      },
+      {
+        id: "forced-object",
+        builtin: false,
+        json: validThemeJson({
+          name: "Forced Object",
+          rendering: { svgChannel: "object" },
+          eyeTracking: { enabled: false, states: [] },
+          reactions: { clickLeft: { file: "react-once.svg", duration: 840 } },
+        }),
+        assets: {
+          "idle.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+          "react-once.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+        },
+      },
+    ]);
+  });
+  after(() => fixture && fixture.cleanup());
+
+  it("keeps schemaVersion 1 themes valid while adding safe defaults", () => {
+    const theme = themeLoader.loadTheme("old-schema", { strict: true });
+    const rendererConfig = contextFor(theme).getRendererConfig();
+
+    assert.strictEqual(theme.schemaVersion, 1);
+    assert.deepStrictEqual(theme.trustedRuntime, { scriptedSvgFiles: [] });
+    assert.deepStrictEqual(theme.rendering, { svgChannel: "auto" });
+    assert.deepStrictEqual(rendererConfig.rendering, { svgChannel: "auto" });
+    assert.deepStrictEqual(theme.fileViewBoxes, {});
+    assert.strictEqual(theme.miniMode.viewBox, null);
+  });
+
+  it("preserves trustedRuntime only for built-in themes and sanitizes filenames", () => {
+    const theme = themeLoader.loadTheme("trusted", { strict: true });
+    const rendererConfig = contextFor(theme).getRendererConfig();
+
+    assert.strictEqual(theme._builtin, true);
+    assert.deepStrictEqual(theme.trustedRuntime, {
+      scriptedSvgFiles: ["scripted.svg", "also-scripted.svg"],
+      scriptedSvgCycleMs: {
+        "scripted.svg": 2400,
+        "also-scripted.svg": 3600,
+      },
+    });
+    assert.deepStrictEqual(rendererConfig.trustedScriptedSvgFiles, ["scripted.svg", "also-scripted.svg"]);
+    assert.deepStrictEqual(rendererConfig.fileViewBoxes, {
+      "mini-special.svg": { x: -12, y: -12, width: 48, height: 48 },
+    });
+    assert.deepStrictEqual(rendererConfig.miniModeViewBox, { x: -12, y: -12, width: 48, height: 48 });
+    assert.deepStrictEqual(theme.fileViewBoxes, {
+      "mini-special.svg": { x: -12, y: -12, width: 48, height: 48 },
+    });
+    assert.deepStrictEqual(theme.miniMode.viewBox, { x: -12, y: -12, width: 48, height: 48 });
+  });
+
+  it("does not let external themes forge trustedRuntime into renderer config", () => {
+    const warn = mock.method(console, "warn", () => {});
+
+    const theme = themeLoader.loadTheme("forged", { strict: true });
+    const rendererConfig = contextFor(theme).getRendererConfig();
+
+    assert.strictEqual(theme._builtin, false);
+    assert.deepStrictEqual(theme.trustedRuntime, { scriptedSvgFiles: [] });
+    assert.deepStrictEqual(rendererConfig.trustedScriptedSvgFiles, []);
+    assert.deepStrictEqual(rendererConfig.fileViewBoxes, {
+      "mini-special.svg": { x: -10, y: -10, width: 40, height: 40 },
+    });
+    assert.deepStrictEqual(rendererConfig.miniModeViewBox, { x: -10, y: -10, width: 40, height: 40 });
+    assert.strictEqual(warn.mock.callCount(), 1);
+    assert.match(warn.mock.calls[0].arguments[0], /trustedRuntime ignored for non-builtin theme "forged"/);
+    assert.deepStrictEqual(theme.fileViewBoxes, {
+      "mini-special.svg": { x: -10, y: -10, width: 40, height: 40 },
+    });
+    assert.deepStrictEqual(theme.miniMode.viewBox, { x: -10, y: -10, width: 40, height: 40 });
+  });
+
+  it("passes forced SVG object-channel rendering through for external themes", () => {
+    const theme = themeLoader.loadTheme("forced-object", { strict: true });
+    const rendererConfig = contextFor(theme).getRendererConfig();
+
+    assert.strictEqual(theme._builtin, false);
+    assert.deepStrictEqual(theme.rendering, { svgChannel: "object" });
+    assert.deepStrictEqual(rendererConfig.rendering, { svgChannel: "object" });
+    assert.deepStrictEqual(rendererConfig.eyeTrackingStates, []);
+    assert.deepStrictEqual(rendererConfig.trustedScriptedSvgFiles, []);
+    assert.strictEqual(theme.reactions.clickLeft.file, "react-once.svg");
+  });
+
+  it("rejects path traversal before marking a theme as built-in", () => {
+    const escapedDir = path.join(fixture.tmp, "escaped-theme");
+    fs.mkdirSync(escapedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(escapedDir, "theme.json"),
+      JSON.stringify(validThemeJson({
+        name: "Escaped",
+        trustedRuntime: { scriptedSvgFiles: ["escaped.svg"] },
+      })),
+      "utf8"
+    );
+
+    assert.throws(
+      () => themeLoader.loadTheme(path.join("..", "escaped-theme"), { strict: true }),
+      /not found/
     );
   });
 });
@@ -278,22 +460,99 @@ describe("theme-loader preview sound selection", () => {
   after(() => fixture && fixture.cleanup());
 
   it("prefers confirm for settings preview when available", () => {
-    themeLoader.loadTheme("preview-theme", { strict: true });
-    const previewUrl = themeLoader.getPreviewSoundUrl();
+    const theme = themeLoader.loadTheme("preview-theme", { strict: true });
+    const previewUrl = contextFor(theme).getPreviewSoundUrl();
     assert.ok(previewUrl, "preview URL expected");
     assert.ok(previewUrl.includes("preview-confirm.mp3"));
   });
 
   it("falls back to complete when confirm is unavailable", () => {
-    themeLoader.loadTheme("fallback-theme", { strict: true });
-    const previewUrl = themeLoader.getPreviewSoundUrl();
+    const theme = themeLoader.loadTheme("fallback-theme", { strict: true });
+    const previewUrl = contextFor(theme).getPreviewSoundUrl();
     assert.ok(previewUrl, "preview URL expected");
     assert.ok(previewUrl.includes("complete.mp3"));
   });
 
   it("returns null when neither confirm nor complete is available", () => {
-    themeLoader.loadTheme("silent-theme", { strict: true });
-    assert.strictEqual(themeLoader.getPreviewSoundUrl(), null);
+    const theme = themeLoader.loadTheme("silent-theme", { strict: true });
+    assert.strictEqual(contextFor(theme).getPreviewSoundUrl(), null);
+  });
+});
+
+describe("theme-loader fileHitBoxes", () => {
+  let fixture;
+  before(() => {
+    fixture = makeFixture([
+      { id: "clawd", builtin: true, json: validThemeJson({ name: "Clawd" }) },
+      {
+        id: "filehit",
+        builtin: true,
+        json: validThemeJson({
+          name: "File Hitboxes",
+          fileHitBoxes: {
+            "./nested/working.svg": { x: 1, y: 2, w: 3, h: 4 },
+            "zero-width.svg": { x: 1, y: 2, w: 0, h: 4 },
+            "missing-height.svg": { x: 1, y: 2, w: 3 },
+            "not-object.svg": 42,
+          },
+        }),
+      },
+      {
+        id: "variant-filehit",
+        builtin: true,
+        json: validThemeJson({
+          name: "Variant File Hitboxes",
+          fileHitBoxes: {
+            "base.svg": { x: 0, y: 1, w: 2, h: 3 },
+            "pose.svg": { x: 1, y: 2, w: 3, h: 4 },
+          },
+          variants: {
+            tuned: {
+              fileHitBoxes: {
+                "pose.svg": { x: 10, y: 20, w: 30, h: 40 },
+                "./nested/extra.svg": { x: 5, y: 6, w: 7, h: 8 },
+              },
+            },
+            partial: {
+              fileHitBoxes: {
+                "pose.svg": { x: 99 },
+              },
+            },
+          },
+        }),
+      },
+    ]);
+  });
+  after(() => fixture && fixture.cleanup());
+
+  it("normalizes basename keys and drops invalid entries with warnings", () => {
+    const warn = mock.method(console, "warn", () => {});
+
+    const theme = themeLoader.loadTheme("filehit", { strict: true });
+
+    assert.deepStrictEqual(theme.fileHitBoxes, {
+      "working.svg": { x: 1, y: 2, w: 3, h: 4 },
+    });
+    assert.ok(warn.mock.callCount() >= 3);
+  });
+
+  it("variant fileHitBoxes merge by file key and replace whole rects", () => {
+    const theme = themeLoader.loadTheme("variant-filehit", { strict: true, variant: "tuned" });
+
+    assert.deepStrictEqual(theme.fileHitBoxes, {
+      "base.svg": { x: 0, y: 1, w: 2, h: 3 },
+      "pose.svg": { x: 10, y: 20, w: 30, h: 40 },
+      "extra.svg": { x: 5, y: 6, w: 7, h: 8 },
+    });
+  });
+
+  it("variant partial rects are rejected instead of deep-merged", () => {
+    const warn = mock.method(console, "warn", () => {});
+
+    const theme = themeLoader.loadTheme("variant-filehit", { strict: true, variant: "partial" });
+
+    assert.deepStrictEqual(theme.fileHitBoxes["pose.svg"], { x: 1, y: 2, w: 3, h: 4 });
+    assert.ok(warn.mock.callCount() >= 1);
   });
 });
 
@@ -358,13 +617,81 @@ describe("theme-loader external SVG sanitization", () => {
           ].join(""),
         },
       },
+      {
+        id: "safe-raster-ref",
+        builtin: false,
+        json: validThemeJson({ name: "Safe Raster Ref" }),
+        assets: {
+          "spritesheet.webp": "fake-webp",
+          "nested/sheet.png": "fake-png",
+          "idle.svg": [
+            "<svg xmlns=\"http://www.w3.org/2000/svg\">",
+            "  <style>.bg { fill: url(#local); background: url('./nested/sheet.png'); }</style>",
+            "  <defs><clipPath id=\"frame\"><rect width=\"10\" height=\"10\"/></clipPath></defs>",
+            "  <g clip-path=\"url(#frame)\">",
+            "    <image href=\"spritesheet.webp\"/>",
+            "  </g>",
+            "</svg>",
+          ].join(""),
+        },
+      },
+      {
+        id: "missing-raster-ref",
+        builtin: false,
+        json: validThemeJson({ name: "Missing Raster Ref" }),
+        assets: {
+          "idle.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"missing.webp\"/></svg>",
+        },
+      },
+      {
+        id: "repair-raster-ref",
+        builtin: false,
+        json: validThemeJson({ name: "Repair Raster Ref" }),
+        assets: {
+          "spritesheet.webp": "repair-webp",
+          "idle.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"spritesheet.webp\"/></svg>",
+        },
+      },
+      {
+        id: "invalidation-raster-ref",
+        builtin: false,
+        json: validThemeJson({ name: "Invalidation Raster Ref" }),
+        assets: {
+          "spritesheet.webp": "old-webp",
+          "idle.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"spritesheet.webp\"/></svg>",
+        },
+      },
+      {
+        id: "orphan-raster-ref",
+        builtin: false,
+        json: validThemeJson({ name: "Orphan Raster Ref" }),
+        assets: {
+          "a.webp": "raster-a",
+          "b.webp": "raster-b",
+          "idle.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"a.webp\"/></svg>",
+        },
+      },
+      {
+        id: "legacy-cache-ref",
+        builtin: false,
+        json: validThemeJson({ name: "Legacy Cache Ref" }),
+        assets: {
+          "spritesheet.webp": "legacy-webp",
+          "idle.svg": [
+            "<svg xmlns=\"http://www.w3.org/2000/svg\">",
+            "  <script>alert(1)</script>",
+            "  <image href=\"spritesheet.webp\"/>",
+            "</svg>",
+          ].join(""),
+        },
+      },
     ]);
   });
   after(() => fixture && fixture.cleanup());
 
   it("strips unsafe href/url references while preserving safe local ones", () => {
-    themeLoader.loadTheme("unsafe-inline-style", { strict: true });
-    const sanitizedPath = themeLoader.getAssetPath("idle.svg");
+    const theme = themeLoader.loadTheme("unsafe-inline-style", { strict: true });
+    const sanitizedPath = contextFor(theme).resolveAssetPath("idle.svg");
     const sanitized = fs.readFileSync(sanitizedPath, "utf8");
 
     assert.ok(sanitized.includes("fill:url(pattern.svg#grad)"), "safe relative CSS url should survive");
@@ -375,6 +702,109 @@ describe("theme-loader external SVG sanitization", () => {
     assert.ok(!sanitized.includes("//bad.example"), "protocol-relative presentation attr should be removed");
     assert.ok(!sanitized.includes("//attacker.com"), "protocol-relative href should be removed");
     assert.ok(!sanitized.includes("..%2F..%2Fetc%2Fpasswd"), "encoded traversal href should be removed");
+  });
+
+  it("copies safe relative raster dependencies beside cached SVGs", () => {
+    const theme = themeLoader.loadTheme("safe-raster-ref", { strict: true });
+    const sanitizedPath = contextFor(theme).resolveAssetPath("idle.svg");
+    const sanitized = fs.readFileSync(sanitizedPath, "utf8");
+    const cachedAssetsDir = path.dirname(sanitizedPath);
+    const cachedWebp = path.join(cachedAssetsDir, "spritesheet.webp");
+    const cachedPng = path.join(cachedAssetsDir, "nested", "sheet.png");
+    const cacheMetaPath = path.join(path.dirname(cachedAssetsDir), ".cache-meta.json");
+    const cacheMeta = JSON.parse(fs.readFileSync(cacheMetaPath, "utf8"));
+
+    assert.ok(sanitized.includes("<image"), "safe local image element should survive sanitization");
+    assert.strictEqual(fs.readFileSync(cachedWebp, "utf8"), "fake-webp");
+    assert.strictEqual(fs.readFileSync(cachedPng, "utf8"), "fake-png");
+    assert.strictEqual(cacheMeta.version, 2);
+    assert.ok(cacheMeta.svgs["idle.svg"]);
+    assert.ok(cacheMeta.rasters["spritesheet.webp"]);
+    assert.ok(cacheMeta.rasters["nested/sheet.png"]);
+    assert.ok(!cacheMeta.rasters["#frame"]);
+  });
+
+  it("rejects missing SVG raster dependencies in strict mode", () => {
+    const warn = mock.method(console, "warn", () => {});
+
+    assert.throws(
+      () => themeLoader.loadTheme("missing-raster-ref", { strict: true }),
+      /missing raster dependencies: missing\.webp/
+    );
+    assert.ok(warn.mock.calls.some((call) => String(call.arguments[0]).includes("Missing raster dependency")));
+  });
+
+  it("repairs a missing cached raster when metadata still exists", () => {
+    const theme = themeLoader.loadTheme("repair-raster-ref", { strict: true });
+    const cachedAssetsDir = path.dirname(contextFor(theme).resolveAssetPath("idle.svg"));
+    const cachedWebp = path.join(cachedAssetsDir, "spritesheet.webp");
+
+    assert.strictEqual(fs.readFileSync(cachedWebp, "utf8"), "repair-webp");
+    fs.rmSync(cachedWebp, { force: true });
+
+    themeLoader.loadTheme("repair-raster-ref", { strict: true });
+    assert.strictEqual(fs.readFileSync(cachedWebp, "utf8"), "repair-webp");
+  });
+
+  it("invalidates cached rasters when source mtime or size changes", () => {
+    const theme = themeLoader.loadTheme("invalidation-raster-ref", { strict: true });
+    const cachedAssetsDir = path.dirname(contextFor(theme).resolveAssetPath("idle.svg"));
+    const cachedWebp = path.join(cachedAssetsDir, "spritesheet.webp");
+    const sourceWebp = path.join(fixture.tmp, "userData", "themes", "invalidation-raster-ref", "assets", "spritesheet.webp");
+
+    assert.strictEqual(fs.readFileSync(cachedWebp, "utf8"), "old-webp");
+    fs.writeFileSync(sourceWebp, "new-webp-content", "utf8");
+
+    themeLoader.loadTheme("invalidation-raster-ref", { strict: true });
+    assert.strictEqual(fs.readFileSync(cachedWebp, "utf8"), "new-webp-content");
+  });
+
+  it("removes orphaned cached rasters after SVG references change", () => {
+    const theme = themeLoader.loadTheme("orphan-raster-ref", { strict: true });
+    const cachedAssetsDir = path.dirname(contextFor(theme).resolveAssetPath("idle.svg"));
+    const cachedA = path.join(cachedAssetsDir, "a.webp");
+    const cachedB = path.join(cachedAssetsDir, "b.webp");
+    const sourceSvg = path.join(fixture.tmp, "userData", "themes", "orphan-raster-ref", "assets", "idle.svg");
+
+    assert.strictEqual(fs.readFileSync(cachedA, "utf8"), "raster-a");
+    fs.writeFileSync(
+      sourceSvg,
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><g><image href=\"b.webp\"/></g></svg>",
+      "utf8"
+    );
+
+    themeLoader.loadTheme("orphan-raster-ref", { strict: true });
+    const cacheMeta = JSON.parse(fs.readFileSync(path.join(path.dirname(cachedAssetsDir), ".cache-meta.json"), "utf8"));
+    assert.strictEqual(fs.existsSync(cachedA), false);
+    assert.strictEqual(fs.readFileSync(cachedB, "utf8"), "raster-b");
+    assert.ok(!cacheMeta.rasters["a.webp"]);
+    assert.ok(cacheMeta.rasters["b.webp"]);
+  });
+
+  it("migrates legacy flat cache metadata and refreshes cached SVGs", () => {
+    const themeId = "legacy-cache-ref";
+    const sourceSvg = path.join(fixture.tmp, "userData", "themes", themeId, "assets", "idle.svg");
+    const cacheRoot = path.join(fixture.tmp, "userData", "theme-cache", themeId);
+    const cacheAssetsDir = path.join(cacheRoot, "assets");
+    fs.mkdirSync(cacheAssetsDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheAssetsDir, "idle.svg"), "<svg><script>stale()</script></svg>", "utf8");
+    const sourceStat = fs.statSync(sourceSvg);
+    fs.writeFileSync(
+      path.join(cacheRoot, ".cache-meta.json"),
+      JSON.stringify({ "idle.svg": { mtime: sourceStat.mtimeMs, size: sourceStat.size } }),
+      "utf8"
+    );
+
+    const theme = themeLoader.loadTheme(themeId, { strict: true });
+    const sanitized = fs.readFileSync(contextFor(theme).resolveAssetPath("idle.svg"), "utf8");
+    const cacheMeta = JSON.parse(fs.readFileSync(path.join(cacheRoot, ".cache-meta.json"), "utf8"));
+
+    assert.strictEqual(cacheMeta.version, 2);
+    assert.ok(cacheMeta.svgs["idle.svg"]);
+    assert.ok(cacheMeta.rasters["spritesheet.webp"]);
+    assert.ok(sanitized.includes("<image"));
+    assert.ok(!sanitized.includes("<script"));
+    assert.ok(!sanitized.includes("stale()"));
   });
 });
 
@@ -405,6 +835,32 @@ describe("theme-loader capability metadata", () => {
         }),
       },
       {
+        id: "scriptedPower",
+        builtin: true,
+        json: validThemeJson({
+          name: "Scripted Power",
+          trustedRuntime: { scriptedSvgFiles: ["idle.svg"] },
+        }),
+      },
+      {
+        id: "forgedScriptedPower",
+        builtin: false,
+        json: validThemeJson({
+          name: "Forged Scripted Power",
+          trustedRuntime: { scriptedSvgFiles: ["idle.svg"] },
+        }),
+        assets: {},
+      },
+      {
+        id: "forcedObjectPower",
+        builtin: false,
+        json: validThemeJson({
+          name: "Forced Object Power",
+          rendering: { svgChannel: "object" },
+        }),
+        assets: {},
+      },
+      {
         id: "badMini",
         builtin: true,
         json: validThemeJson({
@@ -433,6 +889,7 @@ describe("theme-loader capability metadata", () => {
       jugglingTiers: true,
       idleMode: "tracked",
       sleepMode: "full",
+      powerProfile: "standard",
     });
   });
 
@@ -447,11 +904,26 @@ describe("theme-loader capability metadata", () => {
       jugglingTiers: true,
       idleMode: "tracked",
       sleepMode: "full",
+      powerProfile: "standard",
     });
 
     const listed = themeLoader.listThemesWithMetadata().find((theme) => theme.id === "capTheme");
     assert.ok(listed, "capTheme should appear in metadata list");
     assert.deepStrictEqual(listed.capabilities, meta.capabilities);
+  });
+
+  it("marks scripted or forced-object themes as a higher power profile without trusting forged user runtime", () => {
+    const scripted = themeLoader.loadTheme("scriptedPower", { strict: true });
+    const forged = themeLoader.loadTheme("forgedScriptedPower", { strict: true });
+    const forcedObject = themeLoader.loadTheme("forcedObjectPower", { strict: true });
+
+    assert.strictEqual(scripted._capabilities.powerProfile, "scripted");
+    assert.strictEqual(themeLoader.getThemeMetadata("scriptedPower").capabilities.powerProfile, "scripted");
+    assert.strictEqual(forged.trustedRuntime.scriptedSvgFiles.length, 0);
+    assert.strictEqual(forged._capabilities.powerProfile, "standard");
+    assert.strictEqual(themeLoader.getThemeMetadata("forgedScriptedPower").capabilities.powerProfile, "standard");
+    assert.strictEqual(forcedObject._capabilities.powerProfile, "scripted");
+    assert.strictEqual(themeLoader.getThemeMetadata("forcedObjectPower").capabilities.powerProfile, "scripted");
   });
 
   it("treats a miniMode block as supported unless supported=false", () => {

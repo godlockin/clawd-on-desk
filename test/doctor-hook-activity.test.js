@@ -38,14 +38,14 @@ describe("doctor hook activity connection test", () => {
     assert.match(result.detail, /dropped-by-dnd/);
   });
 
-  it("warns when fallback files changed but no HTTP event arrived", () => {
+  it("warns when Codex fallback files changed but no HTTP event arrived", () => {
     const result = evaluateConnectionTest({
-      fileActivity: [{ agentId: "gemini-cli", source: "file-mtime", count: 1 }],
+      fileActivity: [{ agentId: "codex", source: "file-mtime", count: 1 }],
     });
 
     assert.strictEqual(result.status, "http-blocked");
     assert.strictEqual(result.level, "warning");
-    assert.match(result.detail, /gemini-cli/);
+    assert.match(result.detail, /codex/);
   });
 
   it("warns when nothing changed during the window", () => {
@@ -55,7 +55,7 @@ describe("doctor hook activity connection test", () => {
     assert.strictEqual(result.level, "warning");
   });
 
-  it("scans Codex and Gemini fallback mtime activity without collecting file names in the summary", () => {
+  it("scans only Codex fallback mtime activity without collecting file names in the summary", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-doctor-activity-"));
     const since = Date.now() - 1000;
     const codexDir = path.join(tmp, ".codex", "sessions", "2026", "04", "28");
@@ -67,7 +67,7 @@ describe("doctor hook activity connection test", () => {
 
     const activity = scanFileMtimeActivity({ homeDir: tmp, since });
 
-    assert.deepStrictEqual(activity.map((entry) => entry.agentId).sort(), ["codex", "gemini-cli"]);
+    assert.deepStrictEqual(activity.map((entry) => entry.agentId).sort(), ["codex"]);
     assert.ok(activity.every((entry) => !Object.prototype.hasOwnProperty.call(entry, "path")));
     fs.rmSync(tmp, { recursive: true, force: true });
   });

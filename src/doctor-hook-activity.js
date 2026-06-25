@@ -119,24 +119,9 @@ function scanCodexMtimeActivity(options = {}) {
   return summarizeActivity("codex", files);
 }
 
-function scanGeminiMtimeActivity(options = {}) {
-  const pathApi = options.path || path;
-  const homeDir = options.homeDir || os.homedir();
-  const rootDir = pathApi.join(homeDir, ".gemini", "tmp");
-  const files = findRecentMatchingFiles({
-    ...options,
-    rootDir,
-    maxDepth: 4,
-    maxEntries: 1500,
-    predicate: (name) => name.startsWith("session-") && name.endsWith(".json"),
-  });
-  return summarizeActivity("gemini-cli", files);
-}
-
 function scanFileMtimeActivity(options = {}) {
   return [
     scanCodexMtimeActivity(options),
-    scanGeminiMtimeActivity(options),
   ].filter(Boolean);
 }
 

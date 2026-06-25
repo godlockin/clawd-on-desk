@@ -71,6 +71,96 @@ describe("CodexLogMonitor", () => {
     monitor.start();
   });
 
+  it("emits Codex Desktop session metadata from session_meta records", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, JSON.stringify({
+      type: "session_meta",
+      payload: {
+        cwd: "/projects/foo",
+        originator: "Codex Desktop",
+        source: "vscode",
+      },
+    }) + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].sid, EXPECTED_SID);
+    assert.strictEqual(events[0].state, "idle");
+    assert.strictEqual(events[0].extra.cwd, "/projects/foo");
+    assert.strictEqual(events[0].extra.codexOriginator, "Codex Desktop");
+    assert.strictEqual(events[0].extra.codexSource, "vscode");
+  });
+
+  it("uses stale Codex Desktop session_meta for later live events without replaying it", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, JSON.stringify({
+      timestamp: new Date(Date.now() - 60 * 1000).toISOString(),
+      type: "session_meta",
+      payload: {
+        cwd: "/projects/foo",
+        originator: "Codex Desktop",
+        source: "vscode",
+      },
+    }) + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.strictEqual(events.length, 0, "old session_meta must not emit idle");
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].sid, EXPECTED_SID);
+    assert.strictEqual(events[0].state, "thinking");
+    assert.strictEqual(events[0].extra.cwd, "/projects/foo");
+    assert.strictEqual(events[0].extra.codexOriginator, "Codex Desktop");
+    assert.strictEqual(events[0].extra.codexSource, "vscode");
+  });
+
+  it("preserves Codex Desktop session metadata across tracker retirement and resume", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, JSON.stringify({
+      type: "session_meta",
+      payload: {
+        cwd: "/projects/foo",
+        originator: "Codex Desktop",
+        source: "vscode",
+      },
+    }) + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+    const tracked = monitor._tracked.get(testFile);
+    assert.ok(tracked);
+    monitor._retireTrackedFile(testFile, tracked);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(events.length, 2);
+    assert.strictEqual(events[1].state, "thinking");
+    assert.strictEqual(events[1].extra.codexOriginator, "Codex Desktop");
+    assert.strictEqual(events[1].extra.codexSource, "vscode");
+  });
+
   it("should map task_started to thinking", (_, done) => {
     const testFile = path.join(dateDir, TEST_FILENAME);
     fs.writeFileSync(testFile, [
@@ -130,6 +220,28 @@ describe("CodexLogMonitor", () => {
     monitor.start();
   });
 
+  it("should map no-tool task_complete to attention when assistant output is present", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"event_msg","payload":{"type":"agent_message","message":"Short answer."}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const states = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      states.push(state);
+      if (state === "attention") {
+        assert.deepStrictEqual(states, ["idle", "thinking", "attention"]);
+        assert.strictEqual(extra.assistantLastOutput, "Short answer.");
+        done();
+      }
+    });
+    monitor.start();
+  });
+
   it("should map task_complete to attention when tools were used", (_, done) => {
     const testFile = path.join(dateDir, TEST_FILENAME);
     fs.writeFileSync(testFile, [
@@ -146,6 +258,94 @@ describe("CodexLogMonitor", () => {
       states.push(state);
       if (state === "attention") {
         assert.deepStrictEqual(states, ["idle", "thinking", "working", "attention"]);
+        done();
+      }
+    });
+    monitor.start();
+  });
+
+  it("carries Codex assistant output on task_complete", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\\"command\\":\\"ls\\"}"}}',
+      '{"type":"event_msg","payload":{"type":"exec_command_end"}}',
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Implemented the Codex fix." }],
+        },
+      }),
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      if (event === "event_msg:task_complete") {
+        assert.strictEqual(state, "attention");
+        assert.strictEqual(extra.assistantLastOutput, "Implemented the Codex fix.");
+        assert.strictEqual(extra.assistantLastOutputTruncated, false);
+        done();
+      }
+    });
+    monitor.start();
+  });
+
+  it("clears Codex assistant output on a new task_started turn", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"event_msg","payload":{"type":"agent_message","message":"Previous answer"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\\"command\\":\\"ls\\"}"}}',
+      '{"type":"event_msg","payload":{"type":"exec_command_end"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const completions = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      if (event !== "event_msg:task_complete") return;
+      completions.push(extra);
+      if (completions.length === 2) {
+        assert.strictEqual(completions[0].assistantLastOutput, "Previous answer");
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(completions[1], "assistantLastOutput"), false);
+        done();
+      }
+    });
+    monitor.start();
+  });
+
+  it("marks subagent emits headless and resolves task_complete to idle", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          cwd: "/projects/sub",
+          source: { subagent: { thread_spawn: { parent_thread_id: "root", agent_role: "explorer" } } },
+          agent_role: "explorer",
+        },
+      }),
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\\"command\\":\\"ls\\"}"}}',
+      '{"type":"event_msg","payload":{"type":"exec_command_end"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ state, event, headless: extra.headless, cwd: extra.cwd });
+      if (event === "event_msg:task_complete") {
+        assert.deepStrictEqual(events.map((entry) => entry.state), ["idle", "thinking", "working", "idle"]);
+        assert.ok(events.every((entry) => entry.headless === true));
+        assert.ok(events.every((entry) => entry.cwd === "/projects/sub"));
         done();
       }
     });
@@ -238,6 +438,127 @@ describe("CodexLogMonitor", () => {
       }
     });
     monitor.start();
+  });
+
+  it("carries token_count context usage on the next mapped state update", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: { total_tokens: 999999 },
+            last_token_usage: { total_tokens: 24846 },
+            model_context_window: 258400,
+          },
+        },
+      }),
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.deepStrictEqual(events.map((entry) => entry.event), [
+      "session_meta",
+      "event_msg:task_started",
+      "event_msg:token_count",
+      "event_msg:task_complete",
+    ]);
+    assert.deepStrictEqual(events[2].extra.contextUsage, {
+      used: 24846,
+      limit: 258400,
+      percent: 10,
+      source: "codex",
+    });
+    assert.deepStrictEqual(events[3].extra.contextUsage, {
+      used: 24846,
+      limit: 258400,
+      percent: 10,
+      source: "codex",
+    });
+  });
+
+  it("does not treat cumulative Codex total_token_usage as context-window usage", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: { total_tokens: 27799148 },
+            model_context_window: 258400,
+          },
+        },
+      }),
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(events.length, 3);
+    assert.deepStrictEqual(events.map((entry) => entry.event), [
+      "session_meta",
+      "event_msg:task_started",
+      "event_msg:task_complete",
+    ]);
+    assert.strictEqual(events[2].extra.contextUsage, undefined);
+  });
+
+  it("emits token_count context usage even when token_count is the final live record", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: { total_tokens: 8118607 },
+            last_token_usage: { total_tokens: 23959 },
+            model_context_window: 258400,
+          },
+        },
+      }),
+    ].join("\n") + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.deepStrictEqual(events.map((entry) => entry.event), [
+      "session_meta",
+      "event_msg:task_started",
+      "event_msg:token_count",
+    ]);
+    assert.deepStrictEqual(events[2].extra.contextUsage, {
+      used: 23959,
+      limit: 258400,
+      percent: 9,
+      source: "codex",
+    });
   });
 
   it("should skip old files (>5min mtime)", (_, done) => {
@@ -375,7 +696,7 @@ describe("CodexLogMonitor", () => {
     }, 200);
   });
 
-  it("drops history-only backfills silently on stale cleanup", () => {
+  it("keeps history-only backfills instead of timing them out", () => {
     const testFile = path.join(dateDir, TEST_FILENAME);
     fs.writeFileSync(testFile, [
       '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
@@ -394,18 +715,13 @@ describe("CodexLogMonitor", () => {
     for (const tracked of monitor._tracked.values()) {
       tracked.lastEventTime = Date.now() - 301000;
     }
-    monitor._cleanStaleFiles();
+    monitor._pruneTrackedFilesIfNeeded();
 
     assert.deepStrictEqual(seen, []);
-    assert.strictEqual(monitor._tracked.size, 0);
+    assert.strictEqual(monitor._tracked.size, 1);
   });
 
-  it("emits SessionEnd on stale cleanup so state.js deletes the session", (_, done) => {
-    // Codex desktop is a long-lived process: every conversation reuses the
-    // same agentPid/sourcePid, so cleanStaleSessions in state.js can never
-    // observe the source dying. The log monitor's stale cleanup is the only
-    // signal that triggers actual deletion — and it must be SessionEnd, not
-    // a regular state event, because only SessionEnd takes the delete path.
+  it("does not synthesize SessionEnd from a 5 minute idle log timeout", (_, done) => {
     const testFile = path.join(dateDir, TEST_FILENAME);
     fs.writeFileSync(testFile, [
       '{"type":"session_meta","payload":{"cwd":"/tmp"}}',
@@ -420,17 +736,171 @@ describe("CodexLogMonitor", () => {
         for (const tracked of monitor._tracked.values()) {
           tracked.lastEventTime = Date.now() - 301000;
         }
-        monitor._cleanStaleFiles();
+        monitor._pruneTrackedFilesIfNeeded();
 
-        const last = events[events.length - 1];
-        assert.strictEqual(last.event, "SessionEnd");
-        assert.strictEqual(last.state, "sleeping");
-        assert.strictEqual(last.sid, EXPECTED_SID);
-        assert.strictEqual(monitor._tracked.size, 0);
+        assert.strictEqual(events.some((entry) => entry.event === "SessionEnd"), false);
+        assert.strictEqual(monitor._tracked.size, 1);
         done();
       }
     });
     monitor.start();
+  });
+
+  it("prunes only never-emitted tracked files when the tracker reaches capacity", () => {
+    const config = makeConfig(tmpDir);
+    monitor = new CodexLogMonitor(config, () => {});
+
+    monitor._tracked.set("visible-session", { hasEmittedState: true, lastEventTime: 1 });
+    for (let i = 0; i < 49; i++) {
+      monitor._tracked.set(`silent-backfill-${i}`, {
+        hasEmittedState: false,
+        lastEventTime: 2 + i,
+      });
+    }
+
+    monitor._pruneTrackedFilesIfNeeded();
+
+    assert.strictEqual(monitor._tracked.size, 49);
+    assert.strictEqual(monitor._tracked.has("visible-session"), true);
+    assert.strictEqual(monitor._tracked.has("silent-backfill-0"), false);
+  });
+
+  it("retired emitted trackers resume from their stored offset if the file becomes active again", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const initial = '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n';
+    fs.writeFileSync(testFile, initial);
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, cwd: extra.cwd, contextUsage: extra.contextUsage });
+    });
+
+    monitor._tracked.set(testFile, {
+      offset: Buffer.byteLength(initial),
+      cwd: "/tmp",
+      sessionTitle: null,
+      lastState: "idle",
+      lastStateEvent: "session_meta",
+      hasEmittedState: true,
+      hadToolUse: false,
+      isSubagent: false,
+      agentPid: null,
+      contextUsage: { used: 1200, limit: 12000, percent: 10, source: "codex" },
+      lastEventTime: 1,
+    });
+    for (let i = 0; i < 49; i++) {
+      monitor._tracked.set(`visible-${i}`, {
+        offset: 1,
+        hasEmittedState: true,
+        lastEventTime: 2 + i,
+      });
+    }
+
+    monitor._pruneTrackedFilesIfNeeded();
+    assert.strictEqual(monitor._tracked.has(testFile), false);
+    assert.strictEqual(monitor._retiredTracked.has(testFile), true);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._pollFile(testFile, TEST_FILENAME);
+
+    assert.deepStrictEqual(events, [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+      cwd: "/tmp",
+      contextUsage: { used: 1200, limit: 12000, percent: 10, source: "codex" },
+    }]);
+  });
+
+  it("includes token_count context usage in backfill snapshots", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const oldTimestamp = new Date(Date.now() - 60 * 1000).toISOString();
+    fs.writeFileSync(testFile, [
+      JSON.stringify({
+        timestamp: oldTimestamp,
+        type: "session_meta",
+        payload: { cwd: "/tmp" },
+      }),
+      JSON.stringify({
+        timestamp: oldTimestamp,
+        type: "event_msg",
+        payload: { type: "task_started" },
+      }),
+      JSON.stringify({
+        timestamp: oldTimestamp,
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            last_token_usage: { total_tokens: 50000 },
+            model_context_window: 200000,
+          },
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 60 * 1000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].state, "thinking");
+    assert.deepStrictEqual(events[0].extra.contextUsage, {
+      used: 50000,
+      limit: 200000,
+      percent: 25,
+      source: "codex",
+    });
+  });
+
+  it("emits token_count metadata when backfill has context usage but no sustained state", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const oldTimestamp = new Date(Date.now() - 60 * 1000).toISOString();
+    fs.writeFileSync(testFile, [
+      JSON.stringify({
+        timestamp: oldTimestamp,
+        type: "session_meta",
+        payload: { cwd: "/tmp" },
+      }),
+      JSON.stringify({
+        timestamp: oldTimestamp,
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            last_token_usage: { total_tokens: 64027 },
+            model_context_window: 258400,
+          },
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 60 * 1000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+      events.push({ sid, state, event, extra });
+    });
+
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].state, "idle");
+    assert.strictEqual(events[0].event, "event_msg:token_count");
+    assert.deepStrictEqual(events[0].extra.contextUsage, {
+      used: 64027,
+      limit: 258400,
+      percent: 25,
+      source: "codex",
+    });
   });
 
   it("should handle corrupted JSON lines gracefully", (_, done) => {
@@ -722,6 +1192,33 @@ describe("CodexLogMonitor", () => {
           done();
         }
       });
+      monitor.start();
+    });
+
+    it("uses Codex /rename thread_name from session_index.jsonl", (_, done) => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      fs.writeFileSync(testFile, [
+        '{"type":"turn_context","payload":{"summary":"Auto Summary"}}',
+        '{"type":"session_meta","payload":{"cwd":"/projects/foo"}}',
+      ].join("\n") + "\n");
+      const codexDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-index-"));
+      fs.writeFileSync(path.join(codexDir, "session_index.jsonl"), [
+        JSON.stringify({
+          id: "019d23d4-f1a9-7633-b9c7-758327137228",
+          thread_name: "요구사항개선",
+        }),
+      ].join("\n") + "\n", "utf8");
+
+      const config = makeConfig(tmpDir);
+      monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+        if (state !== "idle") return;
+        try {
+          assert.strictEqual(extra.sessionTitle, "요구사항개선");
+          done();
+        } finally {
+          fs.rmSync(codexDir, { recursive: true, force: true });
+        }
+      }, { codexDir });
       monitor.start();
     });
   });
