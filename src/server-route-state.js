@@ -11,6 +11,7 @@ const {
 } = require("./server-permission-utils");
 const { resolveHookAgentId } = require("./server-agent-id");
 const { resolveCodexOfficialHookState } = require("./server-codex-official-turns");
+const { normalizeTranscriptPath } = require("./transcript-path");
 
 // /state POST body size cap. Raised from 1024 to 4096 to give new fields
 // (session_title) headroom on top of cwd / pid_chain / host / etc. Still a
@@ -29,6 +30,21 @@ function normalizeHwndString(value) {
   }
 }
 
+function normalizeTmuxSocket(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text || text.length > 4096 || /[\0\r\n]/.test(text)) return null;
+  if (text.startsWith("/")) return text;
+  return text !== "default" && /^[\w.-]{1,64}$/.test(text) ? text : null;
+}
+
+function normalizeTmuxClient(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text || text.length > 256 || text.startsWith("-")) return null;
+  return /^[\w./:-]+$/.test(text) ? text : null;
+}
+
 function normalizeAssistantLastOutput(value) {
   if (typeof value !== "string") return null;
   const text = value
@@ -40,6 +56,26 @@ function normalizeAssistantLastOutput(value) {
   return text.length > ASSISTANT_LAST_OUTPUT_MAX
     ? text.slice(0, ASSISTANT_LAST_OUTPUT_MAX)
     : text;
+}
+
+function normalizeContextUsage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const used = Number(value.used);
+  if (!Number.isFinite(used) || used < 0) return null;
+
+  const out = { used };
+  const limit = Number(value.limit);
+  if (Number.isFinite(limit) && limit > 0) out.limit = limit;
+
+  const percent = Number(value.percent);
+  if (Number.isFinite(percent)) {
+    out.percent = Math.max(0, Math.min(100, Math.round(percent)));
+  } else if (out.limit) {
+    out.percent = Math.max(0, Math.min(100, Math.round((used / out.limit) * 100)));
+  }
+
+  if (value.source === "claude" || value.source === "codex") out.source = value.source;
+  return out;
 }
 
 function sendStateHealthResponse(res, options) {
@@ -87,6 +123,8 @@ function handleStatePost(req, res, options) {
       const cwd = typeof data.cwd === "string" ? data.cwd : "";
       const editor = (data.editor === "code" || data.editor === "cursor") ? data.editor : null;
       const pidChain = Array.isArray(data.pid_chain) ? data.pid_chain.filter(n => Number.isFinite(n) && n > 0) : null;
+      const tmuxSocket = normalizeTmuxSocket(data.tmux_socket);
+      const tmuxClient = normalizeTmuxClient(data.tmux_client);
       const rawAgentPid = data.agent_pid ?? data.claude_pid ?? data.cursor_pid;
       const agentPid = Number.isFinite(rawAgentPid) && rawAgentPid > 0 ? Math.floor(rawAgentPid) : null;
       const agentIdentity = resolveHookAgentId(data);
@@ -108,6 +146,9 @@ function handleStatePost(req, res, options) {
       const codexSource = typeof data.codex_source === "string" && data.codex_source.trim()
         ? data.codex_source.trim()
         : null;
+      const ghosttyTerminalId = typeof data.ghostty_terminal_id === "string" && data.ghostty_terminal_id.trim()
+        ? data.ghostty_terminal_id.trim()
+        : null;
       const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : null;
       const toolUseId = normalizeHookToolUseId(
         data.tool_use_id ?? data.toolUseId ?? data.toolUseID
@@ -120,11 +161,20 @@ function handleStatePost(req, res, options) {
       // "ignore + fall back" pattern used by cwd / agent_id above.
       const rawTitle = typeof data.session_title === "string" ? data.session_title.trim() : "";
       const sessionTitle = rawTitle || null;
+      const contextUsage = normalizeContextUsage(data.context_usage);
       const assistantLastOutput = normalizeAssistantLastOutput(data.assistant_last_output);
       const assistantLastOutputTruncated = data.assistant_last_output_truncated === true;
+      const transcriptPath = normalizeTranscriptPath(data.transcript_path);
       const permissionSuspect = data.permission_suspect === true;
       const preserveState = data.preserve_state === true;
       const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
+      // #406 completion-gate inputs from the Claude Stop hook. Counts / boolean
+      // only — the hook never forwards task command or description text.
+      const backgroundTasksCount = Number.isFinite(data.background_tasks_count)
+        ? data.background_tasks_count : 0;
+      const sessionCronsCount = Number.isFinite(data.session_crons_count)
+        ? data.session_crons_count : 0;
+      const stopHookActive = data.stop_hook_active === true;
       // Agent gate: user disabled this agent in the settings panel. Drop
       // with 204 so hook scripts get a quick no-op response instead of
       // hanging on our HTTP connection. Still surfaces as a success code
@@ -213,6 +263,8 @@ function handleStatePost(req, res, options) {
             cwd,
             editor,
             pidChain,
+            tmuxSocket,
+            tmuxClient,
             agentPid,
             agentId,
             host,
@@ -222,13 +274,20 @@ function handleStatePost(req, res, options) {
             provider,
             codexOriginator,
             codexSource,
+            ghosttyTerminalId,
             displayHint: display_svg,
             sessionTitle,
+            contextUsage,
             assistantLastOutput,
             assistantLastOutputTruncated,
+            toolName,
+            transcriptPath,
             permissionSuspect,
             preserveState,
             hookSource,
+            backgroundTasksCount,
+            sessionCronsCount,
+            stopHookActive,
             ...(agentIdentity.defaulted ? { agentIdDefaulted: true } : {}),
           });
         }

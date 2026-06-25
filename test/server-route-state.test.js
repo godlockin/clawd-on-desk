@@ -51,6 +51,7 @@ function callStatePost(body, overrides = {}) {
     };
     const ctx = {
       STATE_SVGS: {
+        idle: "x.svg",
         working: "x.svg",
         attention: "x.svg",
         "mini-idle": "x.svg",
@@ -108,6 +109,8 @@ describe("server-route-state POST", () => {
       cwd: "D:\\repo",
       editor: "cursor",
       pid_chain: [1, "bad", 3],
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
       agent_pid: 99.8,
       agent_id: "codex",
       host: "remote-host",
@@ -117,7 +120,10 @@ describe("server-route-state POST", () => {
       provider: "openai",
       codex_originator: "Codex Desktop",
       codex_source: "vscode",
+      ghostty_terminal_id: "ghostty-term-7",
       session_title: "  Work title  ",
+      tool_name: "Read",
+      transcript_path: "/Users/tester/.claude/projects/repo/session.jsonl",
       permission_suspect: true,
       preserve_state: true,
       hook_source: "codex-official",
@@ -134,6 +140,8 @@ describe("server-route-state POST", () => {
         cwd: "D:\\repo",
         editor: "cursor",
         pidChain: [1, 3],
+        tmuxSocket: "/tmp/tmux-1000/work",
+        tmuxClient: "/dev/pts/7",
         agentPid: 99,
         agentId: "codex",
         host: "remote-host",
@@ -143,13 +151,20 @@ describe("server-route-state POST", () => {
         provider: "openai",
         codexOriginator: "Codex Desktop",
         codexSource: "vscode",
+        ghosttyTerminalId: "ghostty-term-7",
         displayHint: "display.svg",
         sessionTitle: "Work title",
+        contextUsage: null,
         assistantLastOutput: null,
         assistantLastOutputTruncated: false,
+        toolName: "Read",
+        transcriptPath: "/Users/tester/.claude/projects/repo/session.jsonl",
         permissionSuspect: true,
         preserveState: true,
         hookSource: "codex-official",
+        backgroundTasksCount: 0,
+        sessionCronsCount: 0,
+        stopHookActive: false,
       },
     ]]);
   });
@@ -166,6 +181,50 @@ describe("server-route-state POST", () => {
     assert.strictEqual(res.statusCode, 200);
     assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutput, "Done.\nsecret=abc123");
     assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutputTruncated, true);
+  });
+
+  it("celebrates Codex official no-tool Stop when assistant output is present", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      session_id: "codex:sid",
+      event: "Stop",
+      agent_id: "codex",
+      hook_source: "codex-official",
+      assistant_last_output: "Short answer.",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.calls.updateSession[0][1], "attention");
+    assert.strictEqual(res.calls.updateSession[0][3].assistantLastOutput, "Short answer.");
+  });
+
+  it("passes valid context_usage to updateSession", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      session_id: "sid",
+      event: "PreToolUse",
+      context_usage: { used: 1000, limit: 200000, percent: 1, source: "claude" },
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(res.calls.updateSession[0][3].contextUsage, {
+      used: 1000,
+      limit: 200000,
+      percent: 1,
+      source: "claude",
+    });
+  });
+
+  it("drops invalid context_usage without rejecting state", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      session_id: "sid",
+      event: "PreToolUse",
+      context_usage: { used: -1, limit: 0 },
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.calls.updateSession[0][3].contextUsage, null);
   });
 
   it("marks missing agent_id as a defaulted Claude Code attribution", async () => {
