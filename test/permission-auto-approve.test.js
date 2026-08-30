@@ -1,6 +1,6 @@
-// Auto-pilot (autoApproveAllPermissions) chokepoint in showPermissionBubble.
+// Permission automation chokepoint in showPermissionBubble.
 //
-// When the toggle is on, showPermissionBubble must resolve the entry as
+// When policy selects an automatic action, showPermissionBubble must resolve the entry as
 // "allow" and return BEFORE constructing a BrowserWindow — that early return
 // is also what lets this test run without a real Electron window.
 // The DND / per-agent / headless gates live earlier in the route (server-
@@ -9,20 +9,23 @@
 // agent-specific: some agents get no-decision/native fallback, opencode gets
 // silent TUI fallback, and Claude/CodeBuddy keep their existing auto-deny.
 //
-// Exclusions: passive codex/kimi notifications and the hardware-buddy self
-// test are not approvals and must NOT be auto-resolved.
+// Exclusions: passive codex/kimi notifications are not approvals and must
+// NOT be auto-resolved.
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
 
 const initPermission = require("../src/permission");
+const {
+  classifyPermissionInteraction,
+} = require("../src/permission-automation-policy");
 
 function makeCtx(overrides = {}) {
   return {
     focusTerminalForSession() {},
     getSettingsSnapshot: () => ({}),
     isAgentPermissionsEnabled: () => true,
-    isAutoApproveAllEnabled: () => true,
+    getPermissionAutomationMode: () => "unattended",
     getBubblePolicy: () => ({ enabled: true, autoCloseMs: 0 }),
     getPetWindowBounds: () => null,
     getNearestWorkArea: () => ({ x: 0, y: 0, width: 1920, height: 1080 }),
@@ -51,7 +54,7 @@ function makeCtx(overrides = {}) {
 }
 
 function makePermEntry(overrides = {}) {
-  return {
+  const entry = {
     res: null,
     abortHandler: () => {},
     suggestions: [],
@@ -62,11 +65,18 @@ function makePermEntry(overrides = {}) {
     toolInput: { command: "rm -rf /" },
     resolvedSuggestion: null,
     createdAt: Date.now() - 5000,
+    agentId: "claude-code",
     ...overrides,
   };
+  entry.interaction = overrides.interaction || classifyPermissionInteraction({
+    agentId: entry.agentId,
+    eventKind: entry.isCodexNotify || entry.isKimiNotify ? "passive-notification" : "permission",
+    toolName: entry.toolName,
+  });
+  return entry;
 }
 
-describe("auto-pilot: showPermissionBubble auto-approve chokepoint", () => {
+describe("permission automation: showPermissionBubble chokepoint", () => {
   it("resolves a real tool request as allow without building a bubble", () => {
     const resolved = [];
     const ctx = makeCtx();
@@ -119,12 +129,12 @@ describe("auto-pilot: showPermissionBubble auto-approve chokepoint", () => {
     assert.equal(parsed.hookSpecificOutput.decision.behavior, "allow");
   });
 
-  it("does nothing special when the toggle is off (would build a bubble)", () => {
+  it("does nothing special when the mode is off (would build a bubble)", () => {
     // With auto-approve off and win=null, showPermissionBubble proceeds to
     // BrowserWindow construction. We only assert the early-return did NOT
     // fire by checking the entry stays pending up to the point of bubble
     // creation throwing (no Electron in tests).
-    const ctx = makeCtx({ isAutoApproveAllEnabled: () => false });
+    const ctx = makeCtx({ getPermissionAutomationMode: () => "off" });
     const perm = initPermission(ctx);
     const permEntry = makePermEntry();
     perm.pendingPermissions.push(permEntry);
@@ -146,16 +156,6 @@ describe("auto-pilot: showPermissionBubble auto-approve chokepoint", () => {
     // Passive notify entries route to dismissPassiveNotify on resolve, never
     // to an allow. Auto-approve must skip them: with win=null the subsequent
     // bubble build throws, proving the early-return did not consume it.
-    assert.throws(() => perm.showPermissionBubble(permEntry));
-    assert.equal(perm.pendingPermissions.indexOf(permEntry), 0);
-  });
-
-  it("does NOT auto-approve the hardware-buddy self test", () => {
-    const ctx = makeCtx();
-    const perm = initPermission(ctx);
-    const permEntry = makePermEntry({ isHardwareBuddyTest: true });
-    perm.pendingPermissions.push(permEntry);
-
     assert.throws(() => perm.showPermissionBubble(permEntry));
     assert.equal(perm.pendingPermissions.indexOf(permEntry), 0);
   });
@@ -194,10 +194,145 @@ describe("auto-pilot: showPermissionBubble auto-approve chokepoint", () => {
       "And another?": "You choose whatever is best.",
     });
   });
+
+  it("auto-tools allows ordinary tools but defers questions and plan reviews", () => {
+    const ctx = makeCtx({ getPermissionAutomationMode: () => "auto-tools" });
+    const perm = initPermission(ctx);
+    const tool = makePermEntry();
+    perm.pendingPermissions.push(tool);
+    perm.showPermissionBubble(tool);
+    assert.strictEqual(perm.pendingPermissions.includes(tool), false);
+
+    for (const [toolName, toolInput] of [
+      ["AskUserQuestion", { questions: [{ question: "Choose?" }] }],
+      ["ExitPlanMode", { plan: "ship it" }],
+    ]) {
+      const decision = makePermEntry({ toolName, toolInput });
+      perm.pendingPermissions.push(decision);
+      assert.throws(() => perm.showPermissionBubble(decision));
+      assert.strictEqual(
+        perm.pendingPermissions.includes(decision),
+        true,
+        `${toolName} must remain pending for a human`
+      );
+      perm.pendingPermissions.splice(perm.pendingPermissions.indexOf(decision), 1);
+    }
+  });
+
+  it("rechecks live gates before an immediate session override can auto-allow", () => {
+    const res = makeCapturingRes();
+    const base = {
+      res,
+      sessionAutomationIdentity: { eligible: true, reason: "verified" },
+    };
+    const ctx = makeCtx({
+      getEffectivePermissionAutomationMode: () => "auto-tools",
+      hasSessionAutomationOverride: () => true,
+      isAgentEnabled: () => true,
+      isAgentPermissionsEnabled: () => false,
+      isAgentSubagentPermissionsEnabled: () => true,
+    });
+    const perm = initPermission(ctx);
+    const entry = makePermEntry(base);
+    perm.pendingPermissions.push(entry);
+
+    assert.throws(() => perm.showPermissionBubble(entry));
+    assert.equal(perm.pendingPermissions.includes(entry), true);
+    assert.equal(res.captured.statusCode, null);
+  });
+
+  it("allows an immediate session override only after the shared live gate passes", () => {
+    const res = makeCapturingRes();
+    const ctx = makeCtx({
+      getEffectivePermissionAutomationMode: () => "auto-tools",
+      hasSessionAutomationOverride: () => true,
+      isAgentEnabled: () => true,
+      isAgentPermissionsEnabled: () => true,
+      isAgentSubagentPermissionsEnabled: () => true,
+    });
+    const perm = initPermission(ctx);
+    const entry = makePermEntry({
+      res,
+      sessionAutomationIdentity: { eligible: true, reason: "verified" },
+    });
+    perm.pendingPermissions.push(entry);
+
+    perm.showPermissionBubble(entry);
+    assert.equal(perm.pendingPermissions.includes(entry), false);
+    assert.equal(res.captured.statusCode, 200);
+  });
+
+  it("requires an eligible route identity before global automation can allow a Codex Agent thread", () => {
+    const ctx = makeCtx({
+      getPermissionAutomationMode: () => "auto-tools",
+      isAgentEnabled: () => true,
+      isAgentPermissionsEnabled: () => true,
+      isAgentSubagentPermissionsEnabled: () => true,
+      isCodexPermissionInterceptEnabled: () => true,
+    });
+    const perm = initPermission(ctx);
+    const res = makeCapturingRes();
+    const entry = makePermEntry({
+      res,
+      agentId: "codex",
+      isCodex: true,
+      codexSessionRole: "subagent",
+      codexInteractiveSubagent: true,
+      subagentId: "session-test",
+      sessionAutomationIdentity: { eligible: false, reason: "unsupported-codex-originator" },
+    });
+    perm.pendingPermissions.push(entry);
+
+    assert.throws(() => perm.showPermissionBubble(entry));
+    assert.equal(perm.pendingPermissions.includes(entry), true);
+    assert.equal(res.captured.statusCode, null);
+  });
+
+  it("lets an eligible TUI Agent thread inherit global auto-tools", () => {
+    const ctx = makeCtx({
+      getPermissionAutomationMode: () => "auto-tools",
+      isAgentEnabled: () => true,
+      isAgentPermissionsEnabled: () => true,
+      isAgentSubagentPermissionsEnabled: () => true,
+      isCodexPermissionInterceptEnabled: () => true,
+      sessions: new Map([["session-test", { agentId: "codex", headless: true }]]),
+    });
+    const perm = initPermission(ctx);
+    const res = makeCapturingRes();
+    const entry = makePermEntry({
+      res,
+      agentId: "codex",
+      isCodex: true,
+      codexSessionRole: "subagent",
+      codexInteractiveSubagent: true,
+      subagentId: "session-test",
+      headless: false,
+      sessionAutomationIdentity: { eligible: true, reason: "eligible" },
+    });
+    perm.pendingPermissions.push(entry);
+
+    perm.showPermissionBubble(entry);
+    assert.equal(perm.pendingPermissions.includes(entry), false);
+    assert.equal(res.captured.statusCode, 200);
+    assert.equal(
+      JSON.parse(res.captured.body).hookSpecificOutput.decision.behavior,
+      "allow"
+    );
+  });
+
+  it("fails safe when an entry reaches the chokepoint without a valid interaction", () => {
+    const ctx = makeCtx({ getPermissionAutomationMode: () => "unattended" });
+    const perm = initPermission(ctx);
+    const entry = makePermEntry({ interaction: { intent: "tool-approval" } });
+    perm.pendingPermissions.push(entry);
+
+    assert.throws(() => perm.showPermissionBubble(entry));
+    assert.strictEqual(perm.pendingPermissions.includes(entry), true);
+  });
 });
 
 // ── Per-agent coverage ──────────────────────────────────────────────────────
-// Auto-pilot must emit each agent's own "allow" wire format, not just resolve
+// Unattended mode must emit each agent's own "allow" wire format, not just resolve
 // the entry. resolvePermissionEntry(entry, "allow") branches on the is* flags,
 // so this walks every agent that actually routes through showPermissionBubble
 // (the "A class" agents that hand their permission decision to Clawd) and
@@ -227,7 +362,7 @@ function makeCapturingRes() {
   };
 }
 
-describe("auto-pilot: per-agent allow wire formats", () => {
+describe("unattended: per-agent allow wire formats", () => {
   // Each case: the is* flags that the route stamps + a verify() over the
   // captured HTTP response body. CC / CodeBuddy / Kimi share the generic
   // hookSpecificOutput path (no is* flag).
@@ -244,14 +379,6 @@ describe("auto-pilot: per-agent allow wire formats", () => {
     {
       name: "codebuddy (shares CC path)",
       entry: { agentId: "codebuddy" },
-      verify(captured) {
-        const d = JSON.parse(captured.body).hookSpecificOutput.decision;
-        assert.equal(d.behavior, "allow");
-      },
-    },
-    {
-      name: "kimi-cli (interactive perm, shares CC path)",
-      entry: { agentId: "kimi-cli" },
       verify(captured) {
         const d = JSON.parse(captured.body).hookSpecificOutput.decision;
         assert.equal(d.behavior, "allow");
@@ -337,10 +464,9 @@ describe("auto-pilot: per-agent allow wire formats", () => {
         const permEntry = makePermEntry({
           res: null,
           agentId: "opencode",
-          isOpencode: true,
-          opencodeRequestId: "per_test_123",
-          opencodeBridgeUrl: `http://127.0.0.1:${port}`,
-          opencodeBridgeToken: "tok_test",
+          familyRequestId: "per_test_123",
+          familyBridgeUrl: `http://127.0.0.1:${port}`,
+          familyBridgeToken: "tok_test",
         });
         perm.pendingPermissions.push(permEntry);
         perm.showPermissionBubble(permEntry);
@@ -348,7 +474,7 @@ describe("auto-pilot: per-agent allow wire formats", () => {
       });
     });
 
-    // Auto-pilot does not set opencodeAlwaysPicked, so the reply is "once"
+    // Automation does not set familyAlwaysPicked, so the reply is "once"
     // (single-call allow), authenticated with the bridge token.
     assert.equal(received.body.request_id, "per_test_123");
     assert.equal(received.body.reply, "once");

@@ -20,9 +20,16 @@ ipcRenderer.on("dashboard:lang-change", (_event, payload) => {
 contextBridge.exposeInMainWorld("dashboardAPI", {
   getSnapshot: () => ipcRenderer.invoke("dashboard:get-snapshot"),
   getI18n: () => ipcRenderer.invoke("dashboard:get-i18n"),
+  getKimiQuotaStatus: () => ipcRenderer.invoke("dashboard:get-kimi-quota-status"),
+  refreshKimiQuota: () => ipcRenderer.invoke("dashboard:refresh-kimi-quota"),
   focusSession: (sessionId) => ipcRenderer.send("dashboard:focus-session", sessionId),
   hideSession: (sessionId) => ipcRenderer.invoke("dashboard:hide-session", sessionId),
+  openSessionFolder: (sessionId) => ipcRenderer.invoke("dashboard:open-session-folder", sessionId),
   setSessionAlias: (payload) => ipcRenderer.invoke("dashboard:set-session-alias", payload),
+  setSessionAutomationOverride: (payload) =>
+    ipcRenderer.invoke("dashboard:set-session-automation", payload),
+  clearSessionAutomationGrant: (payload) =>
+    ipcRenderer.invoke("dashboard:clear-session-automation-grant", payload),
   ackCompletion: (sessionId) => ipcRenderer.invoke("session:ack-completion", sessionId),
   onSessionSnapshot: (cb) => {
     if (typeof cb !== "function") return () => {};

@@ -4,8 +4,10 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 const { registerSessionIpc } = require("../src/session-ipc");
+const { SUPPORTED_LANGS } = require("../src/i18n");
 
 class FakeIpcMain {
   constructor() {
@@ -35,6 +37,12 @@ class FakeIpcMain {
     return listener({ sender: "sender-web-contents" }, ...args);
   }
 
+  invokeFrom(event, channel, ...args) {
+    const listener = this.handlers.get(channel);
+    assert.strictEqual(typeof listener, "function", `missing IPC handler ${channel}`);
+    return listener(event, ...args);
+  }
+
   send(channel, ...args) {
     const listener = this.listeners.get(channel);
     assert.strictEqual(typeof listener, "function", `missing IPC listener ${channel}`);
@@ -45,6 +53,14 @@ class FakeIpcMain {
 function createHarness(overrides = {}) {
   const calls = [];
   const ipcMain = new FakeIpcMain();
+  const dashboardMainFrame = {
+    url: pathToFileURL(path.join(__dirname, "..", "src", "dashboard.html")).toString(),
+  };
+  const dashboardWebContents = { mainFrame: dashboardMainFrame };
+  const dashboardWindow = {
+    webContents: dashboardWebContents,
+    isDestroyed: () => false,
+  };
   const runtime = registerSessionIpc({
     ipcMain,
     getSessionSnapshot: overrides.getSessionSnapshot || (() => ({ sessions: [{ id: "s1" }] })),
@@ -70,19 +86,57 @@ function createHarness(overrides = {}) {
       calls.push(["ackSessionCompletion", sessionId]);
       return true;
     }),
+    openSessionFolder: overrides.openSessionFolder || (async (sessionId) => {
+      calls.push(["openSessionFolder", sessionId]);
+      return { status: "ok" };
+    }),
+    setSessionAutomationOverride: overrides.setSessionAutomationOverride || (async (payload, context) => {
+      calls.push(["setSessionAutomationOverride", payload, context]);
+      return { status: "applied" };
+    }),
+    clearSessionAutomationGrant: overrides.clearSessionAutomationGrant || ((payload) => {
+      calls.push(["clearSessionAutomationGrant", payload]);
+      return { status: "applied" };
+    }),
+    getDashboardWindow: overrides.getDashboardWindow || (() => dashboardWindow),
+    getKimiQuotaStatus: overrides.getKimiQuotaStatus || (() => ({
+      status: "ok",
+      configured: true,
+      decryptable: true,
+      collectionEnabled: true,
+      agentEnabled: true,
+    })),
+    refreshKimiQuota: overrides.refreshKimiQuota || (() => {
+      calls.push(["refreshKimiQuota"]);
+      return { status: "ok" };
+    }),
   });
-  return { ipcMain, runtime, calls };
+  return {
+    ipcMain,
+    runtime,
+    calls,
+    trustedDashboardEvent: {
+      sender: dashboardWebContents,
+      senderFrame: dashboardMainFrame,
+    },
+  };
 }
 
 test("session IPC registers owned channels and disposes them", () => {
   const { ipcMain, runtime } = createHarness();
 
   assert.deepStrictEqual([...ipcMain.handlers.keys()].sort(), [
+    "dashboard:clear-session-automation-grant",
     "dashboard:get-i18n",
+    "dashboard:get-kimi-quota-status",
     "dashboard:get-snapshot",
     "dashboard:hide-session",
+    "dashboard:open-session-folder",
+    "dashboard:refresh-kimi-quota",
     "dashboard:set-session-alias",
+    "dashboard:set-session-automation",
     "session-hud:get-i18n",
+    "session-hud:open-session-folder",
     "session:ack-completion",
   ]);
   assert.deepStrictEqual([...ipcMain.listeners.keys()].sort(), [
@@ -126,6 +180,14 @@ test("session IPC delegates dashboard and HUD behavior", async () => {
     await ipcMain.invoke("dashboard:set-session-alias", { sessionId: "s1", alias: "Frontend" }),
     { status: "ok", alias: "Frontend" }
   );
+  assert.deepStrictEqual(
+    await ipcMain.invoke("dashboard:open-session-folder", "folder-session"),
+    { status: "ok" }
+  );
+  assert.deepStrictEqual(
+    await ipcMain.invoke("session-hud:open-session-folder", "hud-folder-session"),
+    { status: "ok" }
+  );
 
   assert.deepStrictEqual(calls, [
     ["focusSession", "dash-session", { requestSource: "dashboard" }],
@@ -134,7 +196,52 @@ test("session IPC delegates dashboard and HUD behavior", async () => {
     ["setSessionHudPinned", false],
     ["hideSession", "hidden-session"],
     ["setSessionAlias", { sessionId: "s1", alias: "Frontend" }],
+    ["openSessionFolder", "folder-session"],
+    ["openSessionFolder", "hud-folder-session"],
   ]);
+});
+
+test("dashboard and HUD open-folder IPC accept only a sessionId string", async () => {
+  const { ipcMain, calls } = createHarness();
+  for (const channel of ["dashboard:open-session-folder", "session-hud:open-session-folder"]) {
+    for (const bad of [null, undefined, "", 42, { sessionId: "s1", cwd: "/tmp" }]) {
+      const result = await ipcMain.invoke(channel, bad);
+      assert.strictEqual(result.status, "error");
+    }
+  }
+  assert.deepStrictEqual(calls, []);
+});
+
+test("Kimi quota Dashboard IPC accepts only the real Dashboard main frame", async () => {
+  const { ipcMain, calls, trustedDashboardEvent } = createHarness();
+
+  assert.deepStrictEqual(
+    await ipcMain.invokeFrom(trustedDashboardEvent, "dashboard:get-kimi-quota-status"),
+    {
+      status: "ok",
+      configured: true,
+      decryptable: true,
+      collectionEnabled: true,
+      agentEnabled: true,
+    }
+  );
+  assert.deepStrictEqual(
+    await ipcMain.invokeFrom(trustedDashboardEvent, "dashboard:refresh-kimi-quota"),
+    { status: "ok" }
+  );
+  assert.deepStrictEqual(calls, [["refreshKimiQuota"]]);
+
+  for (const event of [
+    { sender: trustedDashboardEvent.sender },
+    { sender: {}, senderFrame: trustedDashboardEvent.senderFrame },
+    { sender: trustedDashboardEvent.sender, senderFrame: { ...trustedDashboardEvent.senderFrame } },
+  ]) {
+    assert.deepStrictEqual(
+      await ipcMain.invokeFrom(event, "dashboard:refresh-kimi-quota"),
+      { status: "error", reason: "untrusted-dashboard-sender" }
+    );
+  }
+  assert.deepStrictEqual(calls, [["refreshKimiQuota"]]);
 });
 
 test("session IPC owns dashboard open bridges", () => {
@@ -148,6 +255,46 @@ test("session IPC owns dashboard open bridges", () => {
     ["showDashboard", { source: "hud" }],
     ["showDashboard", { source: "settings" }],
     ["showDashboard", undefined],
+  ]);
+});
+
+test("session automation IPC accepts only the two narrow renderer payloads", async () => {
+  const { ipcMain, calls } = createHarness();
+  assert.deepStrictEqual(
+    await ipcMain.invoke("dashboard:set-session-automation", {
+      sessionId: "s1",
+      mode: "auto-tools",
+    }),
+    { status: "applied" }
+  );
+  assert.deepStrictEqual(
+    await ipcMain.invoke("dashboard:clear-session-automation-grant", { grantId: "g1" }),
+    { status: "applied" }
+  );
+  for (const payload of [
+    { sessionId: "s1", mode: "auto-tools", agentId: "claude-code" },
+    { sessionId: "s1", mode: "unattended" },
+    { mode: "off" },
+  ]) {
+    assert.deepStrictEqual(
+      await ipcMain.invoke("dashboard:set-session-automation", payload),
+      { status: "invalid" }
+    );
+  }
+  assert.deepStrictEqual(
+    await ipcMain.invoke("dashboard:clear-session-automation-grant", {
+      grantId: "g1",
+      target: "remote-revoke",
+    }),
+    { status: "invalid" }
+  );
+  assert.deepStrictEqual(calls, [
+    [
+      "setSessionAutomationOverride",
+      { sessionId: "s1", mode: "auto-tools" },
+      { sender: "sender-web-contents" },
+    ],
+    ["clearSessionAutomationGrant", { grantId: "g1" }],
   ]);
 });
 
@@ -199,6 +346,9 @@ test("registerSessionIpc requires ackSessionCompletion dep", () => {
       setSessionAlias: () => {},
       showDashboard: () => {},
       setSessionHudPinned: () => {},
+      openSessionFolder: () => {},
+      setSessionAutomationOverride: () => {},
+      clearSessionAutomationGrant: () => {},
       // ackSessionCompletion intentionally absent
     }),
     /ackSessionCompletion/
@@ -227,11 +377,38 @@ test("dashboard renderer wires the Mark-read button + ackCompletion fallback (so
     "Mark-read click must re-enable button on ack failure");
 
   const i18nSrc = fs.readFileSync(path.join(__dirname, "..", "src", "i18n.js"), "utf8");
-  // Both new keys must appear in all 5 language tables (en/zh/zh-TW/ko/ja).
+  // Both new keys must appear once in every supported language table.
   for (const key of ["dashboardMarkRead", "dashboardMarkReadTitle"]) {
     const matches = i18nSrc.match(new RegExp(`\\b${key}:`, "g"));
-    assert.ok(matches && matches.length >= 5,
-      `${key} should appear in all 5 language tables (saw ${matches ? matches.length : 0})`);
+    const matchCount = matches ? matches.length : 0;
+    assert.strictEqual(matchCount, SUPPORTED_LANGS.length,
+      `${key} should appear in all ${SUPPORTED_LANGS.length} supported language tables (saw ${matchCount})`);
+  }
+});
+
+test("Dashboard exposes the trusted Kimi quota refresh bridge and localized action", () => {
+  const rendererSrc = fs.readFileSync(path.join(__dirname, "..", "src", "dashboard-renderer.js"), "utf8");
+  const preloadSrc = fs.readFileSync(path.join(__dirname, "..", "src", "preload-dashboard.js"), "utf8");
+  const htmlSrc = fs.readFileSync(path.join(__dirname, "..", "src", "dashboard.html"), "utf8");
+  const i18nSrc = fs.readFileSync(path.join(__dirname, "..", "src", "i18n.js"), "utf8");
+
+  // The refresh button is built by the renderer inside the Kimi quota
+  // section header, not static markup in dashboard.html.
+  assert.match(rendererSrc, /quota-refresh-button/);
+  assert.match(htmlSrc, /\.quota-refresh-button\s*\{/);
+  assert.match(preloadSrc, /dashboard:get-kimi-quota-status/);
+  assert.match(preloadSrc, /dashboard:refresh-kimi-quota/);
+  assert.match(rendererSrc, /refreshKimiQuotaFromDashboard/);
+  for (const key of [
+    "dashboardKimiQuotaRefresh",
+    "dashboardKimiQuotaRefreshing",
+    "dashboardKimiQuotaUpdated",
+    "dashboardKimiQuotaRefreshFailed",
+    "dashboardKimiQuotaEmpty",
+    "dashboardKimiQuotaRefreshShort",
+  ]) {
+    const matches = i18nSrc.match(new RegExp(`\\b${key}:`, "g"));
+    assert.strictEqual(matches ? matches.length : 0, SUPPORTED_LANGS.length);
   }
 });
 

@@ -86,7 +86,7 @@ my-theme/
 
 1. Start from `themes/template/`
 2. Choose whether you want eye tracking:
-   - `eyeTracking.enabled: true` → your `idle` asset must be SVG and include `#eyes-js`
+   - `eyeTracking.enabled: true` → every file in a state listed by `eyeTracking.states` must be SVG. In the template, `idle` is listed: only `states.idle[0]` follows the cursor and it must include the legacy `#eyes-js` target; put additional non-SVG idle visuals in `idleAnimations`
    - `eyeTracking.enabled: false` → idle can also be GIF / APNG / WebP / PNG / JPG / JPEG
 3. Create simple frame animations (4-12 frames) for other states using [Piskel](https://www.piskelapp.com/) (free, browser-based) or [Aseprite](https://www.aseprite.org/) (paid, pixel art pro tool)
 4. Export as APNG / WebP / GIF, or use single-frame PNG / JPG / JPEG for static poses
@@ -123,6 +123,8 @@ External themes are treated as untrusted input. SVG files in user themes are san
 - `url(#local-id)` fragment references for filters, masks, gradients, and markers are allowed
 
 Do not build a user theme that depends on JavaScript inside SVG files. The built-in Cloudling theme uses `trustedRuntime.scriptedSvgFiles`, but that capability is only honored for themes loaded from Clawd's packaged/repo `themes/` directory. If an external theme declares `trustedRuntime`, Clawd ignores it.
+
+Ordinary CSS and SMIL animation can run in Chromium's lower-power `<img>` channel, but that channel does not expose `contentDocument` for runtime controls such as reliable pause/resume or document inspection. List a sanitized SVG basename in `rendering.objectChannelFiles` only when that specific asset has been verified to require document-backed behavior; do not list every animated SVG. Listed files become required theme assets and opt the theme into the higher-power scripted rendering profile. This field does not enable JavaScript: external theme SVGs are still sanitized first, including dynamic SMIL attribute values.
 
 ## theme.json Reference
 
@@ -173,6 +175,22 @@ These are common optional states you can add when you want distinct visuals for 
 | `sweeping` | Context compaction | |
 | `carrying` | Worktree creation | |
 | `juggling` | Subagent active | Declare this and/or `jugglingTiers` if you want a distinct juggling visual |
+| `roam` | Free roam walk | Bind a dedicated walk visual; see Free Roam Walk Visual below |
+
+### Free Roam Walk Visual
+
+While free roam moves the pet across the screen, themes without a `roam` binding show the idle visual with a synthetic walking bob. Bind a dedicated walk visual to replace it:
+
+```json
+"states": {
+  "roam": ["my-theme-walk.apng"]
+}
+```
+
+- Any playback format works (SVG with CSS/SMIL animations, GIF, APNG, WebP)
+- Draw the walk art **facing right** — the renderer mirrors it automatically while the pet walks left
+- If your art faces left instead, declare a top-level `"roamFlipAssets": true` to invert the mirror
+- Without a `roam` binding nothing breaks: the pet keeps the idle-visual-plus-bob fallback
 
 ### Optional Update Visuals
 
@@ -237,13 +255,86 @@ The existing schema fields are the only runtime truth. They already act as the t
 |-------|-----------------|
 | `eyeTracking.enabled` | Global eye-tracking on/off switch. When `false`, states do not need SVG just for cursor tracking. |
 | `eyeTracking.states` | Per-state whitelist for eye tracking. Only listed states must be SVG and will use the object channel. |
+| `rendering.objectChannelFiles` | Optional SVG basename list for files that specifically require document-backed runtime control. Listed files are required assets; external SVGs remain sanitized. |
 | `miniMode.supported` | Enables mini mode for this theme. When `false`, Mini Mode is gated off in the menu/tray and edge-snap path. |
 | `idleAnimations` | Optional idle random pool. Omit or leave empty to keep idle on `states.idle[0]`. |
+| `idleEasterEggs` | Optional conditional idle pool. Each entry runs only for an exact selected head + mouth accessory pair and is subject to its own probability and cooldown. |
 | `reactions` | Optional click/drag reaction block. Omit it to disable click and drag reactions entirely. |
 | `workingTiers` | Optional multi-session working overrides. Omit to fall back to `states.working[0]`. |
-| `jugglingTiers` | Optional subagent juggling overrides. Omit to fall back to `states.juggling[0]` if you provide that state. |
+| `jugglingTiers` | Optional subagent juggling overrides. Its legacy `minSessions` / `maxSessions` fields count live subagents, not top-level sessions. Omit to fall back to `states.juggling[0]` if you provide that state. |
+| `customization.petTint` | Opts the theme into the app's built-in pet color filters. Omit it or set it to `false` when filters distort authored colors. Themes cannot provide custom CSS filter strings. |
+| `customization.accessories` | Opts the theme into Clawd's built-in **head** accessory catalog only when every reachable visual has a deterministic attachment or an explicit hidden policy. Exact `files` entries may also prepare optional assets exposed by the animation-override picker; those files become required theme assets. |
+| `customization.mouthAccessories` | Independently opts the theme into the built-in mouth accessory catalog under the same complete-coverage rule, including optional picker assets declared by exact `files` entries. Omit it for head-only themes. |
 
 The loader also derives read-only metadata such as `idleMode` (`tracked` / `animated` / `static`) from these fields, but that metadata is not a second schema authority.
+
+#### Accessory attachments
+
+Head and mouth accessories render as separate layers outside the pet media, so they keep their own colors. Their fixed paint order is pet media, head, then mouth. Static attachments stay on the normal media channel; while either selected slot uses `followTarget`, that SVG is rendered through the object channel so the external layers can follow their animated targets. Each slot must provide complete attachment coverage before Settings exposes its picker:
+
+```json
+"customization": {
+  "petTint": false,
+  "accessories": {
+    "default": {
+      "staticFrame": { "cx": 7.5, "baseY": 6.5, "width": 16 }
+    },
+    "mini": {
+      "staticFrame": { "cx": 7.5, "baseY": 6.5, "width": 16 }
+    },
+    "files": {
+      "idle.svg": {
+        "staticFrame": { "cx": 7.5, "baseY": 6.5, "width": 16 },
+        "hitBoxPadding": { "left": 1, "top": 2, "right": 1, "bottom": 0 },
+        "followTarget": {
+          "id": "body-js",
+          "frame": { "cx": 7.5, "baseY": 6.5, "width": 16 }
+        }
+      },
+      "sleeping.png": { "visibility": "hidden" }
+    },
+    "itemOverrides": {
+      "cowboy-hat": {
+        "files": {
+          "sleeping.png": { "visibility": "hidden" }
+        }
+      }
+    }
+  },
+  "mouthAccessories": {
+    "default": {
+      "staticFrame": { "cx": 12, "baseY": 11, "width": 5 }
+    },
+    "files": {
+      "notification.svg": {
+        "staticFrame": { "cx": 12, "baseY": 11, "width": 5 },
+        "followTarget": {
+          "id": "mouth-anchor-right",
+          "frame": { "cx": 0.5, "baseY": 1, "width": 1 },
+          "normalizeReflection": "x"
+        }
+      }
+    }
+  }
+}
+```
+
+- `staticFrame` uses the effective viewBox of that visual. `cx` is the head center, `baseY` is the accessory resting line, and `width` is the reference head width.
+- `hitBoxPadding` is optional per-side non-negative motion padding (`left` / `top` / `right` / `bottom`) in the visual's effective viewBox units. It widens only the **drag/click region**; it never moves the drawn accessory. Use it when an animated `followTarget` carries the accessory outside its `staticFrame` — without it those pixels are visible but not draggable.
+  - Accepted on `default`, `mini`, and any `files[basename]` descriptor, but not alongside `{ "visibility": "hidden" }` (a hidden accessory has no hit region to pad).
+  - Every side is optional and defaults to `0`; `{}` is legal and means "no padding". Each side is capped at one effective viewBox dimension by schema validation, and runtime hit geometry clamps the accessory-only contribution to the render-visible viewBox — so a value past the viewBox buys nothing.
+  - Write the values for the visual as drawn, unmirrored. When the pet mirrors (mini mode against the left edge, or a left-heading free-roam walk) the runtime mirrors the padded box for you, so `left` stays the accessory's own left even after the flip.
+  - Mirroring assumes the art is horizontally centred in the pet window. The renderer mirrors about the window centre while hit geometry mirrors about the art rect, so a theme that pushes its art sideways — via `objectScale.fileOffsets[file].x` or a per-file `fileScales` entry — sees the mirrored hit region drift by twice that offset. Every theme that currently enables accessories is centred; `calico` is not, which is safe only because it has no `customization.accessories`.
+  - To pick values, animate the pose and note how far the `followTarget` anchor travels from its `staticFrame` in viewBox units, then round outward. Deriving the bound from the animation's own constants beats sampling it: a sampled figure depends on how fast the machine ran. Built-in envelopes live in `src/pet-accessory-hitbox.js` and are verified by `test/accessory-motion-electron.test.js`; that table is built-in only, so a third-party theme must declare its own padding here.
+- Accessory projection currently supports the SVG default `preserveAspectRatio="xMidYMid meet"` only (omitting the attribute has that default). Themes using `none`, `slice`, or another alignment must not opt into accessories until that projection mode is supported.
+- `default` covers root-viewBox files. `mini` covers mini-viewBox files. A file with its own `fileViewBoxes` entry needs an exact `files[basename]` descriptor.
+- `followTarget.id` is an exact SVG element id, not a CSS selector. Its `frame` coordinates are expressed in that target element's local SVG coordinate system, before the target's own and ancestor transforms. It is used only while that file renders through an accessible `<object>` document; `<img>`, PNG, APNG, GIF, and WebP use the required static fallback.
+- Mouth targets may set `normalizeReflection: "x"` when an internally mirrored target would otherwise reverse an asymmetric mouth item. The runtime keeps the full projected position and only flips the accessory pixels around that projected rectangle's own center.
+- Head attachments may define sparse `itemOverrides.<catalog-id>.files` entries. An exact item/file descriptor wins over the materialized base file descriptor; there is no additional default or mini fallback. `itemOverrides` requires the PR #811 accessory runtime (the first release after 0.16.0); Clawd 0.16.0 and older reject this new key instead of ignoring it.
+- `mouthAccessories` intentionally has no `itemOverrides` in this schema version.
+- Use `{ "visibility": "hidden" }` for poses where an accessory should disappear, such as a covered sleeping pose. Do not combine `visibility` with placement fields.
+- Every reachable state, reaction, idle animation, tier, display hint, mini state, low-power override, update visual, DND sleep transition, and declared idle easter egg must be covered. Incomplete or stale metadata disables only the affected head or mouth capability.
+- Themes choose attachment geometry only. They cannot add accessory files, URLs, scripts, selector heuristics, or custom renderer code.
 
 ### State Visual Fallback
 
@@ -288,6 +379,8 @@ Different animations based on how many agent sessions are running concurrently:
 ]
 ```
 
+`jugglingTiers` uses the same object shape, but its legacy `minSessions` and `maxSessions` names count live subagents within a session.
+
 ### Reactions
 
 Click and drag response animations:
@@ -321,6 +414,33 @@ Random animations played during idle periods:
 ```
 
 Omit `idleAnimations` or use an empty array if you want idle to stay on `states.idle[0]` with no random pool.
+
+### Conditional Idle Easter Eggs
+
+`idleEasterEggs` declares rare idle visuals that belong to one exact head + mouth accessory combination. It does not add another user-selectable idle option:
+
+```json
+"idleEasterEggs": [
+  {
+    "file": "outlaw-bender.svg",
+    "duration": 15000,
+    "chance": 0.05,
+    "cooldownMs": 1800000,
+    "requiresAccessories": {
+      "head": "cowboy-hat",
+      "mouth": "cigarette"
+    }
+  }
+]
+```
+
+- `file` must be a safe basename and is included in required-asset validation, capability coverage, hitbox projection, and animation-cycle discovery.
+- `duration` is 100–60000ms. `cooldownMs` is 0–86400000ms.
+- `chance` is greater than 0 and at most 1. Entries are checked in declaration order against one random roll; their cumulative chance must not exceed 1. The ordinary `idleAnimations` pool is used when no easter egg wins.
+- `requiresAccessories.head` and `.mouth` are both required and must exactly match the active catalog item ids. There is no wildcard or `none` shorthand.
+- The runtime checks eligibility before the roll and again immediately before display. Hidden, low-power, mini, roaming, dragging, menu-open, or non-idle pets neither play the egg nor consume its chance/cooldown. Duration and cooldown begin only after the renderer reports that the logical visual actually committed; an automatic settlement retry may commit under a newer visual generation without losing that playback timer.
+- Both accessory attachment maps must cover the easter-egg file. Use `{ "visibility": "hidden" }` for either external slot when the sprite embeds that item in its own artwork.
+- Third-party easter-egg SVGs receive the normal user-theme sanitizer. Built-in sprites are trusted runtime assets and therefore require repository-level static safety tests instead.
 
 ### Hit Boxes
 

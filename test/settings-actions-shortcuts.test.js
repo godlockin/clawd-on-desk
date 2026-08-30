@@ -29,6 +29,7 @@ function makeDeps(overrides = {}) {
     deps: {
       snapshot,
       globalShortcut,
+      platform: overrides.platform,
       shortcutHandlers: {
         togglePet: () => {},
       },
@@ -69,6 +70,30 @@ test("settings shortcut actions register persistent shortcuts with rollback-safe
   assert.deepStrictEqual([...registered].sort(), ["CommandOrControl+K"]);
 });
 
+test("settings shortcut actions register an explicit macOS Control accelerator", () => {
+  const snapshot = prefs.validate({
+    shortcuts: {
+      togglePet: "CommandOrControl+J",
+    },
+  });
+  const { deps, calls, registered } = makeDeps({
+    snapshot,
+    platform: "darwin",
+    registered: [snapshot.shortcuts.togglePet],
+  });
+
+  const result = shortcutCommands.registerShortcut({
+    actionId: "togglePet",
+    accelerator: "Control+Shift+1",
+  }, deps);
+
+  assert.strictEqual(result.status, "ok");
+  assert.strictEqual(result.commit.shortcuts.togglePet, "Control+Shift+1");
+  assert.deepStrictEqual(calls.register.map((call) => call.accelerator), ["Control+Shift+1"]);
+  assert.deepStrictEqual(calls.unregister, ["CommandOrControl+J"]);
+  assert.deepStrictEqual([...registered].sort(), ["Control+Shift+1"]);
+});
+
 test("settings shortcut actions reject contextual conflicts before touching globalShortcut", () => {
   const snapshot = prefs.getDefaults();
   const { deps, calls } = makeDeps({ snapshot });
@@ -82,4 +107,78 @@ test("settings shortcut actions reject contextual conflicts before touching glob
   assert.match(result.message, /already bound to permissionDeny/);
   assert.deepStrictEqual(calls.register, []);
   assert.deepStrictEqual(calls.unregister, []);
+});
+
+test("settings shortcut actions treat Control and CommandOrControl as equivalent off macOS", () => {
+  const snapshot = prefs.validate({
+    shortcuts: {
+      permissionDeny: "Control+Shift+K",
+    },
+  });
+  const { deps, calls } = makeDeps({ snapshot, platform: "win32" });
+
+  const result = shortcutCommands.registerShortcut({
+    actionId: "permissionAllow",
+    accelerator: "CommandOrControl+Shift+K",
+  }, deps);
+
+  assert.strictEqual(result.status, "error");
+  assert.match(result.message, /already bound to permissionDeny/);
+  assert.deepStrictEqual(calls.register, []);
+  assert.deepStrictEqual(calls.unregister, []);
+});
+
+test("settings shortcut actions reject dangerous accelerators after non-macOS folding", () => {
+  const { deps, calls } = makeDeps({ platform: "linux" });
+
+  const result = shortcutCommands.registerShortcut({
+    actionId: "togglePet",
+    accelerator: "CommandOrControl+Control+C",
+  }, deps);
+
+  assert.strictEqual(result.status, "error");
+  assert.match(result.message, /reserved accelerator/);
+  assert.deepStrictEqual(calls.register, []);
+  assert.deepStrictEqual(calls.unregister, []);
+});
+
+test("settings shortcut actions preserve combined Command and Control on macOS", () => {
+  const snapshot = prefs.validate({
+    shortcuts: {
+      permissionAllow: null,
+    },
+  });
+  const { deps } = makeDeps({ snapshot, platform: "darwin" });
+
+  const result = shortcutCommands.registerShortcut({
+    actionId: "permissionAllow",
+    accelerator: "CommandOrControl+Control+C",
+  }, deps);
+
+  assert.strictEqual(result.status, "ok");
+  assert.strictEqual(
+    result.commit.shortcuts.permissionAllow,
+    "CommandOrControl+Control+C"
+  );
+});
+
+test("settings shortcut actions treat an alias-only non-macOS rebind as a no-op", () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.shortcuts.togglePet = "Control+Shift+K";
+  const { deps, calls, registered } = makeDeps({
+    snapshot,
+    platform: "win32",
+    registered: [snapshot.shortcuts.togglePet],
+  });
+
+  const result = shortcutCommands.registerShortcut({
+    actionId: "togglePet",
+    accelerator: "CommandOrControl+Shift+K",
+  }, deps);
+
+  assert.strictEqual(result.status, "ok");
+  assert.strictEqual(result.noop, true);
+  assert.deepStrictEqual(calls.register, []);
+  assert.deepStrictEqual(calls.unregister, []);
+  assert.deepStrictEqual([...registered], ["Control+Shift+K"]);
 });

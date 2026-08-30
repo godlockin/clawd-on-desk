@@ -5,6 +5,9 @@ const { screen } = require("electron");
 
 module.exports = function initTick(ctx) {
 
+const random = typeof ctx.random === "function" ? ctx.random : Math.random;
+const now = typeof ctx.now === "function" ? ctx.now : Date.now;
+
 // ── Mouse idle tracking ──
 let lastCursorX = null, lastCursorY = null;
 let mouseStillSince = Date.now();
@@ -12,6 +15,8 @@ let isMouseIdle = false;       // showing idle-look
 let hasTriggeredYawn = false;  // 60s threshold already fired
 let idleLookPlayed = false;    // idle-look already played once since last movement
 let idleLookReturnTimer = null;
+let idleLookVisualGeneration = null;
+let idleLookAttempt = null;
 let yawnDelayTimer = null;     // tracked setTimeout for yawn/idle-look transitions
 let idleWasActive = false;
 let lastEyeDx = 0, lastEyeDy = 0;
@@ -21,10 +26,22 @@ let mainTickTimer = null;
 let mainTickActive = false;
 let nextMainTickAt = 0;
 
+// ── Spin detection: tracks cursor circling to trigger dizzy animation ──
+let lastCursorAngle = null;             // last cursor angle (radians) relative to eye-tracking origin
+let accumulatedSpin = 0;                // signed accumulated angular displacement
+let dizzyCooldownUntil = 0;             // timestamp until which dizzy cannot re-trigger
+let lastSpinTickAt = 0;                 // timestamp of last spin tick
+
+const SPIN_THRESHOLD = Math.PI * 4;     // 2 full circles (signed) to trigger dizzy
+const SPIN_IDLE_RESET_MS = 500;         // a pause longer than this resets the spin meter
+const SPIN_MIN_RADIUS = 24;             // cursor must be this many px from center to count
+const DIZZY_COOLDOWN_MS = 12000;        // can't re-trigger dizzy for 12s
+
 const FAST_TICK_MS = 50;
 const BOOST_TICK_MS = 100;
 const IDLE_TICK_MS = 250;
-const LOW_POWER_IDLE_TICK_MS = 5000;
+// Keep a low-rate cursor probe so new movement can leave the paused state.
+const LOW_POWER_IDLE_TICK_MS = 1000;
 const LOW_POWER_MINI_IDLE_TICK_MS = 2000;
 const REACTION_TICK_MS = 500;
 const BACKGROUND_TICK_MS = 750;
@@ -39,7 +56,10 @@ let MOUSE_IDLE_TIMEOUT = 0;
 let MOUSE_SLEEP_TIMEOUT = 0;
 let SVG_IDLE_FOLLOW = null;
 let IDLE_ANIMS = [];
+let IDLE_EASTER_EGGS = [];
+const idleEasterEggLastPlayedAt = new Map();
 let SLEEP_MODE = "full";
+let THEME_SUPPORTS_DIZZY = false;
 
 function refreshTheme() {
   theme = ctx.theme;
@@ -47,10 +67,98 @@ function refreshTheme() {
   MOUSE_SLEEP_TIMEOUT = theme.timings.mouseSleepTimeout;
   SVG_IDLE_FOLLOW = theme.states.idle[0];
   IDLE_ANIMS = (theme.idleAnimations || []).map(a => ({ svg: a.file, duration: a.duration }));
+  IDLE_EASTER_EGGS = (theme.idleEasterEggs || []).map((egg) => ({
+    svg: egg.file,
+    duration: egg.duration,
+    chance: egg.chance,
+    cooldownMs: egg.cooldownMs,
+    requiresAccessories: { ...egg.requiresAccessories },
+  }));
   SLEEP_MODE = theme.sleepSequence && theme.sleepSequence.mode === "direct" ? "direct" : "full";
+  // Precompute dizzy support so the per-tick spin detector can gate cheaply and skip all
+  // its math on themes that don't define a real dizzy state (e.g. Calico, Cloudling).
+  THEME_SUPPORTS_DIZZY = !!(theme.states && Array.isArray(theme.states.dizzy) && theme.states.dizzy.length > 0
+    && theme.timings && theme.timings.autoReturn
+    && Number.isFinite(theme.timings.autoReturn.dizzy) && theme.timings.autoReturn.dizzy > 0);
 }
 
 refreshTheme();
+
+// #509: resting idle sprite — the user-selected default idle visual when set,
+// the theme's follow sprite otherwise. SVG_IDLE_FOLLOW itself stays pure so the
+// eye-tracking gate below only fires on the real follow sprite.
+function idleRestSvg() {
+  const choice = typeof ctx.getIdleVisualChoice === "function" ? ctx.getIdleVisualChoice() : null;
+  return choice || SVG_IDLE_FOLLOW;
+}
+
+function idleEasterEggKey(egg) {
+  const requirements = egg && egg.requiresAccessories;
+  return [
+    theme && theme._id || "",
+    egg && egg.svg || "",
+    requirements && requirements.head || "",
+    requirements && requirements.mouth || "",
+  ].join("|");
+}
+
+function isIdleEasterEggEnvironmentEligible() {
+  if (ctx.currentState !== "idle" || ctx.idlePaused) return false;
+  if (ctx.miniMode || ctx.miniTransitioning || ctx.dragLocked || ctx.menuOpen) return false;
+  if (ctx.lowPowerIdlePaused) return false;
+  if (!ctx.win || ctx.win.isDestroyed()) return false;
+  if (typeof ctx.win.isVisible === "function" && !ctx.win.isVisible()) return false;
+  return true;
+}
+
+function isIdleEasterEggEligible(egg) {
+  if (!IDLE_EASTER_EGGS.includes(egg) || !isIdleEasterEggEnvironmentEligible()) return false;
+  if (typeof ctx.getEffectiveAccessoryIds !== "function") return false;
+  const ids = ctx.getEffectiveAccessoryIds();
+  const requirements = egg.requiresAccessories;
+  if (!ids || ids.head !== requirements.head || ids.mouth !== requirements.mouth) return false;
+  const lastPlayedAt = idleEasterEggLastPlayedAt.get(idleEasterEggKey(egg));
+  return !Number.isFinite(lastPlayedAt) || now() >= lastPlayedAt + egg.cooldownMs;
+}
+
+function chooseIdleEasterEgg() {
+  const eligible = IDLE_EASTER_EGGS.filter(isIdleEasterEggEligible);
+  if (eligible.length === 0) return null;
+  const roll = random();
+  if (!Number.isFinite(roll) || roll < 0 || roll >= 1) return null;
+  let upperBound = 0;
+  for (const egg of eligible) {
+    upperBound += egg.chance;
+    if (roll < upperBound) return egg;
+  }
+  return null;
+}
+
+function finishIdleVisualPlayback(attempt) {
+  idleLookReturnTimer = null;
+  if (idleLookAttempt !== attempt) return;
+  if (!isMouseIdle || ctx.currentState !== "idle") {
+    idleLookVisualGeneration = null;
+    idleLookAttempt = null;
+    return;
+  }
+  if (
+    idleLookVisualGeneration
+    && typeof ctx.isVisualGenerationCurrent === "function"
+    && !ctx.isVisualGenerationCurrent(idleLookVisualGeneration)
+  ) {
+    isMouseIdle = false;
+    idleLookVisualGeneration = null;
+    idleLookAttempt = null;
+    return;
+  }
+  isMouseIdle = false;
+  idleLookVisualGeneration = null;
+  idleLookAttempt = null;
+  const returnSvg = idleRestSvg();
+  ctx.sendToRenderer("state-change", "idle", returnSvg);
+  setTimeout(() => { ctx.forceEyeResend = true; }, 200);
+}
 
 // ── Unified main tick (cursor polling for eye tracking + sleep + mini peek) ──
 // Input routing is handled by hitWin — no setIgnoreMouseEvents toggling here.
@@ -158,6 +266,12 @@ function runMainTickOnce() {
     // ── Idle state edge detection (must run every tick for timer cleanup) ──
     const idleNow = ctx.currentState === "idle" && !ctx.idlePaused;
     const miniIdleNow = ctx.currentState === "mini-idle" && !ctx.idlePaused && !ctx.miniTransitioning;
+    // #569: an active roam walk runs in state "roam", so it must keep polling
+    // the cursor as well — otherwise the "cancel roaming when mouse moves"
+    // block below is unreachable mid-walk, and a user interaction that resizes
+    // the pet (e.g. the Settings size slider) lands mid-walk only to be
+    // overwritten by the walk's anchored per-frame bounds writes.
+    const roamNow = ctx.currentState === "roam" && !ctx.idlePaused;
     const nextDelay = () => getNextTickDelay(idleNow, miniIdleNow);
 
     if (idleNow && !idleWasActive) {
@@ -169,6 +283,9 @@ function runMainTickOnce() {
       mouseStillSince = Date.now();
       lastEyeDx = 0;
       lastEyeDy = 0;
+      lastCursorAngle = null;
+      accumulatedSpin = 0;
+      lastSpinTickAt = 0;
       if (idleLookReturnTimer) { clearTimeout(idleLookReturnTimer); idleLookReturnTimer = null; }
       if (yawnDelayTimer) { clearTimeout(yawnDelayTimer); yawnDelayTimer = null; }
     }
@@ -181,7 +298,7 @@ function runMainTickOnce() {
 
     // Skip expensive native IPC calls (getCursorScreenPoint, getBounds) when
     // cursor tracking is not needed — saves ~20 calls/sec to the OS layer.
-    const needsCursorPoll = idleNow || miniIdleNow || ctx.miniMode;
+    const needsCursorPoll = idleNow || miniIdleNow || ctx.miniMode || roamNow;
     if (!needsCursorPoll) return nextDelay();
 
     const cursor = screen.getCursorScreenPoint();
@@ -233,7 +350,7 @@ function runMainTickOnce() {
 
     sendPointerBridge(cursor, bounds);
 
-    if (!idleNow && !miniIdleNow) return nextDelay();
+    if (!idleNow && !miniIdleNow && !roamNow) return nextDelay();
 
     // ── Free roam: cancel roaming when mouse moves ──
     if (ctx.roam) {
@@ -250,10 +367,12 @@ function runMainTickOnce() {
         hasTriggeredYawn = false;
         idleLookPlayed = false;
         if (idleLookReturnTimer) { clearTimeout(idleLookReturnTimer); idleLookReturnTimer = null; }
+        idleLookVisualGeneration = null;
+        idleLookAttempt = null;
         if (yawnDelayTimer) { clearTimeout(yawnDelayTimer); yawnDelayTimer = null; }
         if (isMouseIdle) {
           isMouseIdle = false;
-          ctx.sendToRenderer("state-change", "idle", SVG_IDLE_FOLLOW);
+          ctx.sendToRenderer("state-change", "idle", idleRestSvg());
         }
       }
 
@@ -280,27 +399,84 @@ function runMainTickOnce() {
         return nextDelay();
       }
 
-      // 20s no mouse movement → random idle animation (play once, then return to idle-follow)
-      if (IDLE_ANIMS.length > 0 && !isMouseIdle && !hasTriggeredYawn && !idleLookPlayed && elapsed >= MOUSE_IDLE_TIMEOUT) {
+      // 20s no mouse movement → random idle animation (play once, then return
+      // to the resting idle visual). A user-chosen resting sprite is excluded
+      // from the pool — "playing" it would be an invisible no-op that eats the
+      // once-per-idle-period slot. With no choice set the pool is untouched:
+      // a theme may deliberately list its follow sprite as a stay-at-rest beat.
+      if (
+        (IDLE_ANIMS.length > 0 || IDLE_EASTER_EGGS.length > 0)
+        && !isMouseIdle
+        && !hasTriggeredYawn
+        && !idleLookPlayed
+        && elapsed >= MOUSE_IDLE_TIMEOUT
+      ) {
+        const choice = typeof ctx.getIdleVisualChoice === "function" ? ctx.getIdleVisualChoice() : null;
+        const pool = choice ? IDLE_ANIMS.filter((a) => a.svg !== choice) : IDLE_ANIMS;
+        const easterEgg = chooseIdleEasterEgg();
+        if (!easterEgg && pool.length === 0) {
+          idleLookPlayed = true;
+          return nextDelay();
+        }
         isMouseIdle = true;
         idleLookPlayed = true;
-        const pick = IDLE_ANIMS[Math.floor(Math.random() * IDLE_ANIMS.length)];
+        const pick = easterEgg || pool[Math.floor(random() * pool.length)];
         if (!shouldSuppressPassiveIpc()) ctx.sendToRenderer("eye-move", 0, 0);
-        setTimeout(() => {
+        yawnDelayTimer = setTimeout(() => {
+          yawnDelayTimer = null;
+          if (easterEgg && !isIdleEasterEggEligible(easterEgg)) {
+            isMouseIdle = false;
+            idleLookPlayed = false;
+            idleLookVisualGeneration = null;
+            if (idleLookReturnTimer) {
+              clearTimeout(idleLookReturnTimer);
+              idleLookReturnTimer = null;
+            }
+            return;
+          }
           if (isMouseIdle && ctx.currentState === "idle") {
-            ctx.sendToRenderer("state-change", "idle", pick.svg);
-            ctx.sendToHitWin("hit-state-sync", { currentSvg: pick.svg });
+            const attempt = {};
+            idleLookAttempt = attempt;
+            const onLogicalSettlement = (settlement) => {
+              if (idleLookAttempt !== attempt) return;
+              if (
+                !settlement
+                || settlement.status !== "committed"
+                || !Number.isSafeInteger(settlement.visualGeneration)
+                || !isMouseIdle
+                || ctx.currentState !== "idle"
+                || (typeof ctx.isVisualGenerationCurrent === "function"
+                  && !ctx.isVisualGenerationCurrent(settlement.visualGeneration))
+              ) {
+                // A failed/superseded load never started playing. Keep the
+                // once-per-idle attempt consumed so a broken asset cannot spin.
+                isMouseIdle = false;
+                idleLookVisualGeneration = null;
+                idleLookAttempt = null;
+                return;
+              }
+              idleLookVisualGeneration = settlement.visualGeneration;
+              if (easterEgg) {
+                idleEasterEggLastPlayedAt.set(idleEasterEggKey(easterEgg), now());
+              }
+              idleLookReturnTimer = setTimeout(
+                () => finishIdleVisualPlayback(attempt),
+                pick.duration
+              );
+            };
+            const request = ctx.sendToRenderer("state-change", "idle", pick.svg, {
+              onLogicalSettlement,
+            });
+            if (idleLookAttempt !== attempt) return;
+            const visualGeneration = request && request.visualGeneration;
+            idleLookVisualGeneration = visualGeneration;
+            if (!Number.isSafeInteger(visualGeneration)) {
+              isMouseIdle = false;
+              idleLookVisualGeneration = null;
+              idleLookAttempt = null;
+            }
           }
         }, 250);
-        idleLookReturnTimer = setTimeout(() => {
-          idleLookReturnTimer = null;
-          if (isMouseIdle && ctx.currentState === "idle") {
-            isMouseIdle = false;
-            ctx.sendToRenderer("state-change", "idle", SVG_IDLE_FOLLOW);
-            ctx.sendToHitWin("hit-state-sync", { currentSvg: SVG_IDLE_FOLLOW });
-            setTimeout(() => { ctx.forceEyeResend = true; }, 200);
-          }
-        }, 250 + pick.duration);
         return nextDelay();
       }
 
@@ -309,8 +485,14 @@ function runMainTickOnce() {
     }
 
     const trackEyesNow = (idleNow && ctx.currentSvg === SVG_IDLE_FOLLOW && !isMouseIdle) || miniIdleNow;
-    if (!trackEyesNow) return nextDelay();
-    if (shouldSuppressPassiveIpc()) {
+    if (!trackEyesNow) {
+      // Resting on a non-follow visual: the eye path below never runs, so
+      // consume the resend flag here — otherwise needsBounds stays true and
+      // getPetWindowBounds() fires every idle tick for nothing.
+      if (idleNow && !isMouseIdle && ctx.forceEyeResend) ctx.forceEyeResend = false;
+      return nextDelay();
+    }
+    if (shouldSuppressPassiveIpc() && !moved) {
       if (ctx.forceEyeResend) ctx.forceEyeResend = false;
       return nextDelay();
     }
@@ -321,7 +503,7 @@ function runMainTickOnce() {
     if (!moved && !ctx.forceEyeResend) return nextDelay();
 
     // ── Eye position calculation (shared by idle and mini-idle) ──
-    const skipDedup = ctx.forceEyeResend;
+    const skipDedup = ctx.forceEyeResend || (ctx.lowPowerIdlePaused && moved);
     ctx.forceEyeResend = false;
 
     if (!bounds) {
@@ -359,6 +541,51 @@ function runMainTickOnce() {
       ctx.sendToRenderer("eye-move", eyeDx, eyeDy);
     }
 
+    // --- Spin detection: detect sustained circling around the pet to trigger dizzy ---
+    // Only active during normal idle eye-follow (not mini-idle, not idle-look), and only
+    // when the active theme actually supports dizzy (THEME_SUPPORTS_DIZZY) — so unsupported
+    // themes (Calico, Cloudling) skip the math entirely and keep normal idle behavior.
+    //
+    // We accumulate SIGNED angular displacement: circling one way keeps the same sign and
+    // builds toward the threshold, while back-and-forth wiggling cancels out. The meter
+    // resets on a pause, or when the cursor is too close to the eye-tracking origin (where
+    // the angle is dominated by sub-pixel jitter), instead of decaying every tick — so a
+    // genuine two-circle gesture reaches ±SPIN_THRESHOLD precisely.
+    if (idleNow && !miniIdleNow && !isMouseIdle && moved && THEME_SUPPORTS_DIZZY) {
+      const now = Date.now();
+
+      if (dist < SPIN_MIN_RADIUS) {
+        // Too close to the center — angle is unreliable; break the accumulation chain.
+        lastCursorAngle = null;
+        accumulatedSpin = 0;
+      } else {
+        const angle = Math.atan2(relY, relX);
+        const stalled = lastSpinTickAt > 0 && (now - lastSpinTickAt) > SPIN_IDLE_RESET_MS;
+        if (lastCursorAngle === null || stalled) {
+          // First sample, or resumed after a pause → (re)start the meter.
+          accumulatedSpin = 0;
+        } else {
+          let delta = angle - lastCursorAngle;
+          if (delta > Math.PI) delta -= 2 * Math.PI;
+          if (delta < -Math.PI) delta += 2 * Math.PI;
+          accumulatedSpin += delta; // signed: reversing direction cancels progress
+
+          if (Math.abs(accumulatedSpin) >= SPIN_THRESHOLD && now > dizzyCooldownUntil) {
+            accumulatedSpin = 0;
+            lastCursorAngle = null;
+            lastSpinTickAt = 0;
+            dizzyCooldownUntil = now + DIZZY_COOLDOWN_MS;
+            lastEyeDx = 0;
+            lastEyeDy = 0;
+            ctx.setState("dizzy");
+            return nextDelay();
+          }
+        }
+        lastCursorAngle = angle;
+      }
+      lastSpinTickAt = now;
+    }
+
     return nextDelay();
 }
 
@@ -371,6 +598,8 @@ function cleanup() {
   if (mainTickTimer) { clearTimeout(mainTickTimer); mainTickTimer = null; }
   nextMainTickAt = 0;
   if (idleLookReturnTimer) { clearTimeout(idleLookReturnTimer); idleLookReturnTimer = null; }
+  idleLookAttempt = null;
+  idleLookVisualGeneration = null;
   if (yawnDelayTimer) { clearTimeout(yawnDelayTimer); yawnDelayTimer = null; }
   lastCursorX = null;
   lastCursorY = null;
@@ -382,6 +611,10 @@ function cleanup() {
   lastEyeDy = 0;
   lastPointerBridgeKey = null;
   lastPointerBridgePayload = null;
+  lastCursorAngle = null;
+  accumulatedSpin = 0;
+  dizzyCooldownUntil = 0;
+  lastSpinTickAt = 0;
 }
 
 // Expose mouseStillSince for wake poll (state.js deep sleep timeout)

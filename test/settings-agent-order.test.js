@@ -40,7 +40,7 @@ describe("settings agent order", () => {
       { id: "cursor-agent", name: "Cursor Agent", capabilities: {} },
       { id: "openclaw", name: "OpenClaw", capabilities: {} },
       { id: "hermes", name: "Hermes Agent", capabilities: {} },
-      { id: "reasonix", name: "Reasonix CLI", capabilities: { notificationHook: true } },
+      { id: "reasonix", name: "Reasonix", capabilities: { notificationHook: true } },
       { id: "codex", name: "Codex CLI", capabilities: { interactiveBubble: true } },
       { id: "kimi-cli", name: "Kimi CLI", capabilities: { permissionApproval: true, notificationHook: true } },
       { id: "qwen-code", name: "Qwen Code", capabilities: { permissionApproval: true, notificationHook: true } },
@@ -74,6 +74,24 @@ describe("settings agent order", () => {
       { id: "claude-code", name: "Claude Code", capabilities: { permissionApproval: true } },
     ]);
     assert.deepStrictEqual(sorted.map((agent) => agent.id), ["claude-code", "codebuddy", "qoder"]);
+  });
+
+  it("places ZCode (state-only) in the non-collapsible group after reasonix", () => {
+    // Regression: zcode was absent from both priority tables, so it fell to
+    // Infinity and landed after every known agent by name — unstable. It is
+    // state-only (no permission/notification hooks) → non-collapsible.
+    const sorted = sortAgentMetadataForSettings([
+      { id: "zcode", name: "ZCode", capabilities: {} },
+      { id: "reasonix", name: "Reasonix", capabilities: {} },
+      { id: "antigravity-cli", name: "Antigravity CLI", capabilities: {} },
+      { id: "claude-code", name: "Claude Code", capabilities: { permissionApproval: true } },
+    ]);
+    assert.deepStrictEqual(sorted.map((agent) => agent.id), [
+      "claude-code",
+      "antigravity-cli",
+      "reasonix",
+      "zcode",
+    ]);
   });
 
   it("keeps unknown agents in their group but appends them after known priorities by name", () => {

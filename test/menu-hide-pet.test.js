@@ -1,12 +1,17 @@
 const assert = require("node:assert");
 const Module = require("node:module");
+const path = require("node:path");
 const { describe, it } = require("node:test");
 
 const MENU_MODULE_PATH = require.resolve("../src/menu");
 
-function loadMenuWithElectron(fakeElectron, fakeTaskbar = null) {
+function loadMenuWithElectron(fakeElectron, fakeTaskbar = null, platform = null) {
   delete require.cache[MENU_MODULE_PATH];
   const originalLoad = Module._load;
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (platform) {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
+  }
   Module._load = function patchedLoad(request, parent, isMain) {
     if (request === "electron") return fakeElectron;
     if (fakeTaskbar && request === "./taskbar") return fakeTaskbar;
@@ -16,6 +21,7 @@ function loadMenuWithElectron(fakeElectron, fakeTaskbar = null) {
     return require("../src/menu");
   } finally {
     Module._load = originalLoad;
+    if (platform) Object.defineProperty(process, "platform", originalPlatform);
   }
 }
 
@@ -67,7 +73,7 @@ function buildBaseCtx(overrides = {}) {
     getMiniMode: () => false,
     getMiniTransitioning: () => false,
     getDisableMiniMode: () => false,
-    getActiveThemeCapabilities: () => ({ miniMode: true }),
+    getActiveThemeCapabilities: () => ({ miniMode: true, petTint: true }),
     openDashboard: () => {},
     openSettingsWindow: () => {},
     togglePetVisibility: () => {},
@@ -85,6 +91,7 @@ function buildBaseCtx(overrides = {}) {
     syncHitWin: () => {},
     flushRuntimeStateToPrefs: () => {},
     reapplyMacVisibility: () => {},
+    getSettingsWindow: () => null,
     clampToScreenVisual: (x, y) => ({ x, y }),
     ...overrides,
   };
@@ -199,6 +206,22 @@ describe("menu grouping invariants", () => {
   });
 });
 
+describe("pet color menu placement", () => {
+  it("keeps pet colors out of both tray and context quick menus", () => {
+    const initMenu = loadMenuWithElectron(fakeElectron());
+    let trayTemplate = null;
+    const ctx = buildBaseCtx({
+      tray: { setContextMenu(menuObj) { trayTemplate = menuObj.template; } },
+    });
+    const menu = initMenu(ctx);
+
+    menu.buildTrayMenu();
+    menu.buildContextMenu();
+    assert.ok(!trayTemplate.some((item) => item.label === "Pet Color"));
+    assert.ok(!ctx.contextMenu.template.some((item) => item.label === "Pet Color"));
+  });
+});
+
 describe("macOS visibility toggles live in the tray, not the right-click menu", () => {
   it("drops Show in Dock / Show in Menu Bar from the context menu but keeps them in the tray", (t) => {
     if (process.platform !== "darwin") {
@@ -219,5 +242,115 @@ describe("macOS visibility toggles live in the tray, not the right-click menu", 
     assert.ok(!ctxLabels.includes("Show in Menu Bar"), "context menu drops Show in Menu Bar");
     assert.ok(trayLabels.includes("Show in Dock"), "tray keeps Show in Dock");
     assert.ok(trayLabels.includes("Show in Menu Bar"), "tray keeps Show in Menu Bar");
+  });
+});
+
+describe("macOS runtime Dock visibility", () => {
+  it("installs the padded Clawd icon before showing Dock after a tray-only launch", async () => {
+    const calls = [];
+    const electron = fakeElectron();
+    electron.app = {
+      quit() {},
+      setActivationPolicy(policy) { calls.push(["activation", policy]); },
+      dock: {
+        setIcon(iconPath) { calls.push(["setIcon", iconPath]); },
+        show() { calls.push(["show"]); return Promise.resolve(); },
+        hide() { calls.push(["hide"]); },
+      },
+    };
+    const initMenu = loadMenuWithElectron(electron, null, "darwin");
+    const ctx = buildBaseCtx({
+      showDock: true,
+      reapplyMacVisibility() { calls.push(["reapplyMacVisibility"]); },
+    });
+
+    await initMenu(ctx).applyDockVisibility();
+
+    assert.deepStrictEqual(calls, [
+      ["setIcon", path.join(__dirname, "../assets/dock-icon.png")],
+      ["activation", "regular"],
+      ["setIcon", path.join(__dirname, "../assets/dock-icon.png")],
+      ["reapplyMacVisibility"],
+    ]);
+  });
+
+  it("hides Dock through accessory policy without redundant icon writes", async () => {
+    const calls = [];
+    const electron = fakeElectron();
+    electron.app = {
+      quit() {},
+      setActivationPolicy(policy) { calls.push(["activation", policy]); },
+      dock: {
+        setIcon(iconPath) { calls.push(["setIcon", iconPath]); },
+        show() { calls.push(["show"]); },
+        hide() { calls.push(["hide"]); },
+      },
+    };
+    const initMenu = loadMenuWithElectron(electron, null, "darwin");
+    const ctx = buildBaseCtx({
+      showDock: false,
+      reapplyMacVisibility() { calls.push(["reapplyMacVisibility"]); },
+    });
+
+    await initMenu(ctx).applyDockVisibility();
+
+    assert.deepStrictEqual(calls, [
+      ["activation", "accessory"],
+      ["reapplyMacVisibility"],
+    ]);
+  });
+
+  it("lets packaged Tahoe render the bundle icon during Dock promotion", async () => {
+    const calls = [];
+    const electron = fakeElectron();
+    electron.app = {
+      isPackaged: true,
+      quit() {},
+      setActivationPolicy(policy) { calls.push(["activation", policy]); },
+      dock: {
+        setIcon(iconPath) { calls.push(["setIcon", iconPath]); },
+      },
+    };
+    const initMenu = loadMenuWithElectron(electron, null, "darwin");
+    const ctx = buildBaseCtx({
+      showDock: true,
+      getSystemVersion: () => "26.5.2",
+      reapplyMacVisibility() { calls.push(["reapplyMacVisibility"]); },
+    });
+
+    await initMenu(ctx).applyDockVisibility();
+
+    assert.deepStrictEqual(calls, [
+      ["activation", "regular"],
+      ["reapplyMacVisibility"],
+    ]);
+  });
+
+  it("retains the padded icon for packaged pre-Tahoe Dock promotion", async () => {
+    const calls = [];
+    const electron = fakeElectron();
+    electron.app = {
+      isPackaged: true,
+      quit() {},
+      setActivationPolicy(policy) { calls.push(["activation", policy]); },
+      dock: {
+        setIcon(iconPath) { calls.push(["setIcon", iconPath]); },
+      },
+    };
+    const initMenu = loadMenuWithElectron(electron, null, "darwin");
+    const ctx = buildBaseCtx({
+      showDock: true,
+      getSystemVersion: () => "25.9",
+      reapplyMacVisibility() { calls.push(["reapplyMacVisibility"]); },
+    });
+
+    await initMenu(ctx).applyDockVisibility();
+
+    assert.deepStrictEqual(calls, [
+      ["setIcon", path.join(__dirname, "../assets/dock-icon.png")],
+      ["activation", "regular"],
+      ["setIcon", path.join(__dirname, "../assets/dock-icon.png")],
+      ["reapplyMacVisibility"],
+    ]);
   });
 });

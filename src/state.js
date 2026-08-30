@@ -35,7 +35,14 @@ const {
   sessionSnapshotSignature,
 } = require("./state-session-snapshot");
 const { getAgentIconUrl } = require("./state-agent-icons");
+const { resolveSessionIdentity } = require("./session-key");
 const { normalizeTranscriptPath } = require("./transcript-path");
+const { createAccountQuotaStore } = require("./state-account-quota");
+const { normalizeQuotaGroup } = require("../hooks/quota-bucket");
+const { ANTIGRAVITY_QUOTA_FIELDS } = require("../hooks/antigravity-context-usage");
+const { CLAUDE_QUOTA_FIELDS } = require("../hooks/claude-rate-limits");
+const { getClaudeStopDisposition } = require("../hooks/claude-stop-disposition");
+const { getStartupRecoveryProcessNames } = require("../agents/registry");
 const {
   readTranscriptTailEntries: readClaudeTranscriptTailEntries,
   extractLastAssistantTextFromEntries: extractLastClaudeAssistantTextFromEntries,
@@ -75,12 +82,37 @@ let DND_SLEEP_TRANSITION_DURATION = 0;
 let COLLAPSE_DURATION = 0;
 let SLEEP_MODE = "full";
 const { SLEEP_SEQUENCE, STATE_PRIORITY, ONESHOT_STATES } = createStatePriorityConstants();
+const {
+  clearSubagentTracker,
+  cloneSubagentTracker,
+  getSubagentVisualCount,
+  hasConfirmedSubagents,
+  hasSubagentHoldEvidence,
+  normalizeChildId,
+} = require("./subagent-lifecycle");
 
 // Session display hints — validated against theme.displayHintMap keys
 let DISPLAY_HINT_MAP = {};
 
 // ── Session tracking ──
 const sessions = new Map();
+// Account-wide rate-limit quota, keyed by reporting source — deliberately
+// NOT session state (see src/state-account-quota.js). Persistence is
+// opt-in via ctx so the many test-constructed state runtimes stay
+// filesystem-free; main.js passes the real path.
+const accountQuota = createAccountQuotaStore({
+  persistPath: ctx.accountQuotaPersistPath || null,
+  logWarn: console.warn,
+});
+// Upgrade cleanup: older builds retained the last local Claude quota even
+// after the user opted out. Remove that misleading cache before the first
+// snapshot while preserving Remote SSH and every non-Claude provider.
+if (ctx.claudeQuotaCollectionEnabled === false) {
+  clearLocalClaudeQuota({ broadcast: false });
+}
+if (ctx.kimiQuotaCollectionEnabled === false) {
+  clearLocalKimiQuota({ broadcast: false });
+}
 const MAX_SESSIONS = 20;
 const ASSISTANT_OUTPUT_MAX = 2400;
 const CODEX_EXIT_PROBE_DELAYS_MS = [1000, 3000, 8000, 15000];
@@ -97,41 +129,12 @@ const COMPLETION_HOUSEKEEPING_EVENTS = new Set([
 const COMPLETION_CANCEL_EVENTS = new Set([
   "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
   "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
-  "PermissionRequest", "Elicitation", "StopFailure", "ApiError", "SessionEnd",
+  "PermissionRequest", "CodexUserInputRequest", "Elicitation", "StopFailure", "ApiError", "SessionEnd",
 ]);
-// #449: headless sessions (claude -p / Agent SDK hosts such as Obsidian-
-// Claudian) end every intermediate orchestrator step with a REAL Stop and
-// submit the next step right after, so each step celebrated. The follow-up
-// UserPromptSubmit lands within hook-spawn latency (~0.3s) of the Stop, so a
-// 2s quiet window absorbs it; a genuinely final Stop just celebrates 2s late.
-const HEADLESS_COMPLETION_DEBOUNCE_MS = 2000;
-// Claude Desktop can leave a background_tasks entry attached to a user-visible
-// final Stop even after the assistant reply is complete. Treat that bg-only
-// Stop as tentative, not permanently working, when the hook also extracted the
-// assistant's final text.
-const BACKGROUND_TASKS_COMPLETION_DEBOUNCE_MS = 2000;
 const CLAUDE_ELICITATION_COMPLETION_PROBE_DELAY_MS = 2000;
 const CLAUDE_ELICITATION_COMPLETION_PROBE_INTERVAL_MS = 3000;
 const CLAUDE_ELICITATION_COMPLETION_PROBE_MAX_MS = 5 * 60 * 1000;
 const CLAUDE_ELICITATION_COMPLETION_TOOLS = new Set(["AskUserQuestion"]);
-function getCompletionDebounceMs(headless) {
-  const raw = process.env.CLAWD_COMPLETION_DEBOUNCE_MS;
-  const n = Number.parseInt(raw, 10);
-  // Explicit env override wins for every session kind (0 = fully off).
-  if (Number.isFinite(n) && n >= 0 && n <= 10000) return n;
-  // Interactive default stays 0 = celebrate immediately on Stop. The field
-  // gates (PostCompact / background_tasks / session_crons / stop_hook_active)
-  // already suppress the common false completions with zero delay; a terminal
-  // user otherwise wants the celebration the instant the turn ends. Headless
-  // sessions default to the #449 window above.
-  return headless ? HEADLESS_COMPLETION_DEBOUNCE_MS : 0;
-}
-function getBackgroundTasksCompletionDebounceMs(headless) {
-  const raw = process.env.CLAWD_COMPLETION_DEBOUNCE_MS;
-  const n = Number.parseInt(raw, 10);
-  if (Number.isFinite(n) && n >= 0 && n <= 10000) return n;
-  return Math.max(getCompletionDebounceMs(headless), BACKGROUND_TASKS_COMPLETION_DEBOUNCE_MS);
-}
 let lastSessionSnapshotSignature = null;
 let lastSessionSnapshot = null;
 let startupRecoveryActive = false;
@@ -176,9 +179,9 @@ let stateChangedAt = Date.now();
 let pendingTimer = null;
 let autoReturnTimer = null;
 let pendingState = null;
-// #406 Stop completion debounce: sessionId -> timer holding a Stop as "working"
-// until a quiet window confirms the turn really ended.
-const pendingCompletionTimers = new Map();
+// #406 Stop completion debounce: sessionId -> record holding one exact Stop
+// as "working" until a quiet window confirms the turn really ended.
+const pendingCompletionDebounces = new Map();
 let eyeResendTimer = null;
 let updateVisualState = null;
 let updateVisualKind = null;
@@ -245,6 +248,65 @@ let _lastKimiPulseAt = 0;
 //   4. If the timer fires, Kimi is probably still blocked on the TUI waiting
 //      for the user — promote to a real permission hold (notification state)
 const kimiPermissionSuspectTimers = new Map();
+
+// ── Kimi CLI permission gate ledger ──
+// Legacy kimi-cli fires the PreToolUse for EVERY queued tool call up front
+// (two calls in one assistant message arrive ~0.1s apart), then blocks on the
+// approval TUI one tool at a time. The hold/suspect slots above are
+// per-session booleans, so without extra bookkeeping only the FIRST approval
+// ever gets a cue — the second prompt sits invisible in the terminal.
+// The ledger tracks outstanding permission-gated tool calls per session:
+//   sessionId -> Array<{ id: string|null, detail: object|null }>
+// insertion-ordered (index 0 = oldest = what the terminal blocks on next).
+// Opened by gated PreToolUse / synthesized PermissionRequest (hook marks them
+// permission_gate_open), closed by gated PostToolUse/PostToolUseFailure —
+// exact match when a tool_call_id is present, FIFO across anonymous entries
+// otherwise. Native Kimi Code PermissionRequests carry no gate markers and
+// never touch the ledger.
+const kimiPermissionGateLedgers = new Map();
+
+function buildKimiGateDetail(toolName, permissionAction, permissionCommand, permissionToolInput) {
+  if (!toolName && !permissionAction && !permissionCommand && !permissionToolInput) return null;
+  return { toolName, permissionAction, permissionCommand, permissionToolInput };
+}
+
+function openKimiPermissionGate(sessionId, gateId, detail) {
+  if (!sessionId) return;
+  let gates = kimiPermissionGateLedgers.get(sessionId);
+  if (!gates) {
+    gates = [];
+    kimiPermissionGateLedgers.set(sessionId, gates);
+  }
+  const id = typeof gateId === "string" && gateId ? gateId : null;
+  if (id) {
+    // Idempotent refresh: a re-sent PreToolUse for the same call replaces its
+    // own entry instead of inflating the queue.
+    const dup = gates.findIndex((gate) => gate.id === id);
+    if (dup !== -1) gates.splice(dup, 1);
+  }
+  gates.push({ id, detail: detail || null });
+}
+
+function closeKimiPermissionGate(sessionId, gateId) {
+  const gates = kimiPermissionGateLedgers.get(sessionId);
+  if (!gates || !gates.length) return false;
+  const id = typeof gateId === "string" && gateId ? gateId : null;
+  let idx = -1;
+  if (id) {
+    // Exact pairing only. An unknown id is a no-op on purpose: a duplicate or
+    // out-of-order Post must not eat an anonymous entry it doesn't own.
+    idx = gates.findIndex((gate) => gate.id === id);
+  } else {
+    // Anonymous close (old hook / payload without tool_call_id): FIFO —
+    // settle the oldest anonymous gate.
+    idx = gates.findIndex((gate) => gate.id === null);
+  }
+  if (idx === -1) return false;
+  gates.splice(idx, 1);
+  if (!gates.length) kimiPermissionGateLedgers.delete(sessionId);
+  return true;
+}
+
 function parseSuspectDelay() {
   const raw = process.env.CLAWD_KIMI_PERMISSION_SUSPECT_MS;
   const n = Number.parseInt(raw, 10);
@@ -257,27 +319,104 @@ function hasPermissionAnimationLock() {
   return kimiPermissionHolds.size > 0;
 }
 
+function hasConfirmedPermissionAnimationLock() {
+  // Native PermissionRequest is authoritative and may pin other one-shot
+  // visuals. The legacy timing heuristic is only a passive cue: a slow but
+  // pre-authorized Kimi tool must not swallow another agent's Stop/error.
+  return [...kimiPermissionHolds.values()].some((hold) => hold && hold.source === "confirmed");
+}
+
+// Later events legitimately omit the pane key, so it has to be sticky — but a
+// session start means the agent just (re)attached to a terminal, and then the key
+// must come from that event's own environment or not at all. `--resume` of the
+// same session id from a different terminal would otherwise keep the old Orca
+// key and, because the pane key outranks the Windows window cache and the hook's
+// wt_hwnd, raise Orca instead of the terminal the agent actually moved to.
+//
+// Producers spell the session start three ways: most post "SessionStart",
+// copilot-hook.js posts its raw argv name "sessionStart", and kiro-hook.js posts
+// "agentSpawn". Kiro is the one that matters most — its stdin carries no session
+// id, so it merges every session into "default" and a pane key stored there would
+// otherwise never be cleared.
+//
+// antigravity-hook.js has no session-start event at all, so the event name alone
+// can never clear one of its keys. Its id normalizes payload.conversationId
+// (falling back to the transcript directory), so resuming the same conversation
+// from a different terminal lands back on the same entry — which is why the
+// identity check below exists rather than a longer list of event names.
+const SESSION_START_EVENTS = new Set(["SessionStart", "sessionStart", "agentSpawn"]);
+
+// A pane key names one specific Orca pane, and focus consults it before the
+// sourcePid/wtHwnd that would otherwise be authoritative. So an event reporting a
+// terminal identity that differs from the stored one means the session moved, and
+// keeping the key would send the user to the old pane instead of the terminal that
+// just reported in. Only values present on BOTH sides count: most events carry no
+// process metadata, and reading "absent" as "moved" would blank the key immediately.
+// Producers disagree on the wire type of the pid, so compare as strings.
+function terminalIdentityChanged(existing, incoming) {
+  if (!existing || !incoming) return false;
+  const differs = (next, stored) => !!next && !!stored && String(next) !== String(stored);
+  return differs(incoming.sourcePid, existing.sourcePid) || differs(incoming.wtHwnd, existing.wtHwnd);
+}
+
+function mergeOrcaPaneKey(orcaPaneKey, existing, event, incoming) {
+  if (orcaPaneKey) return orcaPaneKey;
+  if (SESSION_START_EVENTS.has(event)) return null;
+  if (terminalIdentityChanged(existing, incoming)) return null;
+  return (existing && existing.orcaPaneKey) || null;
+}
+
 function resolveAwaitingInputSinceStop(existing, event) {
   if (POST_COMPLETION_EVENTS.has(event)) return true;
   if (!event || COMPLETION_HOUSEKEEPING_EVENTS.has(event)) return !!(existing && existing.awaitingInputSinceStop === true);
   return false;
 }
 
-function hasCompletionTailWithoutProgress(session) {
+function getCompletionTailWithoutProgress(session) {
   const events = Array.isArray(session && session.recentEvents) ? session.recentEvents : [];
   for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i] && events[i].event;
-    if (POST_COMPLETION_EVENTS.has(event)) return true;
+    const entry = events[i];
+    const event = entry && entry.event;
+    if (POST_COMPLETION_EVENTS.has(event)) return entry;
     if (event == null || COMPLETION_HOUSEKEEPING_EVENTS.has(event)) continue;
-    return false;
+    return null;
   }
-  return false;
+  return null;
+}
+
+function hasCompletionTailWithoutProgress(session) {
+  return !!getCompletionTailWithoutProgress(session);
+}
+
+function markCompletionTailPresented(recentEvents) {
+  const copy = recentEvents.slice();
+  for (let i = copy.length - 1; i >= 0; i--) {
+    const entry = copy[i];
+    const event = entry && entry.event;
+    if (POST_COMPLETION_EVENTS.has(event)) {
+      copy[i] = { ...entry, state: "attention" };
+      break;
+    }
+    if (event == null || COMPLETION_HOUSEKEEPING_EVENTS.has(event)) continue;
+    break;
+  }
+  return copy;
 }
 
 function shouldSuppressDuplicateCompletionVisual(existing, state, event) {
   if (state !== "attention" || !POST_COMPLETION_EVENTS.has(event)) return false;
   if (!existing || (existing.state !== "idle" && existing.state !== "sleeping")) return false;
-  return existing.awaitingInputSinceStop === true || hasCompletionTailWithoutProgress(existing);
+  const completionTail = getCompletionTailWithoutProgress(existing);
+  if (completionTail) return completionTail.state === "attention";
+  return existing.awaitingInputSinceStop === true;
+}
+
+function shouldKeepExistingCompletionEventTail(existing, state, event) {
+  return state === "attention"
+    && existing
+    && (existing.state === "idle" || existing.state === "sleeping")
+    && POST_COMPLETION_EVENTS.has(event)
+    && hasCompletionTailWithoutProgress(existing);
 }
 
 function shouldMuteMiniPostCompletionNotification(state, event, session) {
@@ -449,7 +588,12 @@ function setState(newState, svgOverride, options = {}) {
     clearPendingStateTimer();
   }
 
-  const minTime = MIN_DISPLAY_MS[currentState] || 0;
+  // Internal movement states such as free roam must be interruptible by direct
+  // user interaction. Callers may bypass only the current state's display
+  // hold; DND and pending-state priority checks above still apply unchanged.
+  const minTime = options.bypassMinDisplay === true
+    ? 0
+    : (MIN_DISPLAY_MS[currentState] || 0);
   const elapsed = Date.now() - stateChangedAt;
   const remaining = minTime - elapsed;
 
@@ -596,7 +740,12 @@ function applyState(state, svgOverride, options = {}) {
     if (!applyOptions.muteNotificationSound) ctx.playSound("confirm");
   }
 
-  const svg = svgOverride || resolveVisualBinding(state);
+  // #509: no-override idle entries (e.g. roam ending) also rest on the
+  // user-selected idle visual instead of a random states.idle pick.
+  const userIdle = (state === "idle" && !svgOverride && typeof ctx.getIdleVisualChoice === "function")
+    ? ctx.getIdleVisualChoice()
+    : null;
+  const svg = svgOverride || userIdle || resolveVisualBinding(state);
   currentSvg = svg;
 
   // Force eye resend after SVG load completes (~300ms)
@@ -613,7 +762,7 @@ function applyState(state, svgOverride, options = {}) {
 
   ctx.sendToRenderer("state-change", state, svg);
   ctx.syncHitWin();
-  ctx.sendToHitWin("hit-state-sync", { currentSvg: svg, currentState: state });
+  ctx.sendToHitWin("hit-state-sync", { currentState: state });
   ctx.sendToHitWin("hit-cancel-reaction");
 
   if (state !== "idle" && state !== "mini-idle") {
@@ -727,7 +876,7 @@ function wakeFromDoze() {
   ctx.sendToRenderer("wake-from-doze");
   setTimeout(() => {
     if (currentState === "dozing") {
-      applyState("idle", SVG_IDLE_FOLLOW);
+      applyState("idle", getSvgOverride("idle"));
     }
   }, 350);
 }
@@ -890,10 +1039,18 @@ function buildSessionSnapshot() {
   return buildSessionSnapshotFromSessions(sessions, {
     sessionAliases: getSessionAliases(),
     getAgentIconUrl,
+    resolveAgentDisplayName: ctx.resolveAgentDisplayName,
     statePriority: STATE_PRIORITY,
     sessionHudCleanupDetached: ctx.sessionHudCleanupDetached === true,
     focusHostPlatform: ctx.focusHostPlatform || process.platform,
     isProcessAlive,
+    accountQuota: accountQuota.snapshot({ mergeSources: ctx.quotaMergeSources === true }),
+    sessionAutomationRecords: typeof ctx.getSessionAutomationRecords === "function"
+      ? ctx.getSessionAutomationRecords()
+      : [],
+    permissionAutomationMode: typeof ctx.getPermissionAutomationMode === "function"
+      ? ctx.getPermissionAutomationMode()
+      : "off",
   });
 }
 
@@ -926,16 +1083,42 @@ function getLastSessionSnapshot() {
 
 function describeSession(sessionId, session) {
   if (!session) return `sid=${sessionId} <deleted>`;
+  const tracker = cloneSubagentTracker(session);
   return [
     `sid=${sessionId}`,
     `state=${session.state || "-"}`,
     `resume=${session.resumeState || "-"}`,
+    `confirmed=${tracker.confirmedIds.size}`,
+    `legacy=${tracker.legacyFloor ? 1 : 0}`,
+    `recovered=${tracker.recoveredFloor ? 1 : 0}`,
+    `live=${getSubagentVisualCount(tracker)}`,
     `agent=${session.agentId || "-"}`,
     `agentPid=${session.agentPid || "-"}`,
     `sourcePid=${session.sourcePid || "-"}`,
     `pidReachable=${session.pidReachable ? 1 : 0}`,
     `headless=${session.headless ? 1 : 0}`,
   ].join(" ");
+}
+
+// #583: renders hook-reported stdin diagnostics (present only when the hook's
+// stdin payload had no session_id) for the event log line. bytes:0 + timeout:1
+// means stdin never reached the hook; bytes>0 + stdinErr means it arrived
+// mangled — entirely different culprits, distinguishable from one log line.
+// parseError arrives via /state which any local process can forge: strip
+// quotes, backslashes, and control chars (incl. ANSI escapes) so a crafted
+// value cannot close the quoted field early or corrupt the log line.
+function formatStdinDiag(diag) {
+  if (!diag || typeof diag !== "object") return "";
+  const bytes = Number.isFinite(diag.bytes) ? diag.bytes : "-";
+  const durationMs = Number.isFinite(diag.durationMs) ? diag.durationMs : "-";
+  const err = typeof diag.parseError === "string" && diag.parseError
+    ? ` stdinErr="${diag.parseError
+        .replace(/["\\\u0000-\u001F\u007F-\u009F]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 80)}"`
+    : "";
+  return ` stdin=bytes:${bytes},timeout:${diag.timedOut === true ? 1 : 0},ms:${durationMs}${err}`;
 }
 
 function resolvePidReachable(existing, agentPid, sourcePid) {
@@ -972,7 +1155,7 @@ function evictOldestSessionIfNeeded(sessionId) {
     }
   }
 
-  if (oldestId) sessions.delete(oldestId);
+  if (oldestId) deleteSessionWithCompletionCleanup(oldestId, "max-sessions-evict");
 }
 
 // Sets / clears `requiresCompletionAck` based on the current event.
@@ -1049,8 +1232,51 @@ function normalizeContextUsage(value) {
   if (Number.isFinite(limit) && limit > 0) out.limit = limit;
   const percent = Number(value.percent);
   if (Number.isFinite(percent)) out.percent = Math.max(0, Math.min(100, Math.round(percent)));
-  if (value.source === "claude" || value.source === "codex") out.source = value.source;
+  if (value.source === "claude" || value.source === "codex" || value.source === "antigravity" || value.source === "opencode") out.source = value.source;
   return out;
+}
+
+function normalizeContextUsageOrigin(value) {
+  return value === "claude-statusline" || value === "claude-transcript" || value === "opencode-statusline" ? value : null;
+}
+
+function isStatuslineOrigin(origin) {
+  return origin === "claude-statusline" || origin === "opencode-statusline";
+}
+
+function resolveContextUsageUpdate(existing, incomingValue, incomingOriginValue) {
+  const existingUsage = normalizeContextUsage(existing && existing.contextUsage);
+  const existingOrigin = normalizeContextUsageOrigin(existing && existing.contextUsageOrigin);
+  const incomingUsage = normalizeContextUsage(incomingValue);
+  const incomingOrigin = normalizeContextUsageOrigin(incomingOriginValue);
+  if (!incomingUsage) {
+    return { contextUsage: existingUsage, contextUsageOrigin: existingOrigin };
+  }
+  if (isStatuslineOrigin(incomingOrigin)) {
+    return { contextUsage: incomingUsage, contextUsageOrigin: incomingOrigin };
+  }
+  if (
+    incomingOrigin === "claude-transcript"
+    && existingOrigin === "claude-statusline"
+    && existingUsage
+    && Number.isFinite(existingUsage.limit)
+    && existingUsage.limit > 0
+  ) {
+    const used = incomingUsage.used;
+    return {
+      contextUsage: {
+        used,
+        limit: existingUsage.limit,
+        percent: Math.max(0, Math.min(100, Math.round((used / existingUsage.limit) * 100))),
+        source: "claude",
+      },
+      contextUsageOrigin: "claude-statusline",
+    };
+  }
+  return {
+    contextUsage: incomingUsage,
+    contextUsageOrigin: incomingOrigin,
+  };
 }
 
 function updateSessionFocusMetadata(sessionId, opts = {}) {
@@ -1066,6 +1292,165 @@ function updateSessionFocusMetadata(sessionId, opts = {}) {
   return true;
 }
 
+// Refresh lifecycle liveness from a request-bound observer without inventing a
+// hook event. This deliberately sits between updateSessionFocusMetadata (which
+// owns focus-only fields) and updateSessionMetadata (which must never affect
+// staleness): a correlated request_user_input request/output is real turn
+// activity, but it must not create a ghost row, append recentEvents, fire a
+// sound, or manufacture a completion boundary.
+function touchSessionActivity(sessionId, opts = {}) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) return false;
+  const expectedAgentId = typeof opts.agentId === "string" ? opts.agentId : null;
+  if (expectedAgentId && session.agentId !== expectedAgentId) return false;
+  const expectedProfileId = typeof opts.profileId === "string" ? opts.profileId : null;
+  if (expectedProfileId && (session.profileId || "local") !== expectedProfileId) return false;
+  if (opts.localOnly === true && (session.host || session.headless)) return false;
+  // A completion awaiting acknowledgement is a stronger lifecycle boundary
+  // than a late transcript record; never revive or extend it.
+  if (session.requiresCompletionAck === true) return false;
+
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const reviveIdle = opts.reviveIdle === true && session.state === "idle";
+  session.updatedAt = now;
+  if (reviveIdle) {
+    session.state = "working";
+    session.displayHint = null;
+    session.subagentTracker = clearSubagentTracker(cloneSubagentTracker(session));
+    const resolved = resolveDisplayState();
+    setState(resolved, getSvgOverride(resolved));
+  }
+  emitSessionSnapshot();
+  return true;
+}
+
+// Statusline refresh POSTs (metadata_only: true) annotate a session that real
+// hook traffic already created — they are telemetry, not lifecycle. Hence:
+// never create a session (a statusline for a dead/unknown session id would
+// resurrect it as a ghost card), never touch recentEvents (no hook event
+// happened, and the badge derivation reads that tail), and never bump
+// updatedAt (a statusline refreshing every ~300ms would keep any session
+// eternally "fresh", defeating staleness sweeps and resurrecting completed
+// cards as idle). Context usage is the only per-session field a statusline
+// owns — account quota is not a session property and lives in the
+// session-independent store (updateAccountQuota below).
+// Broadcast goes through emitSessionSnapshot, whose signature dedup already
+// swallows no-op refreshes.
+function updateSessionMetadata(sessionId, opts = {}) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) {
+    debugSession(`metadata-only drop sid=${id} reason=no-session`);
+    return false;
+  }
+  const incomingContextUsage = normalizeContextUsage(opts.contextUsage);
+  const incomingTitle = typeof opts.sessionTitle === "string"
+    ? normalizeTitle(opts.sessionTitle)
+    : null;
+  if (!incomingContextUsage && !incomingTitle) return false;
+  let applied = false;
+  if (incomingContextUsage) {
+    const resolved = resolveContextUsageUpdate(
+      session,
+      incomingContextUsage,
+      opts.contextUsageOrigin
+    );
+    const usageChanged = JSON.stringify(resolved.contextUsage) !== JSON.stringify(session.contextUsage);
+    const originChanged = resolved.contextUsageOrigin !== normalizeContextUsageOrigin(session.contextUsageOrigin);
+    if (usageChanged || originChanged) {
+      session.contextUsage = resolved.contextUsage;
+      session.contextUsageOrigin = resolved.contextUsageOrigin;
+      // Freshness stamp for telemetry arbitration. Deliberately a separate
+      // field from updatedAt: staleness sweeps, badge derivation and eviction
+      // all key on updatedAt, and a statusline heartbeat must not feed them.
+      // Stamped only on real changes, so it cannot re-introduce a per-tick
+      // broadcast (and it is excluded from the snapshot signature anyway).
+      session.metadataUpdatedAt = Date.now();
+      applied = true;
+    }
+  }
+  // OpenCode swaps its placeholder title for a real one after session
+  // creation; that arrives on session.updated which maps to no state change,
+  // so the plugin forwards the title change as a metadata-only POST. Update
+  // the stored title here without touching the lifecycle state. Deliberately
+  // NOT stamping metadataUpdatedAt: that field is context/quota telemetry
+  // freshness, and a rename must not make stale telemetry look fresh. The
+  // title broadcasts anyway - sessionTitle/displayTitle are in the snapshot
+  // signature, so emitSessionSnapshot below fans it out.
+  if (incomingTitle && incomingTitle !== session.sessionTitle) {
+    session.sessionTitle = incomingTitle;
+    applied = true;
+  }
+  if (applied) emitSessionSnapshot();
+  return true;
+}
+
+function clearClaudeStatuslineAuthority(profileId = "local") {
+  let cleared = 0;
+  for (const session of sessions.values()) {
+    if (!session || session.agentId !== "claude-code") continue;
+    if ((session.profileId || "local") !== profileId) continue;
+    if (session.contextUsageOrigin !== "claude-statusline") continue;
+    session.contextUsageOrigin = null;
+    cleared++;
+  }
+  return cleared;
+}
+
+// Account-wide rate-limit quota reported by one source (host prefix for
+// remotes, null for this machine). Session-independent by design: the
+// numbers must survive session eviction and app restarts so "check the
+// remote's quota before starting work" has something honest to show — see
+// src/state-account-quota.js for the expiry/staleness contract.
+function updateAccountQuota(host, quotas = {}) {
+  const changed = accountQuota.update(host, quotas);
+  if (changed) emitSessionSnapshot();
+  return changed;
+}
+
+function clearLocalClaudeQuota(options = {}) {
+  const cleared = accountQuota.clearProvider(
+    "claudeQuota",
+    (sourceKey) => !sourceKey.startsWith("remote:")
+  );
+  if (!cleared) return 0;
+  // An explicit opt-out is a data-lifecycle boundary, not a routine refresh:
+  // persist it synchronously so a crash/restart cannot resurrect stale quota.
+  accountQuota.flush();
+  if (options.broadcast !== false) emitSessionSnapshot();
+  return cleared;
+}
+
+// Kimi quota is collected only by the local, explicit API-key runtime. Its
+// durable commit seam reports persistence separately so the credentialId
+// binding journal can never claim a quota snapshot reached disk when it did
+// not. Existing generic/Claude callers keep their historical boolean/numeric
+// contracts above.
+function commitLocalKimiQuota(kimiQuota) {
+  const result = accountQuota.updateDetailed(null, { kimiQuota });
+  if (!result.accepted) return { accepted: false, persisted: false };
+  const persisted = accountQuota.flush();
+  if (result.changed) emitSessionSnapshot();
+  return { accepted: true, persisted: persisted === true };
+}
+
+function clearLocalKimiQuota(options = {}) {
+  const cleared = accountQuota.clearProvider("kimiQuota", (sourceKey) => sourceKey === "");
+  const persisted = cleared ? accountQuota.flush() === true : true;
+  if (cleared && options.broadcast !== false) emitSessionSnapshot();
+  return { cleared: cleared > 0, persisted };
+}
+
+// Distinct reporting sources that currently carry quota (this machine + WSL /
+// SSH remotes), UNmerged. The settings UI hides the "merge across machines"
+// switch when there is only one source, since merging is then a no-op.
+function getQuotaSourceCount() {
+  return accountQuota.snapshot({ mergeSources: false }).length;
+}
+
 // ── #406 Stop completion gate ──
 // A Claude "Stop" maps to "attention" (celebrate + complete sound), but a Stop
 // is not always a real turn completion. Decidable-now signals (live crons,
@@ -1074,27 +1459,39 @@ function updateSessionFocusMetadata(sessionId, opts = {}) {
 // and bg-only Stops with final assistant text can be debounced: hold "working"
 // and only celebrate if no forward-progress event for the session arrives
 // within the window.
-function scheduleCompletionDebounce(sessionId, debounceMs) {
-  const existing = pendingCompletionTimers.get(sessionId);
-  if (existing) clearTimeout(existing);
-  const timer = setTimeout(() => {
-    pendingCompletionTimers.delete(sessionId);
-    promoteCompletion(sessionId);
+function scheduleCompletionDebounce(sessionId, debounceMs, payload = {}) {
+  const existing = pendingCompletionDebounces.get(sessionId);
+  if (existing && existing.timer) clearTimeout(existing.timer);
+  const text = normalizeAssistantOutput(payload && payload.text);
+  const record = {
+    timer: null,
+    assistantLastOutput: text,
+    assistantLastOutputTruncated: !!(text && payload && payload.truncated === true),
+  };
+  record.timer = setTimeout(() => {
+    if (pendingCompletionDebounces.get(sessionId) !== record) return;
+    pendingCompletionDebounces.delete(sessionId);
+    promoteCompletion(sessionId, {
+      text: record.assistantLastOutput,
+      truncated: record.assistantLastOutputTruncated,
+    });
   }, debounceMs);
-  pendingCompletionTimers.set(sessionId, timer);
+  pendingCompletionDebounces.set(sessionId, record);
 }
 
 function cancelCompletionDebounce(sessionId, reason) {
-  const timer = pendingCompletionTimers.get(sessionId);
-  if (!timer) return;
-  clearTimeout(timer);
-  pendingCompletionTimers.delete(sessionId);
+  const record = pendingCompletionDebounces.get(sessionId);
+  if (!record) return;
+  if (record.timer) clearTimeout(record.timer);
+  pendingCompletionDebounces.delete(sessionId);
   debugSession(`stop-debounce cancel sid=${sessionId} by=${reason || "-"}`);
 }
 
 function clearAllCompletionDebounces() {
-  for (const timer of pendingCompletionTimers.values()) clearTimeout(timer);
-  pendingCompletionTimers.clear();
+  for (const record of pendingCompletionDebounces.values()) {
+    if (record && record.timer) clearTimeout(record.timer);
+  }
+  pendingCompletionDebounces.clear();
 }
 
 function cancelClaudeTranscriptCompletionProbe(sessionId, reason) {
@@ -1110,8 +1507,26 @@ function clearAllClaudeTranscriptCompletionProbes() {
   claudeTranscriptCompletionProbes.clear();
 }
 
+function deleteSessionWithCompletionCleanup(sessionId, reason) {
+  cancelCompletionDebounce(sessionId, reason);
+  cancelClaudeTranscriptCompletionProbe(sessionId, reason);
+  return sessions.delete(sessionId);
+}
+
 function isClaudeElicitationCompletionTool(toolName) {
   return CLAUDE_ELICITATION_COMPLETION_TOOLS.has(toolName);
+}
+
+function hasClaudeBackgroundSubagentCompletionHold(sessionOrTracker) {
+  // Only the authoritative typed-count marker may block completion producers.
+  // Tracker-only evidence keeps the pre-#952 recovery behavior: if an older or
+  // malformed hook misses SubagentStop and never sends a typed zero, a later
+  // parent completion must still be able to settle the session.
+  return !!(
+    sessionOrTracker
+    && Number.isFinite(sessionOrTracker.claudeBackgroundSubagentHoldAt)
+    && sessionOrTracker.claudeBackgroundSubagentHoldAt > 0
+  );
 }
 
 function scheduleClaudeTranscriptCompletionProbe(sessionId, transcriptPath) {
@@ -1132,6 +1547,11 @@ function scheduleClaudeTranscriptCompletionProbe(sessionId, transcriptPath) {
     if (Date.now() - startedAt > CLAUDE_ELICITATION_COMPLETION_PROBE_MAX_MS) {
       claudeTranscriptCompletionProbes.delete(sessionId);
       debugSession(`claude-transcript-stop-probe expire sid=${sessionId}`);
+      return;
+    }
+    if (hasClaudeBackgroundSubagentCompletionHold(session)) {
+      probe.timer = setTimeout(runProbe, CLAUDE_ELICITATION_COMPLETION_PROBE_INTERVAL_MS);
+      claudeTranscriptCompletionProbes.set(sessionId, probe);
       return;
     }
 
@@ -1163,19 +1583,36 @@ function scheduleClaudeTranscriptCompletionProbe(sessionId, transcriptPath) {
 // tail over any Notification that landed during the window), settle to idle,
 // and only now flip awaitingInputSinceStop. Then celebrate, unless a Kimi
 // permission lock is holding the pet.
-function promoteCompletion(sessionId) {
+function promoteCompletion(sessionId, completionPayload = undefined) {
   const session = sessions.get(sessionId);
-  if (!session) return;
-  session.recentEvents = pushRecentEvent(session, "idle", "Stop");
+  if (!session) return false;
+  if (hasClaudeBackgroundSubagentCompletionHold(session)) {
+    debugSession(`completion-promote hold sid=${sessionId} reason=background-subagent`);
+    return false;
+  }
+  if (completionPayload !== undefined) {
+    const text = normalizeAssistantOutput(completionPayload && completionPayload.text);
+    session.assistantLastOutput = text;
+    session.assistantLastOutputTruncated = !!(
+      text
+      && completionPayload
+      && completionPayload.truncated === true
+    );
+  }
+  session.subagentTracker = clearSubagentTracker(cloneSubagentTracker(session));
+  // The stored session settles idle, but this Stop consumed the completion
+  // attention cue. Record that distinction so a later duplicate Stop is
+  // suppressed while an earlier idle-only terminal can still be upgraded.
+  session.recentEvents = pushRecentEvent(session, "attention", "Stop");
   session.state = "idle";
   session.updatedAt = Date.now();
   session.displayHint = null;
   session.awaitingInputSinceStop = true;
   emitSessionSnapshot({ force: true });
-  if (hasPermissionAnimationLock()) {
+  if (hasConfirmedPermissionAnimationLock()) {
     const display = resolveDisplayState();
     setState(display, getSvgOverride(display));
-    return;
+    return true;
   }
   // The completion's data (done badge + Telegram push) already landed via the
   // snapshot above. The celebration is visual-only, so let setState()'s
@@ -1184,12 +1621,86 @@ function promoteCompletion(sessionId) {
   // global pending queue here; pendingTimer/pendingState are process-wide, not
   // per-session, so clearing them would swallow another session's visual.
   setState("attention");
+  return true;
 }
 
 // ── Session management ──
 // Session-related fields go through `opts`. Earlier versions took 13
 // positional params — refactored in B2 to an options bag so new fields
 // (sessionTitle, etc.) don't keep extending the argument list.
+function normalizeSessionAutomationIdentity(value) {
+  if (!value || typeof value !== "object") return null;
+  if (
+    typeof value.eligible !== "boolean"
+    || typeof value.reason !== "string"
+    || !value.reason.trim()
+  ) {
+    return Object.freeze({
+      eligible: false,
+      reason: "invalid-route-assessment",
+    });
+  }
+  return Object.freeze({
+    eligible: value.eligible === true,
+    reason: value.reason.trim().slice(0, 120),
+  });
+}
+
+function mergeSessionProcessMetadata(existing, incoming = {}, options = {}) {
+  const replace = options.replace === true;
+  const incomingPidChain = Array.isArray(incoming.pidChain) && incoming.pidChain.length
+    ? incoming.pidChain.slice()
+    : null;
+
+  if (!replace) {
+    return {
+      sourcePid: incoming.sourcePid || (existing && existing.sourcePid) || null,
+      wtHwnd: incoming.wtHwnd || (existing && existing.wtHwnd) || null,
+      editor: incoming.editor || (existing && existing.editor) || null,
+      pidChain: incomingPidChain || (existing && existing.pidChain) || null,
+      agentPid: incoming.agentPid || (existing && existing.agentPid) || null,
+      identityChanged: terminalIdentityChanged(existing, incoming),
+    };
+  }
+
+  const sourcePid = incoming.sourcePid || null;
+  const agentPid = incoming.agentPid || null;
+  const editor = incoming.editor || null;
+  const previousSourcePid = (existing && existing.sourcePid) || null;
+  const previousAgentPid = (existing && existing.agentPid) || null;
+  const identityChanged = !!existing && (
+    previousSourcePid !== sourcePid
+    || previousAgentPid !== agentPid
+  );
+
+  return {
+    sourcePid,
+    agentPid,
+    editor,
+    pidChain: incomingPidChain,
+    // A foreground HWND is still useful across ordinary lifecycle events for
+    // the same terminal identity. Once authoritative metadata replaces or
+    // clears that identity, retaining the old HWND could focus another
+    // terminal, so it must be cleared unless this event supplied a fresh one.
+    wtHwnd: incoming.wtHwnd || (identityChanged ? null : (existing && existing.wtHwnd) || null),
+    identityChanged,
+  };
+}
+
+// Trae stores the session title server-side, so Clawd derives it from the
+// first prompt line. The first title that reaches the server wins — a title
+// whose POST fails is not permanently claimed, and follow-up prompts never
+// overwrite the first one (matching Trae's constant session title).
+const FIRST_WINS_TITLE_AGENT_IDS = new Set(["traecode"]);
+
+function resolveIncomingSessionTitle(existing, agentId, incomingTitle) {
+  const normalized = normalizeTitle(incomingTitle);
+  if (FIRST_WINS_TITLE_AGENT_IDS.has(agentId)) {
+    return (existing && existing.sessionTitle) || normalized || null;
+  }
+  return normalized || (existing && existing.sessionTitle) || null;
+}
+
 function updateSession(sessionId, state, event, opts = {}) {
   try {
   const {
@@ -1200,9 +1711,13 @@ function updateSession(sessionId, state, event, opts = {}) {
     pidChain = null,
     tmuxSocket = null,
     tmuxClient = null,
+    orcaPaneKey = null,
     agentPid = null,
     agentId = null,
+    profileId = "local",
+    rawSessionId = null,
     host = null,
+    wslDistro = null,
     headless = false,
     platform = null,
     model = null,
@@ -1213,19 +1728,34 @@ function updateSession(sessionId, state, event, opts = {}) {
     displayHint = undefined,
     sessionTitle = null,
     contextUsage = null,
+    contextUsageOrigin = null,
     assistantLastOutput = null,
     assistantLastOutputTruncated = false,
     toolName = null,
     transcriptPath = null,
     permissionSuspect = false,
+    permissionAction = null,
+    permissionCommand = null,
+    permissionToolInput = null,
+    permissionGateOpen = false,
+    permissionGated = false,
+    permissionGateId = null,
     preserveState = false,
     hookSource = null,
     agentIdDefaulted = false,
     muteNotificationSound = false,
     transientPermissionEvent = false,
     backgroundTasksCount = 0,
+    backgroundSubagentsCount,
     sessionCronsCount = 0,
     stopHookActive = false,
+    stdinDiag = null,
+    sessionAutomationIdentity = null,
+    subagentId = null,
+    subagentType = null,
+    subagentLifecycleSource = null,
+    sessionStartSource = null,
+    replaceProcessMetadata = false,
   } = opts;
   if (startupRecoveryActive) {
     startupRecoveryActive = false;
@@ -1243,9 +1773,26 @@ function updateSession(sessionId, state, event, opts = {}) {
 
   const sessionForPerm = sessions.get(sessionId);
   const permAgentId = resolveIncomingAgentId(sessionForPerm, agentId, agentIdDefaulted);
+  const normalizedSessionAutomationIdentity = normalizeSessionAutomationIdentity(
+    sessionAutomationIdentity
+  );
 
-  if (event === "PermissionRequest") {
-    if (permAgentId === "codex") cancelCodexExitProbe(sessionId, "PermissionRequest");
+  const isTransientAttentionRequest = event === "PermissionRequest" || event === "CodexUserInputRequest";
+  if (isTransientAttentionRequest) {
+    if (permAgentId === "codex") cancelCodexExitProbe(sessionId, event);
+    // A transient route event owns its identity assessment just as ordinary
+    // state traffic does. Merge it only into an existing session for the same agent:
+    // PermissionRequest must not create a ghost session, and a raw-id collision
+    // from another agent must not relabel an existing Dashboard row.
+    const shouldStorePermissionAutomationIdentity = !!(
+      normalizedSessionAutomationIdentity
+      && sessionForPerm
+      && permAgentId
+      && sessionForPerm.agentId === permAgentId
+    );
+    if (shouldStorePermissionAutomationIdentity) {
+      sessionForPerm.sessionAutomationIdentity = normalizedSessionAutomationIdentity;
+    }
     // Kimi-only gate: startKimiPermissionPoll suppresses the passive bubble
     // when the user disabled Kimi permissions in Settings, but the setState
     // ran first and flashed notification anyway — leaving a silent animation
@@ -1253,28 +1800,44 @@ function updateSession(sessionId, state, event, opts = {}) {
     // don't need a second DND check here. CC / opencode keep the
     // unconditional setState — their bubble flow gates DND upstream.
     if (
-      permAgentId === "kimi-cli"
+      event === "PermissionRequest"
+      && permAgentId === "kimi-cli"
       && typeof ctx.isAgentPermissionsEnabled === "function"
       && !ctx.isAgentPermissionsEnabled("kimi-cli")
     ) return;
-    const shouldPersistCodexPermissionFocus = permAgentId === "codex" && (
-      sourcePid || wtHwnd || agentPid || (pidChain && pidChain.length) || cwd || host ||
+    const hasCodexPermissionMetadata = !!(
+      sourcePid || wtHwnd || agentPid || (pidChain && pidChain.length) || cwd || host || wslDistro ||
       model || provider || codexOriginator || codexSource || platform || ghosttyTerminalId ||
-      tmuxSocket || tmuxClient
+      tmuxSocket || tmuxClient || orcaPaneKey
+    );
+    const shouldPersistCodexPermissionFocus = permAgentId === "codex" && (
+      hasCodexPermissionMetadata
+      // An authoritative all-null result still has to clear stale process
+      // metadata on an existing session. It must not create a new ghost row.
+      || (replaceProcessMetadata === true && !!sessionForPerm)
     );
     if (shouldPersistCodexPermissionFocus) {
       const existing = sessions.get(sessionId);
       evictOldestSessionIfNeeded(sessionId);
-      const srcPid = sourcePid || (existing && existing.sourcePid) || null;
-      const srcWtHwnd = wtHwnd || (existing && existing.wtHwnd) || null;
+      const processMetadata = mergeSessionProcessMetadata(
+        existing,
+        { sourcePid, wtHwnd, editor, pidChain, agentPid },
+        { replace: replaceProcessMetadata === true }
+      );
+      const srcPid = processMetadata.sourcePid;
+      const srcWtHwnd = processMetadata.wtHwnd;
       const srcCwd = cwd || (existing && existing.cwd) || "";
-      const srcEditor = editor || (existing && existing.editor) || null;
-      const srcPidChain = (pidChain && pidChain.length) ? pidChain : (existing && existing.pidChain) || null;
+      const srcEditor = processMetadata.editor;
+      const srcPidChain = processMetadata.pidChain;
       const srcTmuxSocket = tmuxSocket || (existing && existing.tmuxSocket) || null;
       const srcTmuxClient = tmuxClient || (existing && existing.tmuxClient) || null;
-      const srcAgentPid = agentPid || (existing && existing.agentPid) || null;
+      const srcOrcaPaneKey = processMetadata.identityChanged && !orcaPaneKey
+        ? null
+        : mergeOrcaPaneKey(orcaPaneKey, existing, event, { sourcePid, wtHwnd });
+      const srcAgentPid = processMetadata.agentPid;
       const srcAgentId = resolveIncomingAgentId(existing, agentId, agentIdDefaulted);
       const srcHost = host || (existing && existing.host) || null;
+      const srcWslDistro = wslDistro || (existing && existing.wslDistro) || null;
       const srcHeadless = headless || (existing && existing.headless) || false;
       const srcPlatform = platform || (existing && existing.platform) || null;
       const srcModel = model || (existing && existing.model) || null;
@@ -1282,8 +1845,10 @@ function updateSession(sessionId, state, event, opts = {}) {
       const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
       const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
       const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
-      const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
-      const srcContextUsage = normalizeContextUsage(contextUsage) || (existing && existing.contextUsage) || null;
+      const srcSessionTitle = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
+      const permissionContext = resolveContextUsageUpdate(existing, contextUsage, contextUsageOrigin);
+      const srcContextUsage = permissionContext.contextUsage;
+      const srcContextUsageOrigin = permissionContext.contextUsageOrigin;
       // PermissionRequest should flash the pet via setState("notification"),
       // but a brand-new Codex permission session must not persist as
       // notification. Otherwise, if the prompt is resolved remotely and no
@@ -1304,9 +1869,16 @@ function updateSession(sessionId, state, event, opts = {}) {
         pidChain: srcPidChain,
         tmuxSocket: srcTmuxSocket,
         tmuxClient: srcTmuxClient,
+        orcaPaneKey: srcOrcaPaneKey,
         agentPid: srcAgentPid,
         agentId: srcAgentId,
+        profileId: (existing && existing.profileId) || profileId || "local",
+        rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId,
+        sessionAutomationIdentity: normalizedSessionAutomationIdentity
+          || (existing && existing.sessionAutomationIdentity)
+          || null,
         host: srcHost,
+        wslDistro: srcWslDistro,
         headless: srcHeadless,
         platform: srcPlatform,
         model: srcModel,
@@ -1316,28 +1888,89 @@ function updateSession(sessionId, state, event, opts = {}) {
         ghosttyTerminalId: srcGhosttyTerminalId,
         sessionTitle: srcSessionTitle,
         contextUsage: srcContextUsage,
+        contextUsageOrigin: srcContextUsageOrigin,
         recentEvents,
-        pidReachable: resolvePidReachable(existing, srcAgentPid, srcPid),
+        pidReachable: resolvePidReachable(
+          replaceProcessMetadata === true ? null : existing,
+          srcAgentPid,
+          srcPid
+        ),
         resumeState: (existing && existing.resumeState) || null,
         muteNotificationSound: muteNotificationSound === true,
+        subagentTracker: cloneSubagentTracker(existing),
+        claudeBackgroundSubagentHoldAt: existing
+          && Number.isFinite(existing.claudeBackgroundSubagentHoldAt)
+          && existing.claudeBackgroundSubagentHoldAt > 0
+          ? existing.claudeBackgroundSubagentHoldAt
+          : null,
       });
     }
     setState("notification", undefined, { muteNotificationSound: muteNotificationSound === true });
-    if (permAgentId === "kimi-cli") startKimiPermissionPoll(sessionId);
+    if (event === "PermissionRequest" && permAgentId === "kimi-cli") {
+      // Synthesized PermissionRequest (rewritten gated PreToolUse) carries a
+      // gate marker — record it so the Post that settles it can re-arm the
+      // cue for the next queued approval. Native Kimi Code PermissionRequests
+      // have no marker and skip the ledger.
+      if (permissionGateOpen === true) {
+        openKimiPermissionGate(
+          sessionId,
+          permissionGateId,
+          buildKimiGateDetail(toolName, permissionAction, permissionCommand, permissionToolInput)
+        );
+        // Same invariant as the suspect path: the cue must describe what the
+        // terminal actually blocks on — the OLDEST outstanding gate. Batched
+        // synthesized requests all land up front, so refreshing the card with
+        // the newest arrival would show a tool whose prompt hasn't appeared
+        // yet.
+        const gates = kimiPermissionGateLedgers.get(sessionId);
+        const headDetail = gates && gates.length
+          ? gates[0].detail
+          : buildKimiGateDetail(toolName, permissionAction, permissionCommand, permissionToolInput);
+        startKimiPermissionPoll(sessionId, headDetail);
+      } else {
+        // Native Kimi Code: a PermissionRequest fires when its prompt really
+        // is on screen, so the newest request IS what the terminal blocks on —
+        // refresh-to-newest stays correct here.
+        startKimiPermissionPoll(sessionId, { toolName, permissionAction, permissionCommand, permissionToolInput });
+      }
+    }
+    if (
+      shouldStorePermissionAutomationIdentity
+      || (shouldPersistCodexPermissionFocus && normalizedSessionAutomationIdentity)
+    ) {
+      emitSessionSnapshot();
+    }
     return;
   }
 
   const existing = sessions.get(sessionId);
-  const srcPid = sourcePid || (existing && existing.sourcePid) || null;
-  const srcWtHwnd = wtHwnd || (existing && existing.wtHwnd) || null;
+  if (existing && existing.startupRecovered === true) {
+    delete existing.startupRecovered;
+    delete existing.recoveryEventAt;
+    delete existing.recoveryValidUntil;
+  }
+  const processMetadata = mergeSessionProcessMetadata(
+    existing,
+    { sourcePid, wtHwnd, editor, pidChain, agentPid },
+    { replace: replaceProcessMetadata === true }
+  );
+  const srcPid = processMetadata.sourcePid;
+  const srcWtHwnd = processMetadata.wtHwnd;
   const srcCwd = cwd || (existing && existing.cwd) || "";
-  const srcEditor = editor || (existing && existing.editor) || null;
-  const srcPidChain = (pidChain && pidChain.length) ? pidChain : (existing && existing.pidChain) || null;
+  const srcEditor = processMetadata.editor;
+  const srcPidChain = processMetadata.pidChain;
   const srcTmuxSocket = tmuxSocket || (existing && existing.tmuxSocket) || null;
   const srcTmuxClient = tmuxClient || (existing && existing.tmuxClient) || null;
-  const srcAgentPid = agentPid || (existing && existing.agentPid) || null;
+  const srcOrcaPaneKey = processMetadata.identityChanged && !orcaPaneKey
+    ? null
+    : mergeOrcaPaneKey(orcaPaneKey, existing, event, { sourcePid, wtHwnd });
+  const srcAgentPid = processMetadata.agentPid;
   const srcAgentId = resolveIncomingAgentId(existing, agentId, agentIdDefaulted);
+  const srcSessionAutomationIdentity = normalizedSessionAutomationIdentity
+    || (existing && existing.sessionAutomationIdentity)
+    || null;
   const srcHost = host || (existing && existing.host) || null;
+  const srcWslDistro = wslDistro || (existing && existing.wslDistro) || null;
   const srcHeadless = headless || (existing && existing.headless) || false;
   const srcPlatform = platform || (existing && existing.platform) || null;
   const srcModel = model || (existing && existing.model) || null;
@@ -1347,17 +1980,74 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
   // Sticky: empty input does not clear an existing title. A session that has
   // ever been named keeps that name until the user explicitly renames it.
-  const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
-  const srcContextUsage = normalizeContextUsage(contextUsage) || (existing && existing.contextUsage) || null;
-  const srcAssistantLastOutput = normalizeAssistantOutput(assistantLastOutput);
-  const srcAssistantLastOutputTruncated = !!(srcAssistantLastOutput && assistantLastOutputTruncated === true);
-  const srcToolName = normalizeToolName(toolName) || (existing && existing.lastToolName) || null;
+  const srcSessionTitle = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
+  const normalizedIncomingContextUsage = normalizeContextUsage(contextUsage);
+  const effectiveContextUsageOrigin = normalizeContextUsageOrigin(contextUsageOrigin)
+    || (srcAgentId === "claude-code" && normalizedIncomingContextUsage && normalizedIncomingContextUsage.source === "claude"
+      ? "claude-transcript"
+      : null);
+  const resolvedContextUsage = resolveContextUsageUpdate(
+    existing,
+    normalizedIncomingContextUsage,
+    effectiveContextUsageOrigin
+  );
+  const srcContextUsage = resolvedContextUsage.contextUsage;
+  const srcContextUsageOrigin = resolvedContextUsage.contextUsageOrigin;
+  const incomingAssistantLastOutput = normalizeAssistantOutput(assistantLastOutput);
+  const srcAssistantLastOutput = incomingAssistantLastOutput;
+  const srcAssistantLastOutputTruncated = !!(
+    srcAssistantLastOutput
+    && assistantLastOutputTruncated === true
+  );
+  const incomingToolName = normalizeToolName(toolName);
+  const srcToolName = incomingToolName || (existing && existing.lastToolName) || null;
   const srcTranscriptPath = normalizeTranscriptPath(transcriptPath) || (existing && existing.transcriptPath) || null;
   const srcResumeState = (existing && existing.resumeState) || null;
   const isSubagentStart = event === "SubagentStart" || event === "subagentStart";
   const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
+  const normalizedSubagentId = normalizeChildId(subagentId);
+  const isSubagentScopedSessionEnd = event === "SessionEnd" && !!normalizedSubagentId;
+  const isSyntheticSubagentStart = !!(
+    isSubagentStart
+    && (
+      ["synthetic-tool", "synthetic-task"].includes(subagentLifecycleSource)
+      || ["Agent", "Task"].includes(incomingToolName)
+    )
+  );
   const preservedState = preserveState && existing ? existing.state : null;
   const duplicateCompletionVisualAtEntry = shouldSuppressDuplicateCompletionVisual(existing, state, event);
+  const isClaudeMainStop = event === "Stop"
+    && state === "attention"
+    && srcAgentId === "claude-code"
+    && !normalizedSubagentId;
+  const typedSubagentSnapshotKnown = Object.prototype.hasOwnProperty.call(
+    opts,
+    "backgroundSubagentsCount",
+  ) && Number.isSafeInteger(backgroundSubagentsCount) && backgroundSubagentsCount >= 0;
+  const incomingTypedSubagentCount = typedSubagentSnapshotKnown
+    ? backgroundSubagentsCount
+    : 0;
+  const typedSubagentSnapshotIsZero = typedSubagentSnapshotKnown
+    && incomingTypedSubagentCount === 0;
+  const existingTypedSubagentHold = !!(
+    existing
+    && Number.isFinite(existing.claudeBackgroundSubagentHoldAt)
+    && existing.claudeBackgroundSubagentHoldAt > 0
+  );
+  const effectiveTypedSubagentHold = incomingTypedSubagentCount > 0
+    || (existingTypedSubagentHold && !typedSubagentSnapshotKnown);
+  let claudeBackgroundSubagentHoldAt = existingTypedSubagentHold
+    ? existing.claudeBackgroundSubagentHoldAt
+    : null;
+  if (isClaudeMainStop && duplicateCompletionVisualAtEntry) {
+    // A late duplicate Stop must not reopen a completed session or leave a
+    // private hold behind that can block a later legitimate completion.
+    claudeBackgroundSubagentHoldAt = null;
+  } else if (isClaudeMainStop && incomingTypedSubagentCount > 0) {
+    claudeBackgroundSubagentHoldAt = Math.max(1, Date.now());
+  } else if (isClaudeMainStop && typedSubagentSnapshotIsZero) {
+    claudeBackgroundSubagentHoldAt = null;
+  }
 
   // #406 Stop completion gate — Claude Code only; other agents keep their own
   // completion semantics (Codex task_complete + remote exit probes, etc.). A
@@ -1370,20 +2060,26 @@ function updateSession(sessionId, state, event, opts = {}) {
   // text, can be debounced until a quiet window confirms the turn really ended.
   if (
     !duplicateCompletionVisualAtEntry
-    && event === "Stop"
-    && state === "attention"
-    && srcAgentId === "claude-code"
+    && isClaudeMainStop
   ) {
     cancelCompletionDebounce(sessionId, "stop-superseded");
-    const hasFinalAssistantText = !!srcAssistantLastOutput;
-    const hardLiveWork =
-      sessionCronsCount > 0 ||
-      stopHookActive === true ||
-      (backgroundTasksCount > 0 && !hasFinalAssistantText);
-    const backgroundDebounceMs = backgroundTasksCount > 0 && hasFinalAssistantText
-      ? getBackgroundTasksCompletionDebounceMs(srcHeadless)
-      : 0;
-    const debounceMs = Math.max(getCompletionDebounceMs(srcHeadless), backgroundDebounceMs);
+    const disposition = getClaudeStopDisposition({
+      backgroundTasksCount,
+      backgroundSubagentsCount: typedSubagentSnapshotKnown
+        ? incomingTypedSubagentCount
+        : undefined,
+      sessionCronsCount,
+      stopHookActive,
+      // Incoming, never the carried-forward value: this asks whether THIS Stop
+      // ended the turn with text. Feeding it a carried value flips a genuinely
+      // text-less Stop from "hold" to "promote", celebrating and pushing while
+      // background work is still live -- the exact case #406 exists to prevent.
+      hasFinalAssistantText: !!incomingAssistantLastOutput,
+      headless: srcHeadless,
+    });
+    const hardLiveWork = disposition.kind === "hold"
+      || effectiveTypedSubagentHold;
+    const debounceMs = hardLiveWork ? 0 : disposition.debounceMs;
     if (hardLiveWork || debounceMs > 0) {
       // Hold the Stop as "working" and DROP the event to null so recentEvents
       // keeps NO "Stop" tail while held. Why null and not "Stop": deriveSessionBadge
@@ -1397,7 +2093,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       event = null;
       if (hardLiveWork) {
         debugSession(
-          `stop-gate sid=${sessionId} bg=${backgroundTasksCount} crons=${sessionCronsCount} active=${stopHookActive} action=hold-working`
+          `stop-gate sid=${sessionId} bg=${backgroundTasksCount} subagents=${typedSubagentSnapshotKnown ? incomingTypedSubagentCount : "unknown"} crons=${sessionCronsCount} active=${stopHookActive} action=hold-working`
         );
         // Hard live work never auto-promotes; a later plain Stop (no hard
         // blockers) will.
@@ -1407,7 +2103,10 @@ function updateSession(sessionId, state, event, opts = {}) {
             `stop-gate sid=${sessionId} bg=${backgroundTasksCount} crons=${sessionCronsCount} active=${stopHookActive} action=debounce-working`
           );
         }
-        scheduleCompletionDebounce(sessionId, debounceMs);
+        scheduleCompletionDebounce(sessionId, debounceMs, {
+          text: incomingAssistantLastOutput,
+          truncated: assistantLastOutputTruncated === true,
+        });
       }
     }
     // debounceMs <= 0 && !hardLiveWork → keep "attention" (immediate celebration).
@@ -1444,11 +2143,20 @@ function updateSession(sessionId, state, event, opts = {}) {
     return;
   }
 
-  debugSession(`event ${describeSession(sessionId, existing)} -> incoming=${state}/${event || "-"} hint=${displayHint || "-"} source=${hookSource || "-"}`);
+  debugSession(`event ${describeSession(sessionId, existing)} -> incoming=${state}/${event || "-"} hint=${displayHint || "-"} source=${hookSource || "-"}${formatStdinDiag(stdinDiag)}`);
 
-  const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
+  const pidReachable = resolvePidReachable(
+    replaceProcessMetadata === true ? null : existing,
+    srcAgentPid,
+    srcPid
+  );
 
-  const recentEvents = pushRecentEvent(existing, preservedState || state, event);
+  const keepExistingCompletionEventTail = shouldKeepExistingCompletionEventTail(existing, state, event);
+  const recentEvents = keepExistingCompletionEventTail && Array.isArray(existing.recentEvents)
+    ? (duplicateCompletionVisualAtEntry
+      ? existing.recentEvents.slice()
+      : markCompletionTailPresented(existing.recentEvents))
+    : pushRecentEvent(existing, preservedState || state, event);
   const preserveCompletionAck =
     existing
     && existing.requiresCompletionAck === true
@@ -1470,13 +2178,97 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcLastStopAt = isStopBoundary
     ? Date.now()
     : (existing && Number.isFinite(existing.lastStopAt) ? existing.lastStopAt : null);
-  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, contextUsage: srcContextUsage, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true };
+  // metadataUpdatedAt rides along with the telemetry it timestamps
+  // (contextUsage): a lifecycle event that carries it forward from
+  // `existing` must not silently reset the freshness stamp.
+  const srcMetadataUpdatedAt = existing && Number.isFinite(existing.metadataUpdatedAt) ? existing.metadataUpdatedAt : null;
+  const subagentTracker = cloneSubagentTracker(existing);
+  const hadSubagentHoldBefore = hasSubagentHoldEvidence(subagentTracker);
+
+  // A restored lease is only an initial visual guess. The first real lifecycle
+  // event replaces it; metadata-only statusline traffic bypasses updateSession.
+  if (event && preserveState !== true) subagentTracker.recoveredFloor = false;
+
+  // SessionStart has several upstream sources. Only startup/clear are known to
+  // begin a fresh lifecycle; resume/compact and unknown sources preserve
+  // confirmed ids until D0 proves a stronger boundary.
+  if (
+    event === "SessionStart"
+    && !normalizedSubagentId
+    && (sessionStartSource === "startup" || sessionStartSource === "clear")
+  ) {
+    clearSubagentTracker(subagentTracker);
+    claudeBackgroundSubagentHoldAt = null;
+  }
+
+  // A new parent prompt bounds only anonymous evidence. Trusted child ids may
+  // represent background work spanning the parent turn.
+  if (event === "UserPromptSubmit" && !normalizedSubagentId) {
+    subagentTracker.legacyFloor = false;
+    subagentTracker.recoveredFloor = false;
+  }
+
+  if (isSubagentStart) {
+    subagentTracker.recoveredFloor = false;
+    if (isSyntheticSubagentStart) {
+      subagentTracker.legacyFloor = true;
+      // A nested Task/Agent tool call's id names the originator, not the new
+      // child. Activity still proves that originator itself is live, so it may
+      // be readmitted.
+      if (normalizedSubagentId) subagentTracker.confirmedIds.add(normalizedSubagentId);
+    } else if (normalizedSubagentId) {
+      subagentTracker.confirmedIds.add(normalizedSubagentId);
+    } else {
+      subagentTracker.legacyFloor = true;
+    }
+  } else if (isSubagentStop || isSubagentScopedSessionEnd) {
+    subagentTracker.recoveredFloor = false;
+    if (normalizedSubagentId) subagentTracker.confirmedIds.delete(normalizedSubagentId);
+    // Native + synthetic double delivery observes the same population. Any
+    // child close is also the bounded legacy lane's first-stop release.
+    subagentTracker.legacyFloor = false;
+  } else if (normalizedSubagentId && event !== "SessionEnd") {
+    // SubagentStop can be vetoed by another hook. Any later activity from the
+    // same child is positive liveness evidence and self-corrects the removal.
+    subagentTracker.confirmedIds.add(normalizedSubagentId);
+  }
+
+  if (
+    (isSubagentStop || isSubagentScopedSessionEnd)
+    && typedSubagentSnapshotIsZero
+    && !hasSubagentHoldEvidence(subagentTracker)
+  ) {
+    // SubagentStop is resolving evidence, not a completion event. It may clear
+    // the aggregate typed marker only after the identity tracker agrees that no
+    // child remains; the existing session state is preserved below.
+    claudeBackgroundSubagentHoldAt = null;
+  }
+
+  // Reaching this point with a real main Stop means the completion gate above
+  // accepted it. Held/debounced stops were rewritten to event=null.
+  // An authoritative typed zero must release the tracker before a debounced
+  // completion timer can call promoteCompletion(); duplicate completion Stops
+  // likewise cannot retain hidden child evidence on an already-complete row.
+  if (
+    (event === "Stop" && !normalizedSubagentId)
+    || (isClaudeMainStop && typedSubagentSnapshotIsZero)
+    || (isClaudeMainStop && duplicateCompletionVisualAtEntry)
+  ) {
+    clearSubagentTracker(subagentTracker);
+  }
+
+  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, orcaPaneKey: srcOrcaPaneKey, agentPid: srcAgentPid, agentId: srcAgentId, profileId: (existing && existing.profileId) || profileId || "local", rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId, sessionAutomationIdentity: srcSessionAutomationIdentity, host: srcHost, wslDistro: srcWslDistro, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, contextUsage: srcContextUsage, contextUsageOrigin: srcContextUsageOrigin, metadataUpdatedAt: srcMetadataUpdatedAt, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true, claudeBackgroundSubagentHoldAt };
   if (preserveCompletionAck) base.requiresCompletionAck = true;
+  // #862: every branch below rebuilds the session object from `base`; carry the
+  // private identity tracker through without exposing it on snapshot surfaces.
+  base.subagentTracker = subagentTracker;
+  const typedSubagentHoldActive = Number.isFinite(claudeBackgroundSubagentHoldAt)
+    && claudeBackgroundSubagentHoldAt > 0;
 
   // Evict oldest session if at capacity and this is a new session.
   evictOldestSessionIfNeeded(sessionId);
 
-  if (isSubagentStop) {
+  if (isSubagentStop || isSubagentScopedSessionEnd) {
     updateCodexExitProbe(sessionId, srcAgentId, event);
     if (!existing) {
       debugSession(`subagent-stop ignore sid=${sessionId} reason=no-session`);
@@ -1486,14 +2278,42 @@ function updateSession(sessionId, state, event, opts = {}) {
       return;
     }
 
+    if (hasConfirmedSubagents(subagentTracker)) {
+      const dh = pickDisplayHint("juggling", existing, displayHint);
+      sessions.set(sessionId, {
+        state: "juggling",
+        updatedAt: Date.now(),
+        displayHint: dh,
+        ...base,
+        resumeState: existing.resumeState || null,
+      });
+      debugSession(`subagent-stop hold ${describeSession(sessionId, sessions.get(sessionId))}`);
+      cleanStaleSessions();
+      const heldState = resolveDisplayState();
+      setState(heldState, getSvgOverride(heldState));
+      return;
+    }
+
     if (existing.state === "juggling") {
+      // #862: one stop does not mean the work is over. Restoring on the first
+      // stop dropped the pet back to typing while other subagents were still
+      // running; hold juggling until the last one reports in.
       const resumeState = existing.resumeState || null;
       if (resumeState) {
         const dh = pickDisplayHint(resumeState, existing, displayHint);
         sessions.set(sessionId, { state: resumeState, updatedAt: Date.now(), displayHint: dh, ...base, resumeState: null });
         debugSession(`subagent-stop restore ${describeSession(sessionId, sessions.get(sessionId))}`);
+      } else if (typedSubagentHoldActive) {
+        sessions.set(sessionId, {
+          state: "working",
+          updatedAt: Date.now(),
+          displayHint: pickDisplayHint("working", existing, displayHint),
+          ...base,
+          resumeState: null,
+        });
+        debugSession(`subagent-stop typed-hold ${describeSession(sessionId, sessions.get(sessionId))}`);
       } else {
-        sessions.delete(sessionId);
+        deleteSessionWithCompletionCleanup(sessionId, "subagent-stop-no-resume");
         debugSession(`subagent-stop delete sid=${sessionId} reason=no-resume`);
       }
     } else {
@@ -1511,10 +2331,21 @@ function updateSession(sessionId, state, event, opts = {}) {
   if (event === "SessionEnd") {
     const endingSession = sessions.get(sessionId);
     cancelCodexExitProbe(sessionId, "SessionEnd");
-    sessions.delete(sessionId);
+    if (
+      !subagentId
+      && !subagentType
+      && typeof ctx.onSessionAutomationLifecycleEnd === "function"
+    ) {
+      ctx.onSessionAutomationLifecycleEnd({
+        agentId: (endingSession && endingSession.agentId) || srcAgentId,
+        sessionId,
+        reason: "session-end",
+      });
+    }
+    deleteSessionWithCompletionCleanup(sessionId, "session-end");
     debugSession(`session-end delete ${describeSession(sessionId, endingSession)}`);
     cleanStaleSessions();
-    if (srcAgentId === "kimi-cli") stopKimiPermissionPoll(sessionId);
+    if (srcAgentId === "kimi-cli") disposeKimiPermissionSession(sessionId);
     if (!endingSession || !endingSession.headless) {
       // /clear sends sweeping — play it even if other sessions are active
       // (sweeping is ONESHOT and auto-returns, so it won't interfere)
@@ -1536,9 +2367,43 @@ function updateSession(sessionId, state, event, opts = {}) {
       resumeState: srcResumeState,
     });
   } else if (state === "attention" || state === "notification" || SLEEP_SEQUENCE.has(state)) {
-    sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base, resumeState: null });
+    if (hasSubagentHoldEvidence(subagentTracker)) {
+      sessions.set(sessionId, {
+        state: "juggling",
+        updatedAt: Date.now(),
+        displayHint: pickDisplayHint("juggling", existing, displayHint),
+        ...base,
+        resumeState: (existing && existing.resumeState) || null,
+      });
+    } else if (typedSubagentHoldActive) {
+      sessions.set(sessionId, {
+        state: "working",
+        updatedAt: Date.now(),
+        displayHint: pickDisplayHint("working", existing, displayHint),
+        ...base,
+        resumeState: (existing && existing.resumeState) || null,
+      });
+    } else {
+      sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base, resumeState: null });
+    }
   } else if (ONESHOT_STATES.has(state)) {
-    if (existing) {
+    if (hasSubagentHoldEvidence(subagentTracker)) {
+      sessions.set(sessionId, {
+        state: "juggling",
+        updatedAt: Date.now(),
+        displayHint: pickDisplayHint("juggling", existing, displayHint),
+        ...base,
+        resumeState: (existing && existing.resumeState) || null,
+      });
+    } else if (typedSubagentHoldActive) {
+      sessions.set(sessionId, {
+        state: "working",
+        updatedAt: Date.now(),
+        displayHint: pickDisplayHint("working", existing, displayHint),
+        ...base,
+        resumeState: (existing && existing.resumeState) || null,
+      });
+    } else if (existing) {
       Object.assign(existing, base);
       existing.state = "idle";
       existing.updatedAt = Date.now();
@@ -1550,13 +2415,31 @@ function updateSession(sessionId, state, event, opts = {}) {
   } else {
     if (isSubagentStart) {
       const dh = pickDisplayHint(state, existing, displayHint);
-      const resumeState = existing && existing.state !== "juggling" ? existing.state : srcResumeState;
+      const resumeState = !hadSubagentHoldBefore && existing && existing.state !== "juggling"
+        ? existing.state
+        : srcResumeState;
       sessions.set(sessionId, { state, updatedAt: Date.now(), displayHint: dh, ...base, resumeState });
       debugSession(`subagent-start store ${describeSession(sessionId, sessions.get(sessionId))}`);
-    } else if (existing && existing.state === "juggling" && state === "working") {
-      existing.updatedAt = Date.now();
-      existing.displayHint = pickDisplayHint("juggling", existing, displayHint);
-      debugSession(`juggling-hold ${describeSession(sessionId, existing)} event=${event || "-"}`);
+    } else if (
+      hasSubagentHoldEvidence(subagentTracker)
+      && (state === "working" || state === "thinking" || state === "idle" || state === "juggling")
+    ) {
+      sessions.set(sessionId, {
+        state: "juggling",
+        updatedAt: Date.now(),
+        displayHint: pickDisplayHint("juggling", existing, displayHint),
+        ...base,
+        resumeState: (existing && existing.resumeState) || null,
+      });
+      debugSession(`juggling-hold ${describeSession(sessionId, sessions.get(sessionId))} event=${event || "-"}`);
+    } else if (typedSubagentHoldActive && state === "idle") {
+      sessions.set(sessionId, {
+        state: "working",
+        updatedAt: Date.now(),
+        displayHint: pickDisplayHint("working", existing, displayHint),
+        ...base,
+        resumeState: (existing && existing.resumeState) || null,
+      });
     } else {
       const dh = pickDisplayHint(state, existing, displayHint);
       sessions.set(sessionId, { state, updatedAt: Date.now(), displayHint: dh, ...base, resumeState: null });
@@ -1588,18 +2471,52 @@ function updateSession(sessionId, state, event, opts = {}) {
     "PreCompact",
     "PostCompact",
     "Notification",
+    // Kimi Code native events (#563). PermissionResult is the definitive
+    // "approval answered" signal (decision: approved/rejected). On the
+    // rejected path upstream fires PostToolUseFailure BEFORE
+    // PermissionResult — both clear, so ordering does not matter here.
+    // Interrupt is the user's Esc: any pending approval UI is gone with it.
+    "PermissionResult",
+    "Interrupt",
   ]);
-  const shouldClearKimiPermission = srcAgentId === "kimi-cli"
-    && KIMI_HOLD_CLEAR_EVENTS.has(event);
-  if (shouldClearKimiPermission) stopKimiPermissionPoll(sessionId);
+  if (srcAgentId === "kimi-cli" && KIMI_HOLD_CLEAR_EVENTS.has(event)) {
+    if (event === "PostToolUse" || event === "PostToolUseFailure") {
+      // A gated Post settles its ledger entry first (exact tool_call_id
+      // match, FIFO for anonymous entries). Non-gated Posts leave the
+      // ledger alone.
+      if (permissionGated === true) closeKimiPermissionGate(sessionId, permissionGateId);
+      // Cue-level clear only — the ledger survives. The user answered THIS
+      // tool, so the pet must leave notification now (sleep-30 rule above);
+      // but if the same assistant message queued more gated calls, re-arm
+      // the suspect window so the NEXT pending approval re-surfaces its own
+      // cue ~800ms later. Like any suspect it is cancelled if the next
+      // PostToolUse lands sooner (auto-approved chain → no flash). This also
+      // covers a non-gated tool finishing between two gated ones: its Post
+      // clears the cue, and the re-arm brings the pending approval back.
+      stopKimiPermissionPoll(sessionId);
+      const pendingGates = kimiPermissionGateLedgers.get(sessionId);
+      if (pendingGates && pendingGates.length) {
+        schedulePermissionSuspect(sessionId, pendingGates[0].detail);
+      }
+    } else {
+      // Turn-level / terminal events (Stop, UserPromptSubmit, PermissionResult,
+      // Interrupt, …): the whole approval context is gone — drop the ledger
+      // together with the cue.
+      disposeKimiPermissionSession(sessionId);
+    }
+  }
 
-  // A brand-new PreToolUse for the same Kimi session starts a fresh approval
-  // gate. Drop any leftover hold/suspect from the previous round so the new
-  // suspect heuristic decides cleanly (and the animation doesn't carry over
-  // from the prior tool).
+  // A brand-new PreToolUse normally starts a fresh approval gate. Preserve an
+  // existing cue, however, when the legacy hook batches a gated Pre followed
+  // by a non-gated Pre: the first tool is still blocked in the terminal and
+  // its ledger/timer remains authoritative until its matching Post arrives.
   if (event === "PreToolUse" && srcAgentId === "kimi-cli") {
-    if (kimiPermissionHolds.has(sessionId)) stopKimiPermissionPoll(sessionId);
-    else cancelPermissionSuspect(sessionId);
+    const pendingGates = kimiPermissionGateLedgers.get(sessionId);
+    const preservePendingGateCue = permissionGateOpen !== true && pendingGates && pendingGates.length > 0;
+    if (!preservePendingGateCue) {
+      if (kimiPermissionHolds.has(sessionId)) stopKimiPermissionPoll(sessionId);
+      else cancelPermissionSuspect(sessionId);
+    }
   }
 
   // Kimi permission heuristic: hook reports permission_suspect=true on
@@ -1612,7 +2529,21 @@ function updateSession(sessionId, state, event, opts = {}) {
     && srcAgentId === "kimi-cli"
     && event === "PreToolUse"
   ) {
-    schedulePermissionSuspect(sessionId);
+    if (permissionGateOpen === true) {
+      openKimiPermissionGate(
+        sessionId,
+        permissionGateId,
+        buildKimiGateDetail(toolName, permissionAction, permissionCommand, permissionToolInput)
+      );
+    }
+    // The cue must describe what the terminal actually blocks on — the OLDEST
+    // outstanding gate — not the PreToolUse that happened to arrive last
+    // (batched Pres land back-to-back and each reschedules this timer).
+    const gates = kimiPermissionGateLedgers.get(sessionId);
+    const headDetail = gates && gates.length
+      ? gates[0].detail
+      : buildKimiGateDetail(toolName, permissionAction, permissionCommand, permissionToolInput);
+    schedulePermissionSuspect(sessionId, headDetail);
   }
 
   const suppressDuplicateCompletionVisual =
@@ -1622,7 +2553,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     // Permission animation lock: while any permission request is pending,
     // keep the pet on notification and block all other one-shot visuals.
     // (One-shot branch normally bypasses resolveDisplayState()).
-    if (hasPermissionAnimationLock() && state !== "notification") {
+    if (hasConfirmedPermissionAnimationLock() && state !== "notification") {
       return;
     }
     // Mini mode already celebrated completion with mini-happy. Keep the idle
@@ -1688,6 +2619,74 @@ function updateSession(sessionId, state, event, opts = {}) {
   }
 }
 
+function restoreSessionFromLease(lease) {
+  if (!lease || typeof lease !== "object") return false;
+  const rawSessionId = typeof lease.sessionId === "string" ? lease.sessionId : "";
+  const agentId = typeof lease.agentId === "string" ? lease.agentId : "";
+  if (!rawSessionId || rawSessionId === "default" || agentId !== "claude-code" || lease.active !== true) return false;
+  if (!Number.isFinite(lease.eventAt) || lease.eventAt <= 0 || lease.validUntil !== null) return false;
+  if (lease.state !== "thinking" && lease.state !== "working" && lease.state !== "juggling") return false;
+  const sessionIdentity = resolveSessionIdentity(rawSessionId, "local");
+  const sessionId = sessionIdentity.sessionId;
+  if (sessions.has(sessionId)) return false;
+  if (sessions.size >= MAX_SESSIONS) return false;
+  const pid = Number.isInteger(lease.pid) && lease.pid > 0 ? lease.pid : null;
+  const sourcePid = Number.isInteger(lease.sourcePid) && lease.sourcePid > 0 ? lease.sourcePid : null;
+  if (!pid && !sourcePid) return false;
+  sessions.set(sessionId, {
+    state: lease.state,
+    updatedAt: Date.now(),
+    displayHint: null,
+    sourcePid,
+    wtHwnd: null,
+    cwd: typeof lease.cwd === "string" ? lease.cwd : "",
+    editor: null,
+    pidChain: null,
+    tmuxSocket: null,
+    tmuxClient: null,
+    orcaPaneKey: null,
+    agentPid: pid,
+    agentId,
+    profileId: sessionIdentity.profileId,
+    rawSessionId: sessionIdentity.rawSessionId,
+    host: null,
+    wslDistro: null,
+    headless: false,
+    platform: null,
+    model: null,
+    provider: null,
+    codexOriginator: null,
+    codexSource: null,
+    ghosttyTerminalId: null,
+    sessionTitle: typeof lease.title === "string" ? lease.title : null,
+    contextUsage: null,
+    contextUsageOrigin: null,
+    antigravityQuota: null,
+    claudeQuota: null,
+    metadataUpdatedAt: null,
+    assistantLastOutput: null,
+    assistantLastOutputTruncated: false,
+    lastToolName: null,
+    transcriptPath: null,
+    recentEvents: [],
+    pidReachable: true,
+    resumeState: null,
+    awaitingInputSinceStop: false,
+    muteNotificationSound: false,
+    subagentTracker: {
+      confirmedIds: new Set(),
+      legacyFloor: false,
+      recoveredFloor: lease.state === "juggling",
+    },
+    startupRecovered: true,
+    recoveryEventAt: lease.eventAt,
+    recoveryValidUntil: lease.validUntil,
+  });
+  lastSessionSnapshot = null;
+  lastSessionSnapshotSignature = null;
+  return true;
+}
+
 function isProcessAlive(pid) {
   try { _kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
 }
@@ -1695,7 +2694,10 @@ function isProcessAlive(pid) {
 function cleanStaleSessions() {
   const now = Date.now();
   let changed = false;
-  let snapshotRefreshNeeded = false;
+  // Quota is session-independent and can go stale while no hook events are
+  // arriving. The existing 10-second lifecycle sweep must therefore retire
+  // dead buckets too and force a snapshot refresh when it does.
+  let snapshotRefreshNeeded = accountQuota.prune();
   const staleConfig = typeof ctx.getStaleConfig === "function" ? ctx.getStaleConfig() : null;
   for (const [id, s] of sessions) {
     const decision = getStaleSessionDecision(s, {
@@ -1713,19 +2715,30 @@ function cleanStaleSessions() {
       debugSession(`stale-delete ${decision.reason} ${describeSession(id, s)}${badgeSuffix}`);
       if (s && s.agentId === "codex") cancelCodexExitProbe(id, `stale-delete-${decision.reason}`);
       if (s && s.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-disposed");
-      sessions.delete(id); changed = true;
+      if (s && s.agentId && typeof ctx.onSessionAutomationLifecycleEnd === "function") {
+        ctx.onSessionAutomationLifecycleEnd({
+          agentId: s.agentId,
+          sessionId: id,
+          reason: `stale-delete-${decision.reason}`,
+        });
+      }
+      deleteSessionWithCompletionCleanup(id, `stale-delete-${decision.reason}`); changed = true;
       continue;
     }
 
     if (decision.action === "idle") {
       debugSession(`stale-idle ${decision.reason} ${describeSession(id, s)}`);
       s.state = "idle"; s.displayHint = null;
+      s.subagentTracker = clearSubagentTracker(cloneSubagentTracker(s));
+      s.claudeBackgroundSubagentHoldAt = null;
+      cancelCompletionDebounce(id, `stale-idle-${decision.reason}`);
+      cancelClaudeTranscriptCompletionProbe(id, `stale-idle-${decision.reason}`);
       if (decision.updateTimestamp) s.updatedAt = now;
       changed = true;
     }
   }
   if (changed && sessions.size === 0) {
-    setState("idle", SVG_IDLE_FOLLOW);
+    setState("idle", getSvgOverride("idle"));
   } else if (changed) {
     const resolved = resolveDisplayState();
     setState(resolved, getSvgOverride(resolved));
@@ -1745,6 +2758,7 @@ function cleanStaleSessions() {
 // Session removal helpers. Kimi has extra animation/bubble bookkeeping because
 // its approval prompt is terminal-driven rather than an HTTP permission roundtrip.
 function disposeKimiSessionState(id, reason) {
+  kimiPermissionGateLedgers.delete(id);
   const hadSuspect = cancelPermissionSuspect(id);
   const hold = kimiPermissionHolds.get(id);
   if (hold) {
@@ -1763,7 +2777,7 @@ function dismissSession(sessionId) {
   const session = sessions.get(id);
   if (!session) return false;
   if (session.agentId === "codex") cancelCodexExitProbe(id, "session-hidden");
-  sessions.delete(id);
+  deleteSessionWithCompletionCleanup(id, "session-hidden");
   if (session.agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-session-hidden");
   const resolved = resolveDisplayState();
   setState(resolved, getSvgOverride(resolved));
@@ -1828,7 +2842,7 @@ function clearSessionsByAgent(agentId) {
   for (const [id, s] of sessions) {
     if (s && s.agentId === agentId) {
       if (agentId === "codex") cancelCodexExitProbe(id, "clear-sessions");
-      sessions.delete(id);
+      deleteSessionWithCompletionCleanup(id, "clear-sessions");
       if (agentId === "kimi-cli") disposeKimiSessionState(id, "kimi-clear-sessions");
       removed++;
     }
@@ -1857,6 +2871,12 @@ function clearSessionsByAgent(agentId) {
         ctx.clearKimiNotifyBubbles(id, "kimi-orphan-suspect-cleared");
       }
     }
+    // Gate ledgers can hold the same orphans (immediate-mode sessions never
+    // enter the `sessions` Map either). Today's callers pair this function
+    // with dismissPermissionsByAgent → disposeAllKimiPermissionState, which
+    // would clear them anyway — but this function must not depend on that
+    // pairing to keep the ledger from re-arming a cue for a dead session.
+    kimiPermissionGateLedgers.clear();
   }
   if (removed > 0) {
     const resolved = resolveDisplayState();
@@ -1870,23 +2890,64 @@ function detectRunningAgentProcesses(callback) {
   if (_detectInFlight) return;
   _detectInFlight = true;
   const done = (result) => { _detectInFlight = false; callback(result); };
-  // Agent gate short-circuit: if every agent is disabled, skip the system
-  // call entirely — nothing we could "find" should keep startup recovery
-  // alive. When at least one agent is enabled, we still run the combined
-  // detection because the query can't attribute individual processes back
-  // to agent ids without per-name process queries, and the result
-  // is only a boolean for startup recovery — not a session creator.
+  // Skip the system call when every integration is disabled, then build the
+  // query from each enabled agent's explicit conservative detection surface.
   if (typeof ctx.hasAnyEnabledAgent === "function" && !ctx.hasAnyEnabledAgent()) {
+    done(false);
+    return;
+  }
+  const isEnabled = typeof ctx.isAgentEnabled === "function"
+    ? (agentId) => ctx.isAgentEnabled(agentId)
+    : () => true;
+  const processEntries = getStartupRecoveryProcessNames()
+    .filter((entry) => entry && entry.name && entry.agentId && isEnabled(entry.agentId));
+  // Preserve node-shaped CLI detection only as a weak keep-awake fallback.
+  // A match here never creates a session or publishes a task-level state.
+  // An optional `processName` overrides the default `node.exe` host for an
+  // entry — used by agents whose Windows runtime is a different binary (e.g.
+  // ZCode reuses the desktop executable to run `zcode.cjs`). On POSIX the
+  // same marker is matched with pgrep -f, covering current macOS builds without
+  // treating the always-running GUI shell as active work.
+  const commandLineNeedles = [
+    { agentId: "claude-code", needle: "claude-code" },
+    { agentId: "codex", needle: "codex" },
+    { agentId: "copilot-cli", needle: "copilot" },
+    { agentId: "codebuddy", needle: "codebuddy" },
+    { agentId: "kimi-cli", needle: "kimi-code" },
+    // Current ZCode runtimes use resources/glm/zcode.cjs app-server; only the
+    // cmdline token disambiguates the working process from the GUI shell.
+    { agentId: "zcode", needle: "zcode.cjs", processName: "zcode.exe" },
+  ].filter((entry) => isEnabled(entry.agentId));
+  const platformCommandLineNeedles = process.platform === "win32" || !isEnabled("pi")
+    ? commandLineNeedles
+    : [
+        ...commandLineNeedles,
+        { agentId: "pi", needle: "@earendil-works/pi-coding-agent" },
+        { agentId: "pi", needle: "pi-coding-agent/dist/cli.js" },
+      ];
+  if (processEntries.length === 0 && platformCommandLineNeedles.length === 0) {
     done(false);
     return;
   }
   const { execFile, exec } = require("child_process");
   if (process.platform === "win32") {
+    // Registry declarations are source-controlled literals. External input
+    // must never be spliced into this WQL filter.
+    const names = [...new Set(processEntries.map((entry) => String(entry.name).toLowerCase()))];
+    const quotedNames = names.map((name) => `'${name.replace(/'/g, "''")}'`).join(",");
+    const quotedNeedles = platformCommandLineNeedles
+      .map((entry) => `'${entry.needle.replace(/'/g, "''")}'`)
+      .join(",");
     const psScript =
-      "$names = 'claude.exe','codex.exe','copilot.exe','gemini.exe','agy.exe','codebuddy.exe','kiro-cli.exe','kimi.exe','codewhale.exe','opencode.exe','pi.exe','hermes.exe','qodercli.exe','qoder-cli.exe'; " +
-      "$match = Get-CimInstance Win32_Process | Where-Object { " +
-        "$names -contains $_.Name -or ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*claude-code*') " +
-      "} | Select-Object -First 1; " +
+      `$names = @(${quotedNames}); ` +
+      `$nodeNeedles = @(${quotedNeedles}); ` +
+      // Each needle may carry its own host process name (default node.exe) so a
+      // non-node runtime like ZCode.exe can be matched by name+cmdline jointly.
+      `$nodeNeedleNames = @(${platformCommandLineNeedles.map((entry) => `'${String(entry.processName || "node.exe").replace(/'/g, "''")}'`).join(",")}); ` +
+      "$nameFilters = $names | ForEach-Object { \"Name='$_'\" }; " +
+      "$nodeFilters = for ($i = 0; $i -lt $nodeNeedles.Length; $i++) { \"(Name='$($nodeNeedleNames[$i])' AND CommandLine LIKE '%$($nodeNeedles[$i])%')\" }; " +
+      "$filter = (@($nameFilters) + @($nodeFilters)) -join ' OR '; " +
+      "$match = Get-CimInstance Win32_Process -Filter $filter | Select-Object -First 1; " +
       "if ($match) { $match.ProcessId }";
     execFile(
       "powershell.exe",
@@ -1895,7 +2956,17 @@ function detectRunningAgentProcesses(callback) {
       (err, stdout) => done(!err && /\d+/.test(stdout))
     );
   } else {
-    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi|@earendil-works/pi-coding-agent|pi-coding-agent/dist/cli\\.js' || pgrep -x 'gemini' || pgrep -x 'agy' || pgrep -x 'kiro-cli' || pgrep -x 'codewhale' || pgrep -x 'opencode' || pgrep -x 'hermes' || pgrep -x 'qodercli' || pgrep -x 'qoder-cli'", { timeout: 3000 },
+    const shellQuote = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
+    const regexEscape = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const exactClauses = [...new Set(processEntries.map((entry) => String(entry.name)))]
+      .map((name) => `pgrep -x ${shellQuote(name)}`);
+    const markerPattern = platformCommandLineNeedles
+      .map((entry) => regexEscape(entry.needle))
+      .join("|");
+    const clauses = markerPattern
+      ? [`pgrep -f ${shellQuote(markerPattern)}`, ...exactClauses]
+      : exactClauses;
+    exec(clauses.join(" || "), { timeout: 3000 },
       (err) => done(!err)
     );
   }
@@ -1910,7 +2981,7 @@ function stopStaleCleanup() {
   if (staleCleanupTimer) { clearInterval(staleCleanupTimer); staleCleanupTimer = null; }
 }
 
-function startKimiPermissionPoll(sessionId) {
+function startKimiPermissionPoll(sessionId, permissionDetail = null, source = "confirmed") {
   if (!sessionId) return;
   // DND / agent permissions-off both suppress the passive bubble at creation
   // time (see shouldSuppressKimiNotifyBubble in permission.js). Skipping the
@@ -1933,19 +3004,34 @@ function startKimiPermissionPoll(sessionId) {
     // Last-resort safety cap. The primary release path is event-driven
     // (PostToolUse / Stop / UserPromptSubmit / new PreToolUse / SessionEnd /
     // cleanStaleSessions when the Kimi PID dies). The timer just prevents
-    // permanent stuck state if every other signal is somehow lost.
+    // permanent stuck state if every other signal is somehow lost — and in
+    // that lost-signal world the gate ledger is stale too, so drop it whole.
     timer = setTimeout(() => {
-      stopKimiPermissionPoll(sessionId);
+      disposeKimiPermissionSession(sessionId);
     }, maxMs);
   }
   kimiPermissionHolds.set(sessionId, {
     timer,
     until: maxMs > 0 ? Date.now() + maxMs : null,
+    source: source === "heuristic" ? "heuristic" : "confirmed",
   });
-  // Avoid stacking duplicate passive bubbles for the same pending request.
-  // Refreshing the hold timer should not create extra UI noise.
-  if (!existing && typeof ctx.showKimiNotifyBubble === "function") {
-    ctx.showKimiNotifyBubble({ sessionId });
+  // Refreshing the hold must still forward fresh detail: with the rich cue,
+  // showing request #1's command while the terminal blocks on request #2
+  // would be authoritatively wrong. showKimiNotifyBubble dedupes per session
+  // and refreshes the existing card in place (codex idiom), so no bubble
+  // stacking. Suspect promotions carry no detail object and skip the
+  // refresh — a heuristic re-affirmation must not downgrade a rich card.
+  if (typeof ctx.showKimiNotifyBubble === "function" && (!existing || permissionDetail)) {
+    // #563: Kimi Code native PermissionRequest carries what actually needs
+    // approval; the bubble shows the real command instead of generic copy.
+    // Legacy synthesized requests pass null detail and keep the old text.
+    ctx.showKimiNotifyBubble({
+      sessionId,
+      toolName: permissionDetail && permissionDetail.toolName ? permissionDetail.toolName : null,
+      permissionAction: permissionDetail && permissionDetail.permissionAction ? permissionDetail.permissionAction : null,
+      permissionCommand: permissionDetail && permissionDetail.permissionCommand ? permissionDetail.permissionCommand : null,
+      permissionToolInput: permissionDetail && permissionDetail.permissionToolInput ? permissionDetail.permissionToolInput : null,
+    });
   }
 }
 
@@ -1958,7 +3044,7 @@ function cancelPermissionSuspect(sessionId) {
   return true;
 }
 
-function schedulePermissionSuspect(sessionId) {
+function schedulePermissionSuspect(sessionId, permissionDetail = null) {
   if (!sessionId) return;
   const delay = parseSuspectDelay();
   // A zero delay disables the heuristic entirely (caller shouldn't reach
@@ -1980,14 +3066,24 @@ function schedulePermissionSuspect(sessionId) {
       typeof ctx.isAgentPermissionsEnabled === "function"
       && !ctx.isAgentPermissionsEnabled("kimi-cli")
     ) return;
-    startKimiPermissionPoll(sessionId);
+    // permissionDetail (queue head of the gate ledger, or null for a plain
+    // legacy suspect) makes the promoted cue name the tool that actually
+    // blocks the terminal; null degrades to the generic copy.
+    startKimiPermissionPoll(sessionId, permissionDetail, "heuristic");
     setState("notification");
   }, delay);
   kimiPermissionSuspectTimers.set(sessionId, { timer, scheduledAt: Date.now() });
 }
 
+// Cue-level clear: hold + suspect timer + visible card. The gate ledger is
+// deliberately PRESERVED — a Post that settles one of several batched
+// approvals must clear the current cue without forgetting the queued rest.
+// Full teardown (turn-level events, session disposal, safety cap) goes
+// through disposeKimiPermissionSession instead. The no-arg variant is the
+// global stop-everything path and drops the ledgers too.
 function stopKimiPermissionPoll(sessionId) {
   if (!sessionId) {
+    kimiPermissionGateLedgers.clear();
     const hadHold = kimiPermissionHolds.size > 0;
     const hadSuspect = kimiPermissionSuspectTimers.size > 0;
     if (!hadHold && !hadSuspect) return;
@@ -2012,6 +3108,16 @@ function stopKimiPermissionPoll(sessionId) {
     if (typeof ctx.clearKimiNotifyBubbles === "function") ctx.clearKimiNotifyBubbles(sessionId, "kimi-stop-suspect");
     applyResolvedDisplayState();
   }
+}
+
+// Full per-session teardown: cue + gate ledger. Used by turn-level events
+// (Stop/UserPromptSubmit/PermissionResult/Interrupt/…), SessionEnd, the
+// safety-cap timer, and session disposal — every path where the approval
+// context as a whole is gone and queued gates must not re-arm a cue later.
+function disposeKimiPermissionSession(sessionId) {
+  if (!sessionId) return;
+  kimiPermissionGateLedgers.delete(sessionId);
+  stopKimiPermissionPoll(sessionId);
 }
 
 function resolveDisplayState() {
@@ -2043,6 +3149,7 @@ function getSvgOverride(state) {
     updateVisualState,
     updateVisualSvgOverride,
     idleFollowSvg: SVG_IDLE_FOLLOW,
+    idleDefaultVisual: typeof ctx.getIdleVisualChoice === "function" ? ctx.getIdleVisualChoice() : null,
     sessions,
     displayHintMap: DISPLAY_HINT_MAP,
     theme,
@@ -2072,6 +3179,7 @@ function formatElapsed(ms) {
 // mid-transition and will resolve the visible state themselves. Returns
 // `true` if anything was cleared so callers can trigger their own resolve.
 function disposeAllKimiPermissionState() {
+  kimiPermissionGateLedgers.clear();
   const hadHold = kimiPermissionHolds.size > 0;
   const hadSuspect = kimiPermissionSuspectTimers.size > 0;
   if (!hadHold && !hadSuspect) return false;
@@ -2141,6 +3249,10 @@ function getCurrentHitBox() { return currentHitBox; }
 function getStartupRecoveryActive() { return startupRecoveryActive; }
 
 function cleanup() {
+  // The persist debounce timer is unref'd, so a quota update inside the
+  // final debounce window before quit would otherwise never reach disk
+  // (main.js before-quit calls this cleanup).
+  accountQuota.flush();
   if (pendingTimer) clearTimeout(pendingTimer);
   pendingState = null;
   if (autoReturnTimer) clearTimeout(autoReturnTimer);
@@ -2155,12 +3267,13 @@ function cleanup() {
   kimiPermissionHolds.clear();
   for (const { timer } of kimiPermissionSuspectTimers.values()) clearTimeout(timer);
   kimiPermissionSuspectTimers.clear();
+  kimiPermissionGateLedgers.clear();
   for (const id of [...codexExitProbes.keys()]) clearCodexExitProbe(id);
   stopStaleCleanup();
 }
 
 return {
-  setState, applyState, updateSession, resolveDisplayState, resolveVisualBinding, setUpdateVisualState,
+  setState, applyState, updateSession, restoreSessionFromLease, resolveDisplayState, resolveVisualBinding, setUpdateVisualState,
   shouldDropForDnd,
   enableDoNotDisturb, disableDoNotDisturb,
   startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
@@ -2169,13 +3282,23 @@ return {
   emitSessionSnapshot, broadcastSessionSnapshot, getLastSessionSnapshot,
   getActiveSessionAliasKeys,
   dismissSession,
+  formatStdinDiag,
   updateSessionFocusMetadata,
+  touchSessionActivity,
+  updateSessionMetadata,
+  clearClaudeStatuslineAuthority,
+  updateAccountQuota,
+  clearLocalClaudeQuota,
+  commitLocalKimiQuota,
+  clearLocalKimiQuota,
+  getQuotaSourceCount,
   clearPermissionNotification,
+  promoteCompletion,
   ackSessionCompletion,
   clearSessionsByAgent,
   disposeAllKimiPermissionState,
   deriveSessionBadge,
-  getCurrentState, getCurrentSvg, getCurrentHitBox, getStartupRecoveryActive,
+  getCurrentState, getCurrentSvg, getCurrentHitBox, resolveHitBoxForSvg, getStartupRecoveryActive,
   sessions, STATE_PRIORITY, ONESHOT_STATES, SLEEP_SEQUENCE,
   get STATE_SVGS() { return STATE_SVGS; },
   get HIT_BOXES() { return HIT_BOXES; },

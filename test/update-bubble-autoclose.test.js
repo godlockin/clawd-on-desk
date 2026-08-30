@@ -19,12 +19,19 @@ class FakeBrowserWindow {
     this.visible = false;
     this.bounds = null;
     this.listeners = new Map();
+    this.sent = [];
+    this.insertedCss = [];
     this.webContents = {
       _loading: false,
       isDestroyed: () => false,
       isLoading: () => false,
       once: () => {},
-      send: () => {},
+      send: (channel, payload) => this.sent.push({ channel, payload }),
+      setZoomFactor: (value) => { this.zoomFactor = value; },
+      insertCSS: (value) => {
+        this.insertedCss.push(value);
+        return Promise.resolve(`css-${this.insertedCss.length}`);
+      },
     };
     FakeBrowserWindow.instances.push(this);
   }
@@ -61,6 +68,8 @@ function loadUpdateBubbleWithElectron(fakeElectron) {
 function createHarness() {
   FakeBrowserWindow.instances = [];
   let updateAutoCloseMs = 9_000;
+  const orbitRepositions = [];
+  const clipboardWrites = [];
   const initUpdateBubble = loadUpdateBubbleWithElectron({ BrowserWindow: FakeBrowserWindow });
   const api = initUpdateBubble({
     win: { isDestroyed: () => false },
@@ -78,9 +87,15 @@ function createHarness() {
     getHudReservedOffset: () => 0,
     guardAlwaysOnTop: () => {},
     reapplyMacVisibility: () => {},
+    repositionSessionHud: () => orbitRepositions.push("reposition"),
+    clipboard: {
+      writeText(value) { clipboardWrites.push(value); },
+    },
   });
   return {
     api,
+    orbitRepositions,
+    clipboardWrites,
     setUpdateAutoCloseMs(value) {
       updateAutoCloseMs = value;
     },
@@ -115,6 +130,128 @@ describe("update bubble auto-close refresh", () => {
     assert.strictEqual(harness.api.getBubbleWindow().isVisible(), false);
   });
 
+  it("uses the fixed target work area for initial size, zoom, and final bounds", async () => {
+    const targetWorkArea = { x: -1600, y: 200, width: 1600, height: 900 };
+    const targetCalls = [];
+    const scaleCalls = [];
+    const initUpdateBubble = loadUpdateBubbleWithElectron({ BrowserWindow: FakeBrowserWindow });
+    const api = initUpdateBubble({
+      win: { isDestroyed: () => false },
+      bubbleFollowPet: false,
+      bubbleFixedCorner: "bottom-right",
+      petHidden: false,
+      getBubblePolicy: () => ({ enabled: true, autoCloseMs: 0 }),
+      getPetWindowBounds: () => ({ x: 20, y: 20, width: 120, height: 120 }),
+      getBubbleWorkArea: (followPet) => {
+        targetCalls.push(followPet);
+        return targetWorkArea;
+      },
+      getTextScale: (workArea) => {
+        scaleCalls.push(workArea);
+        return 1.5;
+      },
+      getUpdateBubbleAnchorRect: () => null,
+      getHitRectScreen: () => null,
+      getPermissionBubbleBounds: () => [],
+      getSessionHudBounds: () => [],
+      guardAlwaysOnTop: () => {},
+      reapplyMacVisibility: () => {},
+      repositionQuotaRing: () => {},
+      clipboard: { writeText: () => {} },
+    });
+
+    await api.showUpdateBubble({
+      mode: "up-to-date",
+      title: "Up to date",
+      message: "Already current.",
+      requireAction: false,
+      defaultAction: "dismiss",
+    });
+
+    const bubble = api.getBubbleWindow();
+    assert.strictEqual(bubble.options.width, 510);
+    assert.strictEqual(bubble.zoomFactor, 1);
+    assert.match(bubble.insertedCss.at(-1), /zoom: 1\.5/);
+    assert.deepStrictEqual(bubble.bounds, { x: -522, y: 863, width: 510, height: 225 });
+    assert.ok(targetCalls.every((followPet) => followPet === false));
+    assert.ok(scaleCalls.every((workArea) => workArea === targetWorkArea));
+    api.cleanup();
+  });
+
+  it("can show against an explicitly visible target before the petHidden getter commits", async () => {
+    const initUpdateBubble = loadUpdateBubbleWithElectron({ BrowserWindow: FakeBrowserWindow });
+    const api = initUpdateBubble({
+      win: { isDestroyed: () => false },
+      bubbleFollowPet: false,
+      petHidden: true,
+      getBubblePolicy: () => ({ enabled: true, autoCloseMs: 0 }),
+      getPetWindowBounds: () => ({ x: 20, y: 20, width: 120, height: 120 }),
+      getNearestWorkArea: () => ({ x: 0, y: 0, width: 1920, height: 1080 }),
+      getUpdateBubbleAnchorRect: () => null,
+      getHitRectScreen: () => null,
+      getPermissionBubbleBounds: () => [],
+      getSessionHudBounds: () => [],
+      guardAlwaysOnTop: () => {},
+      reapplyMacVisibility: () => {},
+      repositionQuotaRing: () => {},
+      clipboard: { writeText: () => {} },
+    });
+
+    await api.showUpdateBubble({
+      mode: "up-to-date",
+      title: "Up to date",
+      message: "Already current.",
+      requireAction: false,
+      defaultAction: "dismiss",
+    });
+    const bubble = api.getBubbleWindow();
+    assert.strictEqual(bubble.isVisible(), false);
+
+    api.syncVisibility(false);
+    assert.strictEqual(bubble.isVisible(), true,
+      "the explicit target state must win over the still-stale petHidden getter");
+    api.cleanup();
+  });
+
+  it("wires permission and HUD bounds into fixed update bubble repositioning", async () => {
+    const workArea = { x: 0, y: 0, width: 1200, height: 800 };
+    const initUpdateBubble = loadUpdateBubbleWithElectron({ BrowserWindow: FakeBrowserWindow });
+    const api = initUpdateBubble({
+      win: { isDestroyed: () => false },
+      bubbleFollowPet: false,
+      bubbleFixedCorner: "bottom-right",
+      petHidden: false,
+      getBubblePolicy: () => ({ enabled: true, autoCloseMs: 0 }),
+      getPetWindowBounds: () => ({ x: 20, y: 20, width: 120, height: 120 }),
+      getBubbleWorkArea: () => workArea,
+      getTextScale: () => 1,
+      getUpdateBubbleAnchorRect: () => null,
+      getHitRectScreen: () => null,
+      getPermissionBubbleBounds: () => [{ x: 852, y: 642, width: 340, height: 150 }],
+      getSessionHudBounds: () => [{ x: 852, y: 560, width: 340, height: 60 }],
+      guardAlwaysOnTop: () => {},
+      reapplyMacVisibility: () => {},
+      repositionQuotaRing: () => {},
+      clipboard: { writeText: () => {} },
+    });
+
+    await api.showUpdateBubble({
+      mode: "up-to-date",
+      title: "Up to date",
+      message: "Already current.",
+      requireAction: false,
+      defaultAction: "dismiss",
+    });
+
+    assert.deepStrictEqual(api.getBubbleWindow().bounds, {
+      x: 852,
+      y: 404,
+      width: 340,
+      height: 150,
+    });
+    api.cleanup();
+  });
+
   it("uses remaining lifetime instead of restarting the full update-bubble countdown", async () => {
     mock.timers.enable({ apis: ["setTimeout", "Date"] });
     mock.timers.setTime(100_000);
@@ -143,5 +280,57 @@ describe("update bubble auto-close refresh", () => {
 
     mock.timers.tick(250);
     assert.strictEqual(bubble.isVisible(), false);
+  });
+
+  it("repositions Orbit when the update bubble shows, resizes, and finishes hiding", async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    const harness = createHarness();
+
+    await harness.api.showUpdateBubble({
+      mode: "up-to-date",
+      title: "Up to date",
+      requireAction: false,
+      defaultAction: "dismiss",
+    });
+    const bubble = harness.api.getBubbleWindow();
+    assert.strictEqual(harness.orbitRepositions.length, 1, "show should add update bounds to Orbit avoidance");
+
+    harness.api.handleUpdateBubbleHeight({ sender: bubble.webContents }, 220);
+    assert.strictEqual(harness.orbitRepositions.length, 2, "measured height should reflow Orbit");
+
+    harness.api.hideUpdateBubble();
+    assert.strictEqual(harness.orbitRepositions.length, 2, "Orbit must keep avoiding the fade-out window");
+    mock.timers.tick(250);
+    assert.strictEqual(harness.orbitRepositions.length, 3, "hidden window should release Orbit avoidance");
+  });
+
+  it("copies error details without closing or resolving the update bubble", async () => {
+    const harness = createHarness();
+    const pending = harness.api.showUpdateBubble({
+      mode: "error",
+      title: "Update failed",
+      message: "Network unavailable",
+      copyText: "NETWORK_OFFLINE\nredacted detail",
+      copyFeedback: { copied: "Copied", failed: "Copy failed" },
+      requireAction: true,
+      defaultAction: "dismiss",
+    });
+    const bubble = harness.api.getBubbleWindow();
+    let settled = false;
+    pending.then(() => { settled = true; });
+
+    harness.api.handleUpdateBubbleAction({ sender: bubble.webContents }, "copy-error");
+    await Promise.resolve();
+
+    assert.deepStrictEqual(harness.clipboardWrites, ["NETWORK_OFFLINE\nredacted detail"]);
+    assert.equal(settled, false);
+    assert.equal(bubble.isVisible(), true);
+    assert.deepStrictEqual(bubble.sent.at(-1), {
+      channel: "update-bubble-copy-result",
+      payload: { status: "ok", label: "Copied" },
+    });
+
+    harness.api.handleUpdateBubbleAction({ sender: bubble.webContents }, "dismiss");
+    assert.deepStrictEqual(await pending, { action: "dismiss", source: "user" });
   });
 });

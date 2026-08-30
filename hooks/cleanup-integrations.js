@@ -4,28 +4,39 @@
 const os = require("os");
 const path = require("path");
 
-const { unregisterHooks: unregisterClaudeHooks } = require("./install");
+const { unregisterHooks: unregisterClaudeHooks, unregisterClaudeStatusline } = require("./install");
 const { unregisterGeminiHooks } = require("./gemini-install");
-const { unregisterAntigravityHooks } = require("./antigravity-install");
+const { unregisterAntigravityHooks, unregisterAntigravityStatusline } = require("./antigravity-install");
 const { unregisterCursorHooks } = require("./cursor-install");
 const { unregisterCopilotHooks } = require("./copilot-install");
 const { unregisterCodeBuddyHooks } = require("./codebuddy-install");
 const { unregisterKiroHooks } = require("./kiro-install");
 const { unregisterKimiHooks } = require("./kimi-install");
 const { unregisterQwenCodeHooks } = require("./qwen-code-install");
+const { unregisterZcodeHooks } = require("./zcode-install");
 const { unregisterCodewhaleHooks } = require("./codewhale-install");
-const { unregisterCodexCommandHooks } = require("./codex-install-utils");
+const {
+  removeStableCodexHookLauncher,
+  unregisterCodexCommandHooks,
+} = require("./codex-install-utils");
 const { unregisterOpencodePlugin } = require("./opencode-install");
+const { unregisterMimocodePlugin } = require("./mimocode-install");
 const { unregisterPiExtension } = require("./pi-install");
 const { unregisterOpenClawPlugin } = require("./openclaw-install");
 const { resolveHermesHome, unregisterHermesPlugin } = require("./hermes-install");
 const { unregisterQoderHooks } = require("./qoder-install");
-const { unregisterReasonixHooks } = require("./reasonix-install");
+const { resolveReasonixConfigTargets, unregisterReasonixHooks } = require("./reasonix-install");
+const { unregisterQoderWorkHooks } = require("./qoderwork-install");
+const { unregisterQwenWorkHooks } = require("./qwenwork-install");
+const { unregisterWorkBuddyHooks } = require("./workbuddy-install");
+const { unregisterTraeCodeHooks } = require("./traecode-install");
+const { unregisterDeepSeekHarness } = require("./dsh-install");
 
 const CODEX_MARKERS = ["codex-hook.js", "codex-debug-hook.js"];
 
 const MANAGED_AGENT_IDS = Object.freeze([
   "claude-code",
+  "deepseek-harness",
   "gemini-cli",
   "antigravity-cli",
   "cursor-agent",
@@ -34,34 +45,47 @@ const MANAGED_AGENT_IDS = Object.freeze([
   "kiro-cli",
   "kimi-cli",
   "qwen-code",
+  "zcode",
   "codewhale",
   "codex",
   "opencode",
+  "mimocode",
   "pi",
   "openclaw",
   "hermes",
   "qoder",
   "reasonix",
+  "qoderwork",
+  "qwenwork",
+  "workbuddy",
+  "traecode",
 ]);
 
 const AGENT_DISPLAY_NAMES = Object.freeze({
   "claude-code": "Claude Code",
+  "deepseek-harness": "DeepSeek Harness",
   "gemini-cli": "Gemini CLI",
   "antigravity-cli": "Antigravity CLI",
   "cursor-agent": "Cursor Agent",
   "copilot-cli": "GitHub Copilot CLI",
   codebuddy: "CodeBuddy",
+  workbuddy: "WorkBuddy",
   "kiro-cli": "Kiro CLI",
-  "kimi-cli": "Kimi Code CLI",
+  "kimi-cli": "Kimi Code",
   "qwen-code": "Qwen Code",
+  zcode: "ZCode",
   codewhale: "CodeWhale",
   codex: "Codex CLI",
   opencode: "opencode",
+  mimocode: "MiMo Code",
   pi: "Pi",
   openclaw: "OpenClaw",
   hermes: "Hermes Agent",
   qoder: "Qoder",
   reasonix: "Reasonix",
+  qoderwork: "QoderWork",
+  traecode: "TraeCode",
+  qwenwork: "QwenWork",
 });
 
 function normalizeHomeDir(value) {
@@ -77,6 +101,16 @@ function buildTargetEnv(homeDir, options = {}) {
     env.HERMES_HOME = path.resolve(options.hermesHome);
   } else if (options.ignoreInheritedHermesHome) {
     delete env.HERMES_HOME;
+  }
+  if (typeof options.reasonixHome === "string" && options.reasonixHome.trim()) {
+    env.REASONIX_HOME = path.resolve(options.reasonixHome);
+  } else if (options.ignoreInheritedReasonixHome) {
+    delete env.REASONIX_HOME;
+  }
+  if (typeof options.dshHome === "string" && options.dshHome.trim()) {
+    env.DSH_HOME = path.resolve(options.dshHome);
+  } else if (options.ignoreInheritedDshHome) {
+    delete env.DSH_HOME;
   }
   if ((options.platform || process.platform) === "win32") {
     env.LOCALAPPDATA = options.localAppData || path.join(homeDir, "AppData", "Local");
@@ -98,13 +132,34 @@ function resolveCopilotHomeForCleanup(homeDir, env, options = {}) {
 function buildCleanupOptionsForHome(homeDirInput, options = {}) {
   const explicitHomeDir = Boolean(homeDirInput || options.homeDir || options.userHome);
   const homeDir = normalizeHomeDir(homeDirInput || options.homeDir || options.userHome);
+  const explicitDshHome = typeof options.dshHome === "string" && options.dshHome.trim()
+    ? options.dshHome.trim()
+    : (options.env && typeof options.env.DSH_HOME === "string" && options.env.DSH_HOME.trim()
+      ? options.env.DSH_HOME.trim()
+      : null);
   const env = buildTargetEnv(homeDir, {
     ...options,
+    dshHome: explicitDshHome,
     ignoreInheritedHermesHome: explicitHomeDir && !options.hermesHome,
+    ignoreInheritedReasonixHome: explicitHomeDir && !options.reasonixHome,
+    ignoreInheritedDshHome: explicitHomeDir && !explicitDshHome,
   });
   const backup = options.backup !== false;
   const silent = options.silent !== false;
   const common = { backup, silent };
+  const explicitCodexHome = typeof options.codexDir === "string" && options.codexDir.trim()
+    ? options.codexDir.trim()
+    : (typeof options.codexHome === "string" && options.codexHome.trim()
+      ? options.codexHome.trim()
+      : (options.env && typeof options.env.CODEX_HOME === "string" && options.env.CODEX_HOME.trim()
+        ? options.env.CODEX_HOME.trim()
+        : null));
+  const inheritedCodexHome = !explicitHomeDir
+    && typeof env.CODEX_HOME === "string"
+    && env.CODEX_HOME.trim()
+    ? env.CODEX_HOME.trim()
+    : null;
+  const codexDir = explicitCodexHome || inheritedCodexHome || path.join(homeDir, ".codex");
   const copilotHome = resolveCopilotHomeForCleanup(homeDir, env, options);
   const openClawStateDir = options.openClawStateDir
     || env.OPENCLAW_STATE_DIR
@@ -124,6 +179,12 @@ function buildCleanupOptionsForHome(homeDirInput, options = {}) {
         ...common,
         settingsPath: path.join(homeDir, ".claude", "settings.json"),
       },
+      "deepseek-harness": {
+        ...common,
+        homeDir,
+        env,
+        dshHome: env.DSH_HOME || path.join(homeDir, ".dsh"),
+      },
       "gemini-cli": {
         ...common,
         settingsPath: path.join(homeDir, ".gemini", "settings.json"),
@@ -131,6 +192,7 @@ function buildCleanupOptionsForHome(homeDirInput, options = {}) {
       "antigravity-cli": {
         ...common,
         configPath: path.join(homeDir, ".gemini", "config", "hooks.json"),
+        settingsPath: path.join(homeDir, ".gemini", "antigravity-cli", "settings.json"),
       },
       "cursor-agent": {
         ...common,
@@ -152,11 +214,19 @@ function buildCleanupOptionsForHome(homeDirInput, options = {}) {
       },
       "kimi-cli": {
         ...common,
-        settingsPath: path.join(homeDir, ".kimi", "config.toml"),
+        // #563: clean both generations — legacy Kimi CLI and Kimi Code.
+        settingsPaths: [
+          path.join(homeDir, ".kimi", "config.toml"),
+          path.join(homeDir, ".kimi-code", "config.toml"),
+        ],
       },
       "qwen-code": {
         ...common,
         settingsPath: path.join(homeDir, ".qwen", "settings.json"),
+      },
+      zcode: {
+        ...common,
+        settingsPath: path.join(homeDir, ".zcode", "cli", "config.json"),
       },
       codewhale: {
         ...common,
@@ -165,12 +235,17 @@ function buildCleanupOptionsForHome(homeDirInput, options = {}) {
       codex: {
         ...common,
         homeDir,
-        hooksPath: path.join(homeDir, ".codex", "hooks.json"),
+        codexDir,
+        hooksPath: path.join(codexDir, "hooks.json"),
         markers: CODEX_MARKERS,
       },
       opencode: {
         ...common,
         configPath: path.join(homeDir, ".config", "opencode", "opencode.json"),
+      },
+      mimocode: {
+        ...common,
+        configPath: path.join(homeDir, ".config", "mimocode", "mimocode.jsonc"),
       },
       pi: {
         ...common,
@@ -196,30 +271,96 @@ function buildCleanupOptionsForHome(homeDirInput, options = {}) {
       },
       reasonix: {
         ...common,
-        settingsPath: path.join(homeDir, ".reasonix", "settings.json"),
+        settingsPaths: resolveReasonixConfigTargets({
+          env,
+          platform: options.platform || process.platform,
+          userHomeDir: homeDir,
+        }).map((target) => target.configPath),
+      },
+      qoderwork: {
+        ...common,
+        settingsPath: path.join(homeDir, ".qoderwork", "settings.json"),
+      },
+      // QwenWork's user-data home is ~/.QwenWorkCN (case-preserving on disk),
+      // NOT the ~/.qwenwork path its hooks docs mention.
+      qwenwork: {
+        ...common,
+        settingsPath: path.join(homeDir, ".QwenWorkCN", "settings.json"),
+      },
+      workbuddy: {
+        ...common,
+        settingsPaths: [
+          path.join(homeDir, ".workbuddy-ai", "settings.json"),
+          path.join(homeDir, ".workbuddy", "settings.json"),
+        ],
+      },
+      traecode: {
+        ...common,
+        hooksPath: path.join(homeDir, ".trae-cn", "hooks.json"),
       },
     },
   };
 }
 
+function unregisterAntigravityIntegration(options = {}) {
+  const hooks = unregisterAntigravityHooks(options);
+  const statusline = unregisterAntigravityStatusline(options);
+  return {
+    removed: removedCountFromResult(hooks) + removedCountFromResult(statusline),
+    changed: changedFromResult(hooks) || changedFromResult(statusline),
+    backupPaths: [...backupPathsFromResult(hooks), ...backupPathsFromResult(statusline)],
+    hooks,
+    statusline,
+  };
+}
+
+function unregisterClaudeIntegration(options = {}) {
+  const hooks = unregisterClaudeHooks(options);
+  const statusline = unregisterClaudeStatusline(options);
+  return {
+    removed: removedCountFromResult(hooks) + removedCountFromResult(statusline),
+    changed: changedFromResult(hooks) || changedFromResult(statusline),
+    backupPaths: [...backupPathsFromResult(hooks), ...backupPathsFromResult(statusline)],
+    hooks,
+    statusline,
+  };
+}
+
+function unregisterCodexIntegration(options = {}) {
+  const hooks = unregisterCodexCommandHooks(options);
+  const stableLauncher = removeStableCodexHookLauncher(options);
+  return {
+    ...hooks,
+    changed: changedFromResult(hooks) || stableLauncher.changed,
+    stableLauncher,
+  };
+}
+
 const AGENT_CLEANERS = Object.freeze({
-  "claude-code": unregisterClaudeHooks,
+  "claude-code": unregisterClaudeIntegration,
+  "deepseek-harness": unregisterDeepSeekHarness,
   "gemini-cli": unregisterGeminiHooks,
-  "antigravity-cli": unregisterAntigravityHooks,
+  "antigravity-cli": unregisterAntigravityIntegration,
   "cursor-agent": unregisterCursorHooks,
   "copilot-cli": unregisterCopilotHooks,
   codebuddy: unregisterCodeBuddyHooks,
   "kiro-cli": unregisterKiroHooks,
   "kimi-cli": unregisterKimiHooks,
   "qwen-code": unregisterQwenCodeHooks,
+  zcode: unregisterZcodeHooks,
   codewhale: unregisterCodewhaleHooks,
-  codex: unregisterCodexCommandHooks,
+  codex: unregisterCodexIntegration,
   opencode: unregisterOpencodePlugin,
+  mimocode: unregisterMimocodePlugin,
   pi: unregisterPiExtension,
   openclaw: unregisterOpenClawPlugin,
   hermes: unregisterHermesPlugin,
   qoder: unregisterQoderHooks,
   reasonix: unregisterReasonixHooks,
+  qoderwork: unregisterQoderWorkHooks,
+  qwenwork: unregisterQwenWorkHooks,
+  workbuddy: unregisterWorkBuddyHooks,
+  traecode: unregisterTraeCodeHooks,
 });
 
 function removedCountFromResult(result) {
@@ -261,7 +402,7 @@ function notesFromResult(agentId, result) {
   return notes;
 }
 
-function cleanupIntegrations(options = {}) {
+async function cleanupIntegrations(options = {}) {
   const plan = buildCleanupOptionsForHome(options.homeDir || options.userHome, options);
   const agents = [];
   let entriesRemoved = 0;
@@ -286,7 +427,34 @@ function cleanupIntegrations(options = {}) {
     };
 
     try {
-      if (!cleanOptions) {
+      // Claude hooks + statusline may already have been unregistered through
+      // the server-owned operation queue (see main.js's cleanupIntegrations
+      // wrapper for #657) before this function runs. When that precomputed
+      // result is provided, record it instead of unregistering Claude a
+      // second time here, outside the queue.
+      if (agentId === "claude-code" && Object.prototype.hasOwnProperty.call(options, "claudeCleanupResult")) {
+        const result = options.claudeCleanupResult;
+        if (result && result.status === "error") {
+          agent.status = "failed";
+          agent.error = result.message || "Claude hook queue cleanup failed";
+          failed++;
+        } else {
+          const removed = removedCountFromResult(result);
+          const changed = changedFromResult(result);
+          agent.removed = removed;
+          agent.changed = changed;
+          agent.backupPaths = backupPathsFromResult(result);
+          agent.result = result;
+          if (changed || removed > 0) {
+            agent.status = "applied";
+            agentsAffected++;
+          } else {
+            agent.status = "skipped";
+            skipped++;
+          }
+          entriesRemoved += removed;
+        }
+      } else if (!cleanOptions) {
         agent.status = "failed";
         agent.error = "Missing cleanup path overrides";
         failed++;
@@ -295,7 +463,7 @@ function cleanupIntegrations(options = {}) {
         agent.error = "No cleaner registered";
         skipped++;
       } else {
-        const result = clean(cleanOptions);
+        const result = await clean(cleanOptions);
         const removed = removedCountFromResult(result);
         const changed = changedFromResult(result);
         agent.removed = removed;
@@ -304,7 +472,12 @@ function cleanupIntegrations(options = {}) {
         agent.warnings = warningsFromResult(agentId, result);
         agent.notes = notesFromResult(agentId, result);
         agent.result = result;
-        if (changed || removed > 0) {
+        if (result && result.status === "error") {
+          agent.status = "failed";
+          agent.error = result.message || `Failed to clean ${agent.displayName} integration`;
+          failed++;
+          if (changed || removed > 0) agentsAffected++;
+        } else if (changed || removed > 0) {
           agent.status = "applied";
           agentsAffected++;
         } else {
@@ -382,15 +555,17 @@ function printResult(result) {
 
 if (require.main === module) {
   let options;
-  try {
-    options = parseArgs(process.argv.slice(2));
-    const result = cleanupIntegrations(options);
-    if (!options.silent) printResult(result);
-    if (result.summary.failed > 0 && !options.failOpen) process.exitCode = 1;
-  } catch (err) {
-    console.error(err && err.message ? err.message : err);
-    if (!options || !options.failOpen) process.exitCode = 1;
-  }
+  Promise.resolve()
+    .then(async () => {
+      options = parseArgs(process.argv.slice(2));
+      const result = await cleanupIntegrations(options);
+      if (!options.silent) printResult(result);
+      if (result.summary.failed > 0 && !options.failOpen) process.exitCode = 1;
+    })
+    .catch((err) => {
+      console.error(err && err.message ? err.message : err);
+      if (!options || !options.failOpen) process.exitCode = 1;
+    });
 }
 
 module.exports = {

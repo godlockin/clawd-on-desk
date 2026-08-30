@@ -1,12 +1,35 @@
 "use strict";
 
-const { describe, it } = require("node:test");
+const { afterEach, beforeEach, describe, it } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
 const { createIntegrationSyncRuntime } = require("../src/integration-sync");
+
+const missingFakeImpls = [];
+let integrationFailureWarnings = [];
+let allowedIntegrationFailureWarningPatterns = [];
+let restoreConsoleWarn = null;
+
+function createGuardedIntegrationCtx(target, calls) {
+  return new Proxy(target, {
+    get(obj, prop, receiver) {
+      if (Object.prototype.hasOwnProperty.call(obj, prop)) {
+        return Reflect.get(obj, prop, receiver);
+      }
+      if (typeof prop !== "string" || !/^(sync|repair)[A-Z]\w*Impl$/.test(prop)) {
+        return Reflect.get(obj, prop, receiver);
+      }
+      return () => {
+        calls.push({ name: `missing-fake:${prop}` });
+        missingFakeImpls.push(prop);
+        throw new Error(`Missing integration test fake: ${prop}`);
+      };
+    },
+  });
+}
 
 function withPatchedExport(modulePath, exportName, replacement, run) {
   const moduleExports = require(modulePath);
@@ -22,7 +45,8 @@ function withPatchedExport(modulePath, exportName, replacement, run) {
 function makeRuntime(overrides = {}) {
   const calls = [];
   const repairOptions = [];
-  const ctx = {
+  const { ctx: ctxOverrides = {}, ...runtimeOverrides } = overrides;
+  const ctx = createGuardedIntegrationCtx({
     autoStartWithClaude: true,
     syncClawdHooksImpl: (options) => {
       calls.push({ name: "claude", options });
@@ -32,18 +56,25 @@ function makeRuntime(overrides = {}) {
     syncAntigravityHooksImpl: () => calls.push({ name: "antigravity" }),
     syncCursorHooksImpl: () => calls.push({ name: "cursor" }),
     syncCopilotHooksImpl: () => calls.push({ name: "copilot" }),
-    syncCodeBuddyHooksImpl: () => calls.push({ name: "codebuddy" }),
+    syncCodeBuddyHooksImpl: (options) => calls.push({ name: "codebuddy", options }),
+    syncWorkBuddyHooksImpl: () => calls.push({ name: "workbuddy" }),
     syncKiroHooksImpl: () => calls.push({ name: "kiro" }),
     syncKimiHooksImpl: () => calls.push({ name: "kimi" }),
     syncQwenHooksImpl: () => calls.push({ name: "qwen" }),
+    syncZcodeHooksImpl: () => calls.push({ name: "zcode" }),
     syncCodewhaleHooksImpl: () => calls.push({ name: "codewhale" }),
     syncCodexHooksImpl: () => calls.push({ name: "codex" }),
+    syncDeepSeekHarnessPluginImpl: (options) => {
+      calls.push({ name: "deepseek-harness", options });
+      return { status: "ok" };
+    },
     repairCodexHooksImpl: (options) => {
       calls.push({ name: "codex-repair" });
       repairOptions.push(options);
       return { status: "ok", message: "done" };
     },
     syncOpencodePluginImpl: () => calls.push({ name: "opencode" }),
+    syncMimocodePluginImpl: () => calls.push({ name: "mimocode" }),
     syncPiExtensionImpl: () => calls.push({ name: "pi" }),
     syncOpenClawPluginImpl: () => calls.push({ name: "openclaw" }),
     repairOpenClawPluginImpl: () => {
@@ -52,10 +83,13 @@ function makeRuntime(overrides = {}) {
     },
     syncHermesPluginImpl: () => calls.push({ name: "hermes" }),
     syncQoderHooksImpl: () => calls.push({ name: "qoder" }),
-    ...(overrides.ctx || {}),
-  };
+    syncReasonixHooksImpl: () => calls.push({ name: "reasonix" }),
+    syncQoderWorkHooksImpl: () => calls.push({ name: "qoderwork" }),
+    syncTraeCodeHooksImpl: () => calls.push({ name: "traecode" }),
+    syncQwenWorkHooksImpl: () => calls.push({ name: "qwenwork" }),
+    ...ctxOverrides,
+  }, calls);
   const runtime = createIntegrationSyncRuntime({
-    ctx,
     getHookServerPort: () => 24444,
     shouldManageClaudeHooks: () => true,
     isAgentEnabled: () => true,
@@ -64,21 +98,169 @@ function makeRuntime(overrides = {}) {
       calls.push({ name: "watcher:stop" });
       return "stopped";
     },
-    ...overrides,
+    ...runtimeOverrides,
+    ctx,
   });
   return { runtime, calls, repairOptions };
 }
 
 describe("integration sync runtime", () => {
-  it("syncClawdHooks passes auto-start and the current server port", () => {
+  beforeEach(() => {
+    const originalWarn = console.warn;
+    integrationFailureWarnings = [];
+    allowedIntegrationFailureWarningPatterns = [];
+    restoreConsoleWarn = () => {
+      console.warn = originalWarn;
+    };
+    console.warn = (...args) => {
+      const message = args.map((arg) => String(arg)).join(" ");
+      if (/^Clawd:\s+failed to (?:sync|repair)\b/i.test(message)) {
+        integrationFailureWarnings.push(message);
+        return;
+      }
+      originalWarn(...args);
+    };
+  });
+
+  afterEach(() => {
+    if (restoreConsoleWarn) restoreConsoleWarn();
+    restoreConsoleWarn = null;
+    const missing = missingFakeImpls.splice(0);
+    const warnings = integrationFailureWarnings;
+    integrationFailureWarnings = [];
+    const unexpectedWarnings = warnings.filter((message) => (
+      !allowedIntegrationFailureWarningPatterns.some((pattern) => pattern.test(message))
+    ));
+    allowedIntegrationFailureWarningPatterns = [];
+    assert.deepStrictEqual(
+      { missingFakeImpls: missing, unexpectedIntegrationFailureWarnings: unexpectedWarnings },
+      { missingFakeImpls: [], unexpectedIntegrationFailureWarnings: [] }
+    );
+  });
+
+  it("test ctx guard records missing sync/repair fakes and blocks real fallbacks", () => {
+    const calls = [];
+    const ctx = createGuardedIntegrationCtx({}, calls);
+    const runtime = createIntegrationSyncRuntime({ ctx });
+    allowedIntegrationFailureWarningPatterns.push(
+      /^Clawd:\s+failed to sync Reasonix hooks:\s+Missing integration test fake: syncReasonixHooksImpl$/
+    );
+
+    const result = runtime.syncReasonixHooks();
+    assert.throws(
+      () => ctx.repairFuturePluginImpl(),
+      /Missing integration test fake: repairFuturePluginImpl/
+    );
+
+    assert.deepStrictEqual(result, {
+      status: "error",
+      message: "Missing integration test fake: syncReasonixHooksImpl",
+    });
+    assert.deepStrictEqual(calls, [
+      { name: "missing-fake:syncReasonixHooksImpl" },
+      { name: "missing-fake:repairFuturePluginImpl" },
+    ]);
+    assert.deepStrictEqual(missingFakeImpls.splice(0), [
+      "syncReasonixHooksImpl",
+      "repairFuturePluginImpl",
+    ]);
+  });
+
+  it("syncClawdHooks passes auto-start, the current server port, and sync provenance", () => {
     const { runtime, calls } = makeRuntime();
 
     const result = runtime.syncClawdHooks();
 
     assert.deepStrictEqual(result, { status: "ok", source: "claude" });
     assert.deepStrictEqual(calls, [
-      { name: "claude", options: { autoStart: true, port: 24444 } },
+      { name: "claude", options: { autoStart: true, port: 24444, source: null, automatic: true } },
     ]);
+  });
+
+  it("syncClawdHooks forwards an explicit source/automatic pair unchanged", () => {
+    const { runtime, calls } = makeRuntime();
+
+    runtime.syncClawdHooks({ source: "doctor", automatic: false });
+
+    assert.deepStrictEqual(calls, [
+      { name: "claude", options: { autoStart: true, port: 24444, source: "doctor", automatic: false } },
+    ]);
+  });
+
+  it("repairIntegrationForAgent('claude-code') syncs as an explicit, non-automatic doctor repair", () => {
+    const { runtime, calls } = makeRuntime();
+
+    const result = runtime.repairIntegrationForAgent("claude-code");
+
+    assert.deepStrictEqual(result, { status: "ok", source: "claude" });
+    // watcher:start appears twice: once from syncIntegrationForAgent's own
+    // success path, once from repairIntegrationForAgent's unconditional
+    // ensure-started call (Doctor Fix's enabled precondition holds regardless
+    // of this repair's outcome). start() is idempotent in production; the
+    // fake watcher stub here just isn't, so both calls show up.
+    assert.deepStrictEqual(calls.map((entry) => entry.name), ["claude", "watcher:start", "watcher:start"]);
+    assert.deepStrictEqual(calls[0].options, { autoStart: true, port: 24444, source: "doctor", automatic: false });
+  });
+
+  it("syncIntegrationForAgent waits for an async Claude sync to settle before starting the watcher", async () => {
+    let resolveSync;
+    const { runtime, calls } = makeRuntime({
+      ctx: {
+        syncClawdHooksImpl: (options) => {
+          calls.push({ name: "claude", options });
+          return new Promise((resolve) => { resolveSync = resolve; });
+        },
+      },
+    });
+
+    const pending = runtime.syncIntegrationForAgent("claude-code");
+    assert.deepStrictEqual(calls.map((entry) => entry.name), ["claude"], "watcher must not start before the async sync settles");
+
+    resolveSync({ status: "ok" });
+    const result = await pending;
+
+    assert.deepStrictEqual(result, { status: "ok" });
+    assert.deepStrictEqual(calls.map((entry) => entry.name), ["claude", "watcher:start"]);
+  });
+
+  it("does not start the Claude watcher when a synchronous sync result is an error (Settings Enable failure)", () => {
+    const { runtime, calls } = makeRuntime({
+      ctx: {
+        syncClawdHooksImpl: (options) => {
+          calls.push({ name: "claude", options });
+          return { status: "error", message: "write failed" };
+        },
+      },
+    });
+
+    const result = runtime.syncIntegrationForAgent("claude-code", { source: "settings-agent-enable", automatic: false });
+
+    assert.deepStrictEqual(result, { status: "error", message: "write failed" });
+    assert.deepStrictEqual(
+      calls.map((entry) => entry.name),
+      ["claude"],
+      "a failed Settings Enable sync must not leave the directory watcher running for a still-disabled agent"
+    );
+  });
+
+  it("does not start the Claude watcher when an async sync resolves an error (Settings Install failure)", async () => {
+    const { runtime, calls } = makeRuntime({
+      ctx: {
+        syncClawdHooksImpl: async (options) => {
+          calls.push({ name: "claude", options });
+          return { status: "error", message: "source script missing" };
+        },
+      },
+    });
+
+    const result = await runtime.syncIntegrationForAgent("claude-code", { source: "settings-agent-install", automatic: false });
+
+    assert.deepStrictEqual(result, { status: "error", message: "source script missing" });
+    assert.deepStrictEqual(
+      calls.map((entry) => entry.name),
+      ["claude"],
+      "a failed Settings Install sync must not leave the directory watcher running for a not-yet-installed agent"
+    );
   });
 
   it("startup syncs enabled integrations in the server order and starts the Claude watcher after Claude sync", () => {
@@ -96,15 +278,23 @@ describe("integration sync runtime", () => {
       "antigravity",
       "copilot",
       "codebuddy",
+      "workbuddy",
       "kiro",
       "kimi",
       "qwen",
+      "zcode",
       "codewhale",
       "codex",
+      "deepseek-harness",
+      "mimocode",
       "pi",
       "openclaw",
       "hermes",
       "qoder",
+      "reasonix",
+      "qoderwork",
+      "traecode",
+      "qwenwork",
     ]);
   });
 
@@ -122,15 +312,23 @@ describe("integration sync runtime", () => {
       "antigravity",
       "cursor",
       "codebuddy",
+      "workbuddy",
       "kiro",
       "kimi",
       "qwen",
+      "zcode",
       "codewhale",
       "codex",
+      "deepseek-harness",
       "opencode",
+      "mimocode",
       "openclaw",
       "hermes",
       "qoder",
+      "reasonix",
+      "qoderwork",
+      "traecode",
+      "qwenwork",
     ]);
   });
 
@@ -159,6 +357,86 @@ describe("integration sync runtime", () => {
 
     assert.ok(result === true || (result && typeof result === "object"));
     assert.deepStrictEqual(calls.map((entry) => entry.name), ["copilot"]);
+  });
+
+  it("gives DSH startup, Settings Install, and Doctor Repair distinct mutation intent", async () => {
+    const { runtime, calls } = makeRuntime();
+    await runtime.syncIntegrationForAgent("deepseek-harness", { source: "startup", automatic: true });
+    await runtime.syncIntegrationForAgent("deepseek-harness", { source: "settings-agent-install", automatic: false });
+    await runtime.repairIntegrationForAgent("deepseek-harness", { source: "doctor-fix" });
+    assert.deepStrictEqual(calls.map((entry) => ({
+      name: entry.name,
+      operation: entry.options.operation,
+      automatic: entry.options.automatic,
+      silent: entry.options.silent,
+    })), [
+      { name: "deepseek-harness", operation: "startup-sync", automatic: true, silent: true },
+      { name: "deepseek-harness", operation: "install", automatic: false, silent: true },
+      { name: "deepseek-harness", operation: "explicit-repair", automatic: false, silent: true },
+    ]);
+  });
+
+  it("awaits DSH repair and preserves its structured failure", async () => {
+    let settle;
+    const { runtime } = makeRuntime({
+      ctx: {
+        syncDeepSeekHarnessPluginImpl: () => new Promise((resolve) => { settle = resolve; }),
+      },
+    });
+    const pending = runtime.repairIntegrationForAgent("deepseek-harness");
+    assert.strictEqual(typeof pending.then, "function");
+    settle({ status: "error", reason: "inspection-required", manualInspectionRequired: true });
+    assert.deepStrictEqual(await pending, {
+      status: "error",
+      reason: "inspection-required",
+      manualInspectionRequired: true,
+    });
+  });
+
+  it("passes custom integration options to CodeBuddy sync", () => {
+    const { runtime, calls } = makeRuntime();
+
+    runtime.syncIntegrationForAgent("codebuddy", {
+      permissionTarget: { mode: "custom", url: "https://approval.example.test/permission" },
+    });
+
+    assert.deepStrictEqual(calls, [{
+      name: "codebuddy",
+      options: { permissionTarget: { mode: "custom", url: "https://approval.example.test/permission" } },
+    }]);
+  });
+
+  it("reads saved custom integration options during startup sync", () => {
+    const { runtime, calls } = makeRuntime({
+      shouldSyncAgentIntegration: (agentId) => agentId === "codebuddy",
+      getAgentIntegrationOptions: (agentId) => (
+        agentId === "codebuddy"
+          ? { permissionTarget: { mode: "custom", url: "https://approval.example.test/permission" } }
+          : {}
+      ),
+    });
+
+    runtime.syncEnabledStartupIntegrations();
+
+    assert.deepStrictEqual(calls, [{
+      name: "codebuddy",
+      options: { permissionTarget: { mode: "custom", url: "https://approval.example.test/permission" } },
+    }]);
+  });
+
+  it("uses an explicit local target when CodeBuddy sync is called without saved options", () => {
+    let received = null;
+    const { runtime } = makeRuntime({
+      ctx: { syncCodeBuddyHooksImpl: null },
+    });
+    const modulePath = require.resolve("../hooks/codebuddy-install.js");
+
+    withPatchedExport(modulePath, "registerCodeBuddyHooks", (options) => {
+      received = options;
+      return { added: 0, updated: 0, skipped: 9 };
+    }, () => runtime.syncCodeBuddyHooks());
+
+    assert.deepStrictEqual(received.permissionTarget, { mode: "local" });
   });
 
   it("syncIntegrationForAgent treats count-style zero writes as a missing local integration", () => {
@@ -190,6 +468,13 @@ describe("integration sync runtime", () => {
         modulePath: "../hooks/codebuddy-install.js",
         exportName: "registerCodeBuddyHooks",
         reason: "codebuddy-not-installed",
+      },
+      {
+        agentId: "workbuddy",
+        ctxKey: "syncWorkBuddyHooksImpl",
+        modulePath: "../hooks/workbuddy-install.js",
+        exportName: "registerWorkBuddyHooks",
+        reason: "workbuddy-not-installed",
       },
       {
         agentId: "kiro-cli",
@@ -294,15 +579,23 @@ describe("integration sync runtime", () => {
       },
     ];
 
+    // antigravity-cli's real syncAntigravityHooks() also calls
+    // registerAntigravityStatusline as a side effect. Patch it to a no-op
+    // stub too, or this test would hit the real ~/.gemini/antigravity-cli
+    // on any machine that has Antigravity CLI installed.
+    const runEntry = (entry, run) => (entry.agentId === "antigravity-cli"
+      ? withPatchedExport("../hooks/antigravity-install.js", "registerAntigravityStatusline", () => ({ installed: false, changed: false, skippedExisting: false }), run)
+      : run());
+
     for (const entry of cases) {
       const missing = withPatchedExport(
         entry.modulePath,
         entry.exportName,
         () => ({ installed: false, skipped: true, updated: false, reason: entry.reason }),
-        () => {
+        () => runEntry(entry, () => {
           const { runtime } = makeRuntime({ ctx: { [entry.ctxKey]: undefined } });
           return runtime.syncIntegrationForAgent(entry.agentId);
-        }
+        })
       );
       assert.strictEqual(missing.status, "skipped", entry.agentId);
       assert.strictEqual(missing.reason, entry.reason, entry.agentId);
@@ -311,10 +604,10 @@ describe("integration sync runtime", () => {
         entry.modulePath,
         entry.exportName,
         () => ({ installed: true, skipped: true, updated: false }),
-        () => {
+        () => runEntry(entry, () => {
           const { runtime } = makeRuntime({ ctx: { [entry.ctxKey]: undefined } });
           return runtime.syncIntegrationForAgent(entry.agentId);
-        }
+        })
       );
       assert.strictEqual(alreadyCurrent.status, "ok", entry.agentId);
       assert.strictEqual(alreadyCurrent.installed, true, entry.agentId);
@@ -360,6 +653,37 @@ describe("integration sync runtime", () => {
       () => {
         const { runtime } = makeRuntime({ ctx: { syncOpencodePluginImpl: undefined } });
         return runtime.syncIntegrationForAgent("opencode");
+      }
+    );
+
+    assert.strictEqual(alreadyCurrent.status, "ok");
+    assert.strictEqual(alreadyCurrent.skipped, true);
+  });
+
+  it("syncIntegrationForAgent distinguishes mimocode missing from already registered (R8 P1)", () => {
+    // Without these, the production mimocode mapping could be swapped for a
+    // no-op and the whole Settings-Install / startup / Doctor-Repair sync
+    // chain would fail green.
+    const missing = withPatchedExport(
+      "../hooks/mimocode-install.js",
+      "registerMimocodePlugin",
+      () => ({ added: false, skipped: true, created: false, reason: "mimocode-not-found" }),
+      () => {
+        const { runtime } = makeRuntime({ ctx: { syncMimocodePluginImpl: undefined } });
+        return runtime.syncIntegrationForAgent("mimocode");
+      }
+    );
+
+    assert.strictEqual(missing.status, "skipped");
+    assert.strictEqual(missing.reason, "mimocode-not-found");
+
+    const alreadyCurrent = withPatchedExport(
+      "../hooks/mimocode-install.js",
+      "registerMimocodePlugin",
+      () => ({ added: false, skipped: true, created: false }),
+      () => {
+        const { runtime } = makeRuntime({ ctx: { syncMimocodePluginImpl: undefined } });
+        return runtime.syncIntegrationForAgent("mimocode");
       }
     );
 

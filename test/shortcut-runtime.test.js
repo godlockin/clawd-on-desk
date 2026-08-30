@@ -208,6 +208,19 @@ test("shortcut runtime broadcasts persistent registration failures and clears th
   ]]);
 });
 
+test("shortcut runtime restores a persisted macOS Control accelerator on startup", () => {
+  const { runtime, globalShortcut } = createRuntime({
+    snapshot: { shortcuts: { togglePet: "Control+Shift+1" } },
+  });
+
+  runtime.registerPersistentShortcutsFromSettings();
+
+  assert.deepStrictEqual(globalShortcut.calls, [
+    ["register", "Control+Shift+1"],
+  ]);
+  assert.ok(globalShortcut.registered.has("Control+Shift+1"));
+});
+
 test("shortcut runtime deduplicates failure broadcasts and ignores empty clears", () => {
   const { runtime, settingsWindow } = createRuntime();
 

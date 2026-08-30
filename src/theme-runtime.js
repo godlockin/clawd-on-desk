@@ -44,6 +44,8 @@ function createThemeRuntime(options = {}) {
   const syncHitWin = options.syncHitWin || (() => {});
   const syncSessionHudVisibility = options.syncSessionHudVisibility || (() => {});
   const startMainTick = options.startMainTick || (() => {});
+  const invalidateDisplayedVisual = options.invalidateDisplayedVisual || (() => {});
+  const refreshDisplayedVisualHitBoxes = options.refreshDisplayedVisualHitBoxes || (() => {});
   const bumpAnimationOverridePreviewPosterGeneration =
     options.bumpAnimationOverridePreviewPosterGeneration || (() => {});
   const rebuildAllMenus = options.rebuildAllMenus || (() => {});
@@ -182,6 +184,7 @@ function createThemeRuntime(options = {}) {
     }
 
     setActiveTheme(newTheme);
+    invalidateDisplayedVisual("theme-activation");
     callMethod(miniRuntime, "refreshTheme");
     callMethod(stateRuntime, "refreshTheme");
     callMethod(tickRuntime, "refreshTheme");
@@ -263,6 +266,7 @@ function createThemeRuntime(options = {}) {
 
     const stateRuntime = getStateRuntime();
     callMethod(stateRuntime, "refreshTheme");
+    refreshDisplayedVisualHitBoxes();
     if (isLiveWindow(getHitWindow())) syncHitStateAfterLoad();
     if (isLiveWindow(getRenderWindow())) syncHitWin();
     flushRuntimeStateToPrefs();

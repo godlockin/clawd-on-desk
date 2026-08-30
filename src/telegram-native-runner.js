@@ -21,12 +21,45 @@ const {
 } = require("./telegram-native-client");
 
 const { EVENTS } = require("./telegram-migration-state");
+const { createTranslator } = require("./i18n");
+const { redactSecrets } = require("./secret-redact");
+const {
+  MAX_ELICITATION_OPTION_LABEL,
+  clampPreviewText,
+} = require("./server-permission-utils");
+const {
+  buildSessionGrantRevokeAction,
+  parseSessionGrantRevokeAction,
+  createRemoteCardWorkRegistry,
+} = require("./session-automation-remote");
+const {
+  appendTelegramStatus,
+  buildTelegramApprovalMessage,
+  isFormattedTelegramMessage,
+  isTelegramHtmlParseError,
+  plainTelegramText,
+} = require("./telegram-message-format");
 
 const APPROVAL_CALLBACK_RE = /^cp:([a-z0-9]+):(a|d|s(\d+))$/;
 const LEGACY_APPROVAL_CALLBACK_RE = /^clawdperm:([a-z0-9]+):(allow|deny)$/;
+const SESSION_TRUST_CALLBACK_RE = /^ct:([a-z0-9]+):(open|yes|no)$/;
+// Elicitation (AskUserQuestion) callback actions:
+//   o<question>_<option> - select option <option> of question <question>
+//   x<question>          - pick "Other" on question <question> (free-text reply follows)
+//   z<question>          - cancel "Other" on question <question>, back to its option list
+//   c<question>          - confirm the in-progress multi-select answer for question <question>
+//   b<question>          - go back to the question before <question>
+//   t                     - bail out to the terminal (parity with Deny's "go to terminal")
+const ELICITATION_CALLBACK_RE = /^cq:([a-z0-9]+):(o(\d+)_(\d+)|x(\d+)|z(\d+)|c(\d+)|b(\d+)|t)$/;
 const MAX_MESSAGE_TEXT = 3800;
 const MAX_BUTTON_TEXT = 32;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 90000;
+// Elicitation waits on the user to read (possibly several) questions and think
+// through an answer, not just tap Allow/Deny - give it more room than a plain
+// approval before treating silence as a timeout.
+const DEFAULT_ELICITATION_TIMEOUT_MS = 300000;
+const MAX_ELICITATION_QUESTIONS = 5;
+const MAX_ELICITATION_OPTIONS = 5;
 // R1a notifications are fire-and-forget: a slow send must not pile up behind
 // the snapshot fanout that triggers it. Bound each send and drop on timeout.
 const DEFAULT_NOTIFY_TIMEOUT_MS = 10000;
@@ -35,27 +68,33 @@ const DEFAULT_NOTIFY_TIMEOUT_MS = 10000;
 const MAX_NOTIFY_RETRY_DELAY_MS = 30000;
 const DEFAULT_POLL_RETRY_INITIAL_MS = 1000;
 const DEFAULT_POLL_RETRY_MAX_MS = 30000;
+const DEFAULT_SESSION_AUTOMATION_EDIT_TIMEOUT_MS = 10000;
 
-// Status lines appended to an approval card whose decision landed somewhere
+// Status line appended to an approval card whose decision landed somewhere
 // other than this Telegram chat, so the chat history shows the outcome
 // (issue #457). Keyed by the reason finishApproval received a null decision.
 // `elsewhere` is deliberately neutral: a signal abort covers more than a
 // desktop answer — the settings approval test arms a 60s abort, and DND /
 // dismissed interactive bubbles also abort without anything being "resolved".
-const APPROVAL_RESOLVED_ELSEWHERE_STATUS = Object.freeze({
-  elsewhere: "\u2705 Resolved outside Telegram",
-  timeout: "\u23F3 Timed out",
-  stopped: "\u23F9\uFE0F Session ended",
-});
+// Reads from `t` at call time (not a module-level constant) so the label
+// follows the app's current language, not whatever it was when this module
+// first loaded.
+function approvalResolvedElsewhereStatusText(t, reason) {
+  if (reason === "elsewhere") return t("telegramApprovalStatusResolvedElsewhere");
+  if (reason === "timeout") return t("telegramApprovalStatusTimedOut");
+  if (reason === "stopped") return t("telegramApprovalStatusSessionEnded");
+  return undefined;
+}
 
-// Status lines for a decision taken on Telegram itself (a button tap). The
+// Status line for a decision taken on Telegram itself (a button tap). The
 // callback toast is instant but ephemeral; rewriting the card body leaves the
 // outcome in the chat history, symmetric with the resolved-elsewhere path.
-const APPROVAL_DECIDED_STATUS = Object.freeze({
-  allow: "\u2705 Allowed",
-  deny: "\u274C Denied",
-  suggestion: "\u2705 Applied",
-});
+function approvalDecidedStatusText(t, action) {
+  if (action === "allow") return t("telegramApprovalStatusAllowed");
+  if (action === "deny") return t("telegramApprovalStatusDenied");
+  if (action === "suggestion") return t("telegramApprovalStatusApplied");
+  return undefined;
+}
 
 function randomId() {
   return Math.random().toString(36).slice(2, 12);
@@ -115,6 +154,13 @@ function parseApprovalCallbackData(data) {
 
 function normalizeApprovalDecision(decision) {
   if (!decision || typeof decision !== "object") return null;
+  if (
+    decision.action === "session-trust"
+    && decision.cardHandle
+    && typeof decision.cardHandle === "object"
+  ) {
+    return { action: "session-trust", cardHandle: decision.cardHandle };
+  }
   if (decision.action === "allow" || decision.action === "deny") {
     return { action: decision.action };
   }
@@ -123,6 +169,183 @@ function normalizeApprovalDecision(decision) {
     return Number.isInteger(index) && index >= 0 ? { action: "suggestion", index } : null;
   }
   return null;
+}
+
+// Function-form replacement: dynamic values (question progress numbers) must
+// never be interpolated with the string form of String.replace, which parses
+// $$/$&/$`/$' as special sequences.
+function interpolate(template, token, value) {
+  return template.replace(token, () => value);
+}
+
+// Mirrors feishu-approval-client.js's normalizeElicitationPayload clamping
+// rules so a malformed or oversized AskUserQuestion payload can't blow past
+// Telegram's message/button length limits or produce an unbounded card.
+function normalizeElicitationPayload(payload) {
+  const title = compactMessageText(payload && payload.title, 120);
+  if (!title) return null;
+  const rawQuestions = Array.isArray(payload && payload.questions) ? payload.questions : [];
+  const questions = rawQuestions
+    .slice(0, MAX_ELICITATION_QUESTIONS)
+    // `index` is the question's position in the ORIGINAL payload.questions
+    // (i.e. toolInput.questions on the permission side) and is the key the
+    // submitted answers map uses. Compacted question text can't serve as the
+    // key: it no longer matches the original for long or whitespace-heavy
+    // questions, and dropped invalid entries below would shift positions.
+    .map((question, index) => {
+      if (!question || typeof question !== "object") return null;
+      const questionText = compactMessageText(question.question, 240);
+      if (!questionText) return null;
+      const options = Array.isArray(question.options)
+        ? question.options
+          .slice(0, MAX_ELICITATION_OPTIONS)
+          .map((option) => {
+            if (!option || typeof option !== "object") return null;
+            // Keep the canonical answer value byte-for-byte aligned with the
+            // server's normalization. Telegram-specific cleanup and the
+            // 32-character cap are presentation concerns handled later by
+            // buildElicitationKeyboard; applying compactMessageText here would
+            // rewrite CRLF, control characters, and whitespace in the value
+            // returned to the agent.
+            const label = clampPreviewText(option.label, MAX_ELICITATION_OPTION_LABEL);
+            if (!label) return null;
+            return { label };
+          })
+          .filter(Boolean)
+        : [];
+      return {
+        index,
+        header: compactMessageText(question.header, 80),
+        question: questionText,
+        multiSelect: question.multiSelect === true,
+        options,
+      };
+    })
+    .filter(Boolean);
+  if (!questions.length) return null;
+  return {
+    title,
+    detail: payload && payload.detail != null ? compactMessageText(payload.detail, MAX_MESSAGE_TEXT) : "",
+    agentId: compactMessageText(payload && payload.agentId, 80),
+    folder: compactMessageText(payload && payload.folder, 80),
+    questions,
+  };
+}
+
+function buildElicitationHeaderText(payload) {
+  const parts = [redactSecrets(payload.title)];
+  if (payload.detail) parts.push(redactSecrets(payload.detail));
+  return parts.join("\n\n");
+}
+
+// Renders the currently active question as the full message body: the
+// (stable) header built once from the payload, plus a progress line and the
+// question itself. The whole message is re-sent via editMessageText on every
+// navigation step - there is no separate "card body" that stays fixed the way
+// requestApproval's does, since which question is showing IS the body.
+function buildElicitationQuestionText(payload, questionIndex, t) {
+  const header = buildElicitationHeaderText(payload);
+  const total = payload.questions.length;
+  const question = payload.questions[questionIndex];
+  const progress = interpolate(
+    interpolate(t("telegramElicitationProgress"), "{current}", String(questionIndex + 1)),
+    "{total}",
+    String(total),
+  );
+  const questionLines = [progress];
+  // Redact secrets from the DISPLAYED question text only. Answers are keyed by
+  // the question's original payload index and remapped on the permission side,
+  // so display redaction can't desync answer round-tripping.
+  if (question.header) questionLines.push(redactSecrets(question.header));
+  questionLines.push(redactSecrets(question.question));
+  return `${header}\n\n${questionLines.join("\n")}`;
+}
+
+function buildElicitationOtherPromptText(payload, questionIndex, t) {
+  const base = buildElicitationQuestionText(payload, questionIndex, t);
+  return `${base}\n\n${t("telegramElicitationOtherPrompt")}`;
+}
+
+// selectedSet is the in-progress (unconfirmed) multi-select toggle state for
+// the currently active question - always empty for a single-select question,
+// since tapping an option there resolves immediately instead of toggling.
+function buildElicitationKeyboard(payload, questionIndex, selectedSet, t) {
+  const question = payload.questions[questionIndex];
+  const callbackBase = `cq:${payload._id}`;
+  const rows = question.options.map((option, optionIndex) => {
+    const checked = selectedSet && selectedSet.has(optionIndex);
+    // Redact the DISPLAYED label only; the answer value still uses the raw
+    // option.label (keyed by option index in the callback), so this is safe.
+    const safeLabel = redactSecrets(option.label);
+    const label = question.multiSelect ? `${checked ? "☑" : "☐"} ${safeLabel}` : safeLabel;
+    return [{ text: compactMessageText(label, MAX_BUTTON_TEXT), callback_data: `${callbackBase}:o${questionIndex}_${optionIndex}` }];
+  });
+  rows.push([{ text: t("telegramElicitationOtherButton"), callback_data: `${callbackBase}:x${questionIndex}` }]);
+  if (question.multiSelect) {
+    rows.push([{ text: t("telegramElicitationConfirmButton"), callback_data: `${callbackBase}:c${questionIndex}` }]);
+  }
+  const navRow = [];
+  if (questionIndex > 0) navRow.push({ text: t("telegramElicitationBackButton"), callback_data: `${callbackBase}:b${questionIndex}` });
+  navRow.push({ text: t("telegramElicitationTerminalButton"), callback_data: `${callbackBase}:t` });
+  rows.push(navRow);
+  return rows;
+}
+
+function parseElicitationCallbackData(data) {
+  if (typeof data !== "string") return null;
+  const match = data.match(ELICITATION_CALLBACK_RE);
+  if (!match) return null;
+  const id = match[1];
+  if (match[3] !== undefined) {
+    const questionIndex = Number(match[3]);
+    const optionIndex = Number(match[4]);
+    if (!Number.isInteger(questionIndex) || !Number.isInteger(optionIndex)) return null;
+    return { id, action: { type: "option", questionIndex, optionIndex } };
+  }
+  if (match[5] !== undefined) {
+    const questionIndex = Number(match[5]);
+    if (!Number.isInteger(questionIndex)) return null;
+    return { id, action: { type: "other", questionIndex } };
+  }
+  if (match[6] !== undefined) {
+    const questionIndex = Number(match[6]);
+    if (!Number.isInteger(questionIndex)) return null;
+    return { id, action: { type: "cancelOther", questionIndex } };
+  }
+  if (match[7] !== undefined) {
+    const questionIndex = Number(match[7]);
+    if (!Number.isInteger(questionIndex)) return null;
+    return { id, action: { type: "confirm", questionIndex } };
+  }
+  if (match[8] !== undefined) {
+    const questionIndex = Number(match[8]);
+    if (!Number.isInteger(questionIndex)) return null;
+    return { id, action: { type: "back", questionIndex } };
+  }
+  return { id, action: { type: "terminal" } };
+}
+
+function findNextUnansweredQuestionIndex(payload, answers) {
+  return payload.questions.findIndex((question) => !Object.prototype.hasOwnProperty.call(answers, String(question.index)));
+}
+
+// Shared fail-closed authorization for both remote approval and elicitation
+// callbacks. A blank allowedUser/chatId is treated as "authorize nobody", not
+// "skip the check": both an Allow/Deny decision and an elicitation answer feed
+// straight back into the agent, so a misconfigured (blank) recipient must
+// never let anyone who can reach the chat drive the decision. Approval
+// previously used a fail-open variant that let any chat member decide once
+// allowedTgUserId was blank; it now shares this check.
+//
+// Validates against BOTH the entry snapshot AND the current live config
+// (currentAllowedUser/currentChatId): if the allowed user was revoked or changed
+// after the card was sent, the stale card can no longer be acted on — the click
+// must match the config in effect right now, not just the one at send time.
+function isCallerAuthorized(entry, fromId, chatId, currentAllowedUser, currentChatId) {
+  if (!currentAllowedUser || !currentChatId) return false;
+  if (fromId !== String(currentAllowedUser) || chatId !== String(currentChatId)) return false;
+  if (!entry.allowedUser || !entry.chatId) return false;
+  return fromId === String(entry.allowedUser) && chatId === String(entry.chatId);
 }
 
 function extractTelegramMessageId(result) {
@@ -138,6 +361,7 @@ function createTelegramNativeRunner({
   getDispatch,        // () => migrationController.dispatch (lazy for cycle)
   getChatId,          // () => "<chat id>" (number-string)
   getAllowedUserId,   // () => "<user id>"
+  getLang = () => "en", // () => current app language, for approval/elicitation card / button text
   onCommand = null,   // async ({ command, args, chatId, fromId }) => text | { text }
   isCommandEnabled = () => true,
   onTextMessage = null, // async ({ text, messageId, replyToMessageId, chatId, fromId }) => text | { text }
@@ -145,20 +369,37 @@ function createTelegramNativeRunner({
   log = () => {},
   longPollTimeoutMs = 25, // Telegram seconds
   approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS,
+  elicitationTimeoutMs = DEFAULT_ELICITATION_TIMEOUT_MS,
   notifyTimeoutMs = DEFAULT_NOTIFY_TIMEOUT_MS,
   pollRetryInitialMs = DEFAULT_POLL_RETRY_INITIAL_MS,
   pollRetryMaxMs = DEFAULT_POLL_RETRY_MAX_MS,
+  sessionAutomationEditTimeoutMs = DEFAULT_SESSION_AUTOMATION_EDIT_TIMEOUT_MS,
+  onSessionGrantRevoke = null,
+  onSessionAutomationRouteChange = null,
+  sessionAutomationCardWorkRegistry = null,
   // Injectable so tests can drive 429 retry without real timers.
   sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t && t.unref) t.unref(); }),
 }) {
   const client = new TelegramNativeClient({ tokenStore, transport });
+  const t = createTranslator(getLang);
 
   let abortController = null;
   let polling = false;
   let pendingTest = null; // { nonce, chatId, allowedUser, messageId }
   const pendingApprovals = new Map(); // id -> { resolve, chatId, allowedUser, messageId, text, timer, signal, onAbort, suggestionIndexes }
+  const issuedSessionTrustCardHandles = new WeakSet();
+  const sessionTrustCardWork = sessionAutomationCardWorkRegistry
+    || createRemoteCardWorkRegistry({
+      log: (err) => safeLog("warn", "native session automation card update failed", {
+        error: err && err.message,
+      }),
+    });
+  // id -> { resolve, chatId, allowedUser, messageId, payload, activeQuestionIndex,
+  //         answers, multiSelectSelections, awaitingOtherFor, timer, signal, onAbort }
+  const pendingElicitations = new Map();
   let lastError = null;
   let pollRetryDelayMs = Math.max(1, pollRetryInitialMs);
+  let sessionAutomationRouteSignature = null;
 
   function isPolling() {
     return polling;
@@ -173,6 +414,7 @@ function createTelegramNativeRunner({
       polling,
       pendingTest: !!pendingTest,
       pendingApprovalCount: pendingApprovals.size,
+      pendingElicitationCount: pendingElicitations.size,
       lastError,
     };
   }
@@ -183,6 +425,51 @@ function createTelegramNativeRunner({
       errorClass: compactMessageText(errorClass || "unknown", 48),
       at: Date.now(),
     };
+  }
+
+  async function deliverFormatted(method, basePayload, message, requestOptions = {}, deliveryOptions = {}) {
+    if (!isFormattedTelegramMessage(message)) {
+      throw new Error("Telegram formatted message contract is required");
+    }
+    const preferPlain = deliveryOptions.preferPlain === true;
+    const signal = requestOptions && requestOptions.signal;
+    const plainBasePayload = { ...basePayload };
+    delete plainBasePayload.parse_mode;
+    const sendPlain = () => {
+      if (typeof deliveryOptions.onPlainAttempt === "function") {
+        try { deliveryOptions.onPlainAttempt(); } catch {}
+      }
+      return client[method]({
+        ...plainBasePayload,
+        text: message.plainText,
+      }, requestOptions);
+    };
+    if (preferPlain) {
+      return { result: await sendPlain(), usedPlain: true };
+    }
+    try {
+      const result = await client[method]({
+        ...basePayload,
+        text: message.html,
+        parse_mode: "HTML",
+      }, requestOptions);
+      return { result, usedPlain: false };
+    } catch (err) {
+      if (!isTelegramHtmlParseError(err)) throw err;
+      if (signal && signal.aborted) throw err;
+      safeLog("warn", "native Telegram HTML rejected, retrying rendered plain text", {
+        operation: method === "editMessageText" ? "edit" : "send",
+      });
+      return { result: await sendPlain(), usedPlain: true };
+    }
+  }
+
+  async function sendFormattedMessage(basePayload, message, requestOptions, deliveryOptions) {
+    return deliverFormatted("sendMessage", basePayload, message, requestOptions, deliveryOptions);
+  }
+
+  async function editFormattedMessage(basePayload, message, requestOptions, deliveryOptions) {
+    return deliverFormatted("editMessageText", basePayload, message, requestOptions, deliveryOptions);
   }
 
   function resetPollRetryDelay() {
@@ -217,32 +504,42 @@ function createTelegramNativeRunner({
     polling = true;
     const controller = new AbortController();
     abortController = controller;
-    // First poll uses retry to absorb 409 from a still-releasing sidecar.
+    // First poll uses retry to absorb 409 from a still-releasing bot consumer.
     loopFirst(controller.signal).catch((err) => {
       log("warn", "native polling stopped", { error: err && err.message });
     }).finally(() => {
       if (abortController === controller) {
         polling = false;
         abortController = null;
+        // stop() clears abortController before its intentional abort reaches
+        // this finally block. Reaching here while still owning the controller
+        // therefore means polling died unexpectedly (for example invalid bot
+        // credentials or a webhook conflict), so remote revocation can no
+        // longer be guaranteed and active grants must tighten to off.
+        notifySessionAutomationRouteChange();
       }
     });
   }
 
   async function stop() {
+    notifySessionAutomationRouteChange();
     polling = false;
     if (abortController) {
       try { abortController.abort(); } catch {}
       abortController = null;
     }
     clearAllApprovals();
+    clearAllElicitations();
   }
 
   async function loopFirst(signal) {
+    let updates;
     try {
-      await pollWithConflictRetry(
+      const firstPoll = await pollWithConflictRetry(
         () => client.getUpdates({ timeout: 0, signal }),
         { signal, sleep },
       );
+      updates = firstPoll && firstPoll.result;
     } catch (err) {
       const cls = classifyError(err);
       if (cls === ERROR_CLASSES.TIMEOUT) return; // aborted
@@ -258,6 +555,7 @@ function createTelegramNativeRunner({
       return loop(signal);
     }
     resetPollRetryDelay();
+    await handleUpdateBatch(updates);
     return loop(signal);
   }
 
@@ -280,14 +578,18 @@ function createTelegramNativeRunner({
         continue;
       }
       resetPollRetryDelay();
-      const batch = Array.isArray(updates) ? updates : [];
-      for (const u of batch) {
-        try {
-          await handleUpdate(u);
-        } catch (err) {
-          noteError("update", "handler_error");
-          safeLog("warn", "native update handler failed", { error: err && err.message });
-        }
+      await handleUpdateBatch(updates);
+    }
+  }
+
+  async function handleUpdateBatch(updates) {
+    const batch = Array.isArray(updates) ? updates : [];
+    for (const u of batch) {
+      try {
+        await handleUpdate(u);
+      } catch (err) {
+        noteError("update", "handler_error");
+        safeLog("warn", "native update handler failed", { error: err && err.message });
       }
     }
   }
@@ -344,6 +646,19 @@ function createTelegramNativeRunner({
   async function handleMessage(message) {
     if (!message) return false;
     const text = typeof message.text === "string" ? message.text : "";
+
+    // Checked before command parsing: a free-text "Other" answer that
+    // happens to start with "/" (e.g. "/help", "/tmp/foo") would otherwise
+    // look like a slash command and get silently swallowed below instead of
+    // answering the question it's a reply to.
+    if (text.trim()) {
+      const replyToMessageId = message.reply_to_message && message.reply_to_message.message_id;
+      const handledOther = replyToMessageId
+        ? await handleElicitationOtherReply({ text, replyToMessageId, message })
+        : false;
+      if (handledOther) return true;
+    }
+
     const parsed = parseMessageCommand(text);
     if (parsed) {
       if (parsed.command !== "status" || typeof onCommand !== "function") return false;
@@ -366,7 +681,9 @@ function createTelegramNativeRunner({
       return true;
     }
 
-    if (typeof onTextMessage !== "function" || !text.trim()) return false;
+    if (!text.trim()) return false;
+
+    if (typeof onTextMessage !== "function") return false;
     if (typeof isTextMessageEnabled === "function" && !isTextMessageEnabled()) return true;
     const auth = getAuthorizedMessageContext(message);
     if (!auth) return true;
@@ -392,25 +709,282 @@ function createTelegramNativeRunner({
     const fromId = cb.from && String(cb.from.id);
     const chatId = cb.message && cb.message.chat && String(cb.message.chat.id);
 
+    const handledPersistentRevoke = await handleSessionGrantRevokeCallback(cb, { fromId, chatId });
+    if (handledPersistentRevoke) return;
+
     if (pendingTest) {
       const handledTest = await handleTestCallback(cb, { fromId, chatId });
       if (handledTest) return;
     }
 
     const handledApproval = await handleApprovalCallback(cb, { fromId, chatId });
-    if (!handledApproval) return;
+    if (handledApproval) return;
+
+    await handleElicitationCallback(cb, { fromId, chatId });
+  }
+
+  function callbackMatchesApprovalCard(entry, cb, chatId) {
+    const messageId = cb && cb.message && cb.message.message_id;
+    return !!(
+      entry
+      && entry.messageId
+      && messageId
+      && String(entry.messageId) === String(messageId)
+      && String(entry.chatId) === String(chatId)
+    );
+  }
+
+  function sessionTrustKeyboard(id, t) {
+    return {
+      inline_keyboard: [[
+        { text: t("telegramSessionTrustConfirmButton"), callback_data: `ct:${id}:yes` },
+        { text: t("telegramSessionTrustCancelButton"), callback_data: `ct:${id}:no` },
+      ]],
+    };
+  }
+
+  async function editSessionTrustPrompt(basePayload, message) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutMs = Number.isFinite(sessionAutomationEditTimeoutMs)
+      && sessionAutomationEditTimeoutMs > 0
+      ? sessionAutomationEditTimeoutMs
+      : DEFAULT_SESSION_AUTOMATION_EDIT_TIMEOUT_MS;
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        if (controller) {
+          try { controller.abort(); } catch {}
+        }
+        reject(new Error("Telegram session automation edit deadline exceeded"));
+      }, timeoutMs);
+      if (timer && typeof timer.unref === "function") timer.unref();
+    });
+    try {
+      return await Promise.race([
+        editFormattedMessage(
+          basePayload,
+          message,
+          controller ? { signal: controller.signal } : undefined
+        ).then((delivery) => delivery.result),
+        timeout,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function buildApprovalKeyboard(id, entry) {
+    const callbackBase = `cp:${id}`;
+    const inlineKeyboard = [[
+      { text: t("telegramApprovalButtonAllowOnce"), callback_data: `${callbackBase}:a` },
+      { text: t("telegramApprovalButtonDeny"), callback_data: `${callbackBase}:d` },
+    ]];
+    for (const suggestion of entry.suggestions || []) {
+      inlineKeyboard.push([
+        { text: suggestion.label, callback_data: `${callbackBase}:s${suggestion.index}` },
+      ]);
+    }
+    if (entry.canOfferSessionTrust === true) {
+      inlineKeyboard.push([{
+        text: t("telegramSessionTrustButton"),
+        callback_data: `ct:${id}:open`,
+      }]);
+    }
+    return { inline_keyboard: inlineKeyboard };
+  }
+
+  async function handleSessionTrustApprovalCallback(cb, { fromId, chatId }) {
+    const data = typeof cb.data === "string" ? cb.data : "";
+    const match = data.match(SESSION_TRUST_CALLBACK_RE);
+    if (!match) return false;
+    const id = match[1];
+    const action = match[2];
+    const entry = pendingApprovals.get(id);
+    if (
+      !entry
+      || entry.canOfferSessionTrust !== true
+      || !isCallerAuthorized(entry, fromId, chatId, getAllowedUserId(), getChatId())
+      || !callbackMatchesApprovalCard(entry, cb, chatId)
+    ) {
+      try {
+        await client.answerCallbackQuery({
+          callback_query_id: cb.id,
+          text: entry ? t("telegramApprovalToastNotAllowed") : t("telegramApprovalToastExpired"),
+        });
+      } catch {}
+      return true;
+    }
+    if (action === "open") {
+      entry.trustConfirming = true;
+      const confirmationMessage = appendTelegramStatus(
+        entry.message,
+        t("telegramSessionTrustConfirmText"),
+        { maxLength: MAX_MESSAGE_TEXT },
+      );
+      try {
+        await editSessionTrustPrompt({
+          chat_id: entry.chatId,
+          message_id: entry.messageId,
+          reply_markup: sessionTrustKeyboard(id, t),
+        }, confirmationMessage);
+        try {
+          await client.answerCallbackQuery({
+            callback_query_id: cb.id,
+            text: t("telegramSessionTrustConfirmToast"),
+          });
+        } catch {}
+      } catch {
+        entry.trustConfirming = false;
+        try {
+          await client.answerCallbackQuery({
+            callback_query_id: cb.id,
+            text: t("telegramApprovalToastUnavailable"),
+          });
+        } catch {}
+      }
+      return true;
+    }
+    if (action === "no") {
+      try {
+        await editSessionTrustPrompt({
+          chat_id: entry.chatId,
+          message_id: entry.messageId,
+          reply_markup: buildApprovalKeyboard(id, entry),
+        }, entry.message);
+        entry.trustConfirming = false;
+      } catch {
+        entry.trustConfirming = true;
+        try {
+          await client.answerCallbackQuery({
+            callback_query_id: cb.id,
+            text: t("telegramApprovalToastUnavailable"),
+          });
+        } catch {}
+        return true;
+      }
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id }); } catch {}
+      return true;
+    }
+    if (entry.trustConfirming !== true) {
+      try {
+        await client.answerCallbackQuery({
+          callback_query_id: cb.id,
+          text: t("telegramApprovalToastExpired"),
+        });
+      } catch {}
+      return true;
+    }
+    const cardWork = sessionTrustCardWork.reserve(`pending:${id}`, {
+      chatId: entry.chatId,
+      messageId: entry.messageId,
+      text: entry.text,
+      message: entry.message,
+    });
+    if (!cardWork) {
+      try {
+        await editSessionTrustPrompt({
+          chat_id: entry.chatId,
+          message_id: entry.messageId,
+          reply_markup: buildApprovalKeyboard(id, entry),
+        }, entry.message);
+        entry.trustConfirming = false;
+      } catch {
+        entry.trustConfirming = true;
+      }
+      try {
+        await client.answerCallbackQuery({
+          callback_query_id: cb.id,
+          text: t("telegramApprovalToastUnavailable"),
+        });
+      } catch {}
+      return true;
+    }
+    const cardHandle = Object.freeze({
+      approvalId: id,
+      chatId: entry.chatId,
+      messageId: entry.messageId,
+      text: entry.text,
+      message: entry.message,
+      routeSignature: sessionAutomationRouteSignature,
+      cardWork,
+    });
+    issuedSessionTrustCardHandles.add(cardHandle);
+    client.answerCallbackQuery({
+      callback_query_id: cb.id,
+      text: t("telegramSessionTrustPreparingToast"),
+    }).catch(() => {});
+    finishApproval(id, { action: "session-trust", cardHandle });
+    return true;
+  }
+
+  async function handleSessionGrantRevokeCallback(cb, { fromId, chatId }) {
+    const grantId = parseSessionGrantRevokeAction(cb && cb.data);
+    if (!grantId) return false;
+    const messageId = cb && cb.message && cb.message.message_id;
+    const currentUser = getAllowedUserId();
+    const currentChat = getChatId();
+    const authorized = !!currentUser
+      && !!currentChat
+      && String(fromId) === String(currentUser)
+      && String(chatId) === String(currentChat);
+    const active = authorized && sessionTrustCardWork.hasCard(grantId, (ref) => (
+      ref
+      && String(ref.chatId) === String(chatId)
+      && String(ref.messageId) === String(messageId)
+    ));
+    if (!active || typeof onSessionGrantRevoke !== "function") {
+      try {
+        await client.answerCallbackQuery({
+          callback_query_id: cb.id,
+          text: authorized
+            ? t("telegramSessionTrustStaleToast")
+            : t("telegramApprovalToastNotAllowed"),
+        });
+      } catch {}
+      return true;
+    }
+    let result;
+    try {
+      result = onSessionGrantRevoke(grantId);
+    } catch {
+      result = { status: "invalid" };
+    }
+    if (result && typeof result.then === "function") result = { status: "invalid" };
+    const revoked = result
+      && (result.status === "applied" || result.status === "candidate-cancelled");
+    try {
+      await client.answerCallbackQuery({
+        callback_query_id: cb.id,
+        text: revoked
+          ? t("telegramSessionTrustRevokedToast")
+          : t("telegramSessionTrustStaleToast"),
+      });
+    } catch {}
+    if (!revoked) {
+      sessionTrustCardWork.deactivateGrant(grantId, (ref) => renderSessionTrustTerminal(
+        ref,
+        t("telegramSessionTrustStaleStatus")
+      ));
+    }
+    return true;
   }
 
   async function handleTestCallback(cb, { fromId, chatId }) {
-    const isAllowedUser = !pendingTest.allowedUser || fromId === String(pendingTest.allowedUser);
-    const isExpectedChat = !pendingTest.chatId || chatId === String(pendingTest.chatId);
+    // Fail closed against the CURRENT config: a blank allowed user must not let
+    // any chat member mark a broken config as native-verified (codex finding 3).
+    const currentUser = getAllowedUserId();
+    const currentChat = getChatId();
+    const isAllowedUser = !!currentUser && fromId === String(currentUser)
+      && !!pendingTest.allowedUser && fromId === String(pendingTest.allowedUser);
+    const isExpectedChat = !!currentChat && chatId === String(currentChat)
+      && (!pendingTest.chatId || chatId === String(pendingTest.chatId));
     if (cb.data !== `clawd-test:${pendingTest.nonce}` || !isAllowedUser || !isExpectedChat) {
       if (typeof cb.data !== "string" || !cb.data.startsWith("clawd-test:")) return false;
       // Acknowledge stray callbacks so the Telegram client closes its spinner.
       try { await client.answerCallbackQuery({ callback_query_id: cb.id }); } catch {}
       return true;
     }
-    try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "OK" }); } catch {}
+    try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramApprovalToastAck") }); } catch {}
     try {
       await client.editMessageReplyMarkup({
         chat_id: chatId,
@@ -425,24 +999,27 @@ function createTelegramNativeRunner({
   }
 
   async function handleApprovalCallback(cb, { fromId, chatId }) {
+    if (await handleSessionTrustApprovalCallback(cb, { fromId, chatId })) return true;
     const data = typeof cb.data === "string" ? cb.data : "";
     const parsed = parseApprovalCallbackData(data);
     if (!parsed) return false;
     const entry = pendingApprovals.get(parsed.id);
     if (!entry) {
-      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Expired" }); } catch {}
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramApprovalToastExpired") }); } catch {}
       return true;
     }
-    const isAllowedUser = !entry.allowedUser || fromId === String(entry.allowedUser);
-    const isExpectedChat = !entry.chatId || chatId === String(entry.chatId);
-    if (!isAllowedUser || !isExpectedChat) {
-      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Not allowed" }); } catch {}
+    if (!isCallerAuthorized(entry, fromId, chatId, getAllowedUserId(), getChatId())) {
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramApprovalToastNotAllowed") }); } catch {}
+      return true;
+    }
+    if (!callbackMatchesApprovalCard(entry, cb, chatId) || entry.trustConfirming === true) {
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramApprovalToastExpired") }); } catch {}
       return true;
     }
 
     const decision = parsed.decision;
     if (decision.action === "suggestion" && !entry.suggestionIndexes.has(decision.index)) {
-      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Unavailable" }); } catch {}
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramApprovalToastUnavailable") }); } catch {}
       return true;
     }
     // Acknowledge the tap (best-effort, NON-blocking) and then claim the
@@ -453,7 +1030,9 @@ function createTelegramNativeRunner({
     // promise up front and fire-and-forgets the status-line rewrite.
     client.answerCallbackQuery({
       callback_query_id: cb.id,
-      text: decision.action === "allow" ? "Allowed" : (decision.action === "deny" ? "Denied" : "Applied"),
+      text: decision.action === "allow"
+        ? t("telegramApprovalToastAllowed")
+        : (decision.action === "deny" ? t("telegramApprovalToastDenied") : t("telegramApprovalToastApplied")),
     }).catch(() => {});
     const messageId = entry.messageId || (cb.message && cb.message.message_id);
     finishApproval(parsed.id, decision, undefined, messageId);
@@ -508,9 +1087,9 @@ function createTelegramNativeRunner({
     try {
       const msg = await client.sendMessage({
         chat_id: chatId,
-        text: "Clawd: test native Telegram bot. Tap to confirm.",
+        text: t("telegramTestMessage"),
         reply_markup: {
-          inline_keyboard: [[{ text: "Confirm", callback_data: `clawd-test:${nonce}` }]],
+          inline_keyboard: [[{ text: t("telegramTestConfirmButton"), callback_data: `clawd-test:${nonce}` }]],
         },
       });
       if (pendingTest && pendingTest.nonce === nonce) {
@@ -543,12 +1122,173 @@ function createTelegramNativeRunner({
   function appendApprovalStatus(entry, status, messageId) {
     const chatId = entry && entry.chatId;
     if (!chatId || !messageId) return Promise.resolve();
-    if (!status || !entry.text) return stripApprovalKeyboard(chatId, messageId);
-    return client.editMessageText({
+    if (!status || !entry.message) return stripApprovalKeyboard(chatId, messageId);
+    const message = appendTelegramStatus(entry.message, status, { maxLength: MAX_MESSAGE_TEXT });
+    return editFormattedMessage({
       chat_id: chatId,
       message_id: messageId,
-      text: `${entry.text}\n\n${status}`,
-    }).catch(() => stripApprovalKeyboard(chatId, messageId));
+    }, message).catch(() => stripApprovalKeyboard(chatId, messageId));
+  }
+
+  function renderSessionTrustCard(cardRef, status, grantId, options = {}) {
+    if (!cardRef || !cardRef.chatId || !cardRef.messageId || !grantId) {
+      return Promise.reject(new Error("session trust card reference is unavailable"));
+    }
+    const baseMessage = cardRef.message || plainTelegramText(cardRef.text || "", {
+      maxLength: MAX_MESSAGE_TEXT,
+      neutralizeMentions: true,
+    });
+    const message = appendTelegramStatus(baseMessage, status, { maxLength: MAX_MESSAGE_TEXT });
+    return editFormattedMessage({
+      chat_id: cardRef.chatId,
+      message_id: cardRef.messageId,
+      reply_markup: {
+        inline_keyboard: [[{
+          text: t("telegramSessionTrustRevokeButton"),
+          callback_data: buildSessionGrantRevokeAction(grantId),
+        }]],
+      },
+    }, message, options).then((delivery) => delivery.result);
+  }
+
+  function renderSessionTrustTerminal(cardRef, status, options = {}) {
+    if (!cardRef || !cardRef.chatId || !cardRef.messageId) return Promise.resolve();
+    const baseMessage = cardRef.message || plainTelegramText(cardRef.text || "", {
+      maxLength: MAX_MESSAGE_TEXT,
+      neutralizeMentions: true,
+    });
+    const message = appendTelegramStatus(baseMessage, status, { maxLength: MAX_MESSAGE_TEXT });
+    return editFormattedMessage({
+      chat_id: cardRef.chatId,
+      message_id: cardRef.messageId,
+    }, message, options).then((delivery) => delivery.result);
+  }
+
+  function notifySessionAutomationRouteChange() {
+    if (typeof onSessionAutomationRouteChange !== "function") return;
+    try { onSessionAutomationRouteChange(api); } catch {}
+  }
+
+  function syncSessionAutomationRoute(route) {
+    const next = JSON.stringify(route && typeof route === "object" ? route : {});
+    if (sessionAutomationRouteSignature !== null && next !== sessionAutomationRouteSignature) {
+      notifySessionAutomationRouteChange();
+    }
+    sessionAutomationRouteSignature = next;
+  }
+
+  function supportsSessionAutomation() {
+    return polling
+      && typeof onSessionGrantRevoke === "function"
+      && typeof client.editMessageText === "function";
+  }
+
+  function beginSessionTrustCandidate({ grantId, cardHandle } = {}) {
+    if (!issuedSessionTrustCardHandles.has(cardHandle)) return null;
+    issuedSessionTrustCardHandles.delete(cardHandle);
+    const cardWork = cardHandle.cardWork;
+    if (
+      !supportsSessionAutomation()
+      || cardHandle.routeSignature !== sessionAutomationRouteSignature
+      || !sessionTrustCardWork.bindCandidateGrant(cardWork, grantId)
+    ) {
+      // The user already completed the two-step confirmation, so leaving the
+      // old yes/no keyboard behind would invite a second click that can only be
+      // reported as stale. Best-effort terminalize it through the same bounded
+      // queue; even an obsolete credential cannot retain the slot past deadline.
+      sessionTrustCardWork.enqueue(cardWork, (cardRef, { signal }) => (
+        renderSessionTrustTerminal(
+          cardRef,
+          t("telegramSessionTrustFailedStatus"),
+          { signal }
+        )
+      ), { terminal: true, outcome: "terminal" });
+      return null;
+    }
+    return cardWork;
+  }
+
+  function discardSessionTrustCardHandle(cardHandle, { reason } = {}) {
+    if (!issuedSessionTrustCardHandles.has(cardHandle)) return false;
+    issuedSessionTrustCardHandles.delete(cardHandle);
+    const cardWork = cardHandle && cardHandle.cardWork;
+    const status = reason === "remote-revoke"
+      ? t("telegramSessionTrustRevokedStatus")
+      : t("telegramSessionTrustResolvedStatus");
+    sessionTrustCardWork.enqueue(cardWork, (cardRef, { signal }) => (
+      renderSessionTrustTerminal(cardRef, status, { signal })
+    ), { terminal: true, outcome: "terminal" });
+    return true;
+  }
+
+  function prepareSessionTrustCandidate(cardWork, { grantId } = {}) {
+    return sessionTrustCardWork.enqueue(cardWork, (cardRef, { signal }) => (
+      renderSessionTrustCard(
+        cardRef,
+        t("telegramSessionTrustPreparingStatus"),
+        grantId,
+        { signal }
+      )
+    ), { outcome: "preparing" });
+  }
+
+  function activateSessionTrustCandidate(cardWork, { grantId } = {}) {
+    return sessionTrustCardWork.activate(cardWork, grantId);
+  }
+
+  function renderActiveSessionTrust(cardWork, { grantId, outcome } = {}) {
+    const status = outcome === "already-active"
+      ? t("telegramSessionTrustAlreadyActiveStatus")
+      : t("telegramSessionTrustActiveStatus");
+    return sessionTrustCardWork.enqueue(cardWork, (cardRef, { signal }) => (
+      renderSessionTrustCard(cardRef, status, grantId, { signal })
+    ), { outcome: "active" });
+  }
+
+  function cancelSessionTrustCandidate(cardWork, { reason, activeGrantId } = {}) {
+    if (activeGrantId && sessionTrustCardWork.activate(cardWork, activeGrantId)) {
+      renderActiveSessionTrust(cardWork, {
+        grantId: activeGrantId,
+        outcome: "already-active",
+      });
+      return true;
+    }
+    const status = reason === "remote-revoke"
+      ? t("telegramSessionTrustRevokedStatus")
+      : (reason === "resolved" || reason === "permission-resolved")
+        ? t("telegramSessionTrustResolvedStatus")
+        : t("telegramSessionTrustFailedStatus");
+    sessionTrustCardWork.enqueue(cardWork, (cardRef, { signal }) => (
+      renderSessionTrustTerminal(cardRef, status, { signal })
+    ), { terminal: true, outcome: "terminal" });
+    return true;
+  }
+
+  function handleSessionAutomationChanges(changes) {
+    for (const change of Array.isArray(changes) ? changes : []) {
+      const previous = change && change.previous;
+      const next = change && change.next;
+      if (!previous || !previous.grantId || (next && next.grantId === previous.grantId)) continue;
+      const status = change.reason === "remote-revoke"
+        ? t("telegramSessionTrustRevokedStatus")
+        : t("telegramSessionTrustExpiredStatus");
+      sessionTrustCardWork.deactivateGrant(previous.grantId, (cardRef, _grantId, { signal }) => (
+        renderSessionTrustTerminal(cardRef, status, { signal })
+      ));
+    }
+  }
+
+  function listActiveSessionAutomationGrantIds() {
+    return sessionTrustCardWork.activeGrantIds();
+  }
+
+  function retireSessionAutomationGrant(grantId, options = {}) {
+    const status = options.reason === "stale"
+      ? t("telegramSessionTrustStaleStatus")
+      : t("telegramSessionTrustExpiredStatus");
+    return sessionTrustCardWork.deactivateGrant(grantId, (cardRef, _id, { signal }) => (
+      renderSessionTrustTerminal(cardRef, status, { signal })
+    ));
   }
 
   // Single resolution point for an approval, used by every exit: a Telegram
@@ -573,13 +1313,14 @@ function createTelegramNativeRunner({
     }
     const normalized = normalizeApprovalDecision(decision);
     entry.resolve(normalized);
+    if (normalized && normalized.action === "session-trust") return;
     // Rewrite the card so the chat history shows the outcome and the inline
     // keyboard is dropped. A Telegram-side decision shows the chosen action; a
     // null decision (resolved elsewhere / timeout / polling stopped) shows the
     // neutral reason. Best-effort — appendApprovalStatus never throws.
     const status = normalized
-      ? APPROVAL_DECIDED_STATUS[normalized.action]
-      : APPROVAL_RESOLVED_ELSEWHERE_STATUS[reason];
+      ? approvalDecidedStatusText(t, normalized.action)
+      : approvalResolvedElsewhereStatusText(t, reason);
     appendApprovalStatus(entry, status, messageIdOverride || entry.messageId);
   }
 
@@ -591,26 +1332,20 @@ function createTelegramNativeRunner({
   function requestApproval(payload, options = {}) {
     const chatId = getChatId();
     const allowedUser = getAllowedUserId();
-    const text = buildApprovalText(payload);
+    const message = buildTelegramApprovalMessage(payload, { maxLength: MAX_MESSAGE_TEXT });
+    const text = message && message.plainText;
     const suggestions = normalizeApprovalSuggestions(payload && payload.suggestions);
     const signal = options && options.signal;
-    if (!polling || !chatId || !text || (signal && signal.aborted)) {
+    const onDelivered = options && typeof options.onDelivered === "function"
+      ? options.onDelivered
+      : null;
+    if (!polling || !chatId || !allowedUser || !text || (signal && signal.aborted)) {
       const reason = !polling ? "not polling"
-        : (!chatId ? "missing chat" : (!text ? "missing text" : "aborted"));
+        : (!chatId ? "missing chat" : (!allowedUser ? "missing allowed user" : (!text ? "missing text" : "aborted")));
       log("debug", `native approval skipped: ${reason}`);
       return Promise.resolve(null);
     }
     const id = randomId();
-    const callbackBase = `cp:${id}`;
-    const inlineKeyboard = [[
-      { text: "Allow once", callback_data: `${callbackBase}:a` },
-      { text: "Deny", callback_data: `${callbackBase}:d` },
-    ]];
-    for (const suggestion of suggestions) {
-      inlineKeyboard.push([
-        { text: suggestion.label, callback_data: `${callbackBase}:s${suggestion.index}` },
-      ]);
-    }
     return new Promise((resolve) => {
       const entry = {
         resolve,
@@ -620,10 +1355,14 @@ function createTelegramNativeRunner({
         // Card body as sent, kept so a resolved-elsewhere edit can rebuild the
         // text with a status line appended (issue #457).
         text,
+        message,
         timer: null,
         signal,
         onAbort: null,
         suggestionIndexes: new Set(suggestions.map((suggestion) => suggestion.index)),
+        suggestions,
+        canOfferSessionTrust: payload && payload.canOfferSessionTrust === true,
+        trustConfirming: false,
       };
       pendingApprovals.set(id, entry);
 
@@ -635,16 +1374,22 @@ function createTelegramNativeRunner({
         signal.addEventListener("abort", entry.onAbort, { once: true });
       }
 
-      client.sendMessage({
+      sendFormattedMessage({
         chat_id: chatId,
-        text,
         reply_markup: {
-          inline_keyboard: inlineKeyboard,
+          ...buildApprovalKeyboard(id, entry),
         },
-      }, signal ? { signal } : undefined).then((msg) => {
+      }, message, signal ? { signal } : undefined).then((delivery) => {
+        const msg = delivery.result;
         const current = pendingApprovals.get(id);
         if (!current || (signal && signal.aborted)) return;
-        current.messageId = msg && msg.message_id;
+        const messageId = msg && msg.message_id;
+        current.messageId = messageId;
+        if (messageId !== null && messageId !== undefined && messageId !== "" && onDelivered) {
+          try { onDelivered({ messageId }); } catch (err) {
+            safeLog("warn", "native approval delivery callback failed", { error: err && err.message });
+          }
+        }
         safeLog("debug", "native approval card sent");
       }).catch((err) => {
         if (signal && signal.aborted) {
@@ -655,6 +1400,317 @@ function createTelegramNativeRunner({
         safeLog("warn", "native approval send failed", { error: err && err.message });
         noteError("approval", classifyError(err));
         finishApproval(id, null);
+      });
+    });
+  }
+
+  // Best-effort: rewrite the elicitation card in place, either to show the
+  // next/previous question (with a fresh keyboard) or - when called without a
+  // keyboard - to show a final status line with no keyboard, mirroring
+  // appendApprovalStatus's fallback-to-stripped-keyboard behavior on failure.
+  function renderElicitationCard(entry, message, keyboard) {
+    if (!entry.chatId || !entry.messageId) return Promise.resolve();
+    const payload = { chat_id: entry.chatId, message_id: entry.messageId };
+    if (keyboard) payload.reply_markup = { inline_keyboard: keyboard };
+    return editFormattedMessage(payload, message).then((delivery) => delivery.result).catch(() => {
+      if (!keyboard) return undefined;
+      return stripApprovalKeyboard(entry.chatId, entry.messageId);
+    });
+  }
+
+  function renderElicitationQuestion(entry) {
+    if (entry.awaitingOtherFor != null) {
+      const text = buildElicitationOtherPromptText(entry.payload, entry.awaitingOtherFor, t);
+      const message = plainTelegramText(text, {
+        maxLength: MAX_MESSAGE_TEXT,
+        neutralizeMentions: true,
+      });
+      const callbackBase = `cq:${entry.payload._id}`;
+      // A dead end otherwise: without a way back to the option list, tapping
+      // Other by mistake (or changing your mind) would force either typing
+      // something or giving up and bailing to the terminal, discarding every
+      // answer already collected for the other questions.
+      const keyboard = [
+        [{ text: t("telegramElicitationCancelOtherButton"), callback_data: `${callbackBase}:z${entry.awaitingOtherFor}` }],
+        [{ text: t("telegramElicitationTerminalButton"), callback_data: `${callbackBase}:t` }],
+      ];
+      return renderElicitationCard(entry, message, keyboard);
+    }
+    const text = buildElicitationQuestionText(entry.payload, entry.activeQuestionIndex, t);
+    const message = plainTelegramText(text, {
+      maxLength: MAX_MESSAGE_TEXT,
+      neutralizeMentions: true,
+    });
+    const keyboard = buildElicitationKeyboard(entry.payload, entry.activeQuestionIndex, entry.multiSelectSelections, t);
+    return renderElicitationCard(entry, message, keyboard);
+  }
+
+  // Single resolution point for an elicitation, used by every exit: a
+  // Telegram-side submit/terminal tap, a desktop answer (abort), a timeout, or
+  // polling stop. Claims the entry synchronously before any network I/O, same
+  // race-safety reasoning as finishApproval.
+  function finishElicitation(id, decision, reason) {
+    const entry = pendingElicitations.get(id);
+    if (!entry) return;
+    pendingElicitations.delete(id);
+    if (entry.timer) clearTimeout(entry.timer);
+    if (entry.signal && entry.onAbort) {
+      try { entry.signal.removeEventListener("abort", entry.onAbort); } catch {}
+    }
+    entry.resolve(decision);
+    const status = decision === "terminal"
+      ? t("telegramElicitationTerminalStatus")
+      : (decision && typeof decision === "object" && decision.type === "elicitation-submit")
+        ? t("telegramElicitationSubmittedStatus")
+        : approvalResolvedElsewhereStatusText(t, reason);
+    const baseText = entry.awaitingOtherFor != null
+      ? buildElicitationOtherPromptText(entry.payload, entry.awaitingOtherFor, t)
+      : buildElicitationQuestionText(entry.payload, entry.activeQuestionIndex, t);
+    if (!entry.chatId || !entry.messageId) return;
+    const baseMessage = plainTelegramText(baseText, {
+      maxLength: MAX_MESSAGE_TEXT,
+      neutralizeMentions: true,
+    });
+    const message = status
+      ? appendTelegramStatus(baseMessage, status, { maxLength: MAX_MESSAGE_TEXT })
+      : baseMessage;
+    renderElicitationCard(entry, message, null);
+  }
+
+  function clearAllElicitations() {
+    const ids = Array.from(pendingElicitations.keys());
+    for (const id of ids) finishElicitation(id, null, "stopped");
+  }
+
+  // Records an answer for the active question and moves the entry forward:
+  // to the next unanswered question, or - once every question has an answer -
+  // resolves the whole request with the collected answers.
+  function advanceElicitation(id, entry) {
+    entry.multiSelectSelections = new Set();
+    entry.awaitingOtherFor = null;
+    const nextIndex = findNextUnansweredQuestionIndex(entry.payload, entry.answers);
+    if (nextIndex === -1) {
+      finishElicitation(id, { type: "elicitation-submit", answers: entry.answers });
+      return;
+    }
+    entry.activeQuestionIndex = nextIndex;
+    renderElicitationQuestion(entry).catch(() => {});
+  }
+
+  async function handleElicitationCallback(cb, { fromId, chatId }) {
+    const data = typeof cb.data === "string" ? cb.data : "";
+    const parsed = parseElicitationCallbackData(data);
+    if (!parsed) return false;
+    const entry = pendingElicitations.get(parsed.id);
+    if (!entry) {
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastExpired") }); } catch {}
+      return true;
+    }
+    // Backfill from the callback's own message id if the in-flight sendMessage
+    // for this card hasn't resolved yet (a fast enough tap can race it) -
+    // every render below reads entry.messageId, and without this every card
+    // edit for this exchange would silently no-op forever, not just once.
+    if (!entry.messageId) {
+      entry.messageId = (cb.message && cb.message.message_id) || entry.messageId;
+    }
+    if (!isCallerAuthorized(entry, fromId, chatId, getAllowedUserId(), getChatId())) {
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastNotAllowed") }); } catch {}
+      return true;
+    }
+
+    const { action } = parsed;
+
+    if (action.type === "terminal") {
+      client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastTerminal") }).catch(() => {});
+      finishElicitation(parsed.id, "terminal");
+      return true;
+    }
+
+    // Every other action targets a specific question; a tap on a stale
+    // rendering of a question that's no longer active (double-tap, or the
+    // card already moved on) is a no-op rather than corrupting a later
+    // question's state.
+    if (action.questionIndex !== entry.activeQuestionIndex) {
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastExpired") }); } catch {}
+      return true;
+    }
+    const question = entry.payload.questions[entry.activeQuestionIndex];
+    if (!question) return true;
+
+    if (action.type === "back") {
+      if (entry.activeQuestionIndex <= 0) {
+        try { await client.answerCallbackQuery({ callback_query_id: cb.id }); } catch {}
+        return true;
+      }
+      client.answerCallbackQuery({ callback_query_id: cb.id }).catch(() => {});
+      entry.activeQuestionIndex -= 1;
+      entry.multiSelectSelections = new Set();
+      entry.awaitingOtherFor = null;
+      renderElicitationQuestion(entry).catch(() => {});
+      return true;
+    }
+
+    if (action.type === "other") {
+      client.answerCallbackQuery({ callback_query_id: cb.id }).catch(() => {});
+      entry.awaitingOtherFor = entry.activeQuestionIndex;
+      renderElicitationQuestion(entry).catch(() => {});
+      return true;
+    }
+
+    if (action.type === "cancelOther") {
+      client.answerCallbackQuery({ callback_query_id: cb.id }).catch(() => {});
+      entry.awaitingOtherFor = null;
+      renderElicitationQuestion(entry).catch(() => {});
+      return true;
+    }
+
+    if (action.type === "option") {
+      const option = question.options[action.optionIndex];
+      if (!option) {
+        try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastUnavailable") }); } catch {}
+        return true;
+      }
+      if (question.multiSelect) {
+        client.answerCallbackQuery({ callback_query_id: cb.id }).catch(() => {});
+        if (entry.multiSelectSelections.has(action.optionIndex)) {
+          entry.multiSelectSelections.delete(action.optionIndex);
+        } else {
+          entry.multiSelectSelections.add(action.optionIndex);
+        }
+        renderElicitationQuestion(entry).catch(() => {});
+        return true;
+      }
+      client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastAnswered") }).catch(() => {});
+      entry.answers[question.index] = option.label;
+      advanceElicitation(parsed.id, entry);
+      return true;
+    }
+
+    if (action.type === "confirm") {
+      if (!question.multiSelect) {
+        client.answerCallbackQuery({ callback_query_id: cb.id }).catch(() => {});
+        return true;
+      }
+      if (entry.multiSelectSelections.size === 0) {
+        try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastPickAtLeastOne") }); } catch {}
+        return true;
+      }
+      client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastAnswered") }).catch(() => {});
+      const labels = Array.from(entry.multiSelectSelections)
+        .sort((a, b) => a - b)
+        .map((optionIndex) => question.options[optionIndex].label);
+      entry.answers[question.index] = labels.join(", ");
+      advanceElicitation(parsed.id, entry);
+      return true;
+    }
+
+    return true;
+  }
+
+  // Answers the active "Other" question with free-text typed as a reply to
+  // the elicitation card, mirroring how a Telegram button tap answers a fixed
+  // option. Must run BEFORE the generic onTextMessage (Direct Send) handler:
+  // a pending elicitation blocks the agent on this decision, so its reply
+  // belongs to the question, not to whatever session Direct Send would guess
+  // from the completion-notification mapping.
+  async function handleElicitationOtherReply({ text, replyToMessageId, message }) {
+    let match = null;
+    for (const [id, entry] of pendingElicitations) {
+      if (entry.awaitingOtherFor != null && entry.messageId === replyToMessageId) {
+        match = { id, entry };
+        break;
+      }
+    }
+    if (!match) return false;
+    const { id, entry } = match;
+    const fromId = message.from && String(message.from.id);
+    const chatId = message.chat && String(message.chat.id);
+    // A reply to a pending elicitation card is this feature's business either
+    // way: returning `false` here (instead of the button-tap handler's
+    // equivalent "not allowed" `true`) would let an unauthorized reply fall
+    // through to the generic Direct Send text pipeline instead of being
+    // dropped here.
+    if (!isCallerAuthorized(entry, fromId, chatId, getAllowedUserId(), getChatId())) return true;
+    const question = entry.payload.questions[entry.awaitingOtherFor];
+    const answer = compactMessageText(text, 500);
+    if (!question || !answer) return true;
+    entry.answers[question.index] = answer;
+    advanceElicitation(id, entry);
+    return true;
+  }
+
+  function requestElicitation(payload, options = {}) {
+    const chatId = getChatId();
+    const allowedUser = getAllowedUserId();
+    const normalized = normalizeElicitationPayload(payload);
+    const signal = options && options.signal;
+    const onDelivered = options && typeof options.onDelivered === "function"
+      ? options.onDelivered
+      : null;
+    if (!polling || !chatId || !allowedUser || !normalized || (signal && signal.aborted)) {
+      const reason = !polling ? "not polling"
+        : (!chatId ? "missing chat" : (!allowedUser ? "missing allowed user" : (!normalized ? "invalid payload" : "aborted")));
+      log("debug", `native elicitation skipped: ${reason}`);
+      return Promise.resolve(null);
+    }
+    const id = randomId();
+    normalized._id = id;
+    const text = buildElicitationQuestionText(normalized, 0, t);
+    const message = plainTelegramText(text, {
+      maxLength: MAX_MESSAGE_TEXT,
+      neutralizeMentions: true,
+    });
+    const keyboard = buildElicitationKeyboard(normalized, 0, null, t);
+
+    return new Promise((resolve) => {
+      const entry = {
+        resolve,
+        chatId,
+        allowedUser,
+        messageId: null,
+        payload: normalized,
+        activeQuestionIndex: 0,
+        answers: {},
+        multiSelectSelections: new Set(),
+        awaitingOtherFor: null,
+        timer: null,
+        signal,
+        onAbort: null,
+      };
+      pendingElicitations.set(id, entry);
+
+      entry.timer = setTimeout(() => finishElicitation(id, null, "timeout"), Math.max(1, elicitationTimeoutMs));
+      if (entry.timer && typeof entry.timer.unref === "function") entry.timer.unref();
+
+      if (signal) {
+        entry.onAbort = () => finishElicitation(id, null, "elsewhere");
+        signal.addEventListener("abort", entry.onAbort, { once: true });
+      }
+
+      sendFormattedMessage({
+        chat_id: chatId,
+        reply_markup: { inline_keyboard: keyboard },
+      }, message, signal ? { signal } : undefined).then((delivery) => {
+        const msg = delivery.result;
+        const current = pendingElicitations.get(id);
+        if (!current || (signal && signal.aborted)) return;
+        const messageId = msg && msg.message_id;
+        current.messageId = messageId;
+        if (messageId !== null && messageId !== undefined && messageId !== "" && onDelivered) {
+          try { onDelivered({ messageId }); } catch (err) {
+            safeLog("warn", "native elicitation delivery callback failed", { error: err && err.message });
+          }
+        }
+        safeLog("debug", "native elicitation card sent");
+      }).catch((err) => {
+        if (signal && signal.aborted) {
+          safeLog("debug", "native elicitation send aborted");
+          finishElicitation(id, null);
+          return;
+        }
+        safeLog("warn", "native elicitation send failed", { error: err && err.message });
+        noteError("elicitation", classifyError(err));
+        finishElicitation(id, null);
       });
     });
   }
@@ -695,18 +1751,45 @@ function createTelegramNativeRunner({
     }
   }
 
+  async function sendBoundedNotification(chatId, message, deliveryState) {
+    if (!isFormattedTelegramMessage(message)) {
+      return sendBoundedMessage(chatId, message);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      try { controller.abort(); } catch {}
+    }, Math.max(1, notifyTimeoutMs));
+    if (timer && typeof timer.unref === "function") timer.unref();
+    try {
+      const delivery = await sendFormattedMessage(
+        { chat_id: chatId },
+        message,
+        { signal: controller.signal },
+        {
+          preferPlain: deliveryState.preferPlain === true,
+          onPlainAttempt: () => { deliveryState.preferPlain = true; },
+        },
+      );
+      return delivery.result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // Public R1a entry point. Best-effort: never throws, always resolves to a
   // structured result so callers (the snapshot fanout) can log without
   // branching on exceptions. One 429 retry honouring retry_after; everything
   // else (403 blocked, timeout, network) is logged and dropped.
-  async function sendNotification(text) {
+  async function sendNotification(value) {
     const chatId = getChatId();
-    const body = compactMessageText(text);
-    if (!polling || !chatId || !body) {
+    const body = isFormattedTelegramMessage(value) ? value : compactMessageText(value);
+    const hasBody = isFormattedTelegramMessage(body) ? !!body.plainText : !!body;
+    if (!polling || !chatId || !hasBody) {
       return { ok: false, errorClass: "not_active" };
     }
+    const deliveryState = { preferPlain: false };
     try {
-      const sent = await sendBoundedMessage(chatId, body);
+      const sent = await sendBoundedNotification(chatId, body, deliveryState);
       return { ok: true, messageId: extractTelegramMessageId(sent) };
     } catch (err) {
       const cls = classifyError(err);
@@ -727,7 +1810,7 @@ function createTelegramNativeRunner({
           if (!polling || !retryChatId || retryChatId !== chatId) {
             return { ok: false, errorClass: "not_active" };
           }
-          const sent = await sendBoundedMessage(retryChatId, body);
+          const sent = await sendBoundedNotification(retryChatId, body, deliveryState);
           return { ok: true, messageId: extractTelegramMessageId(sent) };
         } catch (err2) {
           const cls2 = classifyError(err2);
@@ -746,18 +1829,32 @@ function createTelegramNativeRunner({
     }
   }
 
-  return {
+  const api = {
     isEnabled,
     isPolling,
     start,
     stop,
     sendTestCard,
     requestApproval,
+    requestElicitation,
     sendNotification,
+    supportsSessionAutomation,
+    beginSessionTrustCandidate,
+    discardSessionTrustCardHandle,
+    prepareSessionTrustCandidate,
+    activateSessionTrustCandidate,
+    renderActiveSessionTrust,
+    cancelSessionTrustCandidate,
+    handleSessionAutomationChanges,
+    listActiveSessionAutomationGrantIds,
+    retireSessionAutomationGrant,
+    syncSessionAutomationRoute,
     getStatus,
     _client: client,
     _pendingApprovals: pendingApprovals,
+    _pendingElicitations: pendingElicitations,
   };
+  return api;
 }
 
 module.exports = {

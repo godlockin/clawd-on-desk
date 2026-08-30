@@ -437,3 +437,44 @@ test("animation override data builds tier cards with transition override metadat
     harness.cleanup();
   }
 });
+
+// #509: default idle visual picker payload
+test("animation override data exposes idle visual options and the current selection", () => {
+  const harness = createRuntimeHarness({
+    snapshot: {
+      themeOverrides: {},
+      idleVisual: { cloudling: "idle-drift.svg" },
+    },
+    activeThemeFactory: (root) => makeTheme(root, {
+      idleAnimations: [
+        { file: "idle-drift.svg", duration: 4000 },
+        { file: "idle-nap.svg", duration: 6000 },
+      ],
+    }),
+  });
+  try {
+    const data = harness.runtime.buildAnimationOverrideData();
+    const info = data.idleDefaultVisual;
+
+    assert.ok(info);
+    assert.strictEqual(info.themeId, "cloudling");
+    assert.strictEqual(info.selectedFile, "idle-drift.svg");
+    assert.deepStrictEqual(info.options, [
+      { file: "idle.svg", isThemeDefault: true, label: "Idle" },
+      { file: "idle-drift.svg", isThemeDefault: false, label: "Idle Drift" },
+      { file: "idle-nap.svg", isThemeDefault: false, label: "Idle Nap" },
+    ]);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("idle visual payload is null when the theme has no idle variants", () => {
+  const harness = createRuntimeHarness();
+  try {
+    const data = harness.runtime.buildAnimationOverrideData();
+    assert.strictEqual(data.idleDefaultVisual, null);
+  } finally {
+    harness.cleanup();
+  }
+});

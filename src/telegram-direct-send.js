@@ -1,10 +1,14 @@
 "use strict";
 
+const { getEntryDisplaySessionTag } = require("./state-session-snapshot");
+
 const { execFile: defaultExecFile } = require("child_process");
 const {
   getSessionFocusTarget,
   isFocusableLocalHudSession,
 } = require("./session-focus");
+const { createTranslator } = require("./i18n");
+const { isPassiveNotifyEntry } = require("./passive-notify-entry");
 
 const DEFAULT_MAPPING_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_REPLY_TEXT = 3800;
@@ -45,9 +49,8 @@ function normalizePromptText(value) {
   return text;
 }
 
-function shortSessionId(sessionId) {
-  const id = String(sessionId || "");
-  return id.length > 12 ? `${id.slice(0, 12)}...` : id;
+function shortSessionId(entry) {
+  return getEntryDisplaySessionTag(entry);
 }
 
 function findSession(snapshot, sessionId) {
@@ -58,9 +61,7 @@ function findSession(snapshot, sessionId) {
 function isInteractivePermissionEntryForSession(permEntry, sessionId) {
   return !!permEntry
     && String(permEntry.sessionId || "") === String(sessionId || "")
-    && permEntry.isCodexNotify !== true
-    && permEntry.isKimiNotify !== true
-    && permEntry.isHardwareBuddyTest !== true;
+    && !isPassiveNotifyEntry(permEntry);
 }
 
 function hasInteractivePermissionPending(entry, getPendingPermissions) {
@@ -78,6 +79,15 @@ function hasInteractivePermissionPending(entry, getPendingPermissions) {
   return entry.state === "notification";
 }
 
+function normalizeOrcaPaneOutcome(value) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    ok: value.ok === true,
+    match: value.match === "exact" || value.match === "cwd" ? value.match : null,
+    reason: typeof value.reason === "string" && value.reason ? value.reason : "unknown",
+  };
+}
+
 function normalizeFocusGateResult(value) {
   if (value && typeof value === "object") {
     return {
@@ -87,6 +97,10 @@ function normalizeFocusGateResult(value) {
       foregroundHwnd: value.foregroundHwnd || null,
       confirmed: value.confirmed === true,
       status: value.confirmed === true ? "confirmed" : "unconfirmed",
+      // This normalizer is a whitelist: without a line here the pane outcome is
+      // dropped between focusSession and the adapter, and the gate reads undefined
+      // on every real delivery while hand-built test payloads still pass.
+      orcaPane: normalizeOrcaPaneOutcome(value.orcaPane),
     };
   }
   return {
@@ -96,6 +110,7 @@ function normalizeFocusGateResult(value) {
     foregroundHwnd: null,
     confirmed: false,
     status: "unconfirmed",
+    orcaPane: null,
   };
 }
 
@@ -177,8 +192,28 @@ function defaultDelay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
-function isEditorHostedEntry(entry) {
-  return !!entry && (entry.editor === "code" || entry.editor === "cursor");
+// These hosts complete their terminal-tab switch asynchronously, after the window
+// focus has already been confirmed. On the default ready delay the paste lands in
+// whichever tab was previously active — dropping the user's reply into another
+// session's prompt, and losing it from the one they answered. For Orca the switch
+// is now awaited outright (see isOrcaPaneConfirmed), so this delay only covers the
+// composer settling after the tab is already in front.
+// The field arrives via buildSessionSnapshotEntry, which is a whitelist — a host
+// added here needs its identifier carried there too or this stays dead code.
+function isAsyncTabSwitchEntry(entry) {
+  if (!entry) return false;
+  return entry.editor === "code" || entry.editor === "cursor" || !!entry.orcaPaneKey;
+}
+
+// A confirmed focus only means Orca's window came forward; the pane switch is a
+// separate CLI round-trip that can miss, time out, or land on a worktree guess.
+// Pasting on anything short of an exact pane match types the reply into a composer
+// the user never chose, so the delivery has to fail into the clipboard fallback
+// instead of reporting success.
+function isOrcaPaneConfirmed(payload) {
+  if (!payload || !payload.entry || !payload.entry.orcaPaneKey) return true;
+  const pane = payload.focusResult && payload.focusResult.orcaPane;
+  return !!(pane && pane.ok === true && pane.match === "exact");
 }
 
 function createWindowsPasteOnlyDeliveryAdapter({
@@ -209,6 +244,12 @@ function createWindowsPasteOnlyDeliveryAdapter({
       if (!clipboard || typeof clipboard.writeText !== "function") {
         return { status: "failed", delivered: false, errorClass: "clipboard_unavailable" };
       }
+      // Ahead of the clipboard write: the fallback adapter owns the clipboard on
+      // this path, and overwriting it here would clobber what the user gets told
+      // was copied for them.
+      if (!isOrcaPaneConfirmed(payload)) {
+        return { status: "failed", delivered: false, errorClass: "orca_pane_unconfirmed" };
+      }
 
       let previousText = null;
       let canRestore = false;
@@ -226,7 +267,7 @@ function createWindowsPasteOnlyDeliveryAdapter({
       }
 
       try {
-        const effectiveReadyDelayMs = isEditorHostedEntry(payload.entry)
+        const effectiveReadyDelayMs = isAsyncTabSwitchEntry(payload.entry)
           ? Math.max(readyDelayMs, WINDOWS_EDITOR_PASTE_READY_DELAY_MS)
           : readyDelayMs;
         await delay(effectiveReadyDelayMs);
@@ -311,26 +352,32 @@ async function invokeFallbackAdapter(fallbackAdapter, payload) {
   return { status: "failed", delivered: false, errorClass: "fallback_adapter_missing" };
 }
 
-function formatDeliveryAck(status, entry, deliveryResult) {
-  const shortId = shortSessionId(entry && entry.id);
+// Function-form replacement: shortId is dynamic and must not be parsed for
+// $$/$&/$`/$' replacement-pattern sequences.
+function interpolate(template, token, value) {
+  return template.replace(token, () => value);
+}
+
+function formatDeliveryAck(status, entry, deliveryResult, t) {
+  const shortId = shortSessionId(entry);
   switch (status) {
     case "sent_with_enter":
-      return `Sent to terminal for session ${shortId}.`;
+      return interpolate(t("directSendAckSent"), "{session}", shortId);
     case "pasted_without_enter":
       if (deliveryResult && deliveryResult.clipboardRestored === true) {
-        return `Pasted text into session ${shortId}; press Enter locally to send it. Your previous clipboard text was restored.`;
+        return interpolate(t("directSendAckPastedRestored"), "{session}", shortId);
       }
-      return `Pasted text into session ${shortId}; press Enter locally to send it. The text is still on this computer's clipboard for manual retry.`;
+      return interpolate(t("directSendAckPastedManual"), "{session}", shortId);
     case "fallback_copied":
-      return `Copied text to this computer's clipboard for session ${shortId}. Paste and send it locally when ready.`;
+      return interpolate(t("directSendAckCopied"), "{session}", shortId);
     case "failed":
-      return "Direct Send failed after focus confirmation. No text was pasted.";
+      return t("directSendAckFailed");
     case "focus_only":
     default:
       if (deliveryResult && deliveryResult.errorClass === "delivery_not_implemented") {
-        return `Focused session ${shortId} on your computer. Direct Send is in focus-only dogfood mode; no text was pasted.`;
+        return interpolate(t("directSendAckFocusOnlyDogfood"), "{session}", shortId);
       }
-      return `Focused session ${shortId} on your computer. Direct Send did not send text.`;
+      return interpolate(t("directSendAckFocusOnly"), "{session}", shortId);
   }
 }
 
@@ -346,7 +393,9 @@ function createTelegramDirectSend({
   maxDeliveries = DEFAULT_MAX_DELIVERIES,
   osPlatform = process.platform,
   log = () => {},
+  getLang = () => "en",
 } = {}) {
+  const t = createTranslator(getLang);
   const mappings = new Map(); // Telegram completion message id -> { sessionId, expiresAt }
   const deliveries = new Map(); // delivery id -> in-memory prompt delivery entry
   let deliverySeq = 0;
@@ -457,7 +506,7 @@ function createTelegramDirectSend({
       deliveryId: deliveryEntry && deliveryEntry.id,
       focusResult: patch.focusResult || undefined,
       deliveryResult: fallbackResult,
-      text: formatDeliveryAck("fallback_copied", entry || { id: patch.sessionId }, fallbackResult),
+      text: formatDeliveryAck("fallback_copied", entry || { id: patch.sessionId }, fallbackResult, t),
     };
   }
 
@@ -500,7 +549,7 @@ function createTelegramDirectSend({
     if (!promptText) {
       return {
         status: "empty",
-        text: "Send text as a reply to a Clawd completion notification.",
+        text: t("directSendEmptyText"),
       };
     }
 
@@ -512,7 +561,7 @@ function createTelegramDirectSend({
       return {
         status: "unmapped",
         deliveryId: deliveryEntry.id,
-        text: "Reply to a Clawd completion notification to choose the session.",
+        text: t("directSendUnmapped"),
       };
     }
 
@@ -535,7 +584,7 @@ function createTelegramDirectSend({
         status: "session_not_live",
         sessionId: mapping.sessionId,
         deliveryId: deliveryEntry.id,
-        text: "That session is no longer live on this computer.",
+        text: t("directSendSessionNotLive"),
       };
     }
 
@@ -558,7 +607,7 @@ function createTelegramDirectSend({
         status: "permission_pending",
         sessionId: entry.id,
         deliveryId: deliveryEntry.id,
-        text: "That session appears to be waiting for a permission decision, so I did not focus it for direct send.",
+        text: t("directSendPermissionPending"),
       };
     }
 
@@ -583,7 +632,7 @@ function createTelegramDirectSend({
         status: "not_focusable",
         sessionId: entry.id,
         deliveryId: deliveryEntry.id,
-        text: "That session cannot be focused as a local terminal on this computer.",
+        text: t("directSendNotFocusable"),
       };
     }
 
@@ -620,7 +669,7 @@ function createTelegramDirectSend({
         sessionId: entry.id,
         deliveryId: deliveryEntry.id,
         focusResult,
-        text: "I could not confirm that terminal was foregrounded. Direct Send stayed in focus-only fallback; no text was pasted.",
+        text: t("directSendFocusUnconfirmed"),
       };
     }
 
@@ -684,7 +733,7 @@ function createTelegramDirectSend({
       deliveryId: deliveryEntry.id,
       focusResult,
       deliveryResult,
-      text: formatDeliveryAck(deliveryResult.status, entry, deliveryResult),
+      text: formatDeliveryAck(deliveryResult.status, entry, deliveryResult, t),
     };
   }
 
@@ -698,6 +747,7 @@ function createTelegramDirectSend({
 
 module.exports = {
   DEFAULT_MAPPING_TTL_MS,
+  formatDeliveryAck,
   DEFAULT_MAX_DELIVERIES,
   createTelegramDirectSend,
   createClipboardFallbackDeliveryAdapter,

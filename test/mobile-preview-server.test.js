@@ -88,6 +88,20 @@ function httpGet(port, pathStr) {
   });
 }
 
+function httpGetBuffer(port, pathStr) {
+  return new Promise((resolve, reject) => {
+    http.get({ hostname: "127.0.0.1", port, path: pathStr }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => { chunks.push(chunk); });
+      res.on("end", () => resolve({
+        status: res.statusCode,
+        body: Buffer.concat(chunks),
+        headers: res.headers,
+      }));
+    }).on("error", reject);
+  });
+}
+
 function waitForClose(ws, timeoutMs = 3000) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), timeoutMs);
@@ -150,6 +164,18 @@ describe("Mobile Preview Server", () => {
     assert.ok(res.headers["content-type"].includes("text/html"));
   });
 
+  it("serves canonical project icons at the stable PWA icon URLs", async () => {
+    for (const [route, canonicalPath] of [
+      ["/mobile/icons/icon-256.png", path.join(__dirname, "..", "assets", "icons", "256x256.png")],
+      ["/mobile/icons/icon-512.png", path.join(__dirname, "..", "assets", "icons", "512x512.png")],
+    ]) {
+      const res = await httpGetBuffer(port, route);
+      assert.strictEqual(res.status, 200, `${route} should resolve`);
+      assert.strictEqual(res.headers["content-type"], "image/png");
+      assert.deepStrictEqual(res.body, fs.readFileSync(canonicalPath));
+    }
+  });
+
   it("serves public connection info without exposing the token", async () => {
     const res = await httpGet(port, "/api/connection-info");
     assert.strictEqual(res.status, 200);
@@ -200,6 +226,43 @@ describe("Mobile Preview Server", () => {
     assert.strictEqual(typeof snapshot.sessions.s1.updatedAt, "number");
 
     client.close();
+    await new Promise((r) => setTimeout(r, 100));
+  });
+
+  it("keeps internal and explicitly hidden display folders out of public sessions", async () => {
+    const opaque = "mqgw60jiigjsjcid";
+    sessions.set("qwenwork:hidden", {
+      state: "working",
+      agentId: "qwenwork",
+      cwd: `/Users/me/.QwenWorkCN/workspace/${opaque}`,
+      sessionTitle: "Private workspace",
+      updatedAt: Date.now(),
+      recentEvents: [],
+    });
+    sessions.set("legacy:explicit-hidden", {
+      state: "working",
+      agentId: "claude-code",
+      cwd: `/Users/me/projects/${opaque}`,
+      displayFolder: "",
+      sessionTitle: "Explicitly private workspace",
+      updatedAt: Date.now(),
+      recentEvents: [],
+    });
+    server.onSnapshot();
+
+    const client = connectClient(port, token);
+    await waitForOpen(client.ws);
+    const snapshot = await client.waitFor("snapshot");
+
+    assert.equal(snapshot.sessions["qwenwork:hidden"].basename, null);
+    assert.ok(!JSON.stringify(snapshot.sessions["qwenwork:hidden"]).includes(opaque));
+    assert.equal(snapshot.sessions["legacy:explicit-hidden"].basename, null);
+    assert.ok(!JSON.stringify(snapshot.sessions["legacy:explicit-hidden"]).includes(opaque));
+
+    client.close();
+    sessions.delete("qwenwork:hidden");
+    sessions.delete("legacy:explicit-hidden");
+    server.onSnapshot();
     await new Promise((r) => setTimeout(r, 100));
   });
 

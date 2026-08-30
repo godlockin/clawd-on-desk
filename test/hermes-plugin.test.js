@@ -3,6 +3,7 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { describe, it } = require("node:test");
+const { NESTED_TERMINAL_ENV } = require("../hooks/shared-process");
 
 const pluginDir = path.join(__dirname, "..", "hooks", "hermes-plugin");
 
@@ -26,13 +27,28 @@ function readManifestHooks() {
   return hooks;
 }
 
-function runPluginPython(code) {
+// Terminal-identity env consulted by _resolve_process_metadata and
+// _orca_pane_key_from_env. Tests asserting an exact shape have to strip all of it
+// or they only pass for a developer whose own terminal sets none of it — the
+// nested-terminal markers alone cover gnome-terminal, Konsole, WezTerm, kitty,
+// Alacritty, ConEmu, Windows Terminal and tmux. Taken from shared-process.js so a
+// marker added there cannot silently make these tests machine-dependent again.
+const TERMINAL_IDENTITY_ENV = [...NESTED_TERMINAL_ENV, "TMUX_PANE", "TERM_PROGRAM", "ORCA_PANE_KEY"];
+
+function envWithoutTerminalIdentity() {
+  const env = { ...process.env };
+  for (const key of TERMINAL_IDENTITY_ENV) delete env[key];
+  return env;
+}
+
+function runPluginPython(code, env = null) {
   const pythonCmd = process.platform === "win32" ? "python" : "python3";
   const result = spawnSync(pythonCmd, ["-"], {
     cwd: path.join(__dirname, ".."),
     input: code,
     encoding: "utf8",
     windowsHide: true,
+    ...(env ? { env } : {}),
   });
   assert.strictEqual(
     result.status,
@@ -308,7 +324,7 @@ cases["wrapper_only"] = run_case({
 cases["failure"] = run_case({}, 10)
 
 print(json.dumps(cases, sort_keys=True))
-`);
+`, envWithoutTerminalIdentity());
     const cases = JSON.parse(output);
     assert.strictEqual(cases.terminal.source_pid, 50);
     assert.deepStrictEqual(cases.terminal.pid_chain, [10, 20, 30, 40, 50, 60]);
@@ -318,6 +334,75 @@ print(json.dumps(cases, sort_keys=True))
     assert.strictEqual(cases.wrapper_only.source_pid, undefined);
     assert.deepStrictEqual(cases.wrapper_only.pid_chain, [10, 20, 30, 40]);
     assert.deepStrictEqual(cases.failure, {});
+  });
+
+  it("carries the Orca pane key from the environment through to the payload", () => {
+    // Orca's terminals hang off a detached daemon, so no ancestor in the walk
+    // above identifies it and the env is the only source for the pane key.
+    const script = String.raw`
+import importlib.util
+import json
+import sys
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("hermes_plugin", r"hooks/hermes-plugin/__init__.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+mod._platform_key = lambda: "win32"
+tree = {10: ("python.exe", 20), 20: ("hermes.exe", 30), 30: ("pwsh.exe", 40), 40: ("explorer.exe", 4)}
+
+def fake_query(pid):
+    row = tree.get(pid)
+    if not row:
+        return None
+    name, parent = row
+    return {"pid": pid, "parent_pid": parent, "name": name, "path": "", "cmdline": ""}
+
+mod._query_process_info = fake_query
+meta = mod._resolve_process_metadata(10)
+mod._process_meta = dict(meta)
+mod._process_meta_resolved = True
+payload = {}
+mod._add_process_meta(payload)
+
+# Background walk unfinished (or raised): _cached_process_meta() returns {} and
+# every walk-derived field drops out of the payload.
+mod._process_meta = {}
+mod._process_meta_resolved = False
+unresolved = {}
+mod._add_process_meta(unresolved)
+
+print(json.dumps({"meta": meta, "payload": payload, "unresolved": unresolved}, sort_keys=True))
+`;
+    const orcaEnv = {
+      ...envWithoutTerminalIdentity(),
+      TERM_PROGRAM: "Orca",
+      ORCA_PANE_KEY: "8ce1fff7-tab:9813824b-leaf",
+    };
+
+    const inOrca = JSON.parse(runPluginPython(script, orcaEnv));
+    assert.strictEqual(inOrca.payload.orca_pane_key, "8ce1fff7-tab:9813824b-leaf");
+    // Deliberately NOT a product of the walk: that result is cached and resolved
+    // on a background thread, so a walk-derived key would be missing from every
+    // event posted before the thread finishes and from all of them if it raised.
+    assert.strictEqual(inOrca.meta.orca_pane_key, undefined);
+    assert.strictEqual(inOrca.unresolved.orca_pane_key, "8ce1fff7-tab:9813824b-leaf");
+    assert.strictEqual(inOrca.unresolved.source_pid, undefined);
+
+    // A Windows Terminal shell launched from an Orca pane inherits the key while
+    // genuinely living in WT; only WT sets WT_SESSION.
+    const nested = JSON.parse(runPluginPython(script, { ...orcaEnv, WT_SESSION: "b3e1-nested" }));
+    assert.strictEqual(nested.payload.orca_pane_key, undefined);
+    assert.strictEqual(nested.unresolved.orca_pane_key, undefined);
+
+    // A tmux server outlives the pane it was started from, so its inherited copy
+    // of the key cannot be trusted either.
+    const inTmux = JSON.parse(runPluginPython(script, { ...orcaEnv, TMUX: "/tmp/tmux-1000/default,7,0" }));
+    assert.strictEqual(inTmux.payload.orca_pane_key, undefined);
+
+    const malformed = JSON.parse(runPluginPython(script, { ...orcaEnv, ORCA_PANE_KEY: "no-separator" }));
+    assert.strictEqual(malformed.payload.orca_pane_key, undefined);
   });
 
   it("uses one PowerShell CIM snapshot for Windows process metadata", () => {
@@ -535,7 +620,7 @@ def fake_urlopen(req, timeout=None):
         )
     raise AssertionError(req.full_url)
 
-mod.request.urlopen = fake_urlopen
+mod._local_urlopen = fake_urlopen
 mod._port_candidates = lambda: [23333]
 mod._add_process_meta = lambda payload: None
 mod._runtime_cwd = lambda: "/repo"
@@ -553,6 +638,58 @@ print(json.dumps({"result": result, "calls": calls, "cached_port": mod._cached_p
       ["GET", "http://127.0.0.1:23333/state", 0.25],
       ["POST", "http://127.0.0.1:23333/permission", 600],
     ]);
+  });
+
+  it("bypasses inherited HTTP proxies for Clawd loopback state posts", () => {
+    const output = runPluginPython(String.raw`
+import importlib.util
+import json
+import os
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+sys.dont_write_bytecode = True
+for key in ("NO_PROXY", "no_proxy"):
+    os.environ.pop(key, None)
+for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+    os.environ[key] = "http://127.0.0.1:1"
+
+spec = importlib.util.spec_from_file_location("hermes_plugin", r"hooks/hermes-plugin/__init__.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+received = []
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        received.append(json.loads(self.rfile.read(length).decode("utf-8")))
+        self.send_response(200)
+        self.send_header(mod.CLAWD_SERVER_HEADER, mod.CLAWD_SERVER_ID)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+try:
+    mod._port_candidates = lambda: [server.server_port]
+    mod._append_log = lambda *args, **kwargs: None
+    mod._cached_port = None
+    mod._no_server_until = 0.0
+    mod._post_state({"agent_id": "hermes", "state": "thinking", "session_id": "proxy-smoke"})
+finally:
+    server.shutdown()
+    thread.join(timeout=2)
+    server.server_close()
+
+print(json.dumps({"received": received, "cached_port": mod._cached_port}, sort_keys=True))
+`);
+    const result = JSON.parse(output);
+    assert.strictEqual(result.received.length, 1);
+    assert.strictEqual(result.received[0].agent_id, "hermes");
+    assert.strictEqual(result.cached_port > 0, true);
   });
 
   it("skips process metadata on WebUI permission posts", () => {
@@ -600,7 +737,7 @@ def fake_add_process_meta(payload):
     payload["source_pid"] = 1234
     payload["editor"] = "code"
 
-mod.request.urlopen = fake_urlopen
+mod._local_urlopen = fake_urlopen
 mod._port_candidates = lambda: [23333]
 mod._add_process_meta = fake_add_process_meta
 mod._runtime_cwd = lambda: "/repo"
@@ -640,7 +777,7 @@ def fake_urlopen(*args, **kwargs):
     calls.append([str(args), kwargs])
     raise AssertionError("urlopen should not run during cooldown")
 
-mod.request.urlopen = fake_urlopen
+mod._local_urlopen = fake_urlopen
 mod._append_log = lambda payload, **kwargs: logs.append(payload)
 mod._cached_port = None
 mod._no_server_until = time.monotonic() + 10
@@ -652,6 +789,29 @@ print(json.dumps({"result": result, "calls": calls, "logs": logs}, sort_keys=Tru
     assert.strictEqual(result.result, null);
     assert.deepStrictEqual(result.calls, []);
     assert.strictEqual(result.logs[0].event, "post_permission_skipped_no_server");
+  });
+
+  it("fails closed when an opted-in permission tool receives no decision", () => {
+    const output = runPluginPython(String.raw`
+import importlib.util
+import json
+import sys
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("hermes_plugin", r"hooks/hermes-plugin/__init__.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+hook_events = []
+mod._post_permission = lambda *args, **kwargs: None
+mod._handle_hook = lambda event_name, **kwargs: hook_events.append(event_name)
+result = mod._handle_permission_request("execute_bash", args={"command": "rm -rf build"})
+print(json.dumps({"result": result, "hook_events": hook_events}, sort_keys=True))
+`);
+    const result = JSON.parse(output);
+    assert.strictEqual(result.result.action, "block");
+    assert.match(result.result.message, /did not return a permission decision/i);
+    assert.deepStrictEqual(result.hook_events, ["pre_tool_call"]);
   });
 
   it("does not issue the long permission POST when the short probe is not Clawd", () => {
@@ -685,7 +845,7 @@ def fake_urlopen(req, timeout=None):
     assert req.full_url.endswith("/state"), "permission POST should not be attempted after probe mismatch"
     return FakeResponse()
 
-mod.request.urlopen = fake_urlopen
+mod._local_urlopen = fake_urlopen
 mod._port_candidates = lambda: [23333]
 mod._append_log = lambda *args, **kwargs: None
 mod._cached_port = None

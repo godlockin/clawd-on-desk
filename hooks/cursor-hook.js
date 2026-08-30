@@ -2,8 +2,19 @@
 // Clawd — Cursor Agent hook (stdin JSON, hook_event_name; stdout JSON for gating hooks)
 // Registered in ~/.cursor/hooks.json by hooks/cursor-install.js
 
-const { postStateToRunningServer, readHostPrefix } = require("./server-config");
-const { createPidResolver, readStdinJson, getPlatformConfig } = require("./shared-process");
+const {
+  postStateToRunningServer,
+  readHostPrefix,
+  applyWslSourceFields,
+  readWindowsProcessChainHookContext,
+} = require("./server-config");
+const {
+  createPidResolver,
+  readStdinJson,
+  getPlatformConfig,
+  applyOrcaPaneKey,
+  processAlive,
+} = require("./shared-process");
 
 const HOOK_TO_STATE = {
   sessionStart: { state: "idle", event: "SessionStart" },
@@ -18,10 +29,24 @@ const HOOK_TO_STATE = {
   afterAgentThought: { state: "thinking", event: "AfterAgentThought" },
 };
 
+// #634: lifecycle for the shared resolver's cross-process pid cache. Raw
+// Cursor hook names (pre-mapping). sessionEnd drops the cache; everything
+// unlisted is "event" (cache hit = zero snapshot spawns).
+const EVENT_TO_LIFECYCLE = {
+  sessionStart: "start",
+  beforeSubmitPrompt: "prompt",
+  sessionEnd: "end",
+};
+
 const config = getPlatformConfig({ extraTerminals: { win: ["cursor.exe"] } });
+let runtimeContext = Object.freeze({
+  identity: { ok: false, reason: "not-observed", port: null, ownerPid: null },
+  observation: null,
+});
 const resolve = createPidResolver({
   agentNames: { win: new Set(["cursor.exe"]), mac: new Set(["cursor"]), linux: new Set(["cursor"]) },
   platformConfig: config,
+  readRuntimeIdentity: () => runtimeContext.identity,
 });
 
 function stdoutForCursorHook(hookName) {
@@ -92,7 +117,21 @@ readStdinJson()
     }
 
     const { state, event } = mapped;
-    if (hookNameResolved === "sessionStart" && !process.env.CLAWD_REMOTE) resolve();
+    const remote = !!process.env.CLAWD_REMOTE;
+    if (!remote && process.platform === "win32") {
+      runtimeContext = readWindowsProcessChainHookContext("cursor-agent");
+    }
+    const runtimeObservation = runtimeContext.observation;
+    const serverProcessChainEnabled = !!(
+      !remote
+      && process.platform === "win32"
+      && runtimeObservation
+      && runtimeObservation.agentMode !== "legacy"
+      && processAlive(runtimeObservation.ownerPid)
+    );
+    const authoritativeProcessChain = serverProcessChainEnabled
+      && runtimeObservation.agentMode === "b1a-authoritative";
+    if (hookNameResolved === "sessionStart" && !remote && !authoritativeProcessChain) resolve();
 
     const sessionId =
       (payload && (payload.conversation_id || payload.session_id)) || "default";
@@ -101,25 +140,38 @@ readStdinJson()
       cwd = payload.workspace_roots[0];
     }
 
-    const { stablePid, agentPid, detectedEditor, pidChain, tmuxSocket, tmuxClient } = resolve();
+    const pidMetadata = authoritativeProcessChain ? {} : resolve({
+        namespace: "cursor-agent",
+        sessionId,
+        cacheCwd: cwd,
+        lifecycle: EVENT_TO_LIFECYCLE[hookNameResolved] || "event",
+        cacheable: sessionId !== "default" && !!cwd,
+      });
+    const { stablePid, agentPid, detectedEditor, pidChain, tmuxSocket, tmuxClient } = pidMetadata;
 
     const body = { state, session_id: sessionId, event };
     body.agent_id = "cursor-agent";
     const hint = displaySvgFromToolHook(hookNameResolved, payload);
     if (hint !== undefined) body.display_svg = hint;
     if (cwd) body.cwd = cwd;
-    if (process.env.CLAWD_REMOTE) {
+    if (remote) {
       body.host = readHostPrefix();
+      applyWslSourceFields(body, { remote: true });
+      applyOrcaPaneKey(body);
     } else {
-      body.source_pid = stablePid;
-      body.editor = detectedEditor || "cursor";
-      if (agentPid) {
-        body.agent_pid = agentPid;
-        body.cursor_pid = agentPid;
+      applyWslSourceFields(body);
+      if (!authoritativeProcessChain) {
+        body.source_pid = stablePid;
+        body.editor = detectedEditor || "cursor";
+        if (agentPid) {
+          body.agent_pid = agentPid;
+          body.cursor_pid = agentPid;
+        }
+        if (Array.isArray(pidChain) && pidChain.length) body.pid_chain = pidChain;
+        if (tmuxSocket) body.tmux_socket = tmuxSocket;
+        if (tmuxClient) body.tmux_client = tmuxClient;
       }
-      if (pidChain.length) body.pid_chain = pidChain;
-      if (tmuxSocket) body.tmux_socket = tmuxSocket;
-      if (tmuxClient) body.tmux_client = tmuxClient;
+      applyOrcaPaneKey(body);
     }
 
     // Answer Cursor immediately so it never sees empty/malformed stdout, but
@@ -127,7 +179,18 @@ readStdinJson()
     // process, so we exit in its callback (with the safety timer as backstop).
     writeStdoutOnce(outLine);
 
-    postStateToRunningServer(JSON.stringify(body), { timeoutMs: 100 }, () => {
+    const postOptions = { timeoutMs: 100 };
+    if (serverProcessChainEnabled) {
+      postOptions.preferredPort = runtimeObservation.port;
+      postOptions.runtimePort = runtimeObservation.port;
+      postOptions.windowsProcessChain = {
+        agentId: "cursor-agent",
+        hookPid: process.pid,
+        runtimeObservation,
+        legacyCacheSource: pidMetadata.cacheSource || "none",
+      };
+    }
+    postStateToRunningServer(JSON.stringify(body), postOptions, () => {
       finish(outLine);
     });
   })

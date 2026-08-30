@@ -84,3 +84,45 @@ describe("display_svg session hints (updateSession path)", () => {
     assert.strictEqual(api.getSvgOverride("thinking"), "clawd-working-thinking.svg");
   });
 });
+
+// #509: user-selected default idle visual flows through state.js
+describe("default idle visual (getIdleVisualChoice ctx hook)", () => {
+  it("getSvgOverride('idle') returns the user choice when set", () => {
+    const ctx = makeCtx();
+    ctx.getIdleVisualChoice = () => "clawd-idle-reading.svg";
+    const api = require("../src/state")(ctx);
+    assert.strictEqual(api.getSvgOverride("idle"), "clawd-idle-reading.svg");
+  });
+
+  it("getSvgOverride('idle') falls back to the follow sprite when unset", () => {
+    const ctx = makeCtx();
+    ctx.getIdleVisualChoice = () => null;
+    const api = require("../src/state")(ctx);
+    assert.strictEqual(api.getSvgOverride("idle"), "clawd-idle-follow.svg");
+
+    const apiNoHook = require("../src/state")(makeCtx());
+    assert.strictEqual(apiNoHook.getSvgOverride("idle"), "clawd-idle-follow.svg");
+  });
+
+  it("applyState('idle') with no override rests on the user choice", () => {
+    const ctx = makeCtx();
+    ctx.getIdleVisualChoice = () => "clawd-idle-reading.svg";
+    const api = require("../src/state")(ctx);
+    api.applyState("idle");
+    assert.strictEqual(api.getCurrentSvg(), "clawd-idle-reading.svg");
+  });
+
+  it("applyState('idle') without the hook keeps today's behavior", () => {
+    const api = require("../src/state")(makeCtx());
+    api.applyState("idle");
+    assert.strictEqual(api.getCurrentSvg(), "clawd-idle-follow.svg");
+  });
+
+  it("an explicit svgOverride still wins over the user choice", () => {
+    const ctx = makeCtx();
+    ctx.getIdleVisualChoice = () => "clawd-idle-reading.svg";
+    const api = require("../src/state")(ctx);
+    api.applyState("idle", "clawd-idle-bubble.svg");
+    assert.strictEqual(api.getCurrentSvg(), "clawd-idle-bubble.svg");
+  });
+});

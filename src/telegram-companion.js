@@ -1,5 +1,13 @@
 "use strict";
 
+const { getEntryDisplaySessionTag } = require("./state-session-snapshot");
+
+const {
+  clipUtf16Safe,
+  concatTelegramParts,
+  renderTelegramMarkdown,
+} = require("./telegram-message-format");
+
 // R1a: Telegram "session finished" notifications.
 //
 // Driven off the session-snapshot fanout (main.js broadcastSessionSnapshot).
@@ -74,6 +82,22 @@ const NOTIFICATION_LOCALES = Object.freeze({
     truncated: "省略",
     wrapStatus: (status) => `（${status}）`,
   },
+  "pt-BR": {
+    session: "sessão",
+    done: "concluída",
+    interrupted: "interrompida",
+    assistantOutput: "Saída do assistente",
+    truncated: "truncado",
+    wrapStatus: (status) => `(${status})`,
+  },
+  es: {
+    session: "sesión",
+    done: "completada",
+    interrupted: "interrumpida",
+    assistantOutput: "Salida del asistente",
+    truncated: "truncada",
+    wrapStatus: (status) => `(${status})`,
+  },
 });
 
 function dedupeKey(entry) {
@@ -94,9 +118,15 @@ function folderName(cwd) {
   return parts[parts.length - 1] || "";
 }
 
-function shortId(id) {
-  const s = String(id || "");
-  return s.length > 6 ? s.slice(0, 6) : s;
+function entryFolderName(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  // Snapshot producers use an explicit empty displayFolder to suppress opaque
+  // internal workspace ids. Only legacy payloads without the field may fall
+  // back to cwd.
+  if (Object.prototype.hasOwnProperty.call(entry, "displayFolder")) {
+    return folderName(entry.displayFolder);
+  }
+  return folderName(entry.cwd);
 }
 
 function getNotificationLocale(lang) {
@@ -129,30 +159,46 @@ function truncateWithMiddle(text, maxLen) {
   if (text.length <= maxLen) return { text, truncated: false };
   const marker = "\n...[truncated]...\n";
   if (maxLen <= marker.length + 20) {
-    return { text: text.slice(0, maxLen), truncated: true };
+    return { text: clipUtf16Safe(text, maxLen), truncated: true };
   }
   const keep = maxLen - marker.length;
   const head = Math.ceil(keep / 2);
   const tail = Math.floor(keep / 2);
+  const safeHead = clipUtf16Safe(text, head);
+  let safeTail = "";
+  let safeTailLength = 0;
+  for (const character of Array.from(text).reverse()) {
+    if (safeTailLength + character.length > tail) break;
+    safeTail = `${character}${safeTail}`;
+    safeTailLength += character.length;
+  }
   return {
-    text: `${text.slice(0, head)}${marker}${text.slice(text.length - tail)}`,
+    text: `${safeHead}${marker}${safeTail}`,
     truncated: true,
   };
 }
 
-function formatAssistantOutputSection(entry, mode, locale) {
+function prepareAssistantOutput(entry, mode) {
   const outputMode = normalizeCompletionOutputMode(mode);
-  if (outputMode === "off") return "";
+  if (outputMode === "off") return null;
   const raw = entry && typeof entry.assistantLastOutput === "string" ? entry.assistantLastOutput : "";
   const redacted = redactAssistantOutputText(raw);
-  if (!redacted) return "";
+  if (!redacted) return null;
   const limited = truncateWithMiddle(redacted, OUTPUT_FULL_MAX);
-  const truncated = limited.truncated || !!(entry && entry.assistantLastOutputTruncated === true);
+  return {
+    text: limited.text,
+    truncated: limited.truncated || !!(entry && entry.assistantLastOutputTruncated === true),
+  };
+}
+
+function formatAssistantOutputSection(entry, mode, locale) {
+  const prepared = prepareAssistantOutput(entry, mode);
+  if (!prepared) return "";
   const label = locale.assistantOutput || NOTIFICATION_LOCALES.en.assistantOutput;
-  const suffix = truncated
+  const suffix = prepared.truncated
     ? ` (${locale.truncated || NOTIFICATION_LOCALES.en.truncated})`
     : "";
-  return `\n\n${label}${suffix}:\n${limited.text}`;
+  return `\n\n${label}${suffix}:\n${prepared.text}`;
 }
 
 function hasAssistantOutputSection(entry, mode) {
@@ -165,7 +211,7 @@ function hasAssistantOutputSection(entry, mode) {
 function truncateNotificationText(text, locale) {
   if (text.length <= NOTIFICATION_TEXT_MAX) return text;
   const marker = `\n... ${locale.truncated || NOTIFICATION_LOCALES.en.truncated}`;
-  return `${text.slice(0, Math.max(0, NOTIFICATION_TEXT_MAX - marker.length))}${marker}`;
+  return `${clipUtf16Safe(text, Math.max(0, NOTIFICATION_TEXT_MAX - marker.length))}${marker}`;
 }
 
 // Privacy note: displayTitle is the same session title shown on the desktop
@@ -183,13 +229,14 @@ function formatNotification(entry, options = {}) {
   const interrupted = entry.badge === "interrupted";
   const icon = interrupted ? "⚠️" : "✅"; // ⚠️ / ✅
   const status = interrupted ? locale.interrupted : locale.done;
-  const title = entry.displayTitle || (entry.id ? `${shortId(entry.id)}..` : locale.session);
+  const title = entry.displayTitle || locale.session;
+  const displaySessionTag = getEntryDisplaySessionTag(entry);
   const meta = [];
   if (entry.agentId) meta.push(entry.agentId);
-  const folder = folderName(entry.cwd);
+  const folder = entryFolderName(entry);
   if (folder) meta.push(folder);
   if (entry.host) meta.push(entry.host);
-  if (entry.id) meta.push(`#${shortId(entry.id)}`);
+  if (displaySessionTag) meta.push(`#${displaySessionTag}`);
   const wrapStatus = typeof locale.wrapStatus === "function"
     ? locale.wrapStatus(status)
     : `(${status})`;
@@ -197,6 +244,84 @@ function formatNotification(entry, options = {}) {
   const base = meta.length ? `${head}\n${meta.join(" · ")}` : head; // " · "
   const withOutput = `${base}${outputSection}`;
   return truncateNotificationText(withOutput, locale);
+}
+
+function formatTelegramNotificationMessage(entry, options = {}) {
+  if (!entry) return null;
+  const locale = getNotificationLocale(options.lang);
+  const completionOutputMode = normalizeCompletionOutputMode(options.completionOutputMode);
+  const prepared = prepareAssistantOutput(entry, completionOutputMode);
+  if (!prepared && options.includeBare === false) return null;
+
+  const interrupted = entry.badge === "interrupted";
+  const icon = interrupted ? "⚠️" : "✅";
+  const status = interrupted ? locale.interrupted : locale.done;
+  const title = entry.displayTitle || locale.session;
+  const displaySessionTag = getEntryDisplaySessionTag(entry);
+  const meta = [];
+  if (entry.agentId) meta.push(entry.agentId);
+  const folder = entryFolderName(entry);
+  if (folder) meta.push(folder);
+  if (entry.host) meta.push(entry.host);
+  if (displaySessionTag) meta.push(`#${displaySessionTag}`);
+  const wrapStatus = typeof locale.wrapStatus === "function"
+    ? locale.wrapStatus(status)
+    : `(${status})`;
+  const baseParts = [
+    `${icon} `,
+    { text: title, bold: true, neutralizeMentions: true },
+    ` ${wrapStatus}`,
+  ];
+  if (meta.length) {
+    baseParts.push("\n", { text: meta.join(" · "), neutralizeMentions: true });
+  }
+  const truncationText = locale.truncated || NOTIFICATION_LOCALES.en.truncated;
+  const truncationMarker = `\n... ${truncationText}`;
+  if (!prepared) {
+    return concatTelegramParts(baseParts, {
+      maxLength: NOTIFICATION_TEXT_MAX,
+      truncationMarker,
+    });
+  }
+
+  const label = locale.assistantOutput || NOTIFICATION_LOCALES.en.assistantOutput;
+  function composeOutput(showTruncated) {
+    const suffix = showTruncated ? ` (${truncationText})` : "";
+    const headParts = [
+      ...baseParts,
+      "\n\n",
+      { text: `${label}${suffix}:`, bold: true },
+      "\n",
+    ];
+    const head = concatTelegramParts(headParts, {
+      maxLength: NOTIFICATION_TEXT_MAX,
+      truncationMarker,
+    });
+    const outputBudget = Math.max(0, Math.min(
+      OUTPUT_FULL_MAX,
+      NOTIFICATION_TEXT_MAX - head.budgetLength,
+    ));
+    const output = renderTelegramMarkdown(prepared.text, {
+      maxLength: outputBudget,
+      truncationMarker,
+    });
+    return { head, headParts, output };
+  }
+
+  let showTruncated = prepared.truncated === true;
+  let composed = composeOutput(showTruncated);
+  if (!showTruncated && (composed.head.truncated || composed.output.truncated)) {
+    showTruncated = true;
+    composed = composeOutput(true);
+  }
+  const truncated = prepared.truncated === true
+    || composed.head.truncated
+    || composed.output.truncated;
+  return concatTelegramParts([...composed.headParts, composed.output], {
+    maxLength: NOTIFICATION_TEXT_MAX,
+    truncationMarker,
+    reportedTruncated: truncated,
+  });
 }
 
 function createTelegramCompanion({
@@ -270,14 +395,14 @@ function createTelegramCompanion({
         includeBare = typeof getNotifyOnComplete === "function" ? getNotifyOnComplete() === true : true;
       } catch {}
       if (!includeBare && !hasAssistantOutputSection(entry, completionOutputMode)) continue;
-      const text = typeof formatText === "function"
+      const message = typeof formatText === "function"
         ? formatText(entry, { lang, completionOutputMode, includeBare })
-        : formatNotification(entry, { lang, completionOutputMode, includeBare });
-      if (!text) continue;
+        : formatTelegramNotificationMessage(entry, { lang, completionOutputMode, includeBare });
+      if (!message) continue;
       // Fire-and-forget: do NOT await — we are on the synchronous broadcast
       // path. sendNotification never throws, but guard anyway.
       Promise.resolve()
-        .then(() => client.sendNotification(text))
+        .then(() => client.sendNotification(message))
         .then((res) => {
           if (res && res.ok === false) {
             safeLog("warn", "completion notification not delivered", {
@@ -311,6 +436,7 @@ function createTelegramCompanion({
 module.exports = {
   createTelegramCompanion,
   formatNotification,
+  formatTelegramNotificationMessage,
   formatAssistantOutputSection,
   redactAssistantOutputText,
   isCompletion,

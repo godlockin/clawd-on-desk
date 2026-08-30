@@ -2,16 +2,56 @@
 
 const defaultFs = require("fs");
 const defaultPath = require("path");
+const { pathToFileURL } = require("url");
 const { detectAgentInstallations: defaultDetectAgentInstallations } = require("./agent-installation-detector");
+const { DEFAULT_INTEGRATION_INSTALLED_IDS } = require("./prefs");
 const settingsThemeImporter = require("./settings-theme-importer");
+const {
+  listPetTintOptions,
+  listPetAccessoryOptions,
+  listPetMouthAccessoryOptions,
+} = require("./pet-customization-catalog");
 
 const SOUND_OVERRIDE_ASSET_EXTS = new Set([".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"]);
+// #895: cleanup prompts must skip the default integrations, referencing the
+// prefs list rather than a second hardcoded copy of the ids.
+const CLEANUP_EXEMPT_AGENT_IDS = new Set(DEFAULT_INTEGRATION_INSTALLED_IDS);
+// These commands mutate trust material or persist facts learned from an SSH
+// transaction. They are main-process capabilities, not renderer commands.
+// Keeping the check at the IPC boundary means an injected/compromised Settings
+// renderer cannot mint a trusted install binding, advance a deployment
+// transaction, or claim that a remote profile was verified.
+const INTERNAL_SETTINGS_COMMANDS = new Set([
+  "remoteSsh.applyInstallationIdentity",
+  "remoteSsh.beginIdentityRotation",
+  "remoteSsh.updateIdentityStep",
+  "remoteSsh.commitIdentityRotation",
+  "remoteSsh.forceRevoke",
+  "remoteSsh.beginRuntimeModeSwitch",
+  "remoteSsh.advanceRuntimeModeSwitch",
+  "remoteSsh.switchRuntimeMode",
+  "remoteSsh.markDeployed",
+  "remoteSsh.markRemoteNode",
+  "feishuApproval.commitResolvedApprover",
+]);
 const SOUND_OVERRIDE_DIALOG_STRINGS = {
   en: { title: "Choose a sound file", filterName: "Audio" },
   zh: { title: "选择音效文件", filterName: "音频" },
   "zh-TW": { title: "選擇音效檔案", filterName: "音效" },
   ko: { title: "음향 파일 선택", filterName: "오디오" },
   ja: { title: "音声ファイルを選択", filterName: "音声" },
+  "pt-BR": { title: "Escolha um arquivo de som", filterName: "Áudio" },
+  es: { title: "Elige un archivo de sonido", filterName: "Audio" },
+};
+
+const AGENT_DISCOVERY_DIALOG_STRINGS = {
+  en: { file: "Choose a tool executable", directory: "Choose a tool installation folder" },
+  zh: { file: "选择工具可执行文件", directory: "选择工具安装目录" },
+  "zh-TW": { file: "選擇工具執行檔", directory: "選擇工具安裝目錄" },
+  ko: { file: "도구 실행 파일 선택", directory: "도구 설치 폴더 선택" },
+  ja: { file: "ツールの実行ファイルを選択", directory: "ツールのインストールフォルダーを選択" },
+  "pt-BR": { file: "Escolha o executável da ferramenta", directory: "Escolha a pasta de instalação da ferramenta" },
+  es: { file: "Elige el ejecutable de la herramienta", directory: "Elige la carpeta de instalación de la herramienta" },
 };
 
 const REMOVE_THEME_DIALOG_STRINGS = {
@@ -44,6 +84,18 @@ const REMOVE_THEME_DIALOG_STRINGS = {
     cancel: "キャンセル",
     message: (name) => `テーマ "${name}" を削除しますか？`,
     detail: "この操作は元に戻せません。このテーマのすべてのファイルがディスクから削除されます。",
+  },
+  "pt-BR": {
+    delete: "Excluir",
+    cancel: "Cancelar",
+    message: (name) => `Excluir o tema "${name}"?`,
+    detail: "Isso não pode ser desfeito. Todos os arquivos deste tema serão removidos do disco.",
+  },
+  es: {
+    delete: "Eliminar",
+    cancel: "Cancelar",
+    message: (name) => `¿Eliminar el tema "${name}"?`,
+    detail: "Esta acción no se puede deshacer. Todos los archivos de este tema se eliminarán del disco.",
   },
 };
 
@@ -88,11 +140,45 @@ function rememberRuntimeSoundOverrideFile({ getActiveTheme }, themeId, soundName
 }
 
 function mapAgentMetadata(agent) {
-  return {
+  const metadata = {
     id: agent.id,
     name: agent.name,
     eventSource: agent.eventSource,
     capabilities: agent.capabilities || {},
+    // #895: default integrations never earn a "remove this stale hook" prompt —
+    // their parent dirs are not trustworthy evidence (Clawd's own Claude sync
+    // creates ~/.claude). Shipped as an explicit boolean rather than a list the
+    // renderer has to hold, so a missing field reads as "unknown" and the
+    // renderer fails closed instead of proposing a deletion.
+    cleanupSuggestionExempt: CLEANUP_EXEMPT_AGENT_IDS.has(agent.id),
+  };
+  if (typeof agent.category === "string" && agent.category) {
+    metadata.category = agent.category;
+  }
+  return metadata;
+}
+
+function mapCustomApplicationMetadata(application, options = {}) {
+  return {
+    id: application.id,
+    name: application.name,
+    category: application.category || "code",
+    eventSource: "custom-http",
+    custom: true,
+    sourcePath: application.sourcePath,
+    executablePath: application.executablePath,
+    processName: application.processName,
+    stateEndpoint: options.stateEndpoint || "",
+    lastStateEvent: options.lastStateEvent || null,
+    capabilities: {
+      httpHook: true,
+      permissionApproval: false,
+      interactiveBubble: false,
+      notificationHook: true,
+      sessionEnd: true,
+      subagent: false,
+      managedIntegration: false,
+    },
   };
 }
 
@@ -107,9 +193,14 @@ function registerSettingsIpc(options = {}) {
   const BrowserWindow = requiredDependency(options.BrowserWindow, "BrowserWindow");
   const fs = options.fs || defaultFs;
   const path = options.path || defaultPath;
+  const settingsPageUrl = pathToFileURL(
+    options.settingsHtmlPath || defaultPath.join(__dirname, "settings.html"),
+  ).href;
   const getSettingsWindow = options.getSettingsWindow || (() => null);
   const getActiveTheme = options.getActiveTheme || (() => null);
   const getLang = options.getLang || (() => "en");
+  const roamFenceSettings = requiredDependency(options.roamFenceSettings, "roamFenceSettings");
+  const roamFencePicker = requiredDependency(options.roamFencePicker, "roamFencePicker");
   const settingsSizePreviewSession = requiredDependency(
     options.settingsSizePreviewSession,
     "settingsSizePreviewSession"
@@ -122,6 +213,10 @@ function registerSettingsIpc(options = {}) {
   const getDoNotDisturb = options.getDoNotDisturb || (() => false);
   const getSoundMuted = options.getSoundMuted || (() => false);
   const getSoundVolume = options.getSoundVolume || (() => 1);
+  const saveFeishuApproverByEmail = requiredDependency(
+    options.saveFeishuApproverByEmail,
+    "saveFeishuApproverByEmail",
+  );
   const previewTextScale = options.previewTextScale
     || (() => ({ status: "error", message: "text scale preview unavailable" }));
   const endTextScalePreview = options.endTextScalePreview
@@ -130,21 +225,12 @@ function registerSettingsIpc(options = {}) {
     || (() => ({ percent: 100 }));
   const getAllAgents = requiredDependency(options.getAllAgents, "getAllAgents");
   const detectAgentInstallations = options.detectAgentInstallations || defaultDetectAgentInstallations;
+  const getHookServerPort = options.getHookServerPort || (() => null);
+  const getRecentHookEvents = options.getRecentHookEvents || (() => []);
   const checkForUpdates = options.checkForUpdates || (() => {});
-  const getHardwareBuddyStatus = options.getHardwareBuddyStatus || (() => null);
-  const testHardwareBuddyApproval = options.testHardwareBuddyApproval || (async () => ({
-    status: "error",
-    message: "Hardware Buddy test approval is unavailable",
-  }));
-  const getQuickCommandPresets = options.getQuickCommandPresets || (() => ({
-    enabled: false,
-    presets: [],
-  }));
-  const sendQuickCommand = options.sendQuickCommand || (() => ({
-    status: "error",
-    code: "quick_commands_unavailable",
-    message: "Quick Commands are unavailable",
-  }));
+  const getUpdateCheckSnapshot = options.getUpdateCheckSnapshot || (() => ({ state: "idle" }));
+  const clearUpdateError = options.clearUpdateError || (() => ({ state: "idle" }));
+  const copyUpdateError = options.copyUpdateError || (() => ({ status: "error", message: "clipboard unavailable" }));
   const showTutorial = options.showTutorial || (() => ({
     status: "error",
     message: "Tutorial is unavailable",
@@ -153,25 +239,202 @@ function registerSettingsIpc(options = {}) {
   const aboutHeroSvgPath = options.aboutHeroSvgPath
     || path.join(__dirname, "..", "assets", "svg", "clawd-about-hero.svg");
   const disposers = [];
+  let currentFeishuApproverLookup = null;
 
   function handle(channel, listener) {
     ipcMain.handle(channel, listener);
     disposers.push(() => ipcMain.removeHandler(channel));
   }
 
-  function sanitizeQuickCommandPayload(payload) {
-    const object = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
-    return {
-      id: object.id,
-      clientRequestId: object.clientRequestId,
-    };
-  }
-
   function getDialogParent(event) {
     return getSettingsDialogParent(event, { BrowserWindow, getSettingsWindow });
   }
 
+  function isTrustedSettingsEvent(event) {
+    const win = getSettingsWindow();
+    if (!win || (typeof win.isDestroyed === "function" && win.isDestroyed())) return false;
+    const contents = win.webContents;
+    const frame = event && event.senderFrame;
+    return !!contents
+      && event.sender === contents
+      && !!frame
+      && frame === contents.mainFrame
+      && frame.url === settingsPageUrl;
+  }
+
+  function rejectUntrustedSettingsEvent(event) {
+    return isTrustedSettingsEvent(event)
+      ? null
+      : { status: "error", message: "untrusted settings sender" };
+  }
+
+  function removeFeishuLookupListeners(operation) {
+    if (!operation || !operation.sender || typeof operation.sender.removeListener !== "function") return;
+    operation.sender.removeListener("destroyed", operation.onDestroyed);
+    operation.sender.removeListener("render-process-gone", operation.onRenderProcessGone);
+  }
+
+  function abortCurrentFeishuApproverLookup(reason, sender = null) {
+    const operation = currentFeishuApproverLookup;
+    if (!operation || (sender && operation.sender !== sender)) return false;
+    if (!operation.controller.signal.aborted) {
+      operation.reason = reason;
+      operation.controller.abort();
+    }
+    return true;
+  }
+
+  function publicFeishuLookupResult(result) {
+    if (result && result.status === "ok") return { status: "ok" };
+    return result && typeof result.code === "string"
+      ? { status: "error", code: result.code }
+      : { status: "error" };
+  }
+
+  async function runFeishuApproverLookup(event, email) {
+    abortCurrentFeishuApproverLookup("superseded");
+    const operation = {
+      sender: event.sender,
+      controller: new AbortController(),
+      reason: "cancelled",
+      onDestroyed: null,
+      onRenderProcessGone: null,
+    };
+    operation.onDestroyed = () => {
+      if (currentFeishuApproverLookup === operation) {
+        abortCurrentFeishuApproverLookup("destroyed", operation.sender);
+      }
+    };
+    operation.onRenderProcessGone = operation.onDestroyed;
+    currentFeishuApproverLookup = operation;
+    if (typeof operation.sender.once === "function") {
+      operation.sender.once("destroyed", operation.onDestroyed);
+      operation.sender.once("render-process-gone", operation.onRenderProcessGone);
+    }
+
+    try {
+      let result;
+      try {
+        result = await saveFeishuApproverByEmail({
+          email,
+          signal: operation.controller.signal,
+        });
+      } catch {
+        result = { status: "error", code: "lookup-failed" };
+      }
+      if (operation.controller.signal.aborted) {
+        return {
+          status: "error",
+          code: operation.reason === "superseded" ? "lookup-superseded" : "lookup-cancelled",
+        };
+      }
+      return publicFeishuLookupResult(result);
+    } finally {
+      removeFeishuLookupListeners(operation);
+      if (currentFeishuApproverLookup === operation) currentFeishuApproverLookup = null;
+    }
+  }
+
   handle("settings:get-snapshot", () => settingsController.getSnapshot());
+  // Distinct quota-reporting sources (this machine + WSL / SSH remotes). The
+  // General tab uses it to hide the "merge across machines" switch when it is
+  // a single-machine no-op.
+  handle("settings:get-quota-source-count", () => {
+    try {
+      return typeof options.getQuotaSourceCount === "function" ? options.getQuotaSourceCount() : 0;
+    } catch (_err) {
+      return 0;
+    }
+  });
+  // Which providers the "show beside the pet" list should offer. Driven by the
+  // live snapshot, not by the static provider table, so the list never shows a
+  // checkbox for a provider the user has not connected — the same reasoning
+  // that keeps "merge across machines" hidden on a single-machine setup. An
+  // empty array is the honest failure mode: the settings row hides itself
+  // rather than rendering a list that claims nothing is connected.
+  handle("settings:get-quota-ring-providers", () => {
+    try {
+      return typeof options.getQuotaRingProviders === "function"
+        ? options.getQuotaRingProviders()
+        : [];
+    } catch (_err) {
+      return [];
+    }
+  });
+  // Kimi API keys are accepted only by these trusted Settings-window handlers.
+  // They never transit settings:command, prefs, or a renderer-broadcast
+  // snapshot. Results are deliberately sanitized by kimi-quota-runtime.
+  handle("settings:kimi-quota-status", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    const runtime = options.kimiQuotaRuntime;
+    return runtime && typeof runtime.getStatus === "function"
+      ? runtime.getStatus()
+      : { status: "error", reason: "runtime-unavailable" };
+  });
+  handle("settings:kimi-quota-connect", async (event, payload) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (!payload || typeof payload !== "object" || typeof payload.apiKey !== "string") {
+      return { status: "error", reason: "invalid-credential-input" };
+    }
+    const runtime = options.kimiQuotaRuntime;
+    return runtime && typeof runtime.connect === "function"
+      ? runtime.connect(payload.apiKey)
+      : { status: "error", reason: "runtime-unavailable" };
+  });
+  handle("settings:kimi-quota-refresh", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    const runtime = options.kimiQuotaRuntime;
+    return runtime && typeof runtime.refresh === "function"
+      ? runtime.refresh()
+      : { status: "error", reason: "runtime-unavailable" };
+  });
+  handle("settings:kimi-quota-reconnect", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    const runtime = options.kimiQuotaRuntime;
+    return runtime && typeof runtime.reconnect === "function"
+      ? runtime.reconnect()
+      : { status: "error", reason: "runtime-unavailable" };
+  });
+  handle("settings:kimi-quota-disconnect", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    const runtime = options.kimiQuotaRuntime;
+    return runtime && typeof runtime.disconnect === "function"
+      ? runtime.disconnect()
+      : { status: "error", reason: "runtime-unavailable" };
+  });
+  handle("settings:kimi-quota-forget", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    const runtime = options.kimiQuotaRuntime;
+    return runtime && typeof runtime.forget === "function"
+      ? runtime.forget()
+      : { status: "error", reason: "runtime-unavailable" };
+  });
+  handle("settings:get-pet-tint-options", () => listPetTintOptions());
+  handle("settings:get-pet-accessory-options", () => listPetAccessoryOptions());
+  handle("settings:get-pet-mouth-accessory-options", () => listPetMouthAccessoryOptions());
+  handle("settings:get-roam-fence", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    return rejected || roamFenceSettings.getStatus();
+  });
+  handle("settings:select-roam-fence", async (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    const picked = await roamFencePicker.selectArea({
+      lang: getLang(),
+    });
+    if (!picked || picked.status !== "ok") return picked || { status: "cancel" };
+    return roamFenceSettings.saveFence(picked.fence);
+  });
+  handle("settings:clear-roam-fence", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    return rejected || roamFenceSettings.clearFence();
+  });
   handle("settings:update", (_event, payload) => {
     if (!payload || typeof payload !== "object") {
       return { status: "error", message: "settings:update payload must be { key, value }" };
@@ -179,11 +442,18 @@ function registerSettingsIpc(options = {}) {
     if (payload.key === "tgMigration") {
       return { status: "error", message: "tgMigration is internal; use telegramMigration.dispatch" };
     }
-    // DANGER "auto-pilot": never let a plain settings:update flip this on. It
-    // must go through the setAutoApproveAll command, which demands confirmed:true.
-    // This makes the confirmation dialog a real boundary instead of UI-only.
-    if (payload.key === "autoApproveAllPermissions") {
-      return { status: "error", message: "autoApproveAllPermissions is gated; use the setAutoApproveAll command" };
+    // Permission automation is command-only: the command enforces confirmed
+    // transitions for both automatic modes at the data layer.
+    if (
+      payload.key === "permissionAutomationMode"
+      || payload.key === "permissionAutomationAutoToolsWarningDismissed"
+      || payload.key === "permissionAutomationUnattendedWarningDismissed"
+      || payload.key === "autoApproveAllPermissions"
+    ) {
+      return {
+        status: "error",
+        message: "permission automation is gated; use the setPermissionAutomationMode command",
+      };
     }
     return settingsController.applyUpdate(payload.key, payload.value);
   });
@@ -219,9 +489,26 @@ function registerSettingsIpc(options = {}) {
     try { return themeLoader.getPreviewSoundUrl(); }
     catch { return null; }
   });
-  handle("settings:command", async (_event, payload) => {
+  handle("settings:command", async (event, payload) => {
     if (!payload || typeof payload !== "object") {
       return { status: "error", message: "settings:command payload must be { action, payload }" };
+    }
+    if (payload.action === "feishuApproval.saveApproverByEmail") {
+      const rejected = rejectUntrustedSettingsEvent(event);
+      if (rejected) return rejected;
+      const email = payload.payload && typeof payload.payload === "object"
+        ? payload.payload.email
+        : undefined;
+      return runFeishuApproverLookup(event, email);
+    }
+    if (payload.action === "feishuApproval.cancelApproverLookup") {
+      const rejected = rejectUntrustedSettingsEvent(event);
+      if (rejected) return rejected;
+      abortCurrentFeishuApproverLookup("cancelled", event.sender);
+      return { status: "ok" };
+    }
+    if (INTERNAL_SETTINGS_COMMANDS.has(payload.action)) {
+      return { status: "error", message: `settings command "${payload.action}" is internal` };
     }
     return settingsController.applyCommand(payload.action, payload.payload);
   });
@@ -332,12 +619,21 @@ function registerSettingsIpc(options = {}) {
     try {
       const activeTheme = getActiveTheme();
       const activeId = activeTheme ? activeTheme._id : "clawd";
-      return themeLoader.listThemesWithMetadata().map((theme) =>
-        codexPetMain.decorateThemeMetadata({
+      return themeLoader.listThemesWithMetadata().map((theme) => {
+        const active = theme.id === activeId;
+        const runtimeCapabilities = active
+          && activeTheme
+          && isPlainObject(activeTheme._capabilities)
+          ? activeTheme._capabilities
+          : null;
+        return codexPetMain.decorateThemeMetadata({
           ...theme,
-          active: theme.id === activeId,
-        })
-      );
+          active,
+          ...(runtimeCapabilities
+            ? { capabilities: { ...(theme.capabilities || {}), ...runtimeCapabilities } }
+            : {}),
+        });
+      });
     } catch (err) {
       console.warn("Clawd: settings:list-themes failed:", err && err.message);
       return [];
@@ -412,22 +708,71 @@ function registerSettingsIpc(options = {}) {
 
   handle("settings:list-agents", () => {
     try {
-      return getAllAgents().map(mapAgentMetadata);
+      const snapshot = settingsController.getSnapshot();
+      const custom = Array.isArray(snapshot.customApplications)
+        ? snapshot.customApplications.map((application) => {
+          const port = getHookServerPort();
+          const stateEvents = getRecentHookEvents({ agentId: application.id })
+            .filter((event) => event && event.route === "state" && event.outcome === "accepted");
+          const lastStateEvent = stateEvents.length > 0 ? stateEvents[stateEvents.length - 1] : null;
+          return mapCustomApplicationMetadata(application, {
+            stateEndpoint: Number.isInteger(port) ? `http://127.0.0.1:${port}/state` : "",
+            lastStateEvent: lastStateEvent
+              ? { timestamp: lastStateEvent.timestamp, eventType: lastStateEvent.eventType }
+              : null,
+          });
+        })
+        : [];
+      return [...getAllAgents().map(mapAgentMetadata), ...custom];
     } catch (err) {
       console.warn("Clawd: settings:list-agents failed:", err && err.message);
       return [];
     }
   });
 
-  handle("settings:detect-agent-installations", () => {
+  handle("settings:pick-agent-discovery-path", async (event, payload) => {
+    const kind = payload && payload.kind;
+    if (kind !== "file" && kind !== "directory") {
+      return { status: "error", message: "pickAgentDiscoveryPath.kind must be file or directory" };
+    }
+    const lang = getLang();
+    const strings = AGENT_DISCOVERY_DIALOG_STRINGS[lang] || AGENT_DISCOVERY_DIALOG_STRINGS.en;
     try {
-      return detectAgentInstallations({ fs, path, now });
+      const result = await dialog.showOpenDialog(getDialogParent(event), {
+        title: strings[kind],
+        properties: [kind === "file" ? "openFile" : "openDirectory"],
+      });
+      if (!result || result.canceled || !Array.isArray(result.filePaths) || !result.filePaths[0]) {
+        return { status: "cancel" };
+      }
+      return { status: "ok", path: result.filePaths[0] };
+    } catch (err) {
+      return { status: "error", message: `agent discovery path picker failed: ${err && err.message}` };
+    }
+  });
+
+  handle("settings:detect-agent-installations", async (_ev, opts) => {
+    try {
+      const options = opts && typeof opts === "object" ? opts : {};
+      const detectorOptions = { fs, path, now, snapshot: settingsController.getSnapshot() };
+      if (options.refreshWsl) {
+        const { refreshWslDetection } = require("./agent-installation-detector");
+        await refreshWslDetection({ ...detectorOptions, skipDefaultIntegrations: false });
+        return detectAgentInstallations(detectorOptions);
+      }
+      return detectAgentInstallations(detectorOptions);
     } catch (err) {
       console.warn("Clawd: settings:detect-agent-installations failed:", err && err.message);
       return {
         checkedAt: now(),
         agents: [],
+        customAgents: [],
+        customTools: [],
         skippedAgentIds: [],
+        wslAgents: [],
+        wslDistros: [],
+        // Keep the manual Scan entry point alive even on a hard failure.
+        wslSupported: process.platform === "win32",
         error: err && err.message ? err.message : String(err),
       };
     }
@@ -456,16 +801,25 @@ function registerSettingsIpc(options = {}) {
       heroSvgContent,
       pendingUpdateVersion,
       autoUpdateCheck,
+      updateCheckSnapshot: getUpdateCheckSnapshot(),
     };
   });
 
-  handle("settings:check-for-updates", () => {
+  handle("settings:check-for-updates", async () => {
     try {
-      checkForUpdates(true);
-      return { status: "ok" };
+      const snapshot = await checkForUpdates(true);
+      return snapshot || getUpdateCheckSnapshot();
     } catch (err) {
       return { status: "error", message: (err && err.message) || String(err) };
     }
+  });
+
+  handle("settings:clear-update-error", () => clearUpdateError());
+
+  handle("settings:copy-update-error", (_event, copyText) => {
+    const boundedText = String(copyText == null ? "" : copyText).slice(0, 8 * 1024);
+    if (!boundedText) return { status: "error", message: "empty update error report" };
+    return copyUpdateError(boundedText);
   });
 
   handle("settings:show-tutorial", async () => {
@@ -477,10 +831,6 @@ function registerSettingsIpc(options = {}) {
     }
   });
 
-  handle("settings:get-hardware-buddy-status", () => getHardwareBuddyStatus());
-  handle("settings:test-hardware-buddy-approval", () => testHardwareBuddyApproval());
-  handle("settings:get-quick-command-presets", () => getQuickCommandPresets());
-  handle("settings:send-quick-command", (_event, payload) => sendQuickCommand(sanitizeQuickCommandPayload(payload)));
 
   handle("settings:open-external", async (_event, url) => {
     if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
@@ -556,6 +906,7 @@ function registerSettingsIpc(options = {}) {
 
   return {
     dispose() {
+      abortCurrentFeishuApproverLookup("destroyed");
       while (disposers.length) {
         const dispose = disposers.pop();
         try { dispose(); } catch {}

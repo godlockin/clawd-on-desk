@@ -6,6 +6,8 @@
 
 Subagent 事件仍映射到逻辑 `juggling` 状态，但 Clawd 主题现在会按 live 子代理数量选择分层素材：1 个子代理使用 `clawd-headphones-groove.svg`，2 个以上使用 `clawd-working-juggling.svg`。旧版 Clawd conducting 素材已退役；Calico 和云宝的 2+ 子代理分层仍使用各自的 conducting 动画。
 
+下表的 idle 行描述主题原本的默认行为。用户也可以在“设置 → 动画 / 音效 → 动画”中，从当前主题声明的 idle 视觉里选择一个常驻静置造型。这个选项只改变逻辑状态为 `idle` 时显示的画面；任务、权限、完成、睡眠、互动反应和自由漫步仍会优先覆盖，结束后再回到所选造型。选择按主题分别保存，文件被主题更新删除时会回退到主题默认。非主题默认的 idle 视觉有意不启用鼠标眼球跟随或转圈头晕反应。
+
 | 事件 | 状态 | 动画 | Clawd | Calico | 云宝 |
 |---|---|---|---|---|---|
 | 无活动 | 待机 | 眼球跟踪 | <img src="../../assets/gif/clawd-idle.gif" width="160"> | <img src="../../assets/gif/calico-idle.gif" width="130"> | <img src="../../assets/gif/cloudling-idle.gif" width="140"> |
@@ -14,11 +16,12 @@ Subagent 事件仍映射到逻辑 `juggling` 状态，但 Clawd 主题现在会�
 | PreToolUse / PostToolUse（1 个会话） | 工作（打字） | 打字 | <img src="../../assets/gif/clawd-typing.gif" width="160"> | <img src="../../assets/gif/calico-typing.gif" width="130"> | <img src="../../assets/gif/cloudling-typing.gif" width="140"> |
 | PreToolUse / PostToolUse（2 个会话） | 工作（2 会话分层） | 耳机律动 | <img src="../../assets/gif/clawd-headphones-groove.gif" width="160"> | <img src="../../assets/gif/calico-juggling.gif" width="130"> | <img src="../../assets/gif/cloudling-juggling.gif" width="140"> |
 | PreToolUse（3+ 会话） | 工作（建造） | 建造 | <img src="../../assets/gif/clawd-building.gif" width="160"> | <img src="../../assets/gif/calico-building.gif" width="130"> | <img src="../../assets/gif/cloudling-building.gif" width="140"> |
-| SubagentStart（1 个） | 杂耍 | 耳机律动 | <img src="../../assets/gif/clawd-headphones-groove.gif" width="160"> | <img src="../../assets/gif/calico-juggling.gif" width="130"> | <img src="../../assets/gif/cloudling-juggling.gif" width="140"> |
-| SubagentStart（2+） | 杂耍（2+ 分层） | 三球杂耍 | <img src="../../assets/gif/clawd-juggling.gif" width="160"> | <img src="../../assets/gif/calico-conducting.gif" width="130"> | <img src="../../assets/gif/cloudling-conducting.gif" width="140"> |
+| SubagentStart（1 个活跃子代理） | 杂耍 | 耳机律动 | <img src="../../assets/gif/clawd-headphones-groove.gif" width="160"> | <img src="../../assets/gif/calico-juggling.gif" width="130"> | <img src="../../assets/gif/cloudling-juggling.gif" width="140"> |
+| SubagentStart（2+ 个活跃子代理） | 杂耍（2+ 分层） | 三球杂耍 | <img src="../../assets/gif/clawd-juggling.gif" width="160"> | <img src="../../assets/gif/calico-conducting.gif" width="130"> | <img src="../../assets/gif/cloudling-conducting.gif" width="140"> |
 | PostToolUseFailure | 报错 | 报错 | <img src="../../assets/gif/clawd-error.gif" width="160"> | <img src="../../assets/gif/calico-error.gif" width="130"> | <img src="../../assets/gif/cloudling-error.gif" width="140"> |
 | Stop / PostCompact | 注意 | 开心 | <img src="../../assets/gif/clawd-happy.gif" width="160"> | <img src="../../assets/gif/calico-happy.gif" width="130"> | <img src="../../assets/gif/cloudling-attention.gif" width="140"> |
 | PermissionRequest | 通知 | 警报 | <img src="../../assets/gif/clawd-notification.gif" width="160"> | <img src="../../assets/gif/calico-notification.gif" width="130"> | <img src="../../assets/gif/cloudling-notification.gif" width="140"> |
+| Codex `request_user_input` | 通知 | 警报 + 只读问题卡片 | <img src="../../assets/gif/clawd-notification.gif" width="160"> | <img src="../../assets/gif/calico-notification.gif" width="130"> | <img src="../../assets/gif/cloudling-notification.gif" width="140"> |
 | PreCompact | 扫地 | 扫地 | <img src="../../assets/gif/clawd-sweeping.gif" width="160"> | <img src="../../assets/gif/calico-sweeping.gif" width="130"> | <img src="../../assets/gif/cloudling-sweeping.gif" width="140"> |
 | WorktreeCreate | 搬运 | 搬箱子 | <img src="../../assets/gif/clawd-carrying.gif" width="160"> | <img src="../../assets/gif/calico-carrying.gif" width="130"> | <img src="../../assets/gif/cloudling-carrying.gif" width="140"> |
 | 60 秒鼠标静止 | 睡觉 | 睡眠 | <img src="../../assets/gif/clawd-sleeping.gif" width="160"> | <img src="../../assets/gif/calico-sleeping.gif" width="130"> | <img src="../../assets/gif/cloudling-sleeping.gif" width="140"> |
@@ -33,7 +36,7 @@ Kimi Code CLI（Kimi-CLI）现已采用 hook-only 集成（`~/.kimi/config.toml`
 | SessionStart | idle |
 | SessionEnd | 删除会话；无其他 live 会话时回到 idle |
 | UserPromptSubmit | thinking |
-| PreToolUse | 默认映射到 working。只有在 payload 中出现明确审批信号（`permission_required` / `requires_approval` / `waiting_for_approval` / `is_permission_request`）时，才会切到 permission 类动画。持久化模式开关：`CLAWD_KIMI_PERMISSION_MODE=explicit`（默认，仅显式信号触发 notification）或 `CLAWD_KIMI_PERMISSION_MODE=suspect`（对 gated tool 使用延迟启发式判断）。安装脚本（`npm run install:kimi-hooks` 以及启动时自动同步）会把这个值写进 `~/.kimi/config.toml` 中每个 Kimi hook 的 `command` 字段，所以重启 Clawd 后仍会保留。其他可选开关：`CLAWD_KIMI_PERMISSION_IMMEDIATE=1` 可对权限工具强制立即映射；`CLAWD_KIMI_PERMISSION_SUSPECT=1`（旧别名）只对当前进程开启 suspect mode；`CLAWD_KIMI_PERMISSION_SUSPECT_MS=<ms>` 可调 suspect 窗口；`CLAWD_KIMI_DISABLE_PRETOOL_PERMISSION=1` 会在开启可选模式时仍保持 explicit-only 行为。 |
+| PreToolUse | 默认映射到 working。payload 携带明确审批信号（`permission_required` / `requires_approval` / `waiting_for_approval` / `is_permission_request`）时始终立即切到 permission 类动画。在此之外，持久化模式决定门控工具的处理方式：**`suspect`（安装器默认）**启用延迟启发式——suspect 窗口内没等到 `PostToolUse` 就认定 Kimi 阻塞在审批 TUI 上并弹出提示；`explicit` 仅响应显式信号（现行 kimi-cli 从不发出，等于不弹卡）。安装脚本（`npm run install:kimi-hooks` 及启动时自动同步）把模式以 `--permission-mode=<mode>` 参数持久化到 `~/.kimi/config.toml` 的 `command` 字段，重新同步时保留既有选择。运行时环境变量优先级高于持久化参数：`CLAWD_KIMI_PERMISSION_MODE=explicit\|suspect`（压过持久化参数；但 `CLAWD_KIMI_DISABLE_PRETOOL_PERMISSION` 与 `CLAWD_KIMI_PERMISSION_IMMEDIATE` 的判定顺序在它之前）；`CLAWD_KIMI_PERMISSION_IMMEDIATE=1` 对门控工具强制立即映射；`CLAWD_KIMI_PERMISSION_SUSPECT=1`（旧别名）只对当前进程开启 suspect；`CLAWD_KIMI_PERMISSION_SUSPECT_MS=<ms>` 可调 suspect 窗口；`CLAWD_KIMI_DISABLE_PRETOOL_PERMISSION=1` 无论其他开关如何都保持 explicit-only。排队的门控调用由每会话的门控台账跟踪：每答复一个审批，就会为下一个待审批重新弹卡。 |
 | PostToolUse | working |
 | PostToolUseFailure | error |
 | Stop | attention |
@@ -43,6 +46,22 @@ Kimi Code CLI（Kimi-CLI）现已采用 hook-only 集成（`~/.kimi/config.toml`
 | PreCompact | sweeping |
 | PostCompact | attention |
 | Notification | notification |
+
+## ZCode Hook 事件
+
+ZCode 使用 `~/.zcode/cli/config.json` 下的 config-file hooks：
+
+| ZCode Hook Event | 状态 |
+|---|---|
+| SessionStart | idle |
+| UserPromptSubmit | thinking |
+| PreToolUse | working |
+| PostToolUse | working |
+| PostToolUseFailure | error |
+| Stop | attention |
+| PermissionRequest | notification（仅 fail-closed 路径） |
+
+`PermissionRequest` 自 Phase 2 起是阻塞式权限审批：hook 等待 Clawd 本地气泡或远程审批产生人工决定，并通过 stdout 的 `hookSpecificOutput` 回答 allow/deny。在完成 ZCode 工具面与会话身份审计前，权限自动化会 defer。上表的 `notification` 映射只在 fail-closed 路径（tool name 缺失 / unknown）或 Clawd 未运行时触发；真正的决定不会 POST `/state`。当前集成没有 ZCode `SessionEnd` 事件，会话完成依赖 `Stop` 和 Clawd 原有的进程存活 / stale session 清理。当 Clawd 无决定时（超时、断连、DND、气泡关闭），hook 输出 `{}`，由 ZCode 原生权限流程接管。
 
 ## Pi Extension 事件
 

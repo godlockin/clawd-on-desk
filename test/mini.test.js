@@ -45,6 +45,7 @@ function loadMiniWithElectron(screenExports) {
 
 function makeCtx(theme, stateLog, initialX = 160) {
   const bounds = { x: initialX, y: 180, width: 120, height: 120 };
+  const applyBoundsCallLog = [];
   return {
     theme,
     currentState: "idle",
@@ -70,6 +71,26 @@ function makeCtx(theme, stateLog, initialX = 160) {
     SIZES: { m: { width: 120, height: 120 } },
     getCurrentPixelSize() { return { width: 120, height: 120 }; },
     getPetWindowBounds() { return { ...bounds }; },
+    // Issue #690 Phase 3: mini.js's per-frame/placement writes now go through
+    // this instead of raw ctx.win.setBounds()/setPosition(). This harness has
+    // no Linux/Mutter clamp model (none of these tests set isLinux or mock a
+    // WM clamp — that cross-module scenario lives in
+    // test/edge-virtualization.test.js), so physical always equals logical
+    // here: write straight into the same `bounds` closure win.getBounds()/
+    // getBoundsSnapshot() read, exactly reproducing the old setBounds()
+    // behaviour byte-for-byte for every existing assertion.
+    applyPetWindowBounds(next, opts) {
+      applyBoundsCallLog.push({ next: { ...next }, opts: opts ? { ...opts } : undefined });
+      bounds.x = next.x;
+      bounds.y = next.y;
+      bounds.width = next.width;
+      bounds.height = next.height;
+      return { ...bounds };
+    },
+    // Test-only introspection (not part of the real ctx contract) for the
+    // §4.5 point 3 / §12.8 automated thresholds: every mini animation frame
+    // must go through applyMiniFrameBounds() with assertNoYOffset:true.
+    getApplyBoundsCallLog() { return applyBoundsCallLog.map((c) => ({ ...c })); },
     getAnimationAssetCycleMs(file) {
       if (file && file.includes("mini-enter")) return 1000;
       return null;
@@ -213,11 +234,145 @@ describe("mini mode entry timing", () => {
   });
 });
 
+// PR #751 Codex review #10 (rework batch B-5, non-blocking): every
+// getAllDisplaysCalls assertion in this describe block only ever counts
+// mini.js's OWN direct screen.getAllDisplays() call sites (resolveMiniTopology
+// / checkMiniModeSnap) — makeCtx()'s mock ctx.applyPetWindowBounds never
+// reaches the real pet-window-runtime.js, so it cannot see that runtime's OWN
+// internal enumeration (materializeVirtualBounds -> resolveHorizontalClampBounds
+// -> findDisplayIdForPoint(), plus syncHitWin()), which used to re-run on
+// every single per-frame write/drag-move regardless of these budgets. See
+// test/edge-virtualization.test.js's "B-5 (Codex #10): a full drag +
+// mini-entry animation..." test for the real-runtime-assembled version that
+// actually exercises (and, post-fix, bounds) that call count.
+describe("mini entry animation composite-only guardrails (#690 Phase 3 item 6)", () => {
+  let loader;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  });
+
+  afterEach(() => {
+    if (loader) loader.restore();
+    mock.timers.reset();
+    loader = null;
+  });
+
+  it("drag-snap entry never sends a Y viewport-offset IPC, resolves topology at most once, and every frame asserts no Y offset", () => {
+    let getAllDisplaysCalls = 0;
+    loader = loadMiniWithElectron({
+      getAllDisplays() {
+        getAllDisplaysCalls++;
+        return [{ bounds: { x: 0, y: 0, width: 800, height: 600 }, workArea: { x: 0, y: 0, width: 800, height: 600 } }];
+      },
+    });
+    const stateLog = [];
+    const rendererEvents = [];
+    const theme = cloneTheme(_defaultTheme);
+    const ctx = makeCtx(theme, stateLog, 600);
+    ctx.sendToRenderer = (...args) => rendererEvents.push(args);
+    const mini = loader.initMini(ctx);
+
+    mini.enterMiniMode({ x: 0, y: 0, width: 800, height: 600 }, false, "right");
+    mock.timers.tick(120);
+
+    const yOffsetSends = rendererEvents.filter((e) => e[0] === "viewport-offset");
+    assert.deepStrictEqual(yOffsetSends, [], "mini's per-frame writes must never trigger a Y viewport-offset IPC");
+
+    const boundsCalls = ctx.getApplyBoundsCallLog();
+    assert.ok(boundsCalls.length > 0, "expected at least one applyPetWindowBounds call from the entry animation");
+    assert.ok(
+      boundsCalls.every((c) => c.opts && c.opts.assertNoYOffset === true),
+      "every mini animation frame must go through applyMiniFrameBounds() with assertNoYOffset:true"
+    );
+
+    // §12.8: "动画是否只缓存单次 workArea/topology" — enterMiniMode() resolves
+    // the whole transition's topology exactly once (reused for the seam clip
+    // and every animation frame via animCtx), so this must be exactly 1, not
+    // just under some looser bound.
+    assert.equal(
+      getAllDisplaysCalls, 1,
+      `expected screen.getAllDisplays() to be called exactly once for the whole entry animation, got ${getAllDisplaysCalls}`
+    );
+  });
+
+  it("via-menu crabwalk + settle each resolve topology at most once and never send a Y viewport-offset IPC", () => {
+    let getAllDisplaysCalls = 0;
+    loader = loadMiniWithElectron({
+      getAllDisplays() {
+        getAllDisplaysCalls++;
+        return [{ bounds: { x: 0, y: 0, width: 800, height: 600 }, workArea: { x: 0, y: 0, width: 800, height: 600 } }];
+      },
+    });
+    const stateLog = [];
+    const rendererEvents = [];
+    const theme = cloneTheme(_defaultTheme);
+    const ctx = makeCtx(theme, stateLog, 710);
+    ctx.sendToRenderer = (...args) => rendererEvents.push(args);
+    const mini = loader.initMini(ctx);
+
+    mini.enterMiniViaMenu();
+    // Crabwalk phase resolves its own topology once.
+    assert.ok(getAllDisplaysCalls <= 1, `crabwalk phase: expected <=1 getAllDisplays() call, got ${getAllDisplaysCalls}`);
+
+    mock.timers.tick(2500); // walk + jump + preload + mini-enter settle, generously
+
+    const yOffsetSends = rendererEvents.filter((e) => e[0] === "viewport-offset");
+    assert.deepStrictEqual(yOffsetSends, [], "menu-triggered mini entry must never trigger a Y viewport-offset IPC");
+    const boundsCalls = ctx.getApplyBoundsCallLog();
+    assert.ok(
+      boundsCalls.every((c) => c.opts && c.opts.assertNoYOffset === true),
+      "every mini animation frame (crabwalk + settle) must assert no Y offset"
+    );
+    // Crabwalk (enterMiniViaMenu) and the mini handoff (enterMiniMode) each
+    // resolve topology once independently — two separate, non-per-frame
+    // transitions, not one shared animation.
+    assert.ok(
+      getAllDisplaysCalls <= 2,
+      `expected at most 2 total getAllDisplays() calls (crabwalk + mini handoff), got ${getAllDisplaysCalls}`
+    );
+  });
+});
+
 // Two displays tiled side by side: D1 [0,800) and D2 [800,1600), same height.
 const SIDE_BY_SIDE = [
   { bounds: { x: 0, y: 0, width: 800, height: 600 }, workArea: { x: 0, y: 0, width: 800, height: 600 } },
   { bounds: { x: 800, y: 0, width: 800, height: 600 }, workArea: { x: 800, y: 0, width: 800, height: 600 } },
 ];
+
+const THREE_SIDE_BY_SIDE = [
+  { bounds: { x: 0, y: 0, width: 800, height: 600 }, workArea: { x: 0, y: 0, width: 800, height: 600 } },
+  { bounds: { x: 800, y: 0, width: 800, height: 600 }, workArea: { x: 800, y: 0, width: 800, height: 600 } },
+  { bounds: { x: 1600, y: 0, width: 800, height: 600 }, workArea: { x: 1600, y: 0, width: 800, height: 600 } },
+];
+
+function findNearestWorkArea(displays, cx, cy) {
+  let nearest = displays[0].workArea;
+  let minDist = Infinity;
+  for (const d of displays) {
+    const wa = d.workArea;
+    const dx = Math.max(wa.x - cx, 0, cx - (wa.x + wa.width));
+    const dy = Math.max(wa.y - cy, 0, cy - (wa.y + wa.height));
+    const dist = dx * dx + dy * dy;
+    if (dist < minDist) {
+      minDist = dist;
+      nearest = wa;
+    }
+  }
+  return nearest;
+}
+
+function installDisplayAwareClamp(ctx, displays) {
+  ctx.getNearestWorkArea = (cx, cy) => findNearestWorkArea(displays, cx, cy);
+  ctx.clampToScreenVisual = (x, y, width, height, options = {}) => {
+    const wa = options.workArea || findNearestWorkArea(displays, x + width / 2, y + height / 2);
+    const marginX = Math.round(width * 0.25);
+    return {
+      x: Math.max(wa.x - marginX, Math.min(x, wa.x + wa.width - width + marginX)),
+      y: Math.max(wa.y, Math.min(y, wa.y + wa.height - height)),
+    };
+  };
+}
 
 function miniClips(rendererEvents) {
   return rendererEvents.filter((e) => e[0] === "mini-clip").map((e) => e[1]);
@@ -468,5 +623,63 @@ describe("mini mode multi-monitor seam clip", () => {
     ctx.win = null;
     assert.doesNotThrow(() => mini.syncContainedClip());
     assert.equal(rendererEvents.length, 0, "no IPC sent without a render window");
+  });
+});
+
+describe("mini mode restore screen ownership", () => {
+  let loader;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  });
+
+  afterEach(() => {
+    if (loader) loader.restore();
+    mock.timers.reset();
+    loader = null;
+  });
+
+  it("restores onto the middle screen when snapped to the middle screen's left seam", () => {
+    loader = loadMiniWithElectron({ getAllDisplays() { return THREE_SIDE_BY_SIDE; } });
+    const ctx = makeCtx(cloneTheme(_defaultTheme), [], 725);
+    installDisplayAwareClamp(ctx, THREE_SIDE_BY_SIDE);
+    const mini = loader.initMini(ctx);
+    const middle = THREE_SIDE_BY_SIDE[1].workArea;
+
+    // The saved pre-mini center is slightly over the halfway mark into the
+    // left screen, but the snap itself belongs to the middle screen's seam.
+    mini.enterMiniMode(middle, false, "left");
+    mock.timers.tick(1140);
+    mini.exitMiniMode();
+    mock.timers.tick(400);
+
+    const bounds = ctx.getBoundsSnapshot();
+    const centerX = bounds.x + bounds.width / 2;
+    assert.ok(
+      centerX >= middle.x && centerX < middle.x + middle.width,
+      `expected restored center ${centerX} to stay on middle screen`
+    );
+  });
+
+  it("restores onto the right screen when snapped to the right screen's left seam", () => {
+    loader = loadMiniWithElectron({ getAllDisplays() { return THREE_SIDE_BY_SIDE; } });
+    const ctx = makeCtx(cloneTheme(_defaultTheme), [], 1525);
+    installDisplayAwareClamp(ctx, THREE_SIDE_BY_SIDE);
+    const mini = loader.initMini(ctx);
+    const right = THREE_SIDE_BY_SIDE[2].workArea;
+
+    // The saved pre-mini center is slightly over the halfway mark into the
+    // middle screen, but the snap itself belongs to the right screen's seam.
+    mini.enterMiniMode(right, false, "left");
+    mock.timers.tick(1140);
+    mini.exitMiniMode();
+    mock.timers.tick(400);
+
+    const bounds = ctx.getBoundsSnapshot();
+    const centerX = bounds.x + bounds.width / 2;
+    assert.ok(
+      centerX >= right.x && centerX < right.x + right.width,
+      `expected restored center ${centerX} to stay on right screen`
+    );
   });
 });

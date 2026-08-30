@@ -9,8 +9,13 @@ function buildSettingsAgentOrderExports() {
     "qwen-code",
     "codewhale",
     "opencode",
+    "mimocode",
     "codebuddy",
+    "workbuddy",
     "qoder",
+    "qoderwork",
+    "traecode",
+    "qwenwork",
   ];
 
   const NON_COLLAPSIBLE_AGENT_PRIORITY = [
@@ -22,6 +27,7 @@ function buildSettingsAgentOrderExports() {
     "openclaw",
     "hermes",
     "reasonix",
+    "zcode",
   ];
 
   const COLLAPSIBLE_AGENT_PRIORITY_MAP = new Map(
@@ -46,6 +52,7 @@ function buildSettingsAgentOrderExports() {
     if (eventSource === "log-poll") return "eventSourceLogPoll";
     if (eventSource === "plugin-event") return "eventSourcePlugin";
     if (eventSource === "extension") return "eventSourceExtension";
+    if (eventSource === "custom-http") return "eventSourceCustomHttp";
     return "eventSourceHook";
   }
 

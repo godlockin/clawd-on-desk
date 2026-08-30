@@ -1,6 +1,7 @@
 const os = require("os");
 const path = require("path");
 const { runDoctorChecks } = require("./doctor");
+const { getCodexHookHealth } = require("./codex-hook-health");
 const { formatDiagnosticReport, redactDoctorResult } = require("./doctor-report");
 const { createConnectionTestDeduper, runConnectionTest } = require("./doctor-hook-activity");
 const { openClawdLog } = require("./doctor-logs");
@@ -58,8 +59,14 @@ function registerDoctorIpc({
   shell,
   server,
   getPrefsSnapshot,
+  getPrefsReadFailure,
+  getPrefsRecovered,
+  getPrefsRecoveryBackupFailed,
+  getFeishuApprovalSecrets,
   getDoNotDisturb,
   getLocale,
+  resolveAgentDisplayName,
+  getRemoteSshStatuses,
 }) {
   let lastDoctorResult = null;
   let lastDoctorConnectionTest = null;
@@ -69,6 +76,8 @@ function registerDoctorIpc({
       server,
       durationMs: payload && payload.durationMs,
       homeDir: os.homedir(),
+      resolveAgentDisplayName,
+      getCodexHookHealth: () => getCodexHookHealth({ prefs: getPrefsSnapshot() }),
     }),
     {
       onResult: (result) => {
@@ -78,10 +87,22 @@ function registerDoctorIpc({
   );
 
   function buildDoctorResult() {
+    let feishuApprovalSecrets = {};
+    try {
+      feishuApprovalSecrets = typeof getFeishuApprovalSecrets === "function"
+        ? getFeishuApprovalSecrets()
+        : {};
+    } catch {}
     lastDoctorResult = runDoctorChecks({
       server,
       prefs: getPrefsSnapshot(),
+      prefsReadFailure: typeof getPrefsReadFailure === "function" && getPrefsReadFailure() === true,
+      prefsRecovered: typeof getPrefsRecovered === "function" && getPrefsRecovered() === true,
+      prefsRecoveryBackupFailed: typeof getPrefsRecoveryBackupFailed === "function"
+        && getPrefsRecoveryBackupFailed() === true,
+      feishuApprovalSecrets,
       doNotDisturb: getDoNotDisturb(),
+      getRemoteSshStatuses,
     });
     return lastDoctorResult;
   }
@@ -100,6 +121,22 @@ function registerDoctorIpc({
   ipcMain.handle("doctor:run-checks", async () => (
     redactDoctorResult(await runDedupedDoctorChecks(), getDoctorRedactionOptions(app))
   ));
+
+  // Lightweight Codex-only hook-health probe for the Agents tab badge. Reuses
+  // the same per-agent integration check the Doctor uses, but skips the full
+  // doctor sweep so opening the Agents tab stays cheap. Returns a render-safe
+  // subset (no raw fs paths — detailText/error stay main-side).
+  ipcMain.handle("doctor:codex-hook-health", () => {
+    const verdict = getCodexHookHealth({ prefs: getPrefsSnapshot() });
+    return {
+      available: verdict.available,
+      healthy: verdict.healthy,
+      signature: verdict.signature,
+      reasonKey: verdict.reasonKey,
+      status: verdict.status,
+      fixAction: verdict.fixAction,
+    };
+  });
 
   ipcMain.handle("doctor:test-connection", async (_event, payload) => {
     const result = await runDedupedDoctorConnectionTest(normalizeDoctorConnectionTestPayload(payload));

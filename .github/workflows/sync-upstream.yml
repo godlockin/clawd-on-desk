@@ -30,6 +30,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  workflows: write
 
 env:
   UPSTREAM_REPO: rullerzhou-afk/clawd-on-desk

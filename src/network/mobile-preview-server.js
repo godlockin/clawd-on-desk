@@ -11,6 +11,7 @@ const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
 const WebSocket = require("ws");
+const { sessionDisplayFolder } = require("../state-session-snapshot");
 
 const PROTOCOL_VERSION = "v1";
 const DEFAULT_PORT = 23334;
@@ -24,6 +25,11 @@ const GRACE_PERIOD_MS = 5 * 60 * 1000;          // 5 minutes
 const ROTATION_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const PWA_DIR = path.resolve(__dirname, "../../pwa");
+const CANONICAL_ICON_DIR = path.resolve(__dirname, "../../assets/icons");
+const PWA_ICON_ALIASES = new Map([
+  ["icons/icon-256.png", path.join(CANONICAL_ICON_DIR, "256x256.png")],
+  ["icons/icon-512.png", path.join(CANONICAL_ICON_DIR, "512x512.png")],
+]);
 const TOKEN_PATH = path.join(os.homedir(), ".clawd", "mobile-token.json");
 
 const MIME = {
@@ -239,8 +245,10 @@ function initMobilePreviewServer(ctx) {
     if (urlPath === "/mobile/" || urlPath === "/mobile") urlPath = "/mobile/index.html";
     if (!urlPath.startsWith("/mobile/")) { res.writeHead(404); res.end(); return; }
     const rel = urlPath.slice("/mobile/".length);
-    const filePath = path.join(PWA_DIR, rel);
-    if (!isPathInside(PWA_DIR, filePath)) { res.writeHead(403); res.end(); return; }
+    const aliasedIcon = PWA_ICON_ALIASES.get(rel);
+    const assetRoot = aliasedIcon ? CANONICAL_ICON_DIR : PWA_DIR;
+    const filePath = aliasedIcon || path.join(PWA_DIR, rel);
+    if (!isPathInside(assetRoot, filePath)) { res.writeHead(403); res.end(); return; }
     const ext = path.extname(filePath).toLowerCase();
     fs.readFile(filePath, (err, data) => {
       if (err) { res.writeHead(404); res.end(); return; }
@@ -402,11 +410,17 @@ function initMobilePreviewServer(ctx) {
   function buildPayload(sid, session) {
     if (!session) return null;
     const recentEvents = Array.isArray(session.recentEvents) ? session.recentEvents.slice(-10) : [];
+    // Explicit empty displayFolder is a privacy decision made by the shared
+    // snapshot builder. Raw/legacy session maps do not carry the additive field,
+    // so derive the same safe display value through the shared helper.
+    const folderSource = Object.prototype.hasOwnProperty.call(session, "displayFolder")
+      ? session.displayFolder
+      : sessionDisplayFolder(sid, session);
     return {
       sessionId: sid,
       agentId: session.agentId || null,
       title: session.sessionTitle || null,
-      basename: session.cwd ? path.basename(session.cwd) : null,
+      basename: folderSource ? path.basename(String(folderSource)) : null,
       state: session.state || "idle",
       updatedAt: session.updatedAt || null,
       recentEvents,

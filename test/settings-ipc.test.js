@@ -6,13 +6,24 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const zlib = require("node:zlib");
+const { EventEmitter } = require("node:events");
+const { pathToFileURL } = require("node:url");
 
 const { registerSettingsIpc } = require("../src/settings-ipc");
+const {
+  listPetTintOptions,
+  listPetAccessoryOptions,
+  listPetMouthAccessoryOptions,
+} = require("../src/pet-customization-catalog");
+const prefs = require("../src/prefs");
+const { createSettingsController } = require("../src/settings-controller");
+const { commandRegistry } = require("../src/settings-actions");
 
 class FakeIpcMain {
   constructor() {
     this.handlers = new Map();
     this.listeners = new Map();
+    this.invokeEvent = { sender: "sender-web-contents", senderFrame: null };
   }
 
   handle(channel, listener) {
@@ -34,7 +45,7 @@ class FakeIpcMain {
   invoke(channel, ...args) {
     const listener = this.handlers.get(channel);
     assert.strictEqual(typeof listener, "function", `missing IPC handler ${channel}`);
-    return listener({ sender: "sender-web-contents" }, ...args);
+    return listener(this.invokeEvent, ...args);
   }
 
   send(channel, ...args) {
@@ -46,6 +57,15 @@ class FakeIpcMain {
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "clawd-settings-ipc-"));
+}
+
+function createDeferred() {
+  const deferred = {};
+  deferred.promise = new Promise((resolve, reject) => {
+    deferred.resolve = resolve;
+    deferred.reject = reject;
+  });
+  return deferred;
 }
 
 function makeZip(entries) {
@@ -113,6 +133,20 @@ function makeZip(entries) {
 function createHarness(overrides = {}) {
   const calls = [];
   const ipcMain = new FakeIpcMain();
+  const settingsMainFrame = {
+    url: pathToFileURL(path.join(__dirname, "..", "src", "settings.html")).href,
+  };
+  const settingsWebContents = new EventEmitter();
+  settingsWebContents.mainFrame = settingsMainFrame;
+  const settingsWindow = {
+    id: "settings-window",
+    webContents: settingsWebContents,
+    isDestroyed: () => false,
+  };
+  ipcMain.invokeEvent = {
+    sender: settingsWebContents,
+    senderFrame: settingsMainFrame,
+  };
   const activeTheme = overrides.activeTheme || {
     _id: "clawd",
     sounds: { complete: "complete.mp3" },
@@ -165,6 +199,14 @@ function createHarness(overrides = {}) {
       return { status: "ok", phase: "end", value };
     },
   };
+  const roamFenceSettings = overrides.roamFenceSettings || {
+    getStatus: async () => ({ status: "ok", active: false, fence: null }),
+    saveFence: async (fence) => ({ status: "ok", active: true, fence }),
+    clearFence: async () => ({ status: "ok", active: false, fence: null }),
+  };
+  const roamFencePicker = overrides.roamFencePicker || {
+    selectArea: async () => ({ status: "cancel" }),
+  };
   const runtime = registerSettingsIpc({
     ipcMain,
     app: { getVersion: () => "1.2.3" },
@@ -178,9 +220,11 @@ function createHarness(overrides = {}) {
     settingsController,
     themeLoader,
     codexPetMain,
-    getSettingsWindow: () => ({ id: "settings-window" }),
+    getSettingsWindow: () => settingsWindow,
     getActiveTheme: () => activeTheme,
     getLang: overrides.getLang || (() => "en"),
+    roamFenceSettings,
+    roamFencePicker,
     settingsSizePreviewSession,
     isValidSizePreviewKey: (value) => /^P:\d+$/.test(value),
     sendToRenderer: (...args) => calls.push(["sendToRenderer", ...args]),
@@ -188,12 +232,21 @@ function createHarness(overrides = {}) {
     getSoundMuted: overrides.getSoundMuted || (() => false),
     getSoundVolume: overrides.getSoundVolume || (() => 0.4),
     getAllAgents: overrides.getAllAgents || (() => []),
+    getHookServerPort: overrides.getHookServerPort,
+    getRecentHookEvents: overrides.getRecentHookEvents,
+    getQuotaSourceCount: overrides.getQuotaSourceCount,
+    kimiQuotaRuntime: overrides.kimiQuotaRuntime,
     detectAgentInstallations: overrides.detectAgentInstallations,
-    getHardwareBuddyStatus: overrides.getHardwareBuddyStatus || (() => null),
-    testHardwareBuddyApproval: overrides.testHardwareBuddyApproval,
-    getQuickCommandPresets: overrides.getQuickCommandPresets,
-    sendQuickCommand: overrides.sendQuickCommand,
-    checkForUpdates: (manual) => calls.push(["checkForUpdates", manual]),
+    checkForUpdates: overrides.checkForUpdates || ((manual) => {
+      calls.push(["checkForUpdates", manual]);
+      return { state: "up-to-date", version: "1.2.3" };
+    }),
+    getUpdateCheckSnapshot: overrides.getUpdateCheckSnapshot || (() => ({ state: "idle" })),
+    clearUpdateError: overrides.clearUpdateError || (() => ({ state: "idle" })),
+    copyUpdateError: overrides.copyUpdateError || ((text) => {
+      calls.push(["copyUpdateError", text]);
+      return { status: "ok" };
+    }),
     showTutorial: overrides.showTutorial || (() => {
       calls.push(["showTutorial"]);
       return { status: "ok" };
@@ -201,21 +254,75 @@ function createHarness(overrides = {}) {
     aboutHeroSvgPath: overrides.aboutHeroSvgPath || path.join(__dirname, "missing-about-hero.svg"),
     getLanWsServer: overrides.getLanWsServer || (() => null),
     now: overrides.now || (() => 12345),
+    saveFeishuApproverByEmail: overrides.saveFeishuApproverByEmail || (async ({ email, signal }) => {
+      calls.push(["saveFeishuApproverByEmail", email, signal]);
+      return { status: "ok" };
+    }),
   });
-  return { ipcMain, runtime, calls, activeTheme };
+  return { ipcMain, runtime, calls, activeTheme, settingsWindow };
 }
+
+test("Kimi quota IPC is trusted-window-only and bypasses generic settings commands", async () => {
+  const runtimeCalls = [];
+  const kimiQuotaRuntime = {
+    getStatus: () => ({ status: "ok", configured: false, mode: "manual-only" }),
+    connect: async (apiKey) => { runtimeCalls.push(["connect", apiKey]); return { status: "ok" }; },
+    refresh: async () => { runtimeCalls.push(["refresh"]); return { status: "ok" }; },
+    reconnect: async () => { runtimeCalls.push(["reconnect"]); return { status: "ok" }; },
+    disconnect: async () => { runtimeCalls.push(["disconnect"]); return { status: "ok" }; },
+    forget: async () => { runtimeCalls.push(["forget"]); return { status: "ok" }; },
+  };
+  const harness = createHarness({ kimiQuotaRuntime });
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:kimi-quota-status"), {
+    status: "ok",
+    configured: false,
+    mode: "manual-only",
+  });
+  assert.deepStrictEqual(
+    await harness.ipcMain.invoke("settings:kimi-quota-connect", { apiKey: "sk-secret" }),
+    { status: "ok" }
+  );
+  await harness.ipcMain.invoke("settings:kimi-quota-refresh");
+  await harness.ipcMain.invoke("settings:kimi-quota-reconnect");
+  await harness.ipcMain.invoke("settings:kimi-quota-disconnect");
+  await harness.ipcMain.invoke("settings:kimi-quota-forget");
+  assert.deepStrictEqual(runtimeCalls, [
+    ["connect", "sk-secret"],
+    ["refresh"],
+    ["reconnect"],
+    ["disconnect"],
+    ["forget"],
+  ]);
+  assert.equal(harness.calls.some((call) => JSON.stringify(call).includes("sk-secret")), false);
+
+  harness.ipcMain.invokeEvent = { sender: {}, senderFrame: null };
+  assert.deepStrictEqual(
+    await harness.ipcMain.invoke("settings:kimi-quota-connect", { apiKey: "sk-secret" }),
+    { status: "error", message: "untrusted settings sender" }
+  );
+  assert.deepStrictEqual(
+    await harness.ipcMain.invoke("settings:kimi-quota-reconnect"),
+    { status: "error", message: "untrusted settings sender" }
+  );
+  assert.equal(runtimeCalls.length, 5);
+});
 
 test("settings IPC registers owned channels and leaves animation override channels to their module", () => {
   const { ipcMain, runtime } = createHarness();
 
   assert.ok(ipcMain.handlers.has("settings:get-snapshot"));
+  assert.ok(ipcMain.handlers.has("settings:get-quota-source-count"));
+  assert.ok(ipcMain.handlers.has("settings:get-pet-tint-options"));
+  assert.ok(ipcMain.handlers.has("settings:get-pet-accessory-options"));
+  assert.ok(ipcMain.handlers.has("settings:get-pet-mouth-accessory-options"));
+  assert.ok(ipcMain.handlers.has("settings:get-roam-fence"));
+  assert.ok(ipcMain.handlers.has("settings:select-roam-fence"));
+  assert.ok(ipcMain.handlers.has("settings:clear-roam-fence"));
   assert.ok(ipcMain.handlers.has("settings:pick-sound-file"));
   assert.ok(ipcMain.handlers.has("settings:list-themes"));
   assert.ok(ipcMain.handlers.has("settings:detect-agent-installations"));
-  assert.ok(ipcMain.handlers.has("settings:test-hardware-buddy-approval"));
-  assert.ok(ipcMain.handlers.has("settings:get-quick-command-presets"));
-  assert.ok(ipcMain.handlers.has("settings:send-quick-command"));
   assert.ok(ipcMain.handlers.has("settings:show-tutorial"));
+  assert.ok(ipcMain.handlers.has("settings:clear-update-error"));
   assert.ok(ipcMain.handlers.has("settings:open-user-themes-dir"));
   assert.ok(ipcMain.handlers.has("settings:import-user-theme-zip"));
   assert.ok(ipcMain.handlers.has("settings:refresh-codex-pets"));
@@ -234,6 +341,354 @@ test("settings IPC registers owned channels and leaves animation override channe
 
   assert.strictEqual(ipcMain.handlers.size, 0);
   assert.strictEqual(ipcMain.listeners.size, 0);
+});
+
+test("settings IPC reads, selects, and clears the shared roam fence", async () => {
+  const calls = [];
+  const initial = {
+    status: "ok",
+    active: true,
+    fence: { left: 0.1, top: 0.2, right: 0.8, bottom: 0.9 },
+  };
+  const selected = { left: 0.25, top: 0.3, right: 0.75, bottom: 0.85 };
+  const harness = createHarness({
+    getLang: () => "zh",
+    roamFenceSettings: {
+      getStatus: async () => { calls.push(["get"]); return initial; },
+      saveFence: async (fence) => { calls.push(["save", fence]); return { status: "ok", active: true, fence }; },
+      clearFence: async () => { calls.push(["clear"]); return { status: "ok", active: false, fence: null }; },
+    },
+    roamFencePicker: {
+      selectArea: async (payload) => { calls.push(["pick", payload]); return { status: "ok", fence: selected }; },
+    },
+  });
+
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:get-roam-fence"), initial);
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:select-roam-fence"), {
+    status: "ok", active: true, fence: selected,
+  });
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:clear-roam-fence"), {
+    status: "ok", active: false, fence: null,
+  });
+  assert.deepStrictEqual(calls, [
+    ["get"],
+    ["pick", { lang: "zh" }],
+    ["save", selected],
+    ["clear"],
+  ]);
+});
+
+test("roam fence IPC rejects external senders, subframes, and a navigated Settings frame", async () => {
+  const calls = [];
+  const harness = createHarness({
+    roamFenceSettings: {
+      getStatus: async () => { calls.push("get"); return { status: "ok" }; },
+      saveFence: async () => { calls.push("save"); return { status: "ok" }; },
+      clearFence: async () => { calls.push("clear"); return { status: "ok" }; },
+    },
+    roamFencePicker: {
+      selectArea: async () => { calls.push("pick"); return { status: "cancel" }; },
+    },
+  });
+  const contents = harness.settingsWindow.webContents;
+  const frame = contents.mainFrame;
+  const channels = [
+    "settings:get-roam-fence",
+    "settings:select-roam-fence",
+    "settings:clear-roam-fence",
+  ];
+
+  for (const event of [
+    { sender: {}, senderFrame: null },
+    { sender: contents, senderFrame: { url: frame.url } },
+  ]) {
+    harness.ipcMain.invokeEvent = event;
+    for (const channel of channels) {
+      assert.deepStrictEqual(await harness.ipcMain.invoke(channel), {
+        status: "error",
+        message: "untrusted settings sender",
+      });
+    }
+  }
+
+  const localUrl = frame.url;
+  frame.url = "https://example.invalid/";
+  harness.ipcMain.invokeEvent = { sender: contents, senderFrame: frame };
+  for (const channel of channels) {
+    assert.deepStrictEqual(await harness.ipcMain.invoke(channel), {
+      status: "error",
+      message: "untrusted settings sender",
+    });
+  }
+  frame.url = localUrl;
+  assert.deepStrictEqual(calls, [], "untrusted callers must have no picker or file side effects");
+  harness.runtime.dispose();
+});
+
+test("Feishu email save bypasses the controller and exposes only one final IPC result", async () => {
+  const controllerCalls = [];
+  const operationCalls = [];
+  const settingsController = {
+    getSnapshot: () => ({ lang: "en" }),
+    applyUpdate: () => ({ status: "ok" }),
+    applyCommand: async (...args) => {
+      controllerCalls.push(args);
+      return { status: "ok" };
+    },
+  };
+  const harness = createHarness({
+    settingsController,
+    saveFeishuApproverByEmail: async (payload) => {
+      operationCalls.push(payload);
+      return {
+        status: "ok",
+        approverId: "ou_must_not_cross_ipc",
+        message: "raw detail must not cross ipc",
+      };
+    },
+  });
+
+  const trustedEvent = harness.ipcMain.invokeEvent;
+  const invokeSave = () => harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveApproverByEmail",
+    payload: { email: "foreign@example.com" },
+  });
+  for (const invokeEvent of [
+    { sender: {}, senderFrame: null },
+    { sender: trustedEvent.sender, senderFrame: { url: trustedEvent.senderFrame.url } },
+  ]) {
+    harness.ipcMain.invokeEvent = invokeEvent;
+    assert.deepStrictEqual(await invokeSave(), {
+      status: "error",
+      message: "untrusted settings sender",
+    });
+  }
+  const trustedUrl = trustedEvent.senderFrame.url;
+  trustedEvent.senderFrame.url = "https://example.invalid/";
+  harness.ipcMain.invokeEvent = trustedEvent;
+  assert.deepStrictEqual(await invokeSave(), {
+    status: "error",
+    message: "untrusted settings sender",
+  });
+  trustedEvent.senderFrame.url = trustedUrl;
+  assert.equal(operationCalls.length, 0);
+  harness.ipcMain.invokeEvent = trustedEvent;
+
+  const result = await harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveApproverByEmail",
+    payload: {
+      email: "person@example.com",
+      platform: "lark",
+      appSecret: "renderer-secret",
+      approverId: "ou_forged",
+    },
+  });
+
+  assert.deepStrictEqual(result, { status: "ok" });
+  assert.equal(controllerCalls.length, 0);
+  assert.equal(operationCalls.length, 1);
+  assert.deepStrictEqual(Object.keys(operationCalls[0]).sort(), ["email", "signal"]);
+  assert.equal(operationCalls[0].email, "person@example.com");
+  assert.equal(operationCalls[0].signal instanceof AbortSignal, true);
+  assert.equal(harness.settingsWindow.webContents.listenerCount("destroyed"), 0);
+  assert.equal(harness.settingsWindow.webContents.listenerCount("render-process-gone"), 0);
+  harness.runtime.dispose();
+});
+
+test("Feishu email lookup B immediately supersedes A without controller serialization", async () => {
+  const operations = [];
+  const harness = createHarness({
+    saveFeishuApproverByEmail: ({ email, signal }) => {
+      const deferred = createDeferred();
+      operations.push({ email, signal, deferred });
+      return deferred.promise;
+    },
+  });
+
+  const first = harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveApproverByEmail",
+    payload: { email: "a@example.com" },
+  });
+  await Promise.resolve();
+  const second = harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveApproverByEmail",
+    payload: { email: "b@example.com" },
+  });
+  await Promise.resolve();
+
+  assert.deepStrictEqual(operations.map((item) => item.email), ["a@example.com", "b@example.com"]);
+  assert.equal(operations[0].signal.aborted, true);
+  assert.equal(operations[1].signal.aborted, false);
+
+  operations[1].deferred.resolve({ status: "ok" });
+  assert.deepStrictEqual(await second, { status: "ok" });
+  operations[0].deferred.resolve({ status: "ok", approverId: "ou_late" });
+  assert.deepStrictEqual(await first, { status: "error", code: "lookup-superseded" });
+  harness.runtime.dispose();
+});
+
+test("Feishu email lookup A stays superseded when it settles before B", async () => {
+  const operations = [];
+  const harness = createHarness({
+    saveFeishuApproverByEmail: ({ email, signal }) => {
+      const deferred = createDeferred();
+      operations.push({ email, signal, deferred });
+      return deferred.promise;
+    },
+  });
+  const first = harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveApproverByEmail",
+    payload: { email: "a@example.com" },
+  });
+  await Promise.resolve();
+  const second = harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveApproverByEmail",
+    payload: { email: "b@example.com" },
+  });
+  await Promise.resolve();
+
+  operations[0].deferred.resolve({ status: "ok", approverId: "ou_a_late" });
+  assert.deepStrictEqual(await first, { status: "error", code: "lookup-superseded" });
+  assert.equal(operations[1].signal.aborted, false);
+  operations[1].deferred.resolve({ status: "ok" });
+  assert.deepStrictEqual(await second, { status: "ok" });
+  harness.runtime.dispose();
+});
+
+test("Feishu lookup cancel is sender-bound and resolves the pending save as cancelled", async () => {
+  let capturedSignal;
+  const harness = createHarness({
+    saveFeishuApproverByEmail: ({ signal }) => {
+      capturedSignal = signal;
+      return new Promise((resolve) => {
+        signal.addEventListener("abort", () => resolve({ status: "ok", approverId: "ou_late" }), { once: true });
+      });
+    },
+  });
+  const pending = harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveApproverByEmail",
+    payload: { email: "person@example.com" },
+  });
+  await Promise.resolve();
+
+  const contents = harness.settingsWindow.webContents;
+  const frame = contents.mainFrame;
+  harness.ipcMain.invokeEvent = { sender: {}, senderFrame: null };
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.cancelApproverLookup",
+  }), { status: "error", message: "untrusted settings sender" });
+  assert.equal(capturedSignal.aborted, false);
+
+  harness.ipcMain.invokeEvent = { sender: contents, senderFrame: frame };
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:command", {
+    action: "feishuApproval.cancelApproverLookup",
+  }), { status: "ok" });
+  assert.equal(capturedSignal.aborted, true);
+  assert.deepStrictEqual(await pending, { status: "error", code: "lookup-cancelled" });
+  harness.runtime.dispose();
+});
+
+test("Feishu lookup follows Settings WebContents and IPC disposal lifecycle", async () => {
+  for (const terminal of ["destroyed", "render-process-gone", "dispose"]) {
+    let capturedSignal;
+    const harness = createHarness({
+      saveFeishuApproverByEmail: ({ signal }) => {
+        capturedSignal = signal;
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ status: "ok" }), { once: true });
+        });
+      },
+    });
+    const pending = harness.ipcMain.invoke("settings:command", {
+      action: "feishuApproval.saveApproverByEmail",
+      payload: { email: `${terminal}@example.com` },
+    });
+    await Promise.resolve();
+
+    if (terminal === "dispose") harness.runtime.dispose();
+    else harness.settingsWindow.webContents.emit(terminal, {}, { reason: "synthetic" });
+
+    assert.equal(capturedSignal.aborted, true, terminal);
+    assert.deepStrictEqual(await pending, { status: "error", code: "lookup-cancelled" }, terminal);
+    assert.equal(harness.settingsWindow.webContents.listenerCount("destroyed"), 0, terminal);
+    assert.equal(harness.settingsWindow.webContents.listenerCount("render-process-gone"), 0, terminal);
+    harness.runtime.dispose();
+    harness.runtime.dispose();
+  }
+});
+
+test("settings IPC does not write when roam area selection is canceled", async () => {
+  let saveCalls = 0;
+  const harness = createHarness({
+    roamFenceSettings: {
+      getStatus: async () => ({ status: "ok", active: false, fence: null }),
+      saveFence: async () => { saveCalls += 1; return { status: "ok" }; },
+      clearFence: async () => ({ status: "ok", active: false, fence: null }),
+    },
+    roamFencePicker: { selectArea: async () => ({ status: "cancel" }) },
+  });
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:select-roam-fence"), { status: "cancel" });
+  assert.strictEqual(saveCalls, 0);
+});
+
+test("settings IPC preserves picker error codes and does not write an impossible area", async () => {
+  let saveCalls = 0;
+  const tooLarge = {
+    status: "error",
+    code: "pet-too-large",
+    message: "the pet is larger than this display's work area",
+  };
+  const harness = createHarness({
+    roamFenceSettings: {
+      getStatus: async () => ({ status: "ok", active: false, fence: null }),
+      saveFence: async () => { saveCalls += 1; return { status: "ok" }; },
+      clearFence: async () => ({ status: "ok", active: false, fence: null }),
+    },
+    roamFencePicker: { selectArea: async () => tooLarge },
+  });
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:select-roam-fence"), tooLarge);
+  assert.strictEqual(saveCalls, 0);
+});
+
+test("settings IPC reports quota source count and fails closed when the provider throws", async () => {
+  const ok = createHarness({ getQuotaSourceCount: () => 3 });
+  assert.strictEqual(await ok.ipcMain.invoke("settings:get-quota-source-count"), 3);
+  ok.runtime.dispose();
+
+  const broken = createHarness({
+    getQuotaSourceCount: () => {
+      throw new Error("quota store unavailable");
+    },
+  });
+  assert.strictEqual(await broken.ipcMain.invoke("settings:get-quota-source-count"), 0);
+  broken.runtime.dispose();
+});
+
+test("settings:list-themes uses active runtime capabilities over raw metadata", async () => {
+  const { ipcMain } = createHarness({
+    activeTheme: {
+      _id: "clawd",
+      _capabilities: { petTint: true, accessories: false },
+      sounds: {},
+    },
+    themeLoader: {
+      getPreviewSoundUrl: () => null,
+      getSoundOverridesDir: () => null,
+      getSoundUrl: () => null,
+      listThemesWithMetadata: () => [{
+        id: "clawd",
+        capabilities: { petTint: true, accessories: true, reactions: true },
+      }],
+      getThemeMetadata: () => null,
+      ensureUserThemesDir: () => null,
+    },
+  });
+
+  assert.deepStrictEqual(await ipcMain.invoke("settings:list-themes"), [{
+    id: "clawd",
+    active: true,
+    capabilities: { petTint: true, accessories: false, reactions: true },
+  }]);
 });
 
 test("settings IPC opens the tutorial from Settings", async () => {
@@ -289,6 +744,18 @@ test("settings IPC delegates controller and size preview handlers", async () => 
 
   assert.deepStrictEqual(await ipcMain.invoke("settings:get-snapshot"), { lang: "en" });
   assert.deepStrictEqual(
+    await ipcMain.invoke("settings:get-pet-tint-options"),
+    listPetTintOptions()
+  );
+  assert.deepStrictEqual(
+    await ipcMain.invoke("settings:get-pet-accessory-options"),
+    listPetAccessoryOptions()
+  );
+  assert.deepStrictEqual(
+    await ipcMain.invoke("settings:get-pet-mouth-accessory-options"),
+    listPetMouthAccessoryOptions()
+  );
+  assert.deepStrictEqual(
     await ipcMain.invoke("settings:update", null),
     { status: "error", message: "settings:update payload must be { key, value }" }
   );
@@ -301,27 +768,45 @@ test("settings IPC delegates controller and size preview handlers", async () => 
     status: "error",
     message: "tgMigration is internal; use telegramMigration.dispatch",
   });
+  assert.deepStrictEqual(await ipcMain.invoke("settings:update", { key: "permissionAutomationMode", value: "auto-tools" }), {
+    status: "error",
+    message: "permission automation is gated; use the setPermissionAutomationMode command",
+  });
   assert.deepStrictEqual(await ipcMain.invoke("settings:update", { key: "autoApproveAllPermissions", value: true }), {
     status: "error",
-    message: "autoApproveAllPermissions is gated; use the setAutoApproveAll command",
+    message: "permission automation is gated; use the setPermissionAutomationMode command",
   });
+  for (const key of [
+    "permissionAutomationAutoToolsWarningDismissed",
+    "permissionAutomationUnattendedWarningDismissed",
+  ]) {
+    assert.deepStrictEqual(await ipcMain.invoke("settings:update", { key, value: true }), {
+      status: "error",
+      message: "permission automation is gated; use the setPermissionAutomationMode command",
+    });
+  }
   assert.deepStrictEqual(await ipcMain.invoke("settings:command", { action: "resizePet", payload: "P:30" }), {
     status: "ok",
   });
-  assert.strictEqual(await ipcMain.invoke("settings:get-hardware-buddy-status"), null);
-  assert.deepStrictEqual(await ipcMain.invoke("settings:test-hardware-buddy-approval"), {
-    status: "error",
-    message: "Hardware Buddy test approval is unavailable",
-  });
-  assert.deepStrictEqual(await ipcMain.invoke("settings:get-quick-command-presets"), {
-    enabled: false,
-    presets: [],
-  });
-  assert.deepStrictEqual(await ipcMain.invoke("settings:send-quick-command", { id: "plan_first" }), {
-    status: "error",
-    code: "quick_commands_unavailable",
-    message: "Quick Commands are unavailable",
-  });
+  assert.deepStrictEqual(await ipcMain.invoke("settings:command", {
+    action: "feishuApproval.saveManualApprover",
+    payload: { idType: "union_id", approverId: "union-saved" },
+  }), { status: "ok" });
+  for (const action of [
+    "feishuApproval.commitResolvedApprover",
+    "remoteSsh.applyInstallationIdentity",
+    "remoteSsh.beginIdentityRotation",
+    "remoteSsh.updateIdentityStep",
+    "remoteSsh.commitIdentityRotation",
+    "remoteSsh.forceRevoke",
+    "remoteSsh.markDeployed",
+    "remoteSsh.markRemoteNode",
+  ]) {
+    assert.deepStrictEqual(
+      await ipcMain.invoke("settings:command", { action, payload: { forged: true } }),
+      { status: "error", message: `settings command "${action}" is internal` }
+    );
+  }
   assert.deepStrictEqual(await ipcMain.invoke("settings:begin-size-preview"), {
     status: "ok",
     phase: "begin",
@@ -340,62 +825,39 @@ test("settings IPC delegates controller and size preview handlers", async () => 
   assert.deepStrictEqual(calls, [
     ["applyUpdate", "size", "P:20"],
     ["applyCommand", "resizePet", "P:30"],
+    ["applyCommand", "feishuApproval.saveManualApprover", { idType: "union_id", approverId: "union-saved" }],
     ["sizeBegin"],
     ["sizePreview", "P:35"],
     ["sizeEnd", "P:35"],
   ]);
 });
 
-test("settings IPC delegates Hardware Buddy test approval helper", async () => {
-  const calls = [];
-  const { ipcMain } = createHarness({
-    testHardwareBuddyApproval: () => {
-      calls.push("test");
-      return Promise.resolve({ status: "ok", decision: "deny" });
-    },
+test("settings:update cannot bypass the Feishu command-only boundary", async () => {
+  const controller = createSettingsController({
+    loadResult: { snapshot: prefs.getDefaults(), locked: false },
+    commands: commandRegistry,
   });
+  const { ipcMain, runtime } = createHarness({ settingsController: controller });
+  const staleObject = { ...controller.get("feishuApproval") };
 
   assert.deepStrictEqual(
-    await ipcMain.invoke("settings:test-hardware-buddy-approval", { ignored: true }),
-    { status: "ok", decision: "deny" }
+    await controller.applyCommand("feishuApproval.updateConfig", { connectionTimeoutSeconds: 30 }),
+    { status: "ok", message: undefined },
   );
-  assert.deepStrictEqual(calls, ["test"]);
-});
-
-test("settings IPC delegates Quick Command helpers", async () => {
-  const calls = [];
-  const { ipcMain } = createHarness({
-    getQuickCommandPresets: () => ({
-      enabled: true,
-      presets: [{ id: "plan_first", label: "先列计划" }],
-    }),
-    sendQuickCommand: (payload) => {
-      calls.push(payload);
-      return { status: "ok", quickCommand: { id: payload.id } };
-    },
+  const result = await ipcMain.invoke("settings:update", {
+    key: "feishuApproval",
+    value: staleObject,
   });
 
-  assert.deepStrictEqual(await ipcMain.invoke("settings:get-quick-command-presets"), {
-    enabled: true,
-    presets: [{ id: "plan_first", label: "先列计划" }],
-  });
-  assert.deepStrictEqual(
-    await ipcMain.invoke("settings:send-quick-command", {
-      id: "plan_first",
-      clientRequestId: "qc-1",
-      userText: "should be stripped",
-      source: "renderer",
-      duration: "next_turn",
-      target: { scope: "active_session", sessionId: "session-1" },
-    }),
-    { status: "ok", quickCommand: { id: "plan_first" } }
-  );
-  assert.deepStrictEqual(calls, [{ id: "plan_first", clientRequestId: "qc-1" }]);
+  assert.equal(result.status, "error");
+  assert.match(result.message, /command-only/);
+  assert.equal(controller.get("feishuApproval").connectionTimeoutSeconds, 30);
+  runtime.dispose();
 });
 
 test("settings IPC delegates Codex Pet theme channels and decorates metadata", async () => {
   const codexCalls = [];
-  const { ipcMain } = createHarness({
+  const { ipcMain, settingsWindow } = createHarness({
     activeTheme: { _id: "imported-pet", sounds: {} },
     themeLoader: {
       getPreviewSoundUrl: () => null,
@@ -454,7 +916,7 @@ test("settings IPC delegates Codex Pet theme channels and decorates metadata", a
   assert.deepStrictEqual(codexCalls, [
     "refresh",
     "open-dir",
-    ["import", "sender-web-contents"],
+    ["import", settingsWindow.webContents],
     ["remove", "imported-pet"],
   ]);
 });
@@ -513,7 +975,7 @@ test("settings IPC imports Clawd user theme zip packages", async () => {
 
     let dialogParent = null;
     let dialogOptions = null;
-    const { ipcMain } = createHarness({
+    const { ipcMain, settingsWindow } = createHarness({
       dialog: {
         showOpenDialog: async (parent, options) => {
           dialogParent = parent;
@@ -538,7 +1000,7 @@ test("settings IPC imports Clawd user theme zip packages", async () => {
       name: "Pixel Cat",
       path: path.join(userThemesDir, "pixel-cat"),
     });
-    assert.deepStrictEqual(dialogParent, { id: "parent", sender: "sender-web-contents" });
+    assert.deepStrictEqual(dialogParent, { id: "parent", sender: settingsWindow.webContents });
     assert.deepStrictEqual(dialogOptions.properties, ["openFile"]);
     assert.deepStrictEqual(dialogOptions.filters, [{ name: "Clawd theme zip", extensions: ["zip"] }]);
     assert.strictEqual(
@@ -655,7 +1117,7 @@ test("settings IPC serves agent/about/update/external and remove-theme dialog he
     fs.writeFileSync(heroSvgPath, "<svg id=\"hero\"></svg>", "utf8");
     let messageBoxParent = null;
     let messageBoxOptions = null;
-    const { ipcMain, calls } = createHarness({
+    const { ipcMain, calls, settingsWindow } = createHarness({
       aboutHeroSvgPath: heroSvgPath,
       getLang: () => "en",
       dialog: {
@@ -675,12 +1137,83 @@ test("settings IPC serves agent/about/update/external and remove-theme dialog he
       },
       getAllAgents: () => [
         { id: "codex", name: "Codex", eventSource: "hook", capabilities: { permission: true } },
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: {} },
+        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: {} },
       ],
+      getHookServerPort: () => 23335,
+      getRecentHookEvents: ({ agentId }) => [{
+        timestamp: 12345,
+        agentId,
+        eventType: "PreToolUse",
+        route: "state",
+        outcome: "accepted",
+      }],
+      settingsController: {
+        getSnapshot: () => ({
+          lang: "en",
+          customApplications: [{
+            id: "custom-nova-ai-0123456789ab",
+            name: "Nova AI",
+            sourcePath: "C:\\NovaAI",
+            executablePath: "C:\\NovaAI\\NovaAI.exe",
+            processName: "NovaAI.exe",
+            category: "code",
+          }],
+        }),
+        applyUpdate: () => ({ status: "ok" }),
+        applyCommand: async () => ({ status: "ok" }),
+      },
     });
 
     assert.strictEqual(await ipcMain.invoke("settings:get-preview-sound-url"), "file:///preview.mp3");
     assert.deepStrictEqual(await ipcMain.invoke("settings:list-agents"), [
-      { id: "codex", name: "Codex", eventSource: "hook", capabilities: { permission: true } },
+      // #895: cleanupSuggestionExempt is derived from prefs' complete default-
+      // integration list. Both defaults must ship true, while a non-default
+      // agent must ship an explicit false before the renderer may propose
+      // removing its hooks. This three-way contract kills all-true, all-false,
+      // and Codex-only producer mutations.
+      {
+        id: "codex",
+        name: "Codex",
+        eventSource: "hook",
+        capabilities: { permission: true },
+        cleanupSuggestionExempt: true,
+      },
+      {
+        id: "claude-code",
+        name: "Claude Code",
+        eventSource: "hook",
+        capabilities: {},
+        cleanupSuggestionExempt: true,
+      },
+      {
+        id: "qwen-code",
+        name: "Qwen Code",
+        eventSource: "hook",
+        capabilities: {},
+        cleanupSuggestionExempt: false,
+      },
+      {
+        id: "custom-nova-ai-0123456789ab",
+        name: "Nova AI",
+        category: "code",
+        eventSource: "custom-http",
+        custom: true,
+        sourcePath: "C:\\NovaAI",
+        executablePath: "C:\\NovaAI\\NovaAI.exe",
+        processName: "NovaAI.exe",
+        stateEndpoint: "http://127.0.0.1:23335/state",
+        lastStateEvent: { timestamp: 12345, eventType: "PreToolUse" },
+        capabilities: {
+          httpHook: true,
+          permissionApproval: false,
+          interactiveBubble: false,
+          notificationHook: true,
+          sessionEnd: true,
+          subagent: false,
+          managedIntegration: false,
+        },
+      },
     ]);
     assert.deepStrictEqual(await ipcMain.invoke("settings:get-about-info"), {
       version: "1.2.3",
@@ -692,13 +1225,19 @@ test("settings IPC serves agent/about/update/external and remove-theme dialog he
       heroSvgContent: "<svg id=\"hero\"></svg>",
       pendingUpdateVersion: "",
       autoUpdateCheck: true,
+      updateCheckSnapshot: { state: "idle" },
     });
     assert.deepStrictEqual(await ipcMain.invoke("settings:confirm-remove-theme", "user-theme"), {
       confirmed: true,
     });
-    assert.deepStrictEqual(messageBoxParent, { id: "parent", sender: "sender-web-contents" });
+    assert.deepStrictEqual(messageBoxParent, { id: "parent", sender: settingsWindow.webContents });
     assert.strictEqual(messageBoxOptions.message, 'Delete theme "Theme user-theme"?');
-    assert.deepStrictEqual(await ipcMain.invoke("settings:check-for-updates"), { status: "ok" });
+    assert.deepStrictEqual(await ipcMain.invoke("settings:check-for-updates"), {
+      state: "up-to-date",
+      version: "1.2.3",
+    });
+    assert.deepStrictEqual(await ipcMain.invoke("settings:clear-update-error"), { state: "idle" });
+    assert.deepStrictEqual(await ipcMain.invoke("settings:copy-update-error", "safe report"), { status: "ok" });
     assert.deepStrictEqual(await ipcMain.invoke("settings:open-external", "file:///tmp"), {
       status: "error",
       message: "Invalid URL",
@@ -708,11 +1247,40 @@ test("settings IPC serves agent/about/update/external and remove-theme dialog he
     });
     assert.deepStrictEqual(calls, [
       ["checkForUpdates", true],
+      ["copyUpdateError", "safe report"],
       ["openExternal", "https://example.test"],
     ]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("settings IPC picks executable files and installation folders for discovery", async () => {
+  const selections = ["C:\\Tools\\agent.exe", "C:\\Tools\\Agent"];
+  const optionsSeen = [];
+  const { ipcMain } = createHarness({
+    dialog: {
+      showOpenDialog: async (_parent, options) => {
+        optionsSeen.push(options);
+        return { canceled: false, filePaths: [selections[optionsSeen.length - 1]] };
+      },
+      showMessageBox: async () => ({ response: 1 }),
+    },
+  });
+
+  assert.deepStrictEqual(await ipcMain.invoke("settings:pick-agent-discovery-path", { kind: "file" }), {
+    status: "ok",
+    path: selections[0],
+  });
+  assert.deepStrictEqual(await ipcMain.invoke("settings:pick-agent-discovery-path", { kind: "directory" }), {
+    status: "ok",
+    path: selections[1],
+  });
+  assert.deepStrictEqual(optionsSeen.map((options) => options.properties), [["openFile"], ["openDirectory"]]);
+  assert.deepStrictEqual(await ipcMain.invoke("settings:pick-agent-discovery-path", { kind: "anything" }), {
+    status: "error",
+    message: "pickAgentDiscoveryPath.kind must be file or directory",
+  });
 });
 
 test("settings IPC exposes read-only agent installation detection", async () => {
@@ -726,7 +1294,7 @@ test("settings IPC exposes read-only agent installation detection", async () => 
       return {
         checkedAt: options.now(),
         agents: [{ agentId: "qwen-code", detectedInstalled: true }],
-        skippedAgentIds: ["claude-code", "codex"],
+        skippedAgentIds: ["claude-code"],
       };
     },
   });
@@ -734,10 +1302,41 @@ test("settings IPC exposes read-only agent installation detection", async () => 
   assert.deepStrictEqual(await ipcMain.invoke("settings:detect-agent-installations"), {
     checkedAt: 777,
     agents: [{ agentId: "qwen-code", detectedInstalled: true }],
-    skippedAgentIds: ["claude-code", "codex"],
+    skippedAgentIds: ["claude-code"],
   });
   assert.strictEqual(sawFs, true);
   assert.strictEqual(sawPath, true);
 
   runtime.dispose();
+});
+
+// #895 T11d: asserted through the real detector against a throwaway home, so it
+// pins the behaviour the Settings page depends on rather than which option keys
+// happen to be passed. Codex must reach the Agents tab; Claude must not, because
+// Clawd's own sync creates ~/.claude and its presence proves nothing. Settings
+// previously withheld both, and the catalog then labelled the ones it had never
+// examined as "not detected locally".
+test("settings IPC scan examines Codex locally and still withholds Claude", async () => {
+  const { detectAgentInstallations: realDetect } = require("../src/agent-installation-detector");
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-ipc-detect-"));
+  fs.mkdirSync(path.join(homeDir, ".codex"));
+  const { ipcMain, runtime } = createHarness({
+    detectAgentInstallations: (options) => realDetect({ ...options, homeDir, platform: "darwin", env: {} }),
+  });
+
+  try {
+    const report = await ipcMain.invoke("settings:detect-agent-installations");
+    const ids = report.agents.map((entry) => entry.agentId);
+
+    assert.ok(ids.includes("codex"), "Codex must be examined by the Settings scan");
+    assert.ok(!ids.includes("claude-code"), "Claude stays withheld");
+    assert.deepStrictEqual(report.skippedAgentIds, ["claude-code"]);
+
+    const codex = report.agents.find((entry) => entry.agentId === "codex");
+    assert.strictEqual(codex.detectedInstalled, true);
+    assert.strictEqual(codex.reason, "parent-dir");
+  } finally {
+    runtime.dispose();
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
 });

@@ -92,8 +92,85 @@ function computeAutoCloseRemainingMs(shownAt, autoCloseMs, now = Date.now()) {
   return Math.max(0, totalMs - Math.max(0, now - startedAt));
 }
 
+const FOLLOW_PREFERENCES = new Set(["auto", "left", "right"]);
+const FIXED_CORNERS = new Set(["top-left", "top-right", "bottom-left", "bottom-right"]);
+
+function normalizeFollowPreference(value) {
+  return FOLLOW_PREFERENCES.has(value) ? value : "auto";
+}
+
+function normalizeFixedCorner(value) {
+  return FIXED_CORNERS.has(value) ? value : "bottom-right";
+}
+
+function isUsableRect(rect) {
+  return !!(
+    rect
+    && Number.isFinite(rect.x)
+    && Number.isFinite(rect.y)
+    && Number.isFinite(rect.width)
+    && rect.width > 0
+    && Number.isFinite(rect.height)
+    && rect.height > 0
+  );
+}
+
+function rectsIntersect(a, b) {
+  return a.x < b.x + b.width
+    && a.x + a.width > b.x
+    && a.y < b.y + b.height
+    && a.y + a.height > b.y;
+}
+
+function normalizeAvoidRects(avoidRects) {
+  return Array.isArray(avoidRects) ? avoidRects.filter(isUsableRect) : [];
+}
+
+function findDirectionalY(rect, avoidRects, workArea, edgeMargin, gap, direction) {
+  const minY = workArea.y + edgeMargin;
+  const maxY = workArea.y + workArea.height - edgeMargin - rect.height;
+  if (maxY < minY) return minY;
+  let y = Math.max(minY, Math.min(rect.y, maxY));
+  const blockers = normalizeAvoidRects(avoidRects);
+  for (let pass = 0; pass <= blockers.length; pass++) {
+    const candidate = { ...rect, y };
+    const collisions = blockers.filter((blocker) => rectsIntersect(candidate, blocker));
+    if (collisions.length === 0) return y;
+    if (direction === "down") {
+      y = Math.max(...collisions.map((blocker) => blocker.y + blocker.height + gap), y);
+    } else {
+      y = Math.min(...collisions.map((blocker) => blocker.y - gap - rect.height), y);
+    }
+    if (y < minY || y > maxY) return null;
+  }
+  return null;
+}
+
+function findNearestY(rect, avoidRects, workArea, edgeMargin, gap) {
+  const minY = workArea.y + edgeMargin;
+  const maxY = workArea.y + workArea.height - edgeMargin - rect.height;
+  if (maxY < minY) return minY;
+  const idealY = Math.max(minY, Math.min(rect.y, maxY));
+  const blockers = normalizeAvoidRects(avoidRects);
+  const candidates = new Set([idealY, minY, maxY]);
+  for (const blocker of blockers) {
+    if (rect.x >= blocker.x + blocker.width || rect.x + rect.width <= blocker.x) continue;
+    candidates.add(blocker.y - gap - rect.height);
+    candidates.add(blocker.y + blocker.height + gap);
+  }
+  return [...candidates]
+    .filter((candidate) => Number.isFinite(candidate) && candidate >= minY && candidate <= maxY)
+    .sort((a, b) => Math.abs(a - idealY) - Math.abs(b - idealY) || a - b)
+    .find((candidate) => {
+      const positioned = { ...rect, y: candidate };
+      return !blockers.some((blocker) => rectsIntersect(positioned, blocker));
+    });
+}
+
 function computeUpdateBubbleBounds({
   bubbleFollowPet,
+  followPreference = "auto",
+  fixedCorner = "bottom-right",
   width,
   edgeMargin,
   gap,
@@ -104,12 +181,40 @@ function computeUpdateBubbleBounds({
   petBounds,
   anchorRect,
   hitRect,
+  avoidRects = [],
 }) {
   const permissionStackOffset = Math.max(0, Number(reservedHeight) || 0);
-  let x = workArea.x + workArea.width - width - edgeMargin;
-  let y = workArea.y + workArea.height - edgeMargin - height - permissionStackOffset;
-
   const followRect = anchorRect || hitRect;
+  const blockers = normalizeAvoidRects(avoidRects);
+  const minX = workArea.x;
+  const maxX = workArea.x + workArea.width - width;
+  const buildFixedCandidate = (corner, allowCollisionFallback = false) => {
+    const normalizedCorner = normalizeFixedCorner(corner);
+    const left = normalizedCorner.endsWith("left");
+    const top = normalizedCorner.startsWith("top");
+    const x = left ? workArea.x + edgeMargin : maxX - edgeMargin;
+    const idealY = top
+      ? workArea.y + edgeMargin
+      : workArea.y + workArea.height - edgeMargin - height - permissionStackOffset;
+    const baseRect = { x, y: idealY, width, height };
+    const y = findDirectionalY(
+      baseRect,
+      blockers,
+      workArea,
+      edgeMargin,
+      gap,
+      top ? "down" : "up"
+    );
+    if (y !== undefined && y !== null) return { ...baseRect, y };
+    if (!allowCollisionFallback) return null;
+    return {
+      ...baseRect,
+      y: Math.max(
+        workArea.y + edgeMargin,
+        Math.min(idealY, workArea.y + workArea.height - edgeMargin - height)
+      ),
+    };
+  };
 
   if (bubbleFollowPet && petBounds && followRect) {
     const followTop = Math.round(followRect.top);
@@ -119,34 +224,62 @@ function computeUpdateBubbleBounds({
     const underPetY = followRectBottom + gap + reserve + permissionStackOffset;
     const abovePetY = followTop - gap - height;
     const workAreaBottom = workArea.y + workArea.height - edgeMargin;
-    const maxY = workAreaBottom - height;
+    const followRight = Math.round(followRect.right);
+    const followLeft = Math.round(followRect.left);
+    const followCy = Math.round((followRect.top + followRect.bottom) / 2);
+    const spaceRight = workArea.x + workArea.width - followRight;
+    const spaceLeft = followLeft - workArea.x;
+    const autoSideOrder = spaceRight >= spaceLeft ? ["right", "left"] : ["left", "right"];
+    const preference = normalizeFollowPreference(followPreference);
+    const candidateOrder = preference === "left"
+      ? ["left", "below", "above", "right"]
+      : (preference === "right"
+        ? ["right", "below", "above", "left"]
+        : ["below", "above", ...autoSideOrder]);
 
-    if (underPetY + height <= workAreaBottom) {
-      x = Math.max(workArea.x, Math.min(followCx - Math.round(width / 2), workArea.x + workArea.width - width));
-      y = underPetY;
-    } else if (abovePetY >= workArea.y + edgeMargin) {
-      x = Math.max(workArea.x, Math.min(followCx - Math.round(width / 2), workArea.x + workArea.width - width));
-      y = abovePetY;
-    } else {
-      const followRight = Math.round(followRect.right);
-      const followLeft = Math.round(followRect.left);
-      const followCy = Math.round((followRect.top + followRect.bottom) / 2);
-      const spaceRight = workArea.x + workArea.width - followRight;
-      const spaceLeft = followLeft - workArea.x;
-      if (spaceRight >= width || spaceRight >= spaceLeft) {
-        x = Math.min(followRight + gap, workArea.x + workArea.width - width);
-      } else {
-        x = Math.max(workArea.x, followLeft - gap - width);
-      }
-      y = Math.max(
-        workArea.y + edgeMargin,
-        Math.min(followCy - Math.round(height / 2), maxY)
+    const tryVertical = (direction) => {
+      const x = Math.max(minX, Math.min(followCx - Math.round(width / 2), maxX));
+      const idealY = direction === "below" ? underPetY : abovePetY;
+      if (direction === "below" && idealY + height > workAreaBottom) return null;
+      if (direction === "above" && idealY < workArea.y + edgeMargin) return null;
+      const baseRect = { x, y: idealY, width, height };
+      const y = findDirectionalY(
+        baseRect,
+        blockers,
+        workArea,
+        edgeMargin,
+        gap,
+        direction === "below" ? "down" : "up"
       );
+      return y === undefined || y === null ? null : { ...baseRect, y };
+    };
+
+    const trySide = (side) => {
+      if (side === "right" && spaceRight < width) return null;
+      if (side === "left" && spaceLeft < width) return null;
+      const x = side === "right"
+        ? Math.min(followRight + gap, maxX)
+        : Math.max(minX, followLeft - gap - width);
+      const baseRect = {
+        x,
+        y: followCy - Math.round(height / 2),
+        width,
+        height,
+      };
+      const y = findNearestY(baseRect, blockers, workArea, edgeMargin, gap);
+      return y === undefined || y === null ? null : { ...baseRect, y };
+    };
+
+    for (const candidate of candidateOrder) {
+      const result = candidate === "below" || candidate === "above"
+        ? tryVertical(candidate)
+        : trySide(candidate);
+      if (result) return result;
     }
+    return buildFixedCandidate("bottom-right", true);
   }
 
-  y = Math.max(workArea.y + edgeMargin, y);
-  return { x, y, width, height };
+  return buildFixedCandidate(fixedCorner, true);
 }
 
 module.exports = function initUpdateBubble(ctx) {
@@ -159,27 +292,46 @@ module.exports = function initUpdateBubble(ctx) {
   let autoCloseTimer = null;
   let visibleSince = 0;
 
-  function getTextScale() {
-    return clampTextScale(typeof ctx.getTextScale === "function" ? ctx.getTextScale() : 1);
+  function notifyOrbitGeometryChanged() {
+    const reposition = typeof ctx.repositionQuotaRing === "function"
+      ? ctx.repositionQuotaRing
+      : ctx.repositionSessionHud;
+    if (typeof reposition !== "function") return;
+    try { reposition(); } catch {}
   }
 
-  function getPermissionStackHeight() {
-    const pending = typeof ctx.getPendingPermissions === "function" ? ctx.getPendingPermissions() : [];
-    const scale = getTextScale();
-    let total = 0;
-    for (const perm of pending) {
-      if (!perm || !perm.bubble || perm.bubble.isDestroyed() || !perm.bubble.isVisible()) continue;
-      // perm.measuredHeight is CSS px (see permission.js); the offset is DIP.
-      total += scaleHeight(perm.measuredHeight || 200, scale);
-      total += Math.round(GAP * scale);
+  function getTextScale(workArea) {
+    return clampTextScale(typeof ctx.getTextScale === "function" ? ctx.getTextScale(workArea) : 1);
+  }
+
+  function getTargetWorkArea(petBounds) {
+    if (typeof ctx.getBubbleWorkArea === "function") {
+      return ctx.getBubbleWorkArea(!!ctx.bubbleFollowPet, petBounds);
     }
-    return total;
+    const cx = petBounds.x + petBounds.width / 2;
+    const cy = petBounds.y + petBounds.height / 2;
+    return ctx.getNearestWorkArea(cx, cy);
+  }
+
+  function getAvoidRects() {
+    const rects = [];
+    for (const getterName of ["getPermissionBubbleBounds", "getSessionHudBounds"]) {
+      if (typeof ctx[getterName] !== "function") continue;
+      try {
+        const value = ctx[getterName]();
+        if (Array.isArray(value)) rects.push(...value);
+        else if (value) rects.push(value);
+      } catch {}
+    }
+    return rects;
   }
 
   function ensureBubble() {
     if (bubble && !bubble.isDestroyed()) return bubble;
 
-    const scale = getTextScale();
+    const petBounds = ctx.getPetWindowBounds();
+    const workArea = getTargetWorkArea(petBounds);
+    const scale = getTextScale(workArea);
     bubble = new BrowserWindow({
       width: scaleWidth(WIDTH, scale),
       height: scaleHeight(estimateHeight(activePayload), scale),
@@ -206,6 +358,7 @@ module.exports = function initUpdateBubble(ctx) {
     bubble.on("closed", () => {
       bubble = null;
       measuredHeight = 0;
+      notifyOrbitGeometryChanged();
       if (resolveAction) {
         const fallback = activePayload && activePayload.defaultAction != null ? activePayload.defaultAction : null;
         const resolver = resolveAction;
@@ -217,7 +370,8 @@ module.exports = function initUpdateBubble(ctx) {
     bubble.webContents.once("did-finish-load", () => {
       // Explicit even though same-origin propagation usually covers it — a
       // stale partition-persisted factor must never win over prefs.
-      applyZoomToWindow(bubble, getTextScale());
+      const petBounds = ctx.getPetWindowBounds();
+      applyZoomToWindow(bubble, getTextScale(getTargetWorkArea(petBounds)));
       if (activePayload) bubble.webContents.send("update-bubble-show", activePayload);
     });
 
@@ -225,14 +379,12 @@ module.exports = function initUpdateBubble(ctx) {
     return bubble;
   }
 
-  function computeBounds(scale = getTextScale()) {
+  function computeBounds(target = null) {
     if (!ctx.win || ctx.win.isDestroyed()) return null;
-    const petBounds = ctx.getPetWindowBounds();
-    const cx = petBounds.x + petBounds.width / 2;
-    const cy = petBounds.y + petBounds.height / 2;
-    const wa = ctx.getNearestWorkArea(cx, cy);
+    const petBounds = target && target.petBounds ? target.petBounds : ctx.getPetWindowBounds();
+    const wa = target && target.workArea ? target.workArea : getTargetWorkArea(petBounds);
+    const scale = target && Number.isFinite(target.scale) ? target.scale : getTextScale(wa);
     const height = scaleHeight(measuredHeight || estimateHeight(activePayload), scale);
-    const reservedHeight = getPermissionStackHeight();
     const anchorRect = ctx.bubbleFollowPet && typeof ctx.getUpdateBubbleAnchorRect === "function"
       ? ctx.getUpdateBubbleAnchorRect(petBounds)
       : null;
@@ -240,16 +392,19 @@ module.exports = function initUpdateBubble(ctx) {
 
     return computeUpdateBubbleBounds({
       bubbleFollowPet: ctx.bubbleFollowPet,
+      followPreference: ctx.bubbleFollowPreference,
+      fixedCorner: ctx.bubbleFixedCorner,
       width: Math.min(scaleWidth(WIDTH, scale), Math.floor(wa.width * MAX_WORK_AREA_WIDTH_RATIO)),
       edgeMargin: Math.round(EDGE_MARGIN * scale),
       gap: Math.round(GAP * scale),
       height,
-      reservedHeight,
-      hudReservedOffset: typeof ctx.getHudReservedOffset === "function" ? ctx.getHudReservedOffset() : 0,
+      reservedHeight: 0,
+      hudReservedOffset: 0,
       workArea: wa,
       petBounds,
       anchorRect,
       hitRect,
+      avoidRects: getAvoidRects(),
     });
   }
 
@@ -257,15 +412,18 @@ module.exports = function initUpdateBubble(ctx) {
     if (!bubble || bubble.isDestroyed()) return;
     // Resolve the scale ONCE and feed the same value to both the zoom
     // injection and the bounds math (see session-hud syncSessionHud).
-    const scale = getTextScale();
+    const petBounds = ctx.getPetWindowBounds();
+    const workArea = getTargetWorkArea(petBounds);
+    const scale = getTextScale(workArea);
     applyZoomToWindow(bubble, scale);
-    const bounds = computeBounds(scale);
+    const bounds = computeBounds({ petBounds, workArea, scale });
     if (bounds) bubble.setBounds(bounds);
   }
 
-  function syncVisibility() {
+  function syncVisibility(hiddenOverride) {
     if (!bubble || bubble.isDestroyed()) return;
-    if (ctx.petHidden) {
+    const hidden = typeof hiddenOverride === "boolean" ? hiddenOverride : ctx.petHidden;
+    if (hidden) {
       bubble.hide();
       return;
     }
@@ -356,6 +514,7 @@ module.exports = function initUpdateBubble(ctx) {
       if (win && !win.isDestroyed()) {
         win.webContents.send("update-bubble-show", payload);
         syncVisibility();
+        notifyOrbitGeometryChanged();
         scheduleAutoClose(payload);
       }
     };
@@ -383,7 +542,10 @@ module.exports = function initUpdateBubble(ctx) {
     visibleSince = 0;
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
-      if (bubble && !bubble.isDestroyed()) bubble.hide();
+      if (bubble && !bubble.isDestroyed()) {
+        bubble.hide();
+        notifyOrbitGeometryChanged();
+      }
     }, 250);
   }
 
@@ -405,6 +567,25 @@ module.exports = function initUpdateBubble(ctx) {
   function handleUpdateBubbleAction(event, actionId) {
     const senderWin = BrowserWindow.fromWebContents(event.sender);
     if (!bubble || senderWin !== bubble) return;
+    if (actionId === "copy-error") {
+      const feedback = activePayload && activePayload.copyFeedback || {};
+      let status = "ok";
+      try {
+        if (!ctx.clipboard || typeof ctx.clipboard.writeText !== "function") {
+          throw new Error("clipboard unavailable");
+        }
+        ctx.clipboard.writeText(String(activePayload && activePayload.copyText || ""));
+      } catch (_) {
+        status = "error";
+      }
+      if (bubble && !bubble.isDestroyed()) {
+        bubble.webContents.send("update-bubble-copy-result", {
+          status,
+          label: status === "ok" ? feedback.copied : feedback.failed,
+        });
+      }
+      return;
+    }
     hideUpdateBubble();
     resolveCurrentAction(actionId);
   }
@@ -415,6 +596,7 @@ module.exports = function initUpdateBubble(ctx) {
     if (typeof height === "number" && height > 0) {
       measuredHeight = Math.ceil(height);
       repositionUpdateBubble();
+      notifyOrbitGeometryChanged();
     }
   }
 

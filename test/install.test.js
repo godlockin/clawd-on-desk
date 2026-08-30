@@ -3,8 +3,25 @@ const assert = require("node:assert");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { registerHooks, unregisterHooks, registerHooksAsync, unregisterHooksAsync, __test } = require("../hooks/install");
+const {
+  registerHooks,
+  unregisterHooks,
+  registerHooksAsync,
+  unregisterHooksAsync,
+  registerClaudeStatusline,
+  unregisterClaudeStatusline,
+  STATUSLINE_MARKER,
+  CLAUDE_CORE_HOOK_EVENTS,
+  getClaudeHookScriptPath,
+  getClaudeAutoStartScriptPath,
+  __test,
+} = require("../hooks/install");
 const { buildPermissionUrl, SERVER_PORTS } = require("../hooks/server-config");
+const { classifyManagedClaudeStateHookCommand } = require("../hooks/json-utils");
+const {
+  inspectClaudeHookHealth,
+  buildClaudeRepairSignature,
+} = require("../src/claude-hook-health");
 const {
   parseClaudeVersion,
   getWindowsClaudePathSuffixes,
@@ -18,9 +35,32 @@ const {
   readClaudeVersionFallbackAsync,
   getClaudeVersionAsync,
   isClawdPermissionUrl,
+  parseClaudeInstallCliOptions,
 } = __test;
 
+// registerHooks derives the hook command format from real-environment WSL
+// signals; clear them so command-format assertions stay deterministic when
+// the suite itself runs inside WSL.
+delete process.env.CLAWD_WSL_DISTRO;
+delete process.env.WSL_DISTRO_NAME;
+
 const tempDirs = [];
+
+function secureRemoteIdentity(overrides = {}) {
+  return {
+    ok: true,
+    version: 2,
+    layoutVersion: 1,
+    runtimeKey: "profile-a",
+    profileId: "profile-a",
+    installId: "a".repeat(64),
+    remotePort: 23334,
+    routingNonce: "b".repeat(64),
+    deployedAt: 1,
+    filePath: "/home/test/.claude/hooks/clawd-remote.json",
+    ...overrides,
+  };
+}
 
 function makeTempSettings(initialSettings = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-install-"));
@@ -40,17 +80,23 @@ function getCommandHookEntries(settings, event, marker) {
   const hooks = [];
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
-    if (typeof entry.command === "string" && entry.command.includes(marker)) {
+    if (typeof entry.command === "string" && (!marker || entry.command.includes(marker))) {
       hooks.push(entry);
     }
     if (!Array.isArray(entry.hooks)) continue;
     for (const hook of entry.hooks) {
-      if (hook && typeof hook.command === "string" && hook.command.includes(marker)) {
+      if (hook && typeof hook.command === "string" && (!marker || hook.command.includes(marker))) {
         hooks.push(hook);
       }
     }
   }
   return hooks;
+}
+
+function getManagedStateHookEntries(settings, event) {
+  return getCommandHookEntries(settings, event).filter((hook) => (
+    classifyManagedClaudeStateHookCommand(hook.command, settings, event) !== null
+  ));
 }
 
 function getClawdCommands(settings, event) {
@@ -571,16 +617,55 @@ describe("Hook installer version compatibility", () => {
     assert.ok(stopHooks[0].command.endsWith('" Stop'), stopHooks[0].command);
   });
 
-  it("keeps remote hooks on the legacy bash-compatible format", () => {
+  it("keeps remote hooks bash-compatible while pinning secure identity", () => {
     const hook = __test.buildCommandHookSpec("node", "/tmp/clawd-hook.js", "Stop", {
       platform: "win32",
       remote: true,
+      sshRemote: true,
     });
 
-    assert.deepStrictEqual(hook, {
-      type: "command",
-      command: 'CLAWD_REMOTE=1 "node" "/tmp/clawd-hook.js" Stop',
+    assert.strictEqual(hook.type, "command");
+    assert.match(hook.command, /^CLAWD_REMOTE=1 CLAWD_SSH_REMOTE=1 /);
+    assert.match(hook.command, /CLAWD_REMOTE_IDENTITY_PATH=/);
+    assert.match(hook.command, /"node" "\/tmp\/clawd-hook\.js" Stop$/);
+  });
+
+  it("keeps legacy WSL --remote on CLAWD_REMOTE without opting into SSH secure transport", () => {
+    const hook = __test.buildCommandHookSpec(
+      "/usr/bin/node",
+      "/home/u/.claude/hooks/clawd-hook.js",
+      "Stop",
+      {
+        platform: "linux",
+        remote: true,
+        wslDistro: "Ubuntu",
+        env: {},
+      },
+    );
+    assert.match(hook.command, /^CLAWD_REMOTE=1 /);
+    assert.doesNotMatch(hook.command, /CLAWD_SSH_REMOTE|CLAWD_REMOTE_IDENTITY_PATH/);
+  });
+
+  it("uses the plain (unquoted) command format for WSL installs", () => {
+    // Quoted-without-shell breaks Claude Code's hook runner on WSL — quotes
+    // become part of the executable name (silent hook failure, the root
+    // cause this PR fixes). Native POSIX keeps the quoted form.
+    const hook = __test.buildCommandHookSpec("/usr/bin/node", "/home/u/.claude/hooks/clawd-hook.js", "Stop", {
+      platform: "linux",
+      wslDistro: "Ubuntu",
     });
+
+    assert.strictEqual(hook.type, "command");
+    assert.strictEqual(hook.command, "/usr/bin/node /home/u/.claude/hooks/clawd-hook.js Stop");
+    assert.ok(!("shell" in hook), "WSL hooks must not carry a shell field");
+  });
+
+  it("keeps the quoted command format for native POSIX (no wslDistro)", () => {
+    const hook = __test.buildCommandHookSpec("/usr/bin/node", "/opt/app dir/clawd-hook.js", "Stop", {
+      platform: "linux",
+    });
+
+    assert.strictEqual(hook.command, '"/usr/bin/node" "/opt/app dir/clawd-hook.js" Stop');
   });
 
   it("registers remote hooks as async with reverse-tunnel headroom", () => {
@@ -589,6 +674,8 @@ describe("Hook installer version compatibility", () => {
       silent: true,
       settingsPath,
       remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
       nodeBin: "/usr/bin/node",
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
     });
@@ -596,7 +683,8 @@ describe("Hook installer version compatibility", () => {
     const settings = readSettings(settingsPath);
     const stopHooks = getCommandHookEntries(settings, "Stop", "clawd-hook.js");
     assert.strictEqual(stopHooks.length, 1);
-    assert.ok(stopHooks[0].command.startsWith('CLAWD_REMOTE=1 "/usr/bin/node" "'), stopHooks[0].command);
+    assert.ok(stopHooks[0].command.startsWith("CLAWD_REMOTE=1 CLAWD_SSH_REMOTE=1 "), stopHooks[0].command);
+    assert.ok(stopHooks[0].command.includes("CLAWD_REMOTE_IDENTITY_PATH='/home/test/.claude/hooks/clawd-remote.json'"), stopHooks[0].command);
     assert.strictEqual(stopHooks[0].async, true);
     assert.strictEqual(stopHooks[0].timeout, 10);
     assert.ok(!Object.prototype.hasOwnProperty.call(stopHooks[0], "shell"));
@@ -1152,6 +1240,10 @@ describe("Claude permission hook ownership", () => {
         true,
         `expected managed port ${port} to be Clawd-owned`
       );
+      assert.strictEqual(
+        isClawdPermissionUrl(`http://127.0.0.1:${port}/permission?nonce=${"a".repeat(32)}`),
+        true,
+      );
     }
 
     assert.strictEqual(isClawdPermissionUrl("http://127.0.0.1:8080/permission"), false);
@@ -1161,6 +1253,39 @@ describe("Claude permission hook ownership", () => {
     assert.strictEqual(isClawdPermissionUrl("http://127.0.0.1:23333/permission#frag"), false);
     assert.strictEqual(isClawdPermissionUrl("http://user@127.0.0.1:23333/permission"), false);
     assert.strictEqual(isClawdPermissionUrl("http://127.0.0.1/permission"), false);
+  });
+
+  // godlockin fork uses the command-wrapper model (CARD-03) instead of the
+  // upstream HTTP-hook model, so registerHooks no longer adds a Clawd HTTP
+  // entry.
+  it.skip("remote query transport pins the nonce and native fallback removes managed permission hooks", () => {
+    const identity = secureRemoteIdentity();
+    const settingsPath = makeTempSettings({});
+    registerHooks({
+      silent: true,
+      settingsPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: identity,
+      remotePermissionTransport: "query",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+    assert.deepStrictEqual(getHttpUrls(readSettings(settingsPath), "PermissionRequest"), [
+      buildPermissionUrl(identity.remotePort, identity.routingNonce, "query"),
+    ]);
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: identity,
+      remotePermissionTransport: "native",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+    assert.deepStrictEqual(getHttpUrls(readSettings(settingsPath), "PermissionRequest"), []);
   });
 
   // godlockin fork uses the command-wrapper model (CARD-03) instead of the
@@ -1231,6 +1356,74 @@ describe("Claude permission hook ownership", () => {
 });
 
 describe("Hook installer deprecated hook cleanup", () => {
+  it("recognizes only the strict env-indirected command grammar (#852)", () => {
+    const settings = {
+      env: {
+        CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+    };
+    assert.strictEqual(
+      classifyManagedClaudeStateHookCommand(
+        "$CLAWD_NODE_BIN $CLAWD_HOOK_PATH WorktreeCreate",
+        settings,
+        "WorktreeCreate"
+      ),
+      "env"
+    );
+    assert.strictEqual(
+      classifyManagedClaudeStateHookCommand(
+        'node "${CLAWD_HOOK_PATH}" WorktreeCreate',
+        settings,
+        "WorktreeCreate"
+      ),
+      "env"
+    );
+    assert.strictEqual(
+      classifyManagedClaudeStateHookCommand(
+        '"/opt/homebrew/bin/node" "${CLAWD_HOOK_PATH}" WorktreeCreate',
+        settings,
+        "WorktreeCreate"
+      ),
+      "env"
+    );
+    assert.strictEqual(
+      classifyManagedClaudeStateHookCommand(
+        '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" Stop',
+        settings,
+        "WorktreeCreate"
+      ),
+      null,
+      "the trailing event must match the enclosing event"
+    );
+    assert.strictEqual(
+      classifyManagedClaudeStateHookCommand(
+        '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH_SUFFIX}" WorktreeCreate',
+        settings,
+        "WorktreeCreate"
+      ),
+      null
+    );
+    assert.strictEqual(
+      classifyManagedClaudeStateHookCommand(
+        '"/usr/local/bin/node-wrapper" "${CLAWD_HOOK_PATH}" WorktreeCreate',
+        settings,
+        "WorktreeCreate"
+      ),
+      null,
+      "an arbitrary absolute wrapper is not a direct Node executable"
+    );
+    assert.strictEqual(
+      classifyManagedClaudeStateHookCommand(
+        '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" WorktreeCreate',
+        { env: { CLAWD_HOOK_PATH: "/tmp/user-worktree.js" } },
+        "WorktreeCreate"
+      ),
+      null,
+      "settings.env must independently prove the clawd-hook.js basename"
+    );
+  });
+
   it("does not register WorktreeCreate on fresh install (issue #127)", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
@@ -1299,6 +1492,438 @@ describe("Hook installer deprecated hook cleanup", () => {
 
     const settings = readSettings(settingsPath);
     assert.ok(!Object.prototype.hasOwnProperty.call(settings.hooks, "WorktreeCreate"));
+  });
+
+  it("removes every env-owned WorktreeCreate form, preserves settings.env, and backs up cleanup-only writes (#852)", () => {
+    const env = {
+      CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+      CLAWD_HOOK_PATH: "/Applications/Clawd on Desk.app/Contents/Resources/app.asar.unpacked/hooks/clawd-hook.js",
+      USER_SETTING: "preserve-me",
+    };
+    const settingsPath = makeTempSettings({
+      env,
+      hooks: {
+        WorktreeCreate: [
+          {
+            matcher: "",
+            hooks: [{
+              type: "command",
+              command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" WorktreeCreate',
+              timeout: 5,
+            }],
+          },
+          {
+            matcher: "",
+            hooks: [{ type: "command", command: '"/opt/homebrew/bin/node" "${CLAWD_HOOK_PATH}" WorktreeCreate' }],
+          },
+          {
+            matcher: "",
+            hooks: [{ type: "command", command: 'node "${CLAWD_HOOK_PATH}" WorktreeCreate' }],
+          },
+        ],
+      },
+    });
+
+    const result = registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      nodeBin: "/opt/homebrew/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+
+    const settings = readSettings(settingsPath);
+    assert.ok(!Object.prototype.hasOwnProperty.call(settings.hooks, "WorktreeCreate"));
+    assert.deepStrictEqual(settings.env, env);
+    assert.ok(result.removed >= 3);
+    assert.ok(result.backupPath && fs.existsSync(result.backupPath), "cleanup-only mutation should create a backup");
+  });
+
+  it("folds env and canonical active hooks by position while preserving auto-start, matcher, and third-party fields (#852)", () => {
+    const env = {
+      CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+      CLAWD_HOOK_PATH: "/Applications/Clawd on Desk.app/Contents/Resources/app.asar.unpacked/hooks/clawd-hook.js",
+    };
+    const currentHookPath = getClaudeHookScriptPath().replace(/\\/g, "/");
+    const thirdParty = {
+      type: "command",
+      command: 'node "/tmp/third-party.js" SessionStart',
+      timeout: 91,
+      async: false,
+      custom: "unchanged",
+    };
+    const settingsPath = makeTempSettings({
+      env,
+      hooks: {
+        SessionStart: [{
+          matcher: "project-*",
+          wrapperCustom: "keep-wrapper",
+          hooks: [
+            { type: "command", command: '"node" "/old/auto-start.js"' },
+            { type: "command", command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" SessionStart', timeout: 5 },
+            {
+              type: "command",
+              command: `"/opt/homebrew/bin/node" "${currentHookPath}" SessionStart`,
+              async: true,
+              timeout: 5,
+            },
+            thirdParty,
+          ],
+        }],
+      },
+    });
+
+    const first = registerHooks({
+      silent: true,
+      settingsPath,
+      autoStart: true,
+      platform: "darwin",
+      nodeBin: "/opt/homebrew/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+    const afterFirstText = fs.readFileSync(settingsPath, "utf8");
+    const afterFirst = JSON.parse(afterFirstText);
+    const wrapper = afterFirst.hooks.SessionStart[0];
+    assert.strictEqual(wrapper.matcher, "project-*");
+    assert.strictEqual(wrapper.wrapperCustom, "keep-wrapper");
+    assert.strictEqual(getManagedStateHookEntries(afterFirst, "SessionStart").length, 1);
+    assert.strictEqual(getCommandHookEntries(afterFirst, "SessionStart", "auto-start.js").length, 1);
+    assert.deepStrictEqual(
+      getCommandHookEntries(afterFirst, "SessionStart").find((hook) => hook.custom === "unchanged"),
+      thirdParty
+    );
+    assert.deepStrictEqual(afterFirst.env, env);
+    assert.ok(first.removed >= 1);
+
+    const second = registerHooks({
+      silent: true,
+      settingsPath,
+      autoStart: true,
+      platform: "darwin",
+      nodeBin: "/opt/homebrew/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+    assert.strictEqual(fs.readFileSync(settingsPath, "utf8"), afterFirstText);
+    assert.strictEqual(second.added, 0);
+    assert.strictEqual(second.updated, 0);
+    assert.strictEqual(second.removed, 0);
+    assert.strictEqual(second.backupPath, null);
+  });
+
+  it("folds a flat env state entry into one nested canonical survivor (#852)", () => {
+    const nodeBin = "/opt/homebrew/bin/node";
+    const hookScript = getClaudeHookScriptPath();
+    const canonical = __test.buildCommandHookSpec(nodeBin, hookScript, "Stop", {
+      platform: "darwin",
+      async: true,
+      timeout: 5,
+    });
+    const thirdParty = { type: "command", command: 'node "/tmp/user-stop.js" Stop', timeout: 17 };
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: nodeBin,
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+      hooks: {
+        Stop: [
+          {
+            type: "command",
+            command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" Stop',
+            timeout: 5,
+            flatCustom: "owned-flat",
+          },
+          { matcher: "keep-wrapper", wrapperCustom: "keep-me", hooks: [canonical, thirdParty] },
+        ],
+      },
+    });
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      nodeBin,
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+
+    const settings = readSettings(settingsPath);
+    assert.strictEqual(getManagedStateHookEntries(settings, "Stop").length, 1);
+    assert.strictEqual(getManagedStateHookEntries(settings, "Stop")[0].command, canonical.command);
+    assert.ok(!getCommandHookEntries(settings, "Stop").some((hook) => hook.flatCustom === "owned-flat"));
+    assert.strictEqual(settings.hooks.Stop[0].matcher, "keep-wrapper");
+    assert.strictEqual(settings.hooks.Stop[0].wrapperCustom, "keep-me");
+    assert.deepStrictEqual(getCommandHookEntries(settings, "Stop").find((hook) => hook.timeout === 17), thirdParty);
+  });
+
+  it("folds byte-identical literal duplicates to one active state hook (#852)", () => {
+    const settingsPath = makeTempSettings({
+      hooks: {
+        Stop: [
+          { matcher: "a", hooks: [{ type: "command", command: '"/usr/bin/node" "/old-a/clawd-hook.js" Stop' }] },
+          { matcher: "b", hooks: [{ type: "command", command: '"/usr/bin/node" "/old-b/clawd-hook.js" Stop' }] },
+        ],
+      },
+    });
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+    assert.strictEqual(getManagedStateHookEntries(readSettings(settingsPath), "Stop").length, 1);
+  });
+
+  it("preserves a literal hook when the resolved Node path falls outside external env grammar (#852)", () => {
+    const envCommand = '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" SessionStart';
+    const hookScript = getClaudeHookScriptPath();
+    const cases = [
+      { platform: "win32", nodeBin: "C:\\Program Files (x86)\\nodejs\\node.exe" },
+      { platform: "linux", nodeBin: "/usr/bin/nodejs" },
+    ];
+
+    for (const { platform, nodeBin } of cases) {
+      const literalHook = __test.buildCommandHookSpec(nodeBin, hookScript, "SessionStart", {
+        platform,
+        async: true,
+        timeout: 5,
+      });
+      const settingsPath = makeTempSettings({
+        env: {
+          CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+          CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+        },
+        hooks: {
+          SessionStart: [{ matcher: "", hooks: [
+            { type: "command", command: envCommand, timeout: 5 },
+            literalHook,
+          ] }],
+        },
+      });
+
+      registerHooks({
+        silent: true,
+        settingsPath,
+        platform,
+        nodeBin,
+        claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+      });
+
+      const hooks = getCommandHookEntries(readSettings(settingsPath), "SessionStart");
+      assert.strictEqual(hooks.length, 1, `${platform} should converge to one state hook`);
+      assert.strictEqual(hooks[0].command, literalHook.command);
+      assert.ok(!hooks[0].command.includes("CLAWD_HOOK_PATH"));
+    }
+  });
+
+  // godlockin fork registers PermissionRequest as command wrapper, not HTTP hook.
+  it.skip("converges a health env migration signature when the resolved Node path needs normal quoting (#852)", () => {
+    const resolvedNode = "C:\\Program Files (x86)\\nodejs\\node.exe";
+    const envNode = "C:\\Program Files\\nodejs\\node.exe";
+    const hookScript = getClaudeHookScriptPath();
+    const autoStartScript = getClaudeAutoStartScriptPath();
+    const permissionUrl = buildPermissionUrl(SERVER_PORTS[0]);
+    const hooks = {};
+    for (const event of CLAUDE_CORE_HOOK_EVENTS) {
+      hooks[event] = [{ matcher: "", hooks: [{
+        type: "command",
+        command: `"${"${CLAWD_NODE_BIN}"}" "${"${CLAWD_HOOK_PATH}"}" ${event}`,
+        timeout: 5,
+      }] }];
+    }
+    hooks.PermissionRequest = [{ matcher: "", hooks: [{ type: "http", url: permissionUrl, timeout: 600 }] }];
+    const settingsPath = makeTempSettings({
+      env: { CLAWD_NODE_BIN: envNode, CLAWD_HOOK_PATH: hookScript },
+      hooks,
+    });
+    const existing = new Set([resolvedNode, envNode, hookScript, autoStartScript]);
+    const healthOptions = {
+      platform: "win32",
+      fs: {
+        existsSync: (candidate) => existing.has(candidate),
+        accessSync: (candidate) => {
+          if (!existing.has(candidate)) throw new Error("ENOENT");
+        },
+      },
+      expectedPermissionUrl: permissionUrl,
+      expectedHookScriptPath: hookScript,
+      expectedAutoStartScriptPath: autoStartScript,
+      coreEvents: CLAUDE_CORE_HOOK_EVENTS,
+      requireAutoStart: false,
+    };
+
+    const before = inspectClaudeHookHealth(fs.readFileSync(settingsPath, "utf8"), healthOptions);
+    assert.strictEqual(buildClaudeRepairSignature(before.issues), "v1:env-state-hook");
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "win32",
+      nodeBin: resolvedNode,
+      port: SERVER_PORTS[0],
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+
+    const after = inspectClaudeHookHealth(fs.readFileSync(settingsPath, "utf8"), healthOptions);
+    assert.strictEqual(after.status, "healthy");
+    assert.strictEqual(buildClaudeRepairSignature(after.issues), null);
+  });
+
+  it("preserves an env-owned active hook instead of rewriting it to bare node when no absolute Node is usable (#852)", () => {
+    const command = '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" SessionStart';
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: "node",
+        CLAWD_HOOK_PATH: "/Applications/Clawd on Desk.app/Contents/Resources/app.asar.unpacked/hooks/clawd-hook.js",
+      },
+      hooks: {
+        SessionStart: [{ matcher: "", hooks: [{ type: "command", command, timeout: 5 }] }],
+      },
+    });
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      nodeBin: null,
+      accessSync() { throw new Error("ENOENT"); },
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+    const settings = readSettings(settingsPath);
+    assert.strictEqual(getManagedStateHookEntries(settings, "SessionStart").length, 1);
+    assert.strictEqual(getManagedStateHookEntries(settings, "SessionStart")[0].command, command);
+    assert.ok(!getCommandHookEntries(settings, "SessionStart").some((hook) => hook.command.startsWith('"node"')));
+  });
+
+  it("skips a stale direct Node candidate and uses the verified settings.env fallback (#852)", () => {
+    const staleNode = "/missing/bin/node";
+    const envNode = "/opt/homebrew/bin/node";
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: envNode,
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+      hooks: {
+        Stop: [{ matcher: "", hooks: [{
+          type: "command",
+          command: `"${staleNode}" "${"${CLAWD_HOOK_PATH}"}" Stop`,
+        }] }],
+      },
+    });
+    const checked = [];
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      nodeBin: null,
+      accessSync(candidate) {
+        checked.push(candidate);
+        if (candidate === envNode) return;
+        throw new Error("ENOENT");
+      },
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+
+    const stop = getManagedStateHookEntries(readSettings(settingsPath), "Stop");
+    assert.deepStrictEqual(checked, [staleNode, envNode]);
+    assert.strictEqual(stop.length, 1);
+    assert.ok(stop[0].command.startsWith(`"${envNode}" `), stop[0].command);
+  });
+
+  it("never canonicalizes a shell-breaking settings.env Node value even when access succeeds (#852)", () => {
+    const unsafeNode = '/tmp/a";noop;"/node';
+    const command = '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" Stop';
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: unsafeNode,
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+      hooks: {
+        Stop: [{ matcher: "", hooks: [{ type: "command", command }] }],
+      },
+    });
+    let accessCalls = 0;
+
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      nodeBin: null,
+      accessSync() { accessCalls++; },
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+
+    const stop = getManagedStateHookEntries(readSettings(settingsPath), "Stop");
+    assert.strictEqual(accessCalls, 0, "unsafe data must be rejected before filesystem access");
+    assert.strictEqual(stop.length, 1);
+    assert.strictEqual(stop[0].command, command);
+    assert.ok(!stop[0].command.includes("noop"));
+  });
+
+  it("fails closed on compound and single-quoted env-indirected worktree commands (#852)", () => {
+    const compound = '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" WorktreeCreate && create-real-worktree';
+    const singleQuoted = "'${CLAWD_NODE_BIN}' '${CLAWD_HOOK_PATH}' WorktreeCreate";
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+      hooks: {
+        WorktreeCreate: [{ matcher: "", hooks: [
+          { type: "command", command: compound },
+          { type: "command", command: singleQuoted },
+        ] }],
+      },
+    });
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      nodeBin: "/opt/homebrew/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+    assert.deepStrictEqual(
+      getCommandHookEntries(readSettings(settingsPath), "WorktreeCreate").map((hook) => hook.command),
+      [compound, singleQuoted]
+    );
+  });
+
+  // godlockin fork registers PermissionRequest as command wrapper, not HTTP hook.
+  it.skip("applies env ownership to versioned and HTTP-only all-delete reconciliation (#852)", () => {
+    const env = {
+      CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+      CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+    };
+    const userPermission = { type: "command", command: 'node "/tmp/user-permission.js" PermissionRequest', timeout: 19, async: false };
+    const settingsPath = makeTempSettings({
+      env,
+      hooks: {
+        StopFailure: [{ matcher: "", hooks: [
+          { type: "command", command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" StopFailure' },
+          { type: "command", command: 'node "/tmp/user-stop-failure.js" StopFailure' },
+        ] }],
+        PermissionRequest: [{ matcher: "", hooks: [
+          { type: "command", command: 'node "${CLAWD_HOOK_PATH}" PermissionRequest' },
+          userPermission,
+        ] }],
+      },
+    });
+    registerHooks({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      nodeBin: "/opt/homebrew/bin/node",
+      claudeVersionInfo: { version: "2.1.77", source: "test", status: "known" },
+    });
+    const settings = readSettings(settingsPath);
+    assert.deepStrictEqual(
+      getCommandHookEntries(settings, "StopFailure").map((hook) => hook.command),
+      ['node "/tmp/user-stop-failure.js" StopFailure']
+    );
+    assert.deepStrictEqual(
+      getCommandHookEntries(settings, "PermissionRequest"),
+      [userPermission]
+    );
+    assert.strictEqual(getHttpHookEntries(settings, "PermissionRequest").length, 1);
   });
 });
 
@@ -1487,6 +2112,31 @@ describe("Hook installer PermissionRequest wrapper", () => {
 });
 
 describe("Hook installer unregisterHooks", () => {
+  it("removes env-owned state hooks while preserving settings.env and mixed third-party siblings (#852)", () => {
+    const env = {
+      CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+      CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      SHARED_BY_USER: "yes",
+    };
+    const userHook = { type: "command", command: 'node "/tmp/user.js" Stop', timeout: 23 };
+    const settingsPath = makeTempSettings({
+      env,
+      hooks: {
+        Stop: [{ matcher: "keep-me", hooks: [
+          { type: "command", command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" Stop' },
+          userHook,
+        ] }],
+      },
+    });
+
+    const result = unregisterHooks({ settingsPath });
+    const settings = readSettings(settingsPath);
+    assert.strictEqual(result.removed, 1);
+    assert.deepStrictEqual(settings.env, env);
+    assert.strictEqual(settings.hooks.Stop[0].matcher, "keep-me");
+    assert.deepStrictEqual(settings.hooks.Stop[0].hooks, [userHook]);
+  });
+
   it("removes Clawd command hooks, HTTP hook, and auto-start while preserving third-party hooks", () => {
     const settingsPath = makeTempSettings({
       hooks: {
@@ -1675,7 +2325,7 @@ describe("Hook installer unregisterHooks", () => {
 });
 
 describe("async hook installer parity", () => {
-  it("registerHooksAsync preserves an existing Node path before probing asynchronously", async () => {
+  it("registerHooksAsync preserves an existing Node path after a single lightweight access check (#317)", async () => {
     const existingAbsPath = "/Users/tester/.nvm/versions/node/v20.11.0/bin/node";
     const settingsPath = makeTempSettings({
       hooks: {
@@ -1688,6 +2338,8 @@ describe("async hook installer parity", () => {
       },
     });
 
+    let accessCalls = 0;
+    let execFileCalls = 0;
     await registerHooksAsync({
       silent: true,
       settingsPath,
@@ -1695,22 +2347,151 @@ describe("async hook installer parity", () => {
       isElectron: true,
       homeDir: "/Users/tester",
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
-      async access() {
-        throw new Error("async node probing should not run when settings already has a node path");
+      async access(candidate, mode) {
+        accessCalls++;
+        assert.strictEqual(candidate, existingAbsPath, "should only validate the extracted existing path");
+        // POSIX must check the execute bit, matching the doctor validator and
+        // resolver — F_OK alone would preserve a non-executable file that
+        // the health inspector would then judge broken on the next check.
+        assert.strictEqual(mode, fs.constants.X_OK, "POSIX existing-Node validation must check X_OK, not just F_OK");
+        // A valid existing path resolves — no resolver probe should follow.
       },
       async execFile() {
-        throw new Error("async shell probing should not run when settings already has a node path");
+        execFileCalls++;
+        throw new Error("resolver shell probing should not run when the existing path checks out");
       },
       accessSync() {
-        throw new Error("sync node probing should not run");
+        throw new Error("sync node probing should not run from the async installer");
       },
       execFileSync() {
-        throw new Error("sync shell probing should not run");
+        throw new Error("sync shell probing should not run from the async installer");
+      },
+    });
+
+    assert.strictEqual(accessCalls, 1, "existing Node path should be validated exactly once");
+    assert.strictEqual(execFileCalls, 0, "resolver should not run once the existing path is confirmed valid");
+
+    const commands = getClawdCommands(readSettings(settingsPath), "Stop");
+    assert.ok(commands.some((command) => command.includes(existingAbsPath)), commands.join("\n"));
+  });
+
+  it("registerHooksAsync validates an existing Windows Node path with F_OK, not X_OK (#317)", async () => {
+    const existingAbsPath = "C:/Program Files/nodejs/node.exe";
+    const settingsPath = makeTempSettings({
+      hooks: {
+        Stop: [
+          {
+            matcher: "",
+            hooks: [{ type: "command", command: `& "${existingAbsPath}" "C:/app/hooks/clawd-hook.js" Stop` }],
+          },
+        ],
+      },
+    });
+
+    let accessMode = null;
+    await registerHooksAsync({
+      silent: true,
+      settingsPath,
+      platform: "win32",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+      async access(candidate, mode) {
+        accessMode = mode;
+        assert.strictEqual(candidate, existingAbsPath);
+      },
+      async execFile() {
+        throw new Error("resolver should not run when the existing path checks out");
+      },
+    });
+
+    assert.strictEqual(accessMode, fs.constants.F_OK, "Windows has no executable-bit semantics; existence check must use F_OK");
+    const commands = getClawdCommands(readSettings(settingsPath), "Stop");
+    assert.ok(commands.some((command) => command.includes(existingAbsPath)), commands.join("\n"));
+  });
+
+  it("registerHooksAsync falls back to the resolver when the existing Node path is no longer valid (#317)", async () => {
+    const staleAbsPath = "/Users/tester/.nvm/versions/node/v18.0.0/bin/node";
+    const resolvedAbsPath = "/opt/homebrew/bin/node";
+    const settingsPath = makeTempSettings({
+      hooks: {
+        Stop: [
+          {
+            matcher: "",
+            hooks: [{ type: "command", command: `"${staleAbsPath}" "/app/hooks/clawd-hook.js" Stop` }],
+          },
+        ],
+      },
+    });
+
+    await registerHooksAsync({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      isElectron: true,
+      homeDir: "/Users/tester",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+      async access(candidate) {
+        if (candidate === staleAbsPath) throw new Error("ENOENT");
+        if (candidate === resolvedAbsPath) return;
+        throw new Error("ENOENT");
+      },
+      async execFile() {
+        throw new Error("shell probing should not be needed once a well-known candidate resolves");
       },
     });
 
     const commands = getClawdCommands(readSettings(settingsPath), "Stop");
-    assert.ok(commands.some((command) => command.includes(existingAbsPath)), commands.join("\n"));
+    assert.ok(commands.some((command) => command.includes(resolvedAbsPath)), commands.join("\n"));
+    assert.ok(!commands.some((command) => command.includes(staleAbsPath)), commands.join("\n"));
+  });
+
+  it("registerHooksAsync never validates an explicit options.nodeBin against the local filesystem (#317)", async () => {
+    const explicitNodeBin = "/remote/inaccessible/node";
+    const settingsPath = makeTempSettings({});
+
+    await registerHooksAsync({
+      silent: true,
+      settingsPath,
+      nodeBin: explicitNodeBin,
+      platform: "linux",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+      async access() {
+        throw new Error("explicit options.nodeBin must not be validated with access()");
+      },
+      async execFile() {
+        throw new Error("explicit options.nodeBin must never trigger the resolver");
+      },
+    });
+
+    const commands = getClawdCommands(readSettings(settingsPath), "Stop");
+    assert.ok(commands.some((command) => command.includes(explicitNodeBin)), commands.join("\n"));
+  });
+
+  it("registerHooksAsync migrates a stale hook path to the current authoritative script path", async () => {
+    const oldTempPath = "/tmp/clawd-on-desk/hooks/clawd-hook.js";
+    const settingsPath = makeTempSettings({
+      hooks: {
+        Stop: [
+          {
+            matcher: "",
+            hooks: [{ type: "command", command: `"/usr/bin/node" "${oldTempPath}" Stop` }],
+          },
+        ],
+      },
+    });
+
+    await registerHooksAsync({
+      silent: true,
+      settingsPath,
+      nodeBin: "/usr/bin/node",
+      platform: "linux",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    });
+
+    const commands = getClawdCommands(readSettings(settingsPath), "Stop");
+    const currentScriptPath = getClaudeHookScriptPath();
+    assert.ok(commands.some((command) => command.includes(currentScriptPath)), commands.join("\n"));
+    assert.ok(!commands.some((command) => command.includes(oldTempPath)), commands.join("\n"));
+    assert.ok(!commands.some((command) => command.includes("app.asar.unpacked")), "source-tree installs should not force an asar.unpacked path literal");
   });
 
   it("registerHooksAsync resolves Node with async probes without calling sync probes", async () => {
@@ -1743,6 +2524,110 @@ describe("async hook installer parity", () => {
     assert.ok(commands.some((command) => command.startsWith(`"${nodeBin}" "`)), commands.join("\n"));
   });
 
+  it("registerHooksAsync uses a verified settings.env Node candidate only after env hook ownership is proven (#852)", async () => {
+    const envNode = "/custom/node/bin/node";
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: envNode,
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+      hooks: {
+        Stop: [{ matcher: "", hooks: [{
+          type: "command",
+          command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" Stop',
+        }] }],
+      },
+    });
+
+    await registerHooksAsync({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      isElectron: true,
+      homeDir: "/Users/tester",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+      async readdir() { return []; },
+      async access(candidate) {
+        if (candidate === envNode) return;
+        throw new Error("ENOENT");
+      },
+      async execFile() { throw new Error("no shell candidate"); },
+    });
+
+    const stop = getManagedStateHookEntries(readSettings(settingsPath), "Stop");
+    assert.strictEqual(stop.length, 1);
+    assert.ok(stop[0].command.startsWith(`"${envNode}" `), stop[0].command);
+  });
+
+  it("registerHooksAsync continues past a stale first candidate to a later usable direct Node path (#852)", async () => {
+    const staleNode = "/opt/custom/bin/node";
+    const validNode = "/Opt/custom/bin/node";
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: "node",
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+      hooks: {
+        Stop: [
+          { matcher: "", hooks: [{ type: "command", command: `"${staleNode}" "${"${CLAWD_HOOK_PATH}"}" Stop` }] },
+          { matcher: "", hooks: [{ type: "command", command: `"${validNode}" "${"${CLAWD_HOOK_PATH}"}" Stop` }] },
+        ],
+      },
+    });
+    const checked = [];
+
+    await registerHooksAsync({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      isElectron: true,
+      homeDir: "/Users/tester",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+      async readdir() { return []; },
+      async access(candidate) {
+        checked.push(candidate);
+        if (candidate === validNode) return;
+        throw new Error("ENOENT");
+      },
+      async execFile() { throw new Error("no shell candidate"); },
+    });
+
+    const stop = getManagedStateHookEntries(readSettings(settingsPath), "Stop");
+    assert.ok(checked.includes(staleNode), checked.join(","));
+    assert.ok(checked.includes(validNode), checked.join(","));
+    assert.strictEqual(stop.length, 1);
+    assert.ok(stop[0].command.startsWith(`"${validNode}" `), stop[0].command);
+  });
+
+  it("registerHooksAsync preserves an env hook when neither resolver nor env supplies a safe Node path (#852)", async () => {
+    const command = '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" Stop';
+    const settingsPath = makeTempSettings({
+      env: {
+        CLAWD_NODE_BIN: "node",
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
+      hooks: {
+        Stop: [{ matcher: "", hooks: [{ type: "command", command }] }],
+      },
+    });
+
+    await registerHooksAsync({
+      silent: true,
+      settingsPath,
+      platform: "darwin",
+      isElectron: true,
+      homeDir: "/Users/tester",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+      async readdir() { return []; },
+      async access() { throw new Error("ENOENT"); },
+      async execFile() { throw new Error("no shell candidate"); },
+    });
+
+    const stop = getManagedStateHookEntries(readSettings(settingsPath), "Stop");
+    assert.strictEqual(stop.length, 1);
+    assert.strictEqual(stop[0].command, command);
+  });
+
   it.skip("registerHooksAsync writes the same hook set as registerHooks", async () => {
     const syncSettingsPath = makeTempSettings({});
     const asyncSettingsPath = makeTempSettings({});
@@ -1759,13 +2644,76 @@ describe("async hook installer parity", () => {
     });
 
     assert.deepStrictEqual(readSettings(asyncSettingsPath), readSettings(syncSettingsPath));
-    assert.deepStrictEqual(asyncResult, syncResult);
+
+    // backupPath is path-specific (each call uses its own temp settingsPath), so
+    // compare the rest of the result for parity and assert both paths backed up.
+    const { backupPath: syncBackup, ...syncRest } = syncResult;
+    const { backupPath: asyncBackup, ...asyncRest } = asyncResult;
+    assert.deepStrictEqual(asyncRest, syncRest);
+    assert.ok(syncBackup && syncBackup.endsWith(".bak"), "registerHooks should back up the prior settings");
+    assert.ok(asyncBackup && asyncBackup.endsWith(".bak"), "registerHooksAsync should back up the prior settings");
   });
 
-  it("unregisterHooksAsync removes the same entries as unregisterHooks", async () => {
+  it("sync and async registration produce the same env migration and async is a no-op after sync (#852)", async () => {
     const initial = {
+      env: {
+        CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+      },
       hooks: {
-        Stop: [{ matcher: "", hooks: [{ type: "command", command: '"/usr/bin/node" "/tmp/clawd-hook.js"' }] }],
+        SessionStart: [{ matcher: "", hooks: [
+          { type: "command", command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" SessionStart' },
+          { type: "command", command: '"/opt/homebrew/bin/node" "/old/clawd-hook.js" SessionStart' },
+        ] }],
+        WorktreeCreate: [{ matcher: "", hooks: [
+          { type: "command", command: 'node "${CLAWD_HOOK_PATH}" WorktreeCreate', timeout: 5 },
+        ] }],
+      },
+    };
+    const syncSettingsPath = makeTempSettings(initial);
+    const asyncSettingsPath = makeTempSettings(initial);
+    const options = {
+      silent: true,
+      platform: "darwin",
+      nodeBin: "/opt/homebrew/bin/node",
+      claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
+    };
+
+    const syncResult = registerHooks({ ...options, settingsPath: syncSettingsPath });
+    const asyncResult = await registerHooksAsync({ ...options, settingsPath: asyncSettingsPath });
+    assert.deepStrictEqual(readSettings(asyncSettingsPath), readSettings(syncSettingsPath));
+    const { backupPath: syncBackup, ...syncRest } = syncResult;
+    const { backupPath: asyncBackup, ...asyncRest } = asyncResult;
+    assert.deepStrictEqual(asyncRest, syncRest);
+    assert.ok(syncBackup && asyncBackup);
+
+    const beforeSecond = fs.readFileSync(syncSettingsPath, "utf8");
+    const second = await registerHooksAsync({ ...options, settingsPath: syncSettingsPath });
+    assert.strictEqual(fs.readFileSync(syncSettingsPath, "utf8"), beforeSecond);
+    assert.strictEqual(second.added, 0);
+    assert.strictEqual(second.updated, 0);
+    assert.strictEqual(second.removed, 0);
+    assert.strictEqual(second.backupPath, null);
+  });
+
+  it("unregisterHooksAsync removes env and literal entries exactly like unregisterHooks (#852)", async () => {
+    const initial = {
+      env: {
+        CLAWD_NODE_BIN: "/opt/homebrew/bin/node",
+        CLAWD_HOOK_PATH: "/Applications/Clawd/hooks/clawd-hook.js",
+        USER_SETTING: "preserve-me",
+      },
+      hooks: {
+        Stop: [{ matcher: "", custom: "keep-wrapper", hooks: [
+          { type: "command", command: '"/usr/bin/node" "/tmp/clawd-hook.js" Stop' },
+          { type: "command", command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" Stop', timeout: 5 },
+          { type: "command", command: 'node "/tmp/user-stop.js" Stop', timeout: 33 },
+        ] }],
+        WorktreeCreate: [{ matcher: "", hooks: [{
+          type: "command",
+          command: '"${CLAWD_NODE_BIN}" "${CLAWD_HOOK_PATH}" WorktreeCreate',
+          timeout: 5,
+        }] }],
         PermissionRequest: [{ matcher: "", hooks: [{ type: "http", url: "http://127.0.0.1:23333/permission" }] }],
       },
     };
@@ -1777,5 +2725,454 @@ describe("async hook installer parity", () => {
 
     assert.deepStrictEqual(readSettings(asyncSettingsPath), readSettings(syncSettingsPath));
     assert.deepStrictEqual(asyncResult, syncResult);
+    const after = readSettings(asyncSettingsPath);
+    assert.deepStrictEqual(after.env, initial.env);
+    assert.deepStrictEqual(getCommandHookEntries(after, "Stop"), [
+      { type: "command", command: 'node "/tmp/user-stop.js" Stop', timeout: 33 },
+    ]);
+    assert.ok(!Object.prototype.hasOwnProperty.call(after.hooks, "WorktreeCreate"));
+  });
+});
+
+describe("Hook installer settings backup", () => {
+  const versionInfo = { version: "2.1.78", source: "test", status: "known" };
+
+  function bakFiles(settingsPath) {
+    const dir = path.dirname(settingsPath);
+    return fs.readdirSync(dir).filter((name) => name.endsWith(".bak"));
+  }
+
+  it("backs up an existing settings.json before injecting hooks", () => {
+    const original = { hooks: { Stop: [{ matcher: "", hooks: [{ type: "command", command: "user-own-hook" }] }] } };
+    const settingsPath = makeTempSettings(original);
+
+    const result = registerHooks({ silent: true, settingsPath, claudeVersionInfo: versionInfo });
+
+    assert.ok(result.backupPath, "should return a backupPath");
+    assert.ok(fs.existsSync(result.backupPath), "backup file should exist on disk");
+    // Backup holds the ORIGINAL pre-install content (the user's own hook, no Clawd hooks).
+    assert.deepStrictEqual(readSettings(result.backupPath), original);
+    // Live file was mutated (Clawd hooks added) and the user's hook is preserved.
+    assert.ok(getClawdCommands(readSettings(settingsPath), "Stop").length > 0, "Clawd hooks should be installed");
+  });
+
+  it("does not back up when settings.json does not pre-exist", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-install-"));
+    tempDirs.push(tmpDir);
+    const settingsPath = path.join(tmpDir, "settings.json"); // intentionally absent
+
+    const result = registerHooks({ silent: true, settingsPath, claudeVersionInfo: versionInfo });
+
+    assert.strictEqual(result.backupPath, null, "no backup for a freshly created file");
+    assert.deepStrictEqual(bakFiles(settingsPath), [], "no .bak files written");
+    assert.ok(fs.existsSync(settingsPath), "settings.json should still be created");
+  });
+
+  it("respects backup: false (opt out)", () => {
+    const settingsPath = makeTempSettings({ hooks: {} });
+
+    const result = registerHooks({ silent: true, settingsPath, backup: false, claudeVersionInfo: versionInfo });
+
+    assert.strictEqual(result.backupPath, null);
+    assert.deepStrictEqual(bakFiles(settingsPath), []);
+  });
+
+  it("backs up on the async path too", async () => {
+    const settingsPath = makeTempSettings({ hooks: {} });
+
+    const result = await registerHooksAsync({ silent: true, settingsPath, claudeVersionInfo: versionInfo });
+
+    assert.ok(result.backupPath && fs.existsSync(result.backupPath), "async install should back up");
+  });
+
+  it("caps backups under repeated re-register instead of piling up unbounded", () => {
+    // Simulates a CC-Switch style write war: an external tool keeps stripping
+    // Clawd's hooks from settings.json, the watcher keeps re-registering them.
+    // Each real write snapshots the prior file, but the total must stay bounded.
+    const thirdParty = { hooks: { Stop: [{ matcher: "", hooks: [{ type: "command", command: "user-own-hook" }] }] } };
+    const settingsPath = makeTempSettings(thirdParty);
+    const dir = path.dirname(settingsPath);
+    const countBaks = () => fs.readdirSync(dir).filter((n) => n.endsWith(".bak")).length;
+
+    for (let i = 0; i < 8; i++) {
+      // External tool overwrites settings.json back to third-party-only (drops Clawd hooks).
+      fs.writeFileSync(settingsPath, JSON.stringify(thirdParty, null, 2), "utf-8");
+      const result = registerHooks({ silent: true, settingsPath, claudeVersionInfo: versionInfo, backupKeep: 3 });
+      assert.ok(result.backupPath, "each re-register over an existing file should back up");
+      // The returned path must actually exist — i.e. the fresh backup is never
+      // the one pruned away (regression: copyFileSync inherits the source mtime).
+      assert.ok(fs.existsSync(result.backupPath), "returned backup path must exist on disk");
+    }
+
+    assert.strictEqual(countBaks(), 3, `backups must stay capped at backupKeep, found ${countBaks()}`);
+    // The live file still has Clawd's hooks plus the user's own hook preserved.
+    assert.ok(getClawdCommands(readSettings(settingsPath), "Stop").length > 0, "Clawd hooks still installed");
+  });
+});
+
+describe("Claude Code statusline installer", () => {
+  it("keeps local CLI hook reinstalls opted out unless --statusline is explicit", () => {
+    assert.deepStrictEqual(parseClaudeInstallCliOptions([]), {
+      remote: false,
+      chainExisting: false,
+      installStatusline: false,
+    });
+    assert.strictEqual(parseClaudeInstallCliOptions(["--statusline"]).installStatusline, true);
+  });
+
+  it("keeps remote deploy statusline collection enabled without an extra flag", () => {
+    assert.deepStrictEqual(parseClaudeInstallCliOptions(["--remote", "--chain-existing"]), {
+      remote: true,
+      chainExisting: true,
+      installStatusline: true,
+    });
+  });
+
+  it("registers the statusline command when settings.json has none", () => {
+    const settingsPath = makeTempSettings({});
+
+    const result = registerClaudeStatusline({ silent: true, settingsPath, platform: "darwin", nodeBin: "/usr/local/bin/node" });
+
+    assert.strictEqual(result.installed, true);
+    assert.strictEqual(result.changed, true);
+    assert.strictEqual(result.skippedExisting, false);
+    const settings = readSettings(settingsPath);
+    assert.strictEqual(settings.statusLine.type, "command");
+    assert.ok(settings.statusLine.command.includes(STATUSLINE_MARKER));
+    assert.ok(settings.statusLine.command.includes("/usr/local/bin/node"));
+  });
+
+  it("is idempotent on second run", () => {
+    const settingsPath = makeTempSettings({});
+    registerClaudeStatusline({ silent: true, settingsPath, nodeBin: "/usr/local/bin/node" });
+
+    const result = registerClaudeStatusline({ silent: true, settingsPath, nodeBin: "/usr/local/bin/node" });
+
+    assert.strictEqual(result.changed, false);
+  });
+
+  // Remote deploys run install.js --remote ON the remote (POSIX shells only —
+  // deploy aborts on cmd.exe), and CLAWD_REMOTE=1 is what makes the
+  // statusline stamp body.host so quota rides the reverse tunnel. The adapter
+  // itself keeps a short best-effort transport timeout to protect visible UI.
+  it("remote: prefixes the command with CLAWD_REMOTE=1 and stays marker-detectable", () => {
+    const settingsPath = makeTempSettings({});
+
+    const result = registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    });
+
+    assert.strictEqual(result.installed, true);
+    assert.strictEqual(result.changed, true);
+    const command = readSettings(settingsPath).statusLine.command;
+    assert.ok(command.startsWith("CLAWD_REMOTE=1 CLAWD_SSH_REMOTE=1 "), command);
+    assert.ok(command.includes(STATUSLINE_MARKER));
+
+    // Re-register (deploy repair) must be idempotent on the remote form too.
+    const again = registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    });
+    assert.strictEqual(again.changed, false);
+  });
+
+  it("remote: still never overwrites a pre-existing third-party statusline", () => {
+    const settingsPath = makeTempSettings({
+      statusLine: { type: "command", command: "~/.claude/my-custom-statusline.sh" },
+    });
+
+    const result = registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    });
+
+    assert.strictEqual(result.skippedExisting, true);
+    assert.strictEqual(
+      readSettings(settingsPath).statusLine.command,
+      "~/.claude/my-custom-statusline.sh"
+    );
+  });
+
+  // A realistic third-party statusline command: a bash -c one-liner full of
+  // nested quoting (claude-hud shape). The sidecar must preserve the object
+  // verbatim - both for the chained exec and for the unregister restore.
+  const NASTY_STATUSLINE = {
+    type: "command",
+    command: `bash -c 'cols=$(stty size </dev/tty 2>/dev/null | awk '"'"'{print $2}'"'"'); exec "/home/user/.bun/bin/bun" "$HOME/hud/src/index.ts"'`,
+    padding: 1,
+  };
+
+  function makeChainSidecarPath() {
+    return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "clawd-chain-sidecar-")), "clawd-statusline-chain.json");
+  }
+
+  it("remote --chain-existing: wraps a third-party statusline via the sidecar", () => {
+    const settingsPath = makeTempSettings({ statusLine: NASTY_STATUSLINE });
+    const chainSidecarPath = makeChainSidecarPath();
+
+    const result = registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      chainSidecarPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
+      chainExisting: true,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    });
+
+    assert.strictEqual(result.skippedExisting, false);
+    assert.strictEqual(result.chained, true);
+    const command = readSettings(settingsPath).statusLine.command;
+    assert.ok(command.startsWith("CLAWD_REMOTE=1 CLAWD_SSH_REMOTE=1 "), command);
+    assert.ok(command.includes(STATUSLINE_MARKER));
+    assert.ok(command.endsWith(" --chain"), command);
+    // The user's original survives byte-for-byte in the sidecar.
+    assert.deepStrictEqual(
+      JSON.parse(fs.readFileSync(chainSidecarPath, "utf8")).statusLine,
+      NASTY_STATUSLINE
+    );
+  });
+
+  it("remote --chain-existing: an omitted repair preference keeps the chain and sidecar", () => {
+    const settingsPath = makeTempSettings({ statusLine: NASTY_STATUSLINE });
+    const chainSidecarPath = makeChainSidecarPath();
+    const opts = {
+      silent: true,
+      settingsPath,
+      chainSidecarPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
+      chainExisting: true,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    };
+    registerClaudeStatusline(opts);
+
+    const { chainExisting: _omitted, ...repairOpts } = opts;
+    const again = registerClaudeStatusline(repairOpts);
+
+    assert.strictEqual(again.changed, false);
+    assert.strictEqual(again.chained, true);
+    assert.deepStrictEqual(
+      JSON.parse(fs.readFileSync(chainSidecarPath, "utf8")).statusLine,
+      NASTY_STATUSLINE
+    );
+  });
+
+  it("remote --chain-existing: explicit false restores the original statusline", () => {
+    const settingsPath = makeTempSettings({ statusLine: NASTY_STATUSLINE });
+    const chainSidecarPath = makeChainSidecarPath();
+    const opts = {
+      silent: true,
+      settingsPath,
+      chainSidecarPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    };
+    registerClaudeStatusline({ ...opts, chainExisting: true });
+
+    const result = registerClaudeStatusline({ ...opts, chainExisting: false });
+
+    assert.strictEqual(result.changed, true);
+    assert.strictEqual(result.chained, false);
+    assert.strictEqual(result.restoredChained, true);
+    assert.strictEqual(result.skippedExisting, true);
+    assert.deepStrictEqual(readSettings(settingsPath).statusLine, NASTY_STATUSLINE);
+    assert.strictEqual(fs.existsSync(chainSidecarPath), false);
+  });
+
+  it("remote --chain-existing: unregister restores the original statusLine object and consumes the sidecar", () => {
+    const settingsPath = makeTempSettings({ statusLine: NASTY_STATUSLINE });
+    const chainSidecarPath = makeChainSidecarPath();
+    registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      chainSidecarPath,
+      remote: true,
+      sshRemote: true,
+      remoteIdentity: secureRemoteIdentity(),
+      chainExisting: true,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    });
+
+    const result = unregisterClaudeStatusline({ silent: true, settingsPath, chainSidecarPath });
+
+    assert.strictEqual(result.removed, 1);
+    assert.strictEqual(result.restoredChained, true);
+    assert.deepStrictEqual(readSettings(settingsPath).statusLine, NASTY_STATUSLINE);
+    assert.strictEqual(fs.existsSync(chainSidecarPath), false);
+  });
+
+  it("local chainExisting is ignored (chain is remote-only in v1)", () => {
+    const settingsPath = makeTempSettings({ statusLine: NASTY_STATUSLINE });
+    const chainSidecarPath = makeChainSidecarPath();
+
+    const result = registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      chainSidecarPath,
+      chainExisting: true,
+      platform: "linux",
+      nodeBin: "/usr/bin/node",
+    });
+
+    assert.strictEqual(result.skippedExisting, true);
+    assert.strictEqual(fs.existsSync(chainSidecarPath), false);
+    assert.deepStrictEqual(readSettings(settingsPath).statusLine, NASTY_STATUSLINE);
+  });
+
+  // On Windows Claude Code runs statusLine.command through Git Bash whenever
+  // Git is installed (a Claude Code install prerequisite), so the PowerShell
+  // call-operator form (`& "..."`) is a bash syntax error and the statusline
+  // dies silently. statusLine has no `shell` field to pin PowerShell.
+  it("win32: writes a bash-safe command (bare node) when the node path has spaces", () => {
+    const settingsPath = makeTempSettings({});
+
+    registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      platform: "win32",
+      nodeBin: "C:\\Program Files\\nodejs\\node.exe",
+    });
+
+    const command = readSettings(settingsPath).statusLine.command;
+    assert.ok(!command.startsWith("& "), command);
+    assert.ok(command.startsWith('node "'), command);
+    assert.ok(command.includes(STATUSLINE_MARKER));
+  });
+
+  it("win32: keeps a space-free absolute node path, unquoted with forward slashes", () => {
+    const settingsPath = makeTempSettings({});
+
+    registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      platform: "win32",
+      nodeBin: "C:\\nvm\\v20.11.0\\node.exe",
+    });
+
+    const command = readSettings(settingsPath).statusLine.command;
+    assert.ok(command.startsWith('C:/nvm/v20.11.0/node.exe "'), command);
+  });
+
+  it("win32: rewrites our own legacy PowerShell-only command on re-register (startup sync migration)", () => {
+    const settingsPath = makeTempSettings({
+      statusLine: {
+        type: "command",
+        command: '& "C:\\Program Files\\nodejs\\node.exe" "C:/app/hooks/claude-statusline.js"',
+        padding: 0,
+      },
+    });
+
+    const result = registerClaudeStatusline({
+      silent: true,
+      settingsPath,
+      platform: "win32",
+      nodeBin: "C:\\Program Files\\nodejs\\node.exe",
+    });
+
+    assert.strictEqual(result.changed, true);
+    assert.strictEqual(result.skippedExisting, false);
+    const command = readSettings(settingsPath).statusLine.command;
+    assert.ok(!command.startsWith("& "), command);
+    assert.ok(command.includes(STATUSLINE_MARKER));
+  });
+
+  it("never overwrites a pre-existing third-party statusline", () => {
+    const settingsPath = makeTempSettings({
+      statusLine: { type: "command", command: "~/.claude/my-custom-statusline.sh" },
+    });
+
+    const result = registerClaudeStatusline({ silent: true, settingsPath, nodeBin: "/usr/local/bin/node" });
+
+    assert.strictEqual(result.skippedExisting, true);
+    assert.strictEqual(readSettings(settingsPath).statusLine.command, "~/.claude/my-custom-statusline.sh");
+  });
+
+  it("preserves other settings.json keys", () => {
+    const settingsPath = makeTempSettings({ model: "opus" });
+
+    registerClaudeStatusline({ silent: true, settingsPath, nodeBin: "/usr/local/bin/node" });
+
+    const settings = readSettings(settingsPath);
+    assert.strictEqual(settings.model, "opus");
+    assert.ok(settings.statusLine.command.includes(STATUSLINE_MARKER));
+  });
+
+  it("registers into a UTF-8-BOM'd settings.json instead of throwing (Notepad's default save format)", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-install-"));
+    const settingsPath = path.join(tmpDir, "settings.json");
+    fs.writeFileSync(settingsPath, "﻿" + JSON.stringify({ model: "opus" }), "utf8");
+    tempDirs.push(tmpDir);
+
+    const result = registerClaudeStatusline({ silent: true, settingsPath, nodeBin: "/usr/local/bin/node" });
+
+    assert.strictEqual(result.installed, true);
+    assert.strictEqual(result.changed, true);
+    const settings = readSettings(settingsPath);
+    assert.strictEqual(settings.model, "opus");
+    assert.ok(settings.statusLine.command.includes(STATUSLINE_MARKER));
+  });
+
+  it("unregisters from a UTF-8-BOM'd settings.json instead of throwing", () => {
+    const settingsPath = makeTempSettings({});
+    registerClaudeStatusline({ silent: true, settingsPath, nodeBin: "/usr/local/bin/node" });
+    const withBom = "﻿" + fs.readFileSync(settingsPath, "utf8");
+    fs.writeFileSync(settingsPath, withBom, "utf8");
+
+    const result = unregisterClaudeStatusline({ silent: true, settingsPath });
+
+    assert.strictEqual(result.removed, 1);
+    assert.strictEqual(readSettings(settingsPath).statusLine, undefined);
+  });
+
+  it("unregister removes only a Clawd-owned statusline", () => {
+    const settingsPath = makeTempSettings({});
+    registerClaudeStatusline({ silent: true, settingsPath, nodeBin: "/usr/local/bin/node" });
+
+    const result = unregisterClaudeStatusline({ silent: true, settingsPath, backup: true });
+
+    assert.deepStrictEqual(result, {
+      installed: true,
+      removed: 1,
+      changed: true,
+      settingsPath,
+      backupPath: result.backupPath,
+    });
+    assert.strictEqual(readSettings(settingsPath).statusLine, undefined);
+  });
+
+  it("unregister leaves a third-party statusline untouched", () => {
+    const settingsPath = makeTempSettings({
+      statusLine: { type: "command", command: "~/.claude/my-custom-statusline.sh" },
+    });
+
+    const result = unregisterClaudeStatusline({ silent: true, settingsPath });
+
+    assert.deepStrictEqual(result, { installed: true, removed: 0, changed: false, settingsPath });
+    assert.strictEqual(readSettings(settingsPath).statusLine.command, "~/.claude/my-custom-statusline.sh");
   });
 });

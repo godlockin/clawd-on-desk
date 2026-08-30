@@ -200,7 +200,7 @@ describe("CARD-04: res.on('close') semantics", () => {
     assert.strictEqual(resolved[0].behavior, "no-decision");
   });
 
-  it("legacy entry (no request_id) → deny on socket close (regression guard)", async () => {
+  it("legacy entry (no request_id) → no-decision on socket close", async () => {
     const { handler, pendingPermissions, resolved } = startServer();
     const req = makeReq("POST", "/permission", {
       agent_id: "claude-code",
@@ -215,7 +215,7 @@ describe("CARD-04: res.on('close') semantics", () => {
 
     res.emit("close");
     assert.strictEqual(resolved.length, 1);
-    assert.strictEqual(resolved[0].behavior, "deny");
+    assert.strictEqual(resolved[0].behavior, "no-decision");
     assert.strictEqual(resolved[0].message, "Client disconnected");
   });
 });

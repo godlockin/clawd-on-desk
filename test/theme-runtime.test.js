@@ -135,6 +135,8 @@ function createRuntime(options = {}) {
     syncHitWin: () => calls.push("syncHitWin"),
     syncSessionHudVisibility: () => calls.push("syncSessionHud"),
     startMainTick: () => calls.push("startMainTick"),
+    invalidateDisplayedVisual: (detail) => calls.push(["invalidateDisplayedVisual", detail]),
+    refreshDisplayedVisualHitBoxes: () => calls.push("refreshDisplayedVisualHitBoxes"),
     bumpAnimationOverridePreviewPosterGeneration: () => calls.push("bumpPoster"),
     rebuildAllMenus: () => calls.push("rebuildMenus"),
   });
@@ -259,6 +261,7 @@ describe("theme-runtime active ownership", () => {
       "state.cleanup",
       "tick.cleanup",
       "mini.cleanup",
+      ["invalidateDisplayedVisual", "theme-activation"],
       "mini.refreshTheme",
       "state.refreshTheme",
       "tick.refreshTheme",
@@ -290,6 +293,7 @@ describe("theme-runtime active ownership", () => {
     assert.deepStrictEqual(runtime.getActiveTheme().wideHitboxFiles, ["thinking.svg"]);
     assert.deepStrictEqual(calls, [
       "state.refreshTheme",
+      "refreshDisplayedVisualHitBoxes",
       "syncHitState",
       "syncHitWin",
       "flushPrefs",

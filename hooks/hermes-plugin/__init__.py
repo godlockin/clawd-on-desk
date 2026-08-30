@@ -94,6 +94,18 @@ _process_meta_started = False
 _process_meta_resolved = False
 _process_meta: Dict[str, Any] = {}
 
+# Clawd only listens on 127.0.0.1. urllib.request.urlopen() inherits
+# HTTP_PROXY/HTTPS_PROXY from the user's shell, and some proxy environments do
+# not exempt loopback even when the destination is explicit. Sending local
+# state or a blocking permission request through that proxy produces false
+# 502s (verified in a real WSL Hermes run for #540). Use one explicit no-proxy
+# opener for every Clawd request; this must cover both /state and /permission.
+_LOCAL_URL_OPENER = request.build_opener(request.ProxyHandler({}))
+
+
+def _local_urlopen(req: request.Request, timeout: float):
+    return _LOCAL_URL_OPENER.open(req, timeout=timeout)
+
 
 def _debug_enabled() -> bool:
     value = os.environ.get("CLAWD_HERMES_DEBUG", "").strip().lower()
@@ -227,7 +239,7 @@ def _post_state(body: Dict[str, Any]) -> None:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=POST_TIMEOUT_SECONDS) as response:
+            with _local_urlopen(req, timeout=POST_TIMEOUT_SECONDS) as response:
                 if response.headers.get(CLAWD_SERVER_HEADER) == CLAWD_SERVER_ID:
                     _cached_port = port
                     _no_server_until = 0.0
@@ -309,7 +321,7 @@ def _post_permission(tool_name: str, tool_input: dict, session_id: str, platform
             method="GET",
         )
         try:
-            with request.urlopen(probe_req, timeout=POST_TIMEOUT_SECONDS) as probe_resp:
+            with _local_urlopen(probe_req, timeout=POST_TIMEOUT_SECONDS) as probe_resp:
                 if probe_resp.headers.get(CLAWD_SERVER_HEADER) != CLAWD_SERVER_ID:
                     continue
         except Exception:
@@ -323,7 +335,7 @@ def _post_permission(tool_name: str, tool_input: dict, session_id: str, platform
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=PERMISSION_POST_TIMEOUT_SECONDS) as response:
+            with _local_urlopen(req, timeout=PERMISSION_POST_TIMEOUT_SECONDS) as response:
                 if response.status == 204:
                     _cached_port = port
                     return None
@@ -437,7 +449,7 @@ def _query_windows_process_snapshot() -> Dict[int, Dict[str, Any]]:
         "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | "
         "ConvertTo-Json -Compress"
     )
-    result = _run_process_command(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], timeout=3.0)
+    result = _run_process_command(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script], timeout=3.0)
     if not result or result.returncode != 0 or not result.stdout.strip():
         return {}
     try:
@@ -461,7 +473,7 @@ def _query_windows_process_info(pid: int, snapshot: Optional[Dict[int, Dict[str,
         f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' -ErrorAction SilentlyContinue; "
         "if ($p) { $p | Select-Object ProcessId,Name,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress }"
     )
-    result = _run_process_command(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], timeout=3.0)
+    result = _run_process_command(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script], timeout=3.0)
     if result and result.returncode == 0 and result.stdout.strip():
         try:
             row = json.loads(result.stdout)
@@ -487,7 +499,7 @@ def _query_windows_process_info(pid: int, snapshot: Optional[Dict[int, Dict[str,
         "}"
     )
     for shell in ("pwsh.exe", "powershell.exe"):
-        result = _run_process_command([shell, "-NoProfile", "-NonInteractive", "-Command", get_process_script], timeout=2.5)
+        result = _run_process_command([shell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", get_process_script], timeout=2.5)
         if not result or result.returncode != 0 or not result.stdout.strip():
             continue
         try:
@@ -670,6 +682,33 @@ def _cached_process_meta() -> Dict[str, Any]:
         return dict(_process_meta)
 
 
+_NESTED_TERMINAL_ENV = (
+    "WT_SESSION", "ALACRITTY_WINDOW_ID", "WEZTERM_PANE", "KITTY_WINDOW_ID",
+    "KONSOLE_VERSION", "GNOME_TERMINAL_SCREEN", "ConEmuPID", "TMUX", "STY", "ZELLIJ",
+)
+
+
+def _orca_pane_key_from_env() -> str:
+    """Orca's pane key, or "" when this process is not an Orca pane.
+
+    Read per payload rather than inside _resolve_process_metadata: that walk runs
+    on a background thread and is cached, so a walk-derived value would be absent
+    from every event posted before the thread finishes and from all of them if the
+    walk raised. NESTED_TERMINAL_ENV in hooks/shared-process.js is the same list
+    and carries the reasoning for each entry.
+    """
+    if os.environ.get("TERM_PROGRAM") != "Orca":
+        return ""
+    if any(os.environ.get(key) for key in _NESTED_TERMINAL_ENV):
+        return ""
+    pane_key = (os.environ.get("ORCA_PANE_KEY") or "").strip()
+    # ASCII-only: Python's \w matches Unicode word characters, which would make
+    # this copy of the validator laxer than the JavaScript ones.
+    if pane_key and len(pane_key) <= 256 and re.fullmatch(r"[\w-]+:[\w-]+", pane_key, re.ASCII):
+        return pane_key
+    return ""
+
+
 def _add_process_meta(payload: Dict[str, Any]) -> None:
     meta = _cached_process_meta()
     source_pid = _int_pid(meta.get("source_pid"))
@@ -690,6 +729,9 @@ def _add_process_meta(payload: Dict[str, Any]) -> None:
     tmux_client = meta.get("tmux_client")
     if isinstance(tmux_client, str) and tmux_client:
         payload["tmux_client"] = tmux_client
+    orca_pane_key = _orca_pane_key_from_env()
+    if orca_pane_key:
+        payload["orca_pane_key"] = orca_pane_key
 
 
 def _first_string(*values: Any) -> str:
@@ -1134,7 +1176,14 @@ def _handle_permission_request(tool_name: str, **kwargs: Any):
 
     if result is None:
         _handle_hook("pre_tool_call", **kwargs)
-        return None
+        # Permission tools are opt-in gates. A bodyless/no-server result is
+        # not user approval, and Hermes currently has no native approval UI
+        # to hand this request back to. Fail closed without claiming that the
+        # user denied it; they can retry once Clawd can collect a decision.
+        return {
+            "action": "block",
+            "message": "Clawd did not return a permission decision. Retry the tool after approving it in Clawd.",
+        }
 
     decision = result.get("decision", "")
     if decision == "allow":
@@ -1150,7 +1199,10 @@ def _handle_permission_request(tool_name: str, **kwargs: Any):
         return {"action": "block", "message": message}
 
     _handle_hook("pre_tool_call", **kwargs)
-    return None
+    return {
+        "action": "block",
+        "message": "Clawd returned an unrecognized permission decision. Retry the tool after approving it in Clawd.",
+    }
 
 
 def register(ctx) -> None:

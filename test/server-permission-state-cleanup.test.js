@@ -10,6 +10,13 @@ const {
   buildToolInputFingerprint,
   findPendingPermissionForStateEvent,
 } = require("../src/server-permission-utils");
+const { classifyPermissionInteraction } = require("../src/permission-automation-policy");
+const { makeSessionKey } = require("../src/session-key");
+
+const localSessionKey = (rawSessionId) => makeSessionKey({
+  profileId: "local",
+  rawSessionId,
+});
 
 function makeFakeHttp() {
   let capturedHandler = null;
@@ -86,6 +93,18 @@ function makeCtx(overrides = {}) {
     updateLog: () => {},
     ...overrides,
   };
+  ctx.pendingPermissions = (ctx.pendingPermissions || []).map((entry) => {
+    const agentId = entry.agentId || (entry.isQwenCode ? "qwen-code" : "claude-code");
+    return {
+      ...entry,
+      agentId,
+      subagentId: entry.subagentId || null,
+      interaction: entry.interaction || classifyPermissionInteraction({
+        agentId,
+        toolName: entry.toolName,
+      }),
+    };
+  });
   return { ctx, resolved };
 }
 
@@ -215,7 +234,7 @@ describe("/state permission cleanup", () => {
     const pendingPermissions = [
       {
         id: "a",
-        sessionId: "sid",
+        sessionId: localSessionKey("sid"),
         toolUseId: "toolu_a",
         toolName: "Read",
         toolInputFingerprint: buildToolInputFingerprint({ file_path: "src/a.js" }),
@@ -223,7 +242,7 @@ describe("/state permission cleanup", () => {
       },
       {
         id: "b",
-        sessionId: "sid",
+        sessionId: localSessionKey("sid"),
         toolUseId: "toolu_b",
         toolName: "Read",
         toolInputFingerprint: buildToolInputFingerprint({ file_path: "src/b.js" }),
@@ -250,7 +269,7 @@ describe("/state permission cleanup", () => {
     const pendingPermissions = [
       {
         id: "qwen",
-        sessionId: "qwen-code:sid",
+        sessionId: localSessionKey("qwen-code:sid"),
         toolUseId: "toolu_qwen",
         toolName: "Bash",
         toolInputFingerprint: buildToolInputFingerprint({ command: "npm test" }),
@@ -261,6 +280,7 @@ describe("/state permission cleanup", () => {
     const { handler, resolved } = startServer({ pendingPermissions });
 
     const res = await callHandler(handler, makeReq("POST", "/state", JSON.stringify({
+      agent_id: "qwen-code",
       state: "working",
       session_id: "qwen-code:sid",
       event: "PostToolUse",
@@ -275,10 +295,100 @@ describe("/state permission cleanup", () => {
     assert.deepStrictEqual(resolved.map((entry) => entry.message), ["User answered in terminal"]);
   });
 
+  it("clears matching ZCode pending entries as no-decision instead of deny", async () => {
+    const pendingPermissions = [
+      {
+        id: "zcode",
+        agentId: "zcode",
+        sessionId: localSessionKey("zcode:sid"),
+        toolUseId: "toolu_zcode",
+        toolName: "Bash",
+        toolInputFingerprint: buildToolInputFingerprint({ command: "npm test" }),
+        isZcode: true,
+        res: {},
+      },
+    ];
+    const { handler, resolved } = startServer({ pendingPermissions });
+
+    const res = await callHandler(handler, makeReq("POST", "/state", JSON.stringify({
+      agent_id: "zcode",
+      state: "working",
+      session_id: "zcode:sid",
+      event: "PostToolUse",
+      tool_name: "Bash",
+      tool_use_id: "toolu_zcode",
+      tool_input_fingerprint: buildToolInputFingerprint({ command: "npm test" }),
+    })));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(resolved.map((entry) => entry.perm.id), ["zcode"]);
+    // ZCode answers "{}" for no-decision and falls back to its native
+    // permission UI — a sweep deny would reach ZCode as a real decision.
+    assert.deepStrictEqual(resolved.map((entry) => entry.behavior), ["no-decision"]);
+    assert.deepStrictEqual(resolved.map((entry) => entry.message), ["User answered in terminal"]);
+  });
+
+  it("sweeps a stale ZCode decision entry as no-decision, never a forged deny", async () => {
+    // Defense in depth: the route's capability gate keeps decision-type
+    // interactions out of the pending stack, but if one ever lands here the
+    // sweep must still not fabricate a deny for a native-fallback adapter.
+    const pendingPermissions = [
+      {
+        id: "zcode-ask",
+        agentId: "zcode",
+        sessionId: localSessionKey("zcode:sid"),
+        toolName: "AskUserQuestion",
+        interaction: classifyPermissionInteraction({ agentId: "zcode", toolName: "AskUserQuestion" }),
+        isZcode: true,
+        res: {},
+      },
+    ];
+    const { handler, resolved } = startServer({ pendingPermissions });
+
+    // A Stop with no matching tool is the singleton-fallback trigger for the
+    // stale-decision sweep.
+    const res = await callHandler(handler, makeReq("POST", "/state", JSON.stringify({
+      agent_id: "zcode",
+      state: "attention",
+      session_id: "zcode:sid",
+      event: "Stop",
+    })));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(resolved.map((entry) => entry.perm.id), ["zcode-ask"]);
+    assert.deepStrictEqual(resolved.map((entry) => entry.behavior), ["no-decision"]);
+  });
+
+  it("sweeps a stale Qwen decision entry as no-decision, never a forged deny", async () => {
+    const pendingPermissions = [
+      {
+        id: "qwen-ask",
+        agentId: "qwen-code",
+        sessionId: localSessionKey("qwen-code:sid"),
+        toolName: "AskUserQuestion",
+        interaction: classifyPermissionInteraction({ agentId: "qwen-code", toolName: "AskUserQuestion" }),
+        isQwenCode: true,
+        res: {},
+      },
+    ];
+    const { handler, resolved } = startServer({ pendingPermissions });
+
+    const res = await callHandler(handler, makeReq("POST", "/state", JSON.stringify({
+      agent_id: "qwen-code",
+      state: "attention",
+      session_id: "qwen-code:sid",
+      event: "Stop",
+    })));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(resolved.map((entry) => entry.perm.id), ["qwen-ask"]);
+    assert.deepStrictEqual(resolved.map((entry) => entry.behavior), ["no-decision"]);
+  });
+
   it("keeps concurrent pending requests untouched when Stop is ambiguous", async () => {
     const pendingPermissions = [
-      { id: "a", sessionId: "sid", toolName: "Bash", res: {} },
-      { id: "b", sessionId: "sid", toolName: "Bash", res: {} },
+      { id: "a", sessionId: localSessionKey("sid"), toolName: "Bash", res: {} },
+      { id: "b", sessionId: localSessionKey("sid"), toolName: "Bash", res: {} },
     ];
     const { handler, resolved } = startServer({ pendingPermissions });
 
@@ -294,7 +404,7 @@ describe("/state permission cleanup", () => {
 
   it("does not clear a single pending Bash request when another tool finishes", async () => {
     const pendingPermissions = [
-      { id: "bash", sessionId: "sid", toolName: "Bash", res: {} },
+      { id: "bash", sessionId: localSessionKey("sid"), toolName: "Bash", res: {} },
     ];
     const { handler, resolved } = startServer({ pendingPermissions });
 
@@ -313,7 +423,7 @@ describe("/state permission cleanup", () => {
     const pendingPermissions = [
       {
         id: "pending-bash",
-        sessionId: "sid",
+        sessionId: localSessionKey("sid"),
         toolUseId: "toolu_pending",
         toolName: "Bash",
         toolInputFingerprint: buildToolInputFingerprint({ command: "stat -c '%n %y' src/server.js" }),
@@ -339,7 +449,7 @@ describe("/state permission cleanup", () => {
     const pendingPermissions = [
       {
         id: "pending-bash",
-        sessionId: "sid",
+        sessionId: localSessionKey("sid"),
         toolUseId: "toolu_pending",
         toolName: "Bash",
         toolInputFingerprint: buildToolInputFingerprint({ command: "stat -c '%n %y' src/server.js" }),
@@ -365,7 +475,7 @@ describe("/state permission cleanup", () => {
     const pendingPermissions = [
       {
         id: "elicit",
-        sessionId: "sid",
+        sessionId: localSessionKey("sid"),
         toolName: "AskUserQuestion",
         toolUseId: "toolu_elicit",
         toolInputFingerprint: buildToolInputFingerprint({ questions: [{ question: "Pick one" }] }),
@@ -393,7 +503,7 @@ describe("/state permission cleanup", () => {
     const pendingPermissions = [
       {
         id: "elicit",
-        sessionId: "other-sid",
+        sessionId: localSessionKey("other-sid"),
         toolName: "AskUserQuestion",
         toolUseId: "toolu_elicit",
         isElicitation: true,
@@ -401,7 +511,7 @@ describe("/state permission cleanup", () => {
       },
       {
         id: "bash-perm",
-        sessionId: "sid",
+        sessionId: localSessionKey("sid"),
         toolUseId: "toolu_bash_perm",
         toolName: "Bash",
         res: {},
@@ -426,7 +536,7 @@ describe("/state permission cleanup", () => {
     const pendingPermissions = [
       {
         id: "pending-bash",
-        sessionId: "sid",
+        sessionId: localSessionKey("sid"),
         toolName: "Bash",
         toolInputFingerprint: buildToolInputFingerprint({ command }),
         res: {},

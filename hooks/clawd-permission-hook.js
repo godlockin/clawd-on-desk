@@ -29,6 +29,7 @@ const {
   createPidResolver,
   readStdinJson,
   getPlatformConfig,
+  applyOrcaPaneKey,
 } = require("./shared-process");
 const { buildToolInputFingerprint } = require("./clawd-hook");
 
@@ -105,14 +106,22 @@ function buildPermissionBody(payload, resolve, requestId) {
   }
 
   if (process.env.CLAWD_REMOTE) {
+    applyOrcaPaneKey(body);
     body.host = readHostPrefix();
   } else if (typeof resolve === "function") {
     try {
-      const { stablePid, agentPid, detectedEditor, pidChain } = resolve();
+      const { stablePid, agentPid, detectedEditor, pidChain } = resolve({
+        namespace: "claude-code",
+        sessionId,
+        cacheCwd: payload.cwd || "",
+        lifecycle: "event",
+        cacheable: sessionId !== "default" && !!payload.cwd,
+      });
       if (stablePid) body.source_pid = stablePid;
       if (detectedEditor) body.editor = detectedEditor;
       if (agentPid) body.agent_pid = agentPid;
       if (pidChain && pidChain.length) body.pid_chain = pidChain;
+      applyOrcaPaneKey(body);
     } catch {}
   }
 

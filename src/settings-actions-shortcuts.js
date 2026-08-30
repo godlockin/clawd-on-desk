@@ -6,7 +6,13 @@ const {
   getDefaultShortcuts,
   parseAccelerator,
   isDangerousAccelerator,
+  acceleratorsConflict,
 } = require("./shortcut-actions");
+
+function getShortcutPlatformOptions(deps) {
+  const platform = deps && typeof deps.platform === "string" ? deps.platform : process.platform;
+  return { isMac: platform === "darwin" };
+}
 
 function getShortcutSnapshot(snapshot) {
   const defaults = getDefaultShortcuts();
@@ -81,14 +87,15 @@ function validateShortcutBinding(actionId, accelerator, deps) {
   if (!parsed) {
     return { status: "error", message: "invalid accelerator format" };
   }
-  if (isDangerousAccelerator(parsed.accelerator)) {
+  const platformOptions = getShortcutPlatformOptions(deps);
+  if (isDangerousAccelerator(parsed.accelerator, platformOptions)) {
     return { status: "error", message: "reserved accelerator" };
   }
 
   const shortcuts = getShortcutSnapshot(deps && deps.snapshot);
   for (const otherActionId of SHORTCUT_ACTION_IDS) {
     if (otherActionId === actionId) continue;
-    if (shortcuts[otherActionId] === parsed.accelerator) {
+    if (acceleratorsConflict(shortcuts[otherActionId], parsed.accelerator, platformOptions)) {
       return {
         status: "error",
         message: `conflict: already bound to ${otherActionId}`,
@@ -190,6 +197,26 @@ function registerShortcut(payload, deps) {
         actionId,
         currentAccelerator,
         nextAccelerator,
+        deps,
+        { allowRetrySame: true }
+      );
+    }
+    return { status: "ok", noop: true };
+  }
+
+  // On Windows/Linux, Control and CommandOrControl address the same physical
+  // key. Treat an alias-only re-recording as a no-op so Electron does not reject
+  // the new spelling while the equivalent old accelerator is still registered.
+  if (acceleratorsConflict(
+    currentAccelerator,
+    nextAccelerator,
+    getShortcutPlatformOptions(deps)
+  )) {
+    if (SHORTCUT_ACTIONS[actionId].persistent && currentFailure) {
+      return applyPersistentShortcutChange(
+        actionId,
+        currentAccelerator,
+        currentAccelerator,
         deps,
         { allowRetrySame: true }
       );

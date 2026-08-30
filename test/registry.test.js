@@ -8,6 +8,7 @@ describe("Agent Registry", () => {
     const ids = agents.map((a) => a.id);
     assert.deepStrictEqual(ids, [
       "claude-code",
+      "deepseek-harness",
       "codex",
       "copilot-cli",
       "gemini-cli",
@@ -17,18 +18,25 @@ describe("Agent Registry", () => {
       "kiro-cli",
       "kimi-cli",
       "qwen-code",
+      "zcode",
       "codewhale",
       "opencode",
+      "mimocode",
       "pi",
       "openclaw",
       "hermes",
       "qoder",
       "reasonix",
+      "qoderwork",
+      "qwenwork",
+      "workbuddy",
+      "traecode",
     ]);
   });
 
   it("should look up agents by ID", () => {
     assert.strictEqual(registry.getAgent("claude-code").name, "Claude Code");
+    assert.strictEqual(registry.getAgent("deepseek-harness").name, "DeepSeek Harness (web, experimental)");
     assert.strictEqual(registry.getAgent("codex").name, "Codex CLI");
     assert.strictEqual(registry.getAgent("copilot-cli").name, "Copilot CLI");
     assert.strictEqual(registry.getAgent("gemini-cli").name, "Gemini CLI");
@@ -42,7 +50,11 @@ describe("Agent Registry", () => {
     assert.strictEqual(registry.getAgent("openclaw").name, "OpenClaw");
     assert.strictEqual(registry.getAgent("hermes").name, "Hermes Agent");
     assert.strictEqual(registry.getAgent("qoder").name, "Qoder");
-    assert.strictEqual(registry.getAgent("reasonix").name, "Reasonix CLI");
+    assert.strictEqual(registry.getAgent("reasonix").name, "Reasonix");
+    assert.strictEqual(registry.getAgent("qoderwork").name, "QoderWork");
+    assert.strictEqual(registry.getAgent("qwenwork").name, "QwenWork");
+    assert.strictEqual(registry.getAgent("workbuddy").name, "WorkBuddy");
+    assert.strictEqual(registry.getAgent("traecode").name, "TraeCode");
     assert.strictEqual(registry.getAgent("nonexistent"), undefined);
   });
 
@@ -86,7 +98,25 @@ describe("Agent Registry", () => {
     assert.deepStrictEqual(qoder.processNames.win, ["qoder.exe", "qodercli.exe", "qoder-cli.exe"]);
 
     const reasonix = registry.getAgent("reasonix");
-    assert.deepStrictEqual(reasonix.processNames.win, ["reasonix.exe"]);
+    assert.deepStrictEqual(reasonix.processNames.win, ["reasonix.exe", "reasonix-desktop.exe", "reasonix-cli.exe"]);
+
+    const qoderwork = registry.getAgent("qoderwork");
+    assert.deepStrictEqual(qoderwork.processNames.win, ["QoderWork.exe"]);
+
+    const qwenwork = registry.getAgent("qwenwork");
+    assert.deepStrictEqual(qwenwork.processNames.win, ["QwenWorkCN.exe"]);
+
+    const workbuddy = registry.getAgent("workbuddy");
+    assert.deepStrictEqual(workbuddy.processNames.win, ["WorkBuddy.exe", "workbuddy.exe"]);
+    assert.deepStrictEqual(workbuddy.processNames.mac.slice(0, 2), [
+      "WorkBuddy AI Helper",
+      "WorkBuddy AI Helper (Renderer)",
+    ]);
+
+    const traecode = registry.getAgent("traecode");
+    assert.deepStrictEqual(traecode.processNames.win, ["Trae CN.exe", "trae cn.exe", "TraeCN.exe", "traecn.exe"]);
+    assert.deepStrictEqual(traecode.processNames.mac, ["Trae", "trae"]);
+    assert.deepStrictEqual(traecode.processNames.linux, ["trae", "Trae"]);
   });
 
   it("should include explicit Linux process names", () => {
@@ -130,7 +160,20 @@ describe("Agent Registry", () => {
     assert.deepStrictEqual(qoder.processNames.linux, ["qoder", "qodercli", "qoder-cli"]);
 
     const reasonix = registry.getAgent("reasonix");
-    assert.deepStrictEqual(reasonix.processNames.linux, ["reasonix"]);
+    assert.deepStrictEqual(reasonix.processNames.linux, ["reasonix", "reasonix-desktop"]);
+
+    const qoderwork = registry.getAgent("qoderwork");
+    assert.deepStrictEqual(qoderwork.processNames.linux, ["QoderWork"]);
+
+    // #843: QwenWork ships macOS 14+ / Windows 10+ / HarmonyOS 6.1+ only
+    // (https://qwenwork.cn/download). There is no Linux client, so the list is
+    // deliberately empty rather than a speculative executable name.
+    const qwenwork = registry.getAgent("qwenwork");
+    assert.deepStrictEqual(qwenwork.processNames.linux, []);
+    assert.deepStrictEqual(qwenwork.processNames.mac, ["QwenWorkCN", "千问办公"]);
+
+    const workbuddy = registry.getAgent("workbuddy");
+    assert.deepStrictEqual(workbuddy.processNames.linux, ["workbuddy", "WorkBuddy"]);
   });
 
   it("should keep Kiro CLI process names narrowed to kiro-cli only", () => {
@@ -160,6 +203,78 @@ describe("Agent Registry", () => {
     assert.ok(agentIds.includes("hermes"));
   });
 
+  it("requires every agent to declare an explicit startup recovery surface", () => {
+    for (const agent of registry.getAllAgents()) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(agent, "startupRecoveryProcessNames"),
+        `${agent.id} must explicitly declare startupRecoveryProcessNames`
+      );
+      for (const platform of ["win", "mac", "linux"]) {
+        assert.ok(
+          Array.isArray(agent.startupRecoveryProcessNames[platform]),
+          `${agent.id} must declare startupRecoveryProcessNames.${platform}`
+        );
+      }
+    }
+
+    const startupAgentIds = new Set(
+      registry.getStartupRecoveryProcessNames().map((entry) => entry.agentId)
+    );
+    assert.ok(startupAgentIds.has("mimocode"));
+    assert.ok(startupAgentIds.has("qwen-code"));
+    assert.ok(startupAgentIds.has("reasonix"));
+    assert.ok(!startupAgentIds.has("cursor-agent"));
+    assert.ok(!startupAgentIds.has("qoderwork"));
+    assert.ok(!startupAgentIds.has("qwenwork"));
+    assert.ok(!startupAgentIds.has("workbuddy"));
+
+    // ZCode keeps only the unambiguous legacy `zcode-cli` in pure-name startup
+    // recovery. Current macOS/Windows Electron Node-mode runtimes are matched
+    // separately by the `zcode.cjs` command-line marker, never by the bare GUI
+    // executable name.
+    const zcode = registry.getAgent("zcode");
+    assert.deepStrictEqual(zcode.startupRecoveryProcessNames, {
+      win: [],
+      mac: ["zcode-cli"],
+      linux: ["zcode-cli"],
+    });
+  });
+
+  it("keeps ambiguous GUI and POSIX process names out of startup recovery", () => {
+    assert.deepStrictEqual(
+      registry.getAgent("cursor-agent").startupRecoveryProcessNames,
+      { win: [], mac: [], linux: [] }
+    );
+    assert.deepStrictEqual(
+      registry.getAgent("qoderwork").startupRecoveryProcessNames,
+      { win: [], mac: [], linux: [] }
+    );
+    assert.deepStrictEqual(
+      registry.getAgent("qwenwork").startupRecoveryProcessNames,
+      { win: [], mac: [], linux: [] }
+    );
+    assert.deepStrictEqual(
+      registry.getAgent("workbuddy").startupRecoveryProcessNames,
+      { win: [], mac: [], linux: [] }
+    );
+    assert.deepStrictEqual(
+      registry.getAgent("traecode").startupRecoveryProcessNames,
+      { win: [], mac: [], linux: [] }
+    );
+    assert.deepStrictEqual(
+      registry.getAgent("pi").startupRecoveryProcessNames,
+      { win: ["pi.exe"], mac: [], linux: [] }
+    );
+    assert.deepStrictEqual(
+      registry.getAgent("qoder").startupRecoveryProcessNames.win,
+      ["qodercli.exe", "qoder-cli.exe"]
+    );
+    assert.deepStrictEqual(
+      registry.getAgent("reasonix").startupRecoveryProcessNames,
+      { win: ["reasonix.exe", "reasonix-cli.exe"], mac: ["reasonix"], linux: ["reasonix"] }
+    );
+  });
+
   it("should have correct capabilities", () => {
     const cc = registry.getAgent("claude-code");
     assert.strictEqual(cc.capabilities.httpHook, true);
@@ -172,6 +287,16 @@ describe("Agent Registry", () => {
     assert.strictEqual(codex.capabilities.permissionApproval, true);
     assert.strictEqual(codex.capabilities.sessionEnd, false);
     assert.strictEqual(codex.capabilities.subagent, false);
+
+    const zcode = registry.getAgent("zcode");
+    assert.strictEqual(zcode.capabilities.httpHook, false);
+    // Phase 2: blocking PermissionRequest hook answers real allow/deny via
+    // hookSpecificOutput; "{}" falls back to ZCode's native permission flow.
+    assert.strictEqual(zcode.capabilities.permissionApproval, true);
+    assert.strictEqual(zcode.capabilities.interactiveBubble, true);
+    assert.strictEqual(zcode.capabilities.notificationHook, false);
+    assert.strictEqual(zcode.capabilities.sessionEnd, false);
+    assert.strictEqual(zcode.capabilities.subagent, false);
 
     const copilot = registry.getAgent("copilot-cli");
     assert.strictEqual(copilot.capabilities.httpHook, false);
@@ -262,6 +387,37 @@ describe("Agent Registry", () => {
     assert.strictEqual(reasonix.capabilities.notificationHook, true);
     assert.strictEqual(reasonix.capabilities.sessionEnd, true);
     assert.strictEqual(reasonix.capabilities.subagent, true);
+
+    const qoderwork = registry.getAgent("qoderwork");
+    assert.strictEqual(qoderwork.capabilities.httpHook, false);
+    assert.strictEqual(qoderwork.capabilities.permissionApproval, false);
+    assert.strictEqual(qoderwork.capabilities.interactiveBubble, false);
+    assert.strictEqual(qoderwork.capabilities.notificationHook, true);
+    assert.strictEqual(qoderwork.capabilities.sessionEnd, true);
+    assert.strictEqual(qoderwork.capabilities.subagent, false);
+
+    const workbuddy = registry.getAgent("workbuddy");
+    // State-only (#618): the desktop app resolves permissions in its own
+    // native sandbox + GUI, so Clawd never registers a /permission HTTP hook
+    // and never renders an approval bubble. It only mirrors state and pops a
+    // waiting Notification.
+    assert.strictEqual(workbuddy.capabilities.httpHook, false);
+    assert.strictEqual(workbuddy.capabilities.permissionApproval, false);
+    assert.strictEqual(workbuddy.capabilities.interactiveBubble, false);
+    assert.strictEqual(workbuddy.capabilities.notificationHook, true);
+    assert.strictEqual(workbuddy.capabilities.sessionEnd, true);
+    assert.strictEqual(workbuddy.capabilities.subagent, false);
+
+    const traecode = registry.getAgent("traecode");
+    // State-only: TraeCode has no PermissionRequest or SessionEnd event, so no
+    // HTTP hook, no approval bubble. It only mirrors state and pops a
+    // Notification.
+    assert.strictEqual(traecode.capabilities.httpHook, false);
+    assert.strictEqual(traecode.capabilities.permissionApproval, false);
+    assert.strictEqual(traecode.capabilities.interactiveBubble, false);
+    assert.strictEqual(traecode.capabilities.notificationHook, true);
+    assert.strictEqual(traecode.capabilities.sessionEnd, false);
+    assert.strictEqual(traecode.capabilities.subagent, false);
   });
 
   it("should have eventMap for hook-based agents", () => {
@@ -353,6 +509,47 @@ describe("Agent Registry", () => {
     assert.strictEqual(reasonix.eventMap.Notification, "notification");
     assert.strictEqual(reasonix.eventMap.PreCompact, "sweeping");
     assert.strictEqual(reasonix.eventMap.SessionEnd, "sleeping");
+
+    const qoderwork = registry.getAgent("qoderwork");
+    assert.strictEqual(qoderwork.eventSource, "hook");
+    assert.strictEqual(qoderwork.eventMap.SessionStart, "idle");
+    assert.strictEqual(qoderwork.eventMap.UserPromptSubmit, "thinking");
+    assert.strictEqual(qoderwork.eventMap.PreToolUse, "working");
+    assert.strictEqual(qoderwork.eventMap.PostToolUseFailure, "error");
+    assert.strictEqual(qoderwork.eventMap.Stop, "attention");
+    // Permission events map to "working" (not "notification") to avoid
+    // animation spam — QoderWork fires 40+ per task during normal tool use.
+    assert.strictEqual(qoderwork.eventMap.PermissionRequest, "working");
+    assert.strictEqual(qoderwork.eventMap.PermissionDenied, "working");
+    assert.strictEqual(qoderwork.eventMap.SessionEnd, "sleeping");
+
+    const workbuddy = registry.getAgent("workbuddy");
+    assert.strictEqual(workbuddy.eventSource, "hook");
+    assert.strictEqual(workbuddy.eventMap.SessionStart, "idle");
+    assert.strictEqual(workbuddy.eventMap.UserPromptSubmit, "thinking");
+    assert.strictEqual(workbuddy.eventMap.PreToolUse, "working");
+    assert.strictEqual(workbuddy.eventMap.PostToolUse, "working");
+    assert.strictEqual(workbuddy.eventMap.Stop, "attention");
+    // #618: no PermissionRequest mapping — the kernel has no standalone
+    // PermissionRequest event, and desktop approval never reaches Clawd.
+    // Permission surfaces only through Notification.
+    assert.strictEqual(workbuddy.eventMap.PermissionRequest, undefined);
+    assert.strictEqual(workbuddy.eventMap.Notification, "notification");
+    assert.strictEqual(workbuddy.eventMap.PreCompact, "sweeping");
+    assert.strictEqual(workbuddy.eventMap.SessionEnd, "sleeping");
+
+    const traecode = registry.getAgent("traecode");
+    assert.strictEqual(traecode.eventSource, "hook");
+    assert.strictEqual(traecode.eventMap.SessionStart, "idle");
+    assert.strictEqual(traecode.eventMap.UserPromptSubmit, "thinking");
+    assert.strictEqual(traecode.eventMap.PreToolUse, "working");
+    assert.strictEqual(traecode.eventMap.PostToolUse, "working");
+    assert.strictEqual(traecode.eventMap.Stop, "attention");
+    assert.strictEqual(traecode.eventMap.Notification, "notification");
+    // TraeCode has no SessionEnd / PermissionRequest / PreCompact events.
+    assert.strictEqual(traecode.eventMap.SessionEnd, undefined);
+    assert.strictEqual(traecode.eventMap.PermissionRequest, undefined);
+    assert.strictEqual(traecode.eventMap.PreCompact, undefined);
   });
 
   it("treats Gemini CLI as a hook-only agent", () => {
@@ -371,6 +568,15 @@ describe("Agent Registry", () => {
     assert.ok(antigravity.hookConfig);
     assert.strictEqual(antigravity.hookConfig.configFormat, "antigravity-hooks-json");
     assert.strictEqual(antigravity.logConfig, undefined);
+  });
+
+  it("treats TraeCode as a hook-only agent with standalone hooks.json", () => {
+    const traecode = registry.getAgent("traecode");
+
+    assert.strictEqual(traecode.eventSource, "hook");
+    assert.ok(traecode.hookConfig);
+    assert.strictEqual(traecode.hookConfig.configFormat, "traecode-hooks-json");
+    assert.strictEqual(traecode.logConfig, undefined);
   });
 
   it("should have logEventMap for poll-based agents", () => {

@@ -30,6 +30,7 @@
     || ((data) => data);
   const applyAnimationPosterPayloadToRuntime = animMergeApi.applyAnimationPosterPayload
     || (() => ({ valid: false, stored: false, applied: false }));
+  const selectPickerApi = root.ClawdLanguagePicker || {};
 
   const shortcutApi = root.ClawdShortcutActions || {};
   const SHORTCUT_ACTIONS = shortcutApi.SHORTCUT_ACTIONS || {};
@@ -44,6 +45,12 @@
   // startsWith("Mac") not /\bMac\b/ — "MacIntel" has \w after "c", fails \b (regression #135).
   const IS_MAC = (navigator.platform || "").startsWith("Mac");
   const COLLAPSED_GROUPS_STORAGE_KEY = "clawd.settings.collapsedGroups.v1";
+  const NAVIGATION_STORAGE_KEY = "clawd.settings.navigation.v1";
+  const MAX_PERSISTED_SCROLL_TOP = 10_000_000;
+  // Runtime-only geometry belongs in the snapshot for consistency, but has no
+  // mounted Settings control. Re-rendering for it would destroy focused inputs
+  // and reset the active tab's scroll position after every window move/resize.
+  const RENDERER_INERT_SETTINGS_KEYS = new Set(["settingsWindowBounds", "dashboardWindowBounds"]);
 
   const state = {
     snapshot: null,
@@ -69,6 +76,7 @@
       animMapSwitches: new Map(),
       animMapReset: null,
       animOverrideTimingSliders: new Map(),
+      idleVisualPicker: null,
       bubblePolicySummary: null,
       sessionHudSummary: null,
       languagePicker: null,
@@ -76,6 +84,15 @@
       soundSummary: null,
       soundVolume: null,
       textScale: null,
+      roamMovementStyle: null,
+      bubblePlacement: null,
+      roamArea: null,
+      settingsSelects: new Set(),
+      segmentedRadios: new Set(),
+      quotaRingDisplayMode: null,
+      permissionAutomationMode: null,
+      aboutAutoUpdate: null,
+      aboutUpdateStatus: null,
     },
     shortcutRecordingActionId: null,
     shortcutRecordingError: "",
@@ -95,6 +112,9 @@
     userThemeZipImportPending: false,
     codexPetRemovalPendingThemeId: null,
     animationOverridesData: null,
+    petTintOptions: [],
+    petAccessoryOptions: [],
+    petMouthAccessoryOptions: [],
     animationOverridesFetchSeq: 0,
     animationPosterRenderPending: false,
     animationPosterRenderFlags: null,
@@ -102,6 +122,11 @@
     pendingAnimationOverrideEdits: new Map(),
     nextAnimationOverrideEditSeq: 1,
     animOverridesSubtab: "map",
+    settingsTabScrollPositions: new Map(),
+    // null = not chosen yet; the Agents tab resolves it from what is connected.
+    agentsSubtab: null,
+    agentsUnavailableQuery: "",
+    remoteApprovalSubtab: "channels",
     expandedOverrideRowIds: new Set(),
     assetPicker: {
       state: null,
@@ -112,6 +137,7 @@
     about: {
       infoCache: null,
       clickCount: 0,
+      updateCheckSnapshot: { state: "idle" },
     },
   };
 
@@ -168,6 +194,38 @@
     const entry = state.snapshot && state.snapshot.agents && state.snapshot.agents[agentId];
     if (agentId === "codex" && entry && entry.permissionMode === "intercept") return "intercept";
     return "native";
+  }
+
+  function readAgentCustomPermissionUrl(agentId) {
+    const entry = state.snapshot && state.snapshot.agents && state.snapshot.agents[agentId];
+    return entry && typeof entry.customPermissionUrl === "string" ? entry.customPermissionUrl : "";
+  }
+
+  function readAgentCustomDiscoveryPaths(agentId) {
+    if (agentId === "custom") {
+      const value = state.snapshot && state.snapshot.customToolDiscoveryPaths;
+      return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+    }
+    const entry = state.snapshot && state.snapshot.agents && state.snapshot.agents[agentId];
+    const value = entry && entry.customDiscoveryPaths;
+    return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+  }
+
+  function readCustomToolDetectionResults() {
+    const hints = runtime.agentInstallationHints;
+    const value = hints && hints.customTools;
+    return Array.isArray(value) ? value.filter((item) => item && typeof item.path === "string") : [];
+  }
+
+  function readCustomAgentDetectionResults() {
+    const hints = runtime.agentInstallationHints;
+    const value = hints && hints.customAgents;
+    return Array.isArray(value) ? value.filter((item) => item && typeof item.agentId === "string") : [];
+  }
+
+  function readCustomApplications() {
+    const value = state.snapshot && state.snapshot.customApplications;
+    return Array.isArray(value) ? value.filter((item) => item && typeof item.id === "string") : [];
   }
 
   function getShortcutValue(actionId) {
@@ -311,6 +369,197 @@
     return section;
   }
 
+  // Shared Settings button primitive. Feature tabs keep ownership of business
+  // behavior while tone, sizing and pending/accessibility semantics stay
+  // consistent across the Settings window.
+  function buildButton(config = {}) {
+    const button = document.createElement("button");
+    const tone = ["neutral", "accent", "danger", "quiet"].includes(config.tone)
+      ? config.tone
+      : "neutral";
+    const size = ["compact", "regular", "large"].includes(config.size)
+      ? config.size
+      : "regular";
+    button.type = config.type || "button";
+    button.className = [
+      "soft-btn",
+      "settings-button",
+      `settings-button-${size}`,
+      tone === "neutral" ? "" : tone,
+      config.className || "",
+    ].filter(Boolean).join(" ");
+    button.textContent = config.label != null
+      ? String(config.label)
+      : (config.labelKey ? t(config.labelKey) : "");
+    if (config.ariaLabel) button.setAttribute("aria-label", String(config.ariaLabel));
+    if (config.title) button.title = String(config.title);
+    if (config.disabled === true || config.pending === true) button.disabled = true;
+    button.classList.toggle("pending", config.pending === true);
+    button.setAttribute("aria-busy", config.pending === true ? "true" : "false");
+    if (typeof config.onClick === "function") button.addEventListener("click", config.onClick);
+    return button;
+  }
+
+  function buildSettingsSelect(config = {}) {
+    const factory = selectPickerApi.createSettingsSelect || selectPickerApi.createLanguagePicker;
+    if (typeof factory !== "function") {
+      throw new Error("language-picker.js failed to load before settings-ui-core.js");
+    }
+    const className = ["settings-select", config.className || ""].filter(Boolean).join(" ");
+    const control = factory({
+      ...config,
+      className,
+      lockWhilePending: config.lockWhilePending !== false,
+    });
+    state.mountedControls.settingsSelects.add(control);
+    return control;
+  }
+
+  function buildSegmentedRadio(config = {}) {
+    const options = Array.isArray(config.options)
+      ? config.options.filter((option) => option && option.value != null)
+      : [];
+    const values = options.map((option) => String(option.value));
+    let currentValue = values.includes(String(config.value))
+      ? String(config.value)
+      : (values[0] || "");
+    let disabled = config.disabled === true;
+    let pending = false;
+    let disposed = false;
+
+    const element = document.createElement("div");
+    element.className = ["segmented", "settings-segmented-radio", config.className || ""]
+      .filter(Boolean)
+      .join(" ");
+    element.setAttribute("role", "radiogroup");
+    if (config.ariaLabel) element.setAttribute("aria-label", config.ariaLabel);
+
+    const buttons = options.map((option) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.dataset.value = String(option.value);
+
+      const label = document.createElement("span");
+      label.className = "settings-segmented-radio-label";
+      label.textContent = option.label == null ? String(option.value) : String(option.label);
+      button.appendChild(label);
+
+      if (option.description) {
+        const description = document.createElement("span");
+        description.className = "settings-segmented-radio-description";
+        description.textContent = String(option.description);
+        button.appendChild(description);
+      }
+      element.appendChild(button);
+      return button;
+    });
+
+    function syncVisualState() {
+      element.classList.toggle("pending", pending);
+      element.classList.toggle("disabled", disabled);
+      element.setAttribute("aria-busy", pending ? "true" : "false");
+      for (const button of buttons) {
+        const selected = button.dataset.value === currentValue;
+        button.classList.toggle("active", selected);
+        button.setAttribute("aria-checked", selected ? "true" : "false");
+        button.tabIndex = selected ? 0 : -1;
+        button.disabled = disabled || pending;
+      }
+    }
+
+    async function selectValue(nextValue) {
+      const next = String(nextValue);
+      if (disposed || disabled || pending || !values.includes(next)) return false;
+      if (next === currentValue) return true;
+      const previous = currentValue;
+      const focusTarget = buttons.includes(document.activeElement) ? document.activeElement : null;
+      currentValue = next;
+      let accepted = true;
+      try {
+        if (typeof config.onChange === "function") {
+          const result = config.onChange(next);
+          pending = true;
+          syncVisualState();
+          accepted = (await Promise.resolve(result)) !== false;
+        } else {
+          pending = true;
+          syncVisualState();
+        }
+      } catch (_) {
+        accepted = false;
+      }
+      if (!accepted) currentValue = previous;
+      pending = false;
+      syncVisualState();
+      if (focusTarget && focusTarget.isConnected !== false && typeof focusTarget.focus === "function") {
+        const active = document.activeElement;
+        if (!active || active === document.body || active === focusTarget || active.isConnected === false) {
+          try { focusTarget.focus({ preventScroll: true }); } catch (_) { focusTarget.focus(); }
+        }
+      }
+      return accepted;
+    }
+
+    function onClick(event) {
+      const button = event && event.currentTarget;
+      if (button) void selectValue(button.dataset.value);
+    }
+
+    function onKeyDown(event) {
+      if (disabled || pending || buttons.length === 0) return;
+      const currentIndex = Math.max(0, buttons.indexOf(event.currentTarget));
+      let nextIndex = currentIndex;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        nextIndex = (currentIndex + 1) % buttons.length;
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        nextIndex = buttons.length - 1;
+      } else if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      event.preventDefault();
+      const target = buttons[nextIndex];
+      if (target && typeof target.focus === "function") target.focus();
+      void selectValue(target.dataset.value);
+    }
+
+    for (const button of buttons) {
+      button.addEventListener("click", onClick);
+      button.addEventListener("keydown", onKeyDown);
+    }
+    syncVisualState();
+
+    const control = {
+      element,
+      getValue: () => currentValue,
+      setValue(value) {
+        const next = String(value);
+        if (!values.includes(next)) return false;
+        currentValue = next;
+        syncVisualState();
+        return true;
+      },
+      setDisabled(value) {
+        disabled = value === true;
+        syncVisualState();
+      },
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        for (const button of buttons) {
+          button.removeEventListener("click", onClick);
+          button.removeEventListener("keydown", onKeyDown);
+        }
+      },
+    };
+    state.mountedControls.segmentedRadios.add(control);
+    return control;
+  }
+
   function readCollapsedGroupState() {
     try {
       const raw = localStorage.getItem(COLLAPSED_GROUPS_STORAGE_KEY);
@@ -351,9 +600,12 @@
     desc = "",
     summary = null,
     headerContent = null,
+    headerAction = null,
+    disclosureLabel = "",
     children = [],
     defaultCollapsed = false,
     className = "",
+    animateExpansion = true,
   }) {
     const storedState = readCollapsedGroupState();
     let collapsed = Object.prototype.hasOwnProperty.call(storedState, id)
@@ -366,17 +618,23 @@
 
     const header = document.createElement("div");
     header.className = "collapsible-group-header";
-    header.setAttribute("role", "button");
-    header.setAttribute("tabindex", "0");
+    const disclosure = headerAction ? document.createElement("div") : header;
+    if (headerAction) {
+      header.classList.add("collapsible-group-header-with-action");
+      disclosure.className = "collapsible-group-disclosure";
+      header.appendChild(disclosure);
+    }
+    disclosure.setAttribute("role", "button");
+    disclosure.setAttribute("tabindex", "0");
 
     const chevron = createDisclosureChevron("collapsible-group-chevron");
-    header.appendChild(chevron);
+    disclosure.appendChild(chevron);
 
     if (headerContent) {
       const headerWrap = document.createElement("div");
       headerWrap.className = "collapsible-group-header-content";
       headerWrap.appendChild(headerContent);
-      header.appendChild(headerWrap);
+      disclosure.appendChild(headerWrap);
     } else {
       const text = document.createElement("div");
       text.className = "collapsible-group-text";
@@ -390,7 +648,7 @@
         description.textContent = desc;
         text.appendChild(description);
       }
-      header.appendChild(text);
+      disclosure.appendChild(text);
     }
 
     if (summary) {
@@ -398,7 +656,14 @@
       summaryWrap.className = "collapsibleSummary collapsible-group-summary";
       if (typeof summary === "string") summaryWrap.textContent = summary;
       else summaryWrap.appendChild(summary);
-      header.appendChild(summaryWrap);
+      disclosure.appendChild(summaryWrap);
+    }
+
+    if (headerAction) {
+      const actionWrap = document.createElement("div");
+      actionWrap.className = "collapsible-group-header-action";
+      actionWrap.appendChild(headerAction);
+      header.appendChild(actionWrap);
     }
 
     const body = document.createElement("div");
@@ -411,6 +676,44 @@
 
     function setExpandedBodyHeight() {
       body.style.setProperty("--collapsible-body-height", measureCollapsibleBodyHeight());
+    }
+
+    function refreshCollapsibleHeight() {
+      if (collapsed || !group.classList.contains("expanding")) return;
+      requestAnimationFrame(() => {
+        if (!collapsed && group.classList.contains("expanding")) setExpandedBodyHeight();
+      });
+    }
+
+    function mutateCollapsibleBody(mutate) {
+      if (typeof mutate !== "function") return;
+      if (collapsed || group.classList.contains("collapsing")) {
+        mutate();
+        return;
+      }
+      if (group.classList.contains("expanding")) {
+        mutate();
+        refreshCollapsibleHeight();
+        return;
+      }
+
+      const beforeHeight = body.scrollHeight;
+      mutate();
+      const afterHeight = body.scrollHeight;
+      const prefersReducedMotion = typeof window.matchMedia === "function"
+        && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (beforeHeight === afterHeight || prefersReducedMotion) return;
+
+      // The settled-open body normally uses max-height:none so reflow can grow
+      // freely. Pin its pre-mutation height for one frame, then animate to the
+      // new measured height instead of letting async rows cause a layout jump.
+      body.style.setProperty("--collapsible-body-height", `${beforeHeight}px`);
+      group.classList.add("resizing");
+      void body.offsetHeight;
+      requestAnimationFrame(() => {
+        if (collapsed || !group.classList.contains("resizing")) return;
+        body.style.setProperty("--collapsible-body-height", `${afterHeight}px`);
+      });
     }
 
     function setBodyInteractivity(isCollapsed) {
@@ -442,9 +745,10 @@
     }
 
     function applyCollapsedState({ animate = false } = {}) {
-      header.setAttribute("aria-expanded", collapsed ? "false" : "true");
-      header.setAttribute("aria-label", collapsed ? t("collapsibleExpand") : t("collapsibleCollapse"));
-      group.classList.remove("expanding", "collapsing");
+      disclosure.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      const actionLabel = collapsed ? t("collapsibleExpand") : t("collapsibleCollapse");
+      disclosure.setAttribute("aria-label", disclosureLabel ? `${actionLabel}: ${disclosureLabel}` : actionLabel);
+      group.classList.remove("expanding", "collapsing", "resizing");
       if (!animate) {
         group.classList.toggle("collapsed", collapsed);
         setBodyInteractivity(collapsed);
@@ -480,16 +784,26 @@
       });
     }
 
-    function toggleCollapsed() {
-      collapsed = !collapsed;
-      const nextState = readCollapsedGroupState();
-      nextState[id] = collapsed;
-      writeCollapsedGroupState(nextState);
-      preserveScrollAnchor(() => applyCollapsedState({ animate: true }));
+    function setCollapsed(
+      nextCollapsed,
+      { persist = true, animate = animateExpansion } = {},
+    ) {
+      if (collapsed === nextCollapsed) return;
+      collapsed = nextCollapsed;
+      if (persist) {
+        const nextState = readCollapsedGroupState();
+        nextState[id] = collapsed;
+        writeCollapsedGroupState(nextState);
+      }
+      preserveScrollAnchor(() => applyCollapsedState({ animate }));
     }
 
-    header.addEventListener("click", toggleCollapsed);
-    header.addEventListener("keydown", (ev) => {
+    function toggleCollapsed() {
+      setCollapsed(!collapsed);
+    }
+
+    disclosure.addEventListener("click", toggleCollapsed);
+    disclosure.addEventListener("keydown", (ev) => {
       if (ev.key === " " || ev.key === "Enter") {
         ev.preventDefault();
         toggleCollapsed();
@@ -500,7 +814,7 @@
     group.appendChild(body);
     body.addEventListener("transitionend", (ev) => {
       if (ev.target !== body || ev.propertyName !== "max-height") return;
-      group.classList.remove("expanding", "collapsing");
+      group.classList.remove("expanding", "collapsing", "resizing");
       // Release the pinned height once settled so later reflows (text zoom,
       // window resize) can grow the body instead of clipping at the bottom.
       if (!collapsed) body.style.setProperty("--collapsible-body-height", "none");
@@ -509,6 +823,14 @@
     requestAnimationFrame(() => {
       if (!collapsed) body.style.setProperty("--collapsible-body-height", "none");
     });
+    group.expand = ({
+      persist = true,
+      animate = animateExpansion,
+    } = {}) => {
+      setCollapsed(false, { persist, animate });
+    };
+    group.refreshCollapsibleHeight = refreshCollapsibleHeight;
+    group.mutateCollapsibleBody = mutateCollapsibleBody;
     return group;
   }
 
@@ -580,10 +902,7 @@
     setSwitchVisual(sw, visualOn, { pending: override ? override.pending : false });
     state.mountedControls.generalSwitches.set(key, { element: sw, invert, row, text, extraElement });
     if (actionButton) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "soft-btn accent";
-      btn.textContent = t(actionButton.labelKey);
+      const btn = buildButton({ labelKey: actionButton.labelKey, tone: "accent" });
       control.insertBefore(btn, sw);
       attachActivation(btn, actionButton.invoke);
     }
@@ -616,16 +935,12 @@
   }
 
   function buildShortcutButton(label, onClick, { disabled = false, accent = false } = {}) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "soft-btn" + (accent ? " accent" : "");
-    btn.textContent = label;
-    if (disabled) {
-      btn.disabled = true;
-      return btn;
-    }
-    btn.addEventListener("click", onClick);
-    return btn;
+    return buildButton({
+      label,
+      disabled,
+      tone: accent ? "accent" : "neutral",
+      onClick: disabled ? null : onClick,
+    });
   }
 
   // Generic number-input row used by the Session cleanup group. Mirrors the
@@ -804,6 +1119,9 @@
     if (state.mountedControls.languagePicker && typeof state.mountedControls.languagePicker.dispose === "function") {
       state.mountedControls.languagePicker.dispose();
     }
+    if (state.mountedControls.idleVisualPicker && typeof state.mountedControls.idleVisualPicker.dispose === "function") {
+      state.mountedControls.idleVisualPicker.dispose();
+    }
     if (state.mountedControls.size && typeof state.mountedControls.size.dispose === "function") {
       Promise.resolve(state.mountedControls.size.dispose()).catch(() => {});
     }
@@ -816,6 +1134,14 @@
     if (state.mountedControls.textScale && typeof state.mountedControls.textScale.dispose === "function") {
       state.mountedControls.textScale.dispose();
     }
+    for (const control of state.mountedControls.settingsSelects) {
+      if (control && typeof control.dispose === "function") control.dispose();
+    }
+    state.mountedControls.settingsSelects.clear();
+    for (const control of state.mountedControls.segmentedRadios) {
+      if (control && typeof control.dispose === "function") control.dispose();
+    }
+    state.mountedControls.segmentedRadios.clear();
     state.mountedControls.generalSwitches.clear();
     state.mountedControls.bubblePolicyControls.clear();
     state.mountedControls.sessionCleanupControls.clear();
@@ -828,10 +1154,18 @@
     state.mountedControls.bubblePolicySummary = null;
     state.mountedControls.sessionHudSummary = null;
     state.mountedControls.languagePicker = null;
+    state.mountedControls.idleVisualPicker = null;
     state.mountedControls.size = null;
     state.mountedControls.soundSummary = null;
     state.mountedControls.soundVolume = null;
     state.mountedControls.textScale = null;
+    state.mountedControls.roamMovementStyle = null;
+    state.mountedControls.bubblePlacement = null;
+    state.mountedControls.quotaRingDisplayMode = null;
+    state.mountedControls.permissionAutomationMode = null;
+    state.mountedControls.roamArea = null;
+    state.mountedControls.aboutAutoUpdate = null;
+    state.mountedControls.aboutUpdateStatus = null;
   }
 
   function syncMountedSizeControl({ fromBroadcast = false } = {}) {
@@ -854,26 +1188,135 @@
     }
   }
 
+  function getActiveSettingsFocusKey() {
+    const active = document.activeElement;
+    if (!active || active === document.body || typeof active.getAttribute !== "function") return "";
+    return String(active.getAttribute("data-settings-focus-key") || "").trim();
+  }
+
+  function findSettingsFocusTarget(rootNode, focusKey) {
+    if (!rootNode || !focusKey) return null;
+    const stack = Array.isArray(rootNode.children) ? [...rootNode.children] : Array.from(rootNode.children || []);
+    while (stack.length > 0) {
+      const element = stack.shift();
+      if (element && typeof element.getAttribute === "function"
+        && element.getAttribute("data-settings-focus-key") === focusKey) return element;
+      if (element && element.children) stack.push(...Array.from(element.children));
+    }
+    return null;
+  }
+
+  function restoreSettingsFocus(rootNode, focusKey) {
+    const target = findSettingsFocusTarget(rootNode, focusKey);
+    if (!target || target.disabled === true || typeof target.focus !== "function") return;
+    const active = document.activeElement;
+    if (active && active !== document.body && active.isConnected !== false) return;
+    try { target.focus({ preventScroll: true }); } catch (_) { target.focus(); }
+  }
+
   function requestRender({ sidebar = false, content = false, modal = false } = {}) {
     if (sidebar && typeof renderHooks.sidebar === "function") renderHooks.sidebar();
-    if (content && typeof renderHooks.content === "function") renderHooks.content();
+    if (content && typeof renderHooks.content === "function") {
+      const focusKey = getActiveSettingsFocusKey();
+      renderHooks.content();
+      if (focusKey) restoreSettingsFocus(document.getElementById("content"), focusKey);
+    }
     if (modal && typeof renderHooks.modal === "function") renderHooks.modal();
+  }
+
+  function normalizePersistedScrollTop(value) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+    return Math.min(value, MAX_PERSISTED_SCROLL_TOP);
+  }
+
+  function captureActiveTabScrollPosition() {
+    const content = document.getElementById("content");
+    if (!content || !tabs[state.activeTab]) return;
+    const scrollTop = normalizePersistedScrollTop(Number(content.scrollTop));
+    if (scrollTop !== null) runtime.settingsTabScrollPositions.set(state.activeTab, scrollTop);
+  }
+
+  function writeNavigationState() {
+    const scrollPositions = {};
+    for (const [tabId, value] of runtime.settingsTabScrollPositions) {
+      const scrollTop = normalizePersistedScrollTop(value);
+      if (tabs[tabId] && scrollTop !== null) scrollPositions[tabId] = scrollTop;
+    }
+    try {
+      localStorage.setItem(NAVIGATION_STORAGE_KEY, JSON.stringify({
+        activeTab: tabs[state.activeTab] ? state.activeTab : "general",
+        scrollPositions,
+      }));
+    } catch (_) {}
+  }
+
+  function persistNavigationState() {
+    captureActiveTabScrollPosition();
+    writeNavigationState();
+  }
+
+  function restoreNavigationState() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(NAVIGATION_STORAGE_KEY) || "null");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+      if (typeof parsed.activeTab === "string" && tabs[parsed.activeTab]) {
+        state.activeTab = parsed.activeTab;
+      }
+      const scrollPositions = parsed.scrollPositions;
+      if (scrollPositions && typeof scrollPositions === "object" && !Array.isArray(scrollPositions)) {
+        for (const [tabId, value] of Object.entries(scrollPositions)) {
+          const scrollTop = normalizePersistedScrollTop(value);
+          if (tabs[tabId] && scrollTop !== null) {
+            runtime.settingsTabScrollPositions.set(tabId, scrollTop);
+          }
+        }
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function restoreActiveTabScrollPosition() {
+    const content = document.getElementById("content");
+    if (!content) return;
+    const tabId = state.activeTab;
+    const targetScrollTop = runtime.settingsTabScrollPositions.get(tabId) || 0;
+    content.scrollTop = targetScrollTop;
+    requestAnimationFrame(() => {
+      if (state.activeTab !== tabId) return;
+      if (document.getElementById("content") !== content) return;
+      content.scrollTop = targetScrollTop;
+    });
   }
 
   function selectTab(nextTab) {
     const prevTabId = state.activeTab;
     if (prevTabId === nextTab) return;
+    captureActiveTabScrollPosition();
+    const content = document.getElementById("content");
     const prevTab = tabs[prevTabId];
     if (prevTab && typeof prevTab.onExit === "function") {
       prevTab.onExit(core);
     }
     state.activeTab = nextTab;
+    writeNavigationState();
     requestRender({ sidebar: true, content: true, modal: true });
+    if (!content) return;
+
+    const targetScrollTop = runtime.settingsTabScrollPositions.get(nextTab) || 0;
+    content.scrollTop = targetScrollTop;
+    requestAnimationFrame(() => {
+      if (state.activeTab !== nextTab) return;
+      if (document.getElementById("content") !== content) return;
+      content.scrollTop = targetScrollTop;
+    });
   }
 
   function applyBootstrap(snapshotValue) {
     state.snapshot = snapshotValue || {};
     requestRender({ sidebar: true, content: true, modal: true });
+    restoreActiveTabScrollPosition();
   }
 
   function applyAgentMetadata(list) {
@@ -886,7 +1329,13 @@
     const normalized = {
       checkedAt: Number.isFinite(source.checkedAt) ? source.checkedAt : null,
       agents: Array.isArray(source.agents) ? source.agents : [],
+      customAgents: Array.isArray(source.customAgents) ? source.customAgents : [],
+      customTools: Array.isArray(source.customTools) ? source.customTools : [],
       skippedAgentIds: Array.isArray(source.skippedAgentIds) ? source.skippedAgentIds : [],
+      wslAgents: Array.isArray(source.wslAgents) ? source.wslAgents : [],
+      wslDistros: Array.isArray(source.wslDistros) ? source.wslDistros : [],
+      wslPending: source.wslPending === true,
+      wslSupported: source.wslSupported === true,
     };
     if (typeof source.error === "string" && source.error) normalized.error = source.error;
     return normalized;
@@ -896,17 +1345,35 @@
     const result = {
       checkedAt: null,
       agents: [],
+      customAgents: [],
+      customTools: [],
       skippedAgentIds: [],
+      wslAgents: [],
+      wslDistros: [],
+      wslPending: false,
+      wslSupported: false,
     };
     if (error) result.error = error;
     return result;
   }
 
-  function fetchAgentInstallationHints({ force = false } = {}) {
+  function fetchAgentInstallationHints({ force = false, refreshWsl = false } = {}) {
     if (runtime.agentInstallationHintsPending) {
-      return runtime.agentInstallationHintsPromise || Promise.resolve(runtime.agentInstallationHints);
+      const inFlight = runtime.agentInstallationHintsPromise || Promise.resolve(runtime.agentInstallationHints);
+      // A manual WSL rescan must not be swallowed by a passive fetch that
+      // happens to be in flight (e.g. the tab's mount-time poll while
+      // wslPending) — chain one real rescan after it settles.
+      if (refreshWsl && !runtime.agentInstallationHintsWslRefreshQueued) {
+        runtime.agentInstallationHintsWslRefreshQueued = true;
+        return inFlight.then(() => {
+          runtime.agentInstallationHintsWslRefreshQueued = false;
+          return fetchAgentInstallationHints({ refreshWsl: true });
+        });
+      }
+      return inFlight;
     }
-    if (!force && runtime.agentInstallationHintsFetched) {
+    // refreshWsl always re-fetches; plain force only if not already done
+    if (!force && !refreshWsl && runtime.agentInstallationHintsFetched) {
       return Promise.resolve(runtime.agentInstallationHints);
     }
     if (!window.settingsAPI || typeof window.settingsAPI.detectAgentInstallations !== "function") {
@@ -915,8 +1382,12 @@
       return Promise.resolve(runtime.agentInstallationHints);
     }
 
+    // refreshWsl triggers a backend WSL re-scan; force just bypasses the
+    // frontend cache. The backend only inspects refreshWsl — passing force
+    // in the IPC payload would be dead weight.
+    const opts = refreshWsl ? { refreshWsl: true } : undefined;
     runtime.agentInstallationHintsPending = true;
-    runtime.agentInstallationHintsPromise = window.settingsAPI.detectAgentInstallations()
+    runtime.agentInstallationHintsPromise = window.settingsAPI.detectAgentInstallations(opts)
       .then((result) => {
         runtime.agentInstallationHints = normalizeAgentInstallationHints(result);
         return runtime.agentInstallationHints;
@@ -933,6 +1404,28 @@
         runtime.agentInstallationHintsFetched = true;
         runtime.agentInstallationHintsPromise = null;
         if (state.activeTab === "agents") requestRender({ content: true });
+        // wslPending means no WSL scan has ever completed. Startup does not
+        // pre-scan (running a command in each distro boots every stopped VM),
+        // so the first Agents-tab visit kicks off the real scan here. No loop:
+        // the scan marks the cache detected on success AND failure, so
+        // wslPending is false on the next fetch either way.
+        if (
+          !refreshWsl &&
+          runtime.agentInstallationHints &&
+          runtime.agentInstallationHints.wslPending &&
+          runtime.agentInstallationHints.wslSupported
+        ) {
+          if (state.activeTab === "agents") {
+            fetchAgentInstallationHints({ refreshWsl: true });
+          } else {
+            // User left the tab before this fetch resolved. Re-arm the
+            // fetched flag so the next Agents-tab visit takes the full
+            // fetch path again and reaches this trigger — otherwise the
+            // flag short-circuits every later plain fetch and the auto
+            // scan is permanently lost for this settings session.
+            runtime.agentInstallationHintsFetched = false;
+          }
+        }
       });
     return runtime.agentInstallationHintsPromise;
   }
@@ -942,13 +1435,21 @@
       runtime.themeList = [];
       return Promise.resolve([]);
     }
+    const previousThemeList = Array.isArray(runtime.themeList) ? runtime.themeList : [];
     return window.settingsAPI.listThemes().then((list) => {
-      runtime.themeList = Array.isArray(list) ? list : [];
+      const nextThemeList = Array.isArray(list) ? list : [];
+      // Built-in themes make an empty successful list impossible in a healthy
+      // install. Main also returns [] when enumeration throws, so preserve an
+      // already-rendered list instead of blanking the entire Theme tab.
+      if (nextThemeList.length === 0 && previousThemeList.length > 0) {
+        return previousThemeList;
+      }
+      runtime.themeList = nextThemeList;
       return runtime.themeList;
     }).catch((err) => {
       console.warn("settings: listThemes failed", err);
-      runtime.themeList = [];
-      return [];
+      runtime.themeList = previousThemeList;
+      return previousThemeList;
     });
   }
 
@@ -1155,6 +1656,13 @@
     if (!state.snapshot) return;
 
     const changes = payload && payload.changes;
+    const changeKeys = changes && typeof changes === "object" ? Object.keys(changes) : [];
+    if (
+      changeKeys.length > 0
+      && changeKeys.every((key) => RENDERER_INERT_SETTINGS_KEYS.has(key))
+    ) {
+      return;
+    }
     clearTransientStateForChanges(changes);
     const needsAnimOverridesRefresh = !!(changes && (
       "theme" in changes || "themeVariant" in changes || "themeOverrides" in changes
@@ -1207,7 +1715,7 @@
         return;
       }
       if (state.activeTab === "animOverrides" || runtime.assetPicker.state) {
-        fetchAnimationOverridesData().then(() => {
+        Promise.all([fetchAnimationOverridesData(), fetchThemes()]).then(() => {
           normalizeAssetPickerSelection();
           requestRender({ sidebar: true, content: true, modal: true });
         });
@@ -1244,34 +1752,93 @@
     readAgentFlagValue,
     readAgentIntegrationInstalled,
     readAgentPermissionMode,
+    readAgentCustomPermissionUrl,
+    readAgentCustomDiscoveryPaths,
+    readCustomToolDetectionResults,
+    readCustomAgentDetectionResults,
+    readCustomApplications,
     getShortcutValue,
     getLang,
     readThemeOverrideMap,
     hasAnyThemeOverride,
   };
 
-  function showSettingsConfirmModal({ title, detail, actions }) {
+  let settingsDialogSequence = 0;
+  let dismissActiveSettingsDialog = null;
+
+  function showSettingsDialog({
+    title,
+    detail,
+    actions,
+    iconText = "",
+    className = "",
+    checkboxLabel = "",
+    checkboxChecked = false,
+    returnDetails = false,
+    dismissOnBackdrop = true,
+    dismissOnEscape = true,
+  }) {
     const rootNode = document.getElementById("modalRoot");
     if (!rootNode) return Promise.resolve(null);
+    if (typeof dismissActiveSettingsDialog === "function") dismissActiveSettingsDialog();
     return new Promise((resolve) => {
       let settled = false;
+      const previousFocus = document.activeElement;
+      const dialogId = `settings-dialog-${++settingsDialogSequence}`;
       const overlay = document.createElement("div");
-      overlay.className = "modal-backdrop settings-confirm-backdrop";
+      overlay.className = "modal-backdrop settings-dialog-backdrop settings-confirm-backdrop";
 
       const modal = document.createElement("div");
-      modal.className = "settings-confirm-modal";
+      modal.className = ["settings-dialog", "settings-confirm-modal", className].filter(Boolean).join(" ");
       modal.setAttribute("role", "dialog");
       modal.setAttribute("aria-modal", "true");
 
-      const icon = document.createElement("div");
-      icon.className = "settings-confirm-icon";
-      icon.textContent = "!";
+      let icon = null;
+      if (iconText) {
+        icon = document.createElement("div");
+        icon.className = "settings-confirm-icon";
+        icon.setAttribute("aria-hidden", "true");
+        if (String(iconText) === "!") {
+          const createSvgElement = (tagName) => (
+            typeof document.createElementNS === "function"
+              ? document.createElementNS("http://www.w3.org/2000/svg", tagName)
+              : document.createElement(tagName)
+          );
+          const svg = createSvgElement("svg");
+          svg.setAttribute("viewBox", "0 0 20 20");
+          svg.setAttribute("focusable", "false");
+          const path = createSvgElement("path");
+          path.setAttribute("d", "M10 4.2v7.4m0 3.1v.1");
+          svg.appendChild(path);
+          icon.appendChild(svg);
+        } else {
+          icon.textContent = String(iconText);
+        }
+      }
 
       const titleNode = document.createElement("h2");
-      titleNode.textContent = title;
+      titleNode.id = `${dialogId}-title`;
+      titleNode.textContent = title || "";
+      modal.setAttribute("aria-labelledby", titleNode.id);
 
       const detailNode = document.createElement("p");
-      detailNode.textContent = detail;
+      detailNode.id = `${dialogId}-detail`;
+      detailNode.textContent = detail || "";
+      modal.setAttribute("aria-describedby", detailNode.id);
+
+      let checkboxInput = null;
+      let checkboxRow = null;
+      if (checkboxLabel) {
+        checkboxRow = document.createElement("label");
+        checkboxRow.className = "settings-confirm-checkbox";
+        checkboxInput = document.createElement("input");
+        checkboxInput.type = "checkbox";
+        checkboxInput.checked = checkboxChecked === true;
+        const checkboxText = document.createElement("span");
+        checkboxText.textContent = checkboxLabel;
+        checkboxRow.appendChild(checkboxInput);
+        checkboxRow.appendChild(checkboxText);
+      }
 
       const actionsNode = document.createElement("div");
       actionsNode.className = "settings-confirm-actions";
@@ -1279,35 +1846,59 @@
       function close(actionId) {
         if (settled) return;
         settled = true;
+        if (dismissActiveSettingsDialog === close) dismissActiveSettingsDialog = null;
         document.removeEventListener("keydown", onKeyDown, true);
         rootNode.innerHTML = "";
-        resolve(actionId);
+        if (previousFocus
+            && previousFocus.isConnected !== false
+            && typeof previousFocus.focus === "function") previousFocus.focus();
+        resolve(returnDetails
+          ? {
+            actionId,
+            checkboxChecked: !!(checkboxInput && checkboxInput.checked),
+          }
+          : actionId);
       }
 
       function onKeyDown(ev) {
-        if (ev.key === "Escape") close(null);
+        if (ev.key === "Escape" && dismissOnEscape) {
+          ev.preventDefault();
+          close(null);
+          return;
+        }
+        if (ev.key !== "Tab") return;
+        const focusable = [checkboxInput, ...buttons.map((entry) => entry.button)]
+          .filter((element) => element && element.disabled !== true);
+        if (focusable.length === 0) return;
+        const currentIndex = focusable.indexOf(document.activeElement);
+        const nextIndex = ev.shiftKey
+          ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+          : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+        ev.preventDefault();
+        focusable[nextIndex].focus();
       }
 
       overlay.addEventListener("click", (ev) => {
-        if (ev.target === overlay) close(null);
+        if (dismissOnBackdrop && ev.target === overlay) close(null);
       });
       const buttons = (Array.isArray(actions) ? actions : []).map((action) => {
-        const button = document.createElement("button");
         const tone = action && typeof action.tone === "string" ? action.tone : "neutral";
-        const toneClass = tone === "accent"
-          ? "accent"
-          : (tone === "danger" ? "settings-confirm-danger" : "");
-        button.type = "button";
-        button.className = `soft-btn${toneClass ? ` ${toneClass}` : ""}`;
-        button.textContent = action && action.label ? action.label : "";
-        button.addEventListener("click", () => close(action && action.id ? action.id : null));
+        const button = buildButton({
+          label: action && action.label ? action.label : "",
+          tone,
+          size: "large",
+          className: tone === "danger" ? "settings-confirm-danger" : "",
+          onClick: () => close(action && action.id ? action.id : null),
+        });
         actionsNode.appendChild(button);
         return { action, button };
       });
+      dismissActiveSettingsDialog = close;
       document.addEventListener("keydown", onKeyDown, true);
-      modal.appendChild(icon);
+      if (icon) modal.appendChild(icon);
       modal.appendChild(titleNode);
       modal.appendChild(detailNode);
+      if (checkboxRow) modal.appendChild(checkboxRow);
       modal.appendChild(actionsNode);
       overlay.appendChild(modal);
       rootNode.innerHTML = "";
@@ -1320,14 +1911,22 @@
     });
   }
 
+  function showSettingsConfirmModal(options = {}) {
+    return showSettingsDialog({ ...options, iconText: "!" });
+  }
+
   core.helpers = {
     t,
+    buildButton,
+    showSettingsDialog,
     showSettingsConfirmModal,
     escapeHtml,
     setSwitchVisual,
     attachAnimatedSwitch,
     buildSwitchRow,
     buildSection,
+    buildSettingsSelect,
+    buildSegmentedRadio,
     buildCollapsibleGroup,
     createDisclosureChevron,
     attachActivation,
@@ -1359,6 +1958,8 @@
     installRenderHooks,
     requestRender,
     selectTab,
+    persistNavigationState,
+    restoreNavigationState,
     applyBootstrap,
     applyAgentMetadata,
     applyChanges,

@@ -4,17 +4,12 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert");
 
 const {
-  buildCodexMonitorUpdateOptions,
+  buildCodexMonitorSessionOptions,
+  normalizeCodexMonitorAccountQuotas,
   isCodexMonitorMetadataOnlyEvent,
-  isCodexMonitorPermissionEvent,
 } = require("../src/codex-monitor-callback");
 
 describe("Codex monitor callback helpers", () => {
-  it("identifies JSONL permission events", () => {
-    assert.strictEqual(isCodexMonitorPermissionEvent("codex-permission"), true);
-    assert.strictEqual(isCodexMonitorPermissionEvent("working"), false);
-  });
-
   it("identifies token_count context updates as metadata-only events", () => {
     assert.strictEqual(
       isCodexMonitorMetadataOnlyEvent("event_msg:token_count", {
@@ -31,8 +26,62 @@ describe("Codex monitor callback helpers", () => {
     );
   });
 
+  it("identifies token_count quota-only updates as metadata-only events", () => {
+    assert.strictEqual(
+      isCodexMonitorMetadataOnlyEvent("event_msg:token_count", {
+        codexQuota: { codexFiveHour: { usedPercent: 1 } },
+      }),
+      true
+    );
+    assert.strictEqual(
+      isCodexMonitorMetadataOnlyEvent("event_msg:token_count", {
+        codexSparkQuota: { codexWeekly: { usedPercent: 7 } },
+      }),
+      true
+    );
+  });
+
+  it("normalizes generic and Spark quota outside session options", () => {
+    const quotas = normalizeCodexMonitorAccountQuotas({
+      cwd: "/repo",
+      codexQuota: {
+        codexFiveHour: { usedPercent: 1.4, resetAt: 1783669570000 },
+        codexWeekly: { usedPercent: 43 },
+      },
+      codexSparkQuota: {
+        codexWeekly: { usedPercent: 7.4, windowMinutes: 10080 },
+      },
+    });
+    assert.deepStrictEqual(quotas, {
+      codexQuota: {
+        codexFiveHour: { usedPercent: 1, resetAt: 1783669570000 },
+        codexWeekly: { usedPercent: 43 },
+      },
+      codexSparkQuota: {
+        codexWeekly: { usedPercent: 7, windowMinutes: 10080 },
+      },
+    });
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(buildCodexMonitorSessionOptions({
+        cwd: "/repo",
+        codexQuota: quotas.codexQuota,
+        codexSparkQuota: quotas.codexSparkQuota,
+      }), "codexQuota"),
+      false
+    );
+  });
+
+  it("omits invalid quota groups from account quota updates", () => {
+    const quotas = normalizeCodexMonitorAccountQuotas({
+      cwd: "/repo",
+      codexQuota: { codexFiveHour: { usedPercent: "nope" } },
+      codexSparkQuota: { codexWeekly: { usedPercent: "nope" } },
+    });
+    assert.strictEqual(quotas, null);
+  });
+
   it("passes headless for normal monitor state updates", () => {
-    assert.deepStrictEqual(buildCodexMonitorUpdateOptions({
+    assert.deepStrictEqual(buildCodexMonitorSessionOptions({
       cwd: "/repo",
       sessionTitle: "Build",
       headless: true,
@@ -45,7 +94,7 @@ describe("Codex monitor callback helpers", () => {
   });
 
   it("defaults normal monitor headless to false", () => {
-    assert.deepStrictEqual(buildCodexMonitorUpdateOptions({
+    assert.deepStrictEqual(buildCodexMonitorSessionOptions({
       cwd: "/repo",
     }, { includeHeadless: true }), {
       cwd: "/repo",
@@ -56,7 +105,7 @@ describe("Codex monitor callback helpers", () => {
   });
 
   it("passes Codex Desktop focus metadata from JSONL monitor updates", () => {
-    assert.deepStrictEqual(buildCodexMonitorUpdateOptions({
+    assert.deepStrictEqual(buildCodexMonitorSessionOptions({
       cwd: "/repo",
       sourcePid: 11,
       agentPid: 22,
@@ -77,7 +126,7 @@ describe("Codex monitor callback helpers", () => {
   });
 
   it("passes context usage from JSONL monitor updates", () => {
-    assert.deepStrictEqual(buildCodexMonitorUpdateOptions({
+    assert.deepStrictEqual(buildCodexMonitorSessionOptions({
       cwd: "/repo",
       contextUsage: {
         used: 24846,
@@ -100,7 +149,7 @@ describe("Codex monitor callback helpers", () => {
   });
 
   it("omits invalid context usage from JSONL monitor updates", () => {
-    assert.deepStrictEqual(buildCodexMonitorUpdateOptions({
+    assert.deepStrictEqual(buildCodexMonitorSessionOptions({
       cwd: "/repo",
       contextUsage: { used: -1, limit: 0, source: "codex" },
     }, { includeHeadless: true }), {
@@ -111,17 +160,17 @@ describe("Codex monitor callback helpers", () => {
     });
   });
 
-  it("omits headless for permission update options", () => {
-    const options = buildCodexMonitorUpdateOptions({
+  it("omits headless when requested", () => {
+    const options = buildCodexMonitorSessionOptions({
       cwd: "/repo",
-      sessionTitle: "Approval",
+      sessionTitle: "State update",
       headless: true,
     }, { includeHeadless: false });
 
     assert.deepStrictEqual(options, {
       cwd: "/repo",
       agentId: "codex",
-      sessionTitle: "Approval",
+      sessionTitle: "State update",
     });
     assert.strictEqual(Object.prototype.hasOwnProperty.call(options, "headless"), false);
   });

@@ -10,6 +10,8 @@ const {
   CODEX_LOCAL_WORKING_STALE_FLOOR_MS,
   isWorkingLikeState,
   isLocalCodexWorkingLikeSession,
+  isLocalZcodeDesktopIdleSession,
+  isLocalTraeDesktopIdleSession,
   getStaleSessionDecision,
 } = require("../src/state-stale-cleanup");
 
@@ -22,6 +24,34 @@ function session(overrides = {}) {
     agentPid: null,
     ...overrides,
   };
+}
+
+function desktopSession(overrides = {}) {
+  return session({
+    agentId: "codex",
+    codexOriginator: "codex_work_desktop",
+    agentPid: 10,
+    sourcePid: 10,
+    ...overrides,
+  });
+}
+
+function zcodeDesktopSession(overrides = {}) {
+  return session({
+    agentId: "zcode",
+    agentPid: 30,
+    sourcePid: 31,
+    ...overrides,
+  });
+}
+
+function traeDesktopSession(overrides = {}) {
+  return session({
+    agentId: "traecode",
+    agentPid: 40,
+    sourcePid: 41,
+    ...overrides,
+  });
 }
 
 function decision(target, overrides = {}) {
@@ -94,7 +124,7 @@ describe("state stale cleanup decisions", () => {
       sourcePid: 20,
     }), {
       alivePids: new Set([20]),
-    }).result, { action: "idle", reason: "session-timeout", updateTimestamp: false });
+    }).result, { action: "idle", reason: "working-timeout", updateTimestamp: true });
 
     assert.deepStrictEqual(decision(session({
       updatedAt: 1000000 - SESSION_STALE_MS - 1,
@@ -110,6 +140,7 @@ describe("state stale cleanup decisions", () => {
 
   it("handles working stale timeout source exit and idle downgrade", () => {
     assert.deepStrictEqual(decision(session({
+      state: "working",
       updatedAt: 1000000 - WORKING_STALE_MS - 1,
       sourcePid: 20,
     })).result, { action: "delete", reason: "working-source-exit" });
@@ -162,6 +193,158 @@ describe("state stale cleanup decisions", () => {
     assert.deepStrictEqual(result, { action: "delete", reason: "unreachable" });
   });
 
+  it("keeps an idle Codex Desktop thread before its configured timeout", () => {
+    const { result } = decision(desktopSession({
+      updatedAt: 1000000 - 59_999,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("deletes an idle Codex Desktop thread after timeout even while its shared pid is alive", () => {
+    const { result, calls } = decision(desktopSession({
+      updatedAt: 1000000 - 60_001,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: "delete", reason: "codex-desktop-idle-timeout" });
+    assert.deepStrictEqual(calls, [10]);
+  });
+
+  it("keeps idle Codex Desktop threads forever when sessionStaleMs=0", () => {
+    const { result } = decision(desktopSession({
+      updatedAt: 1000000 - 24 * 60 * 60 * 1000,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 0 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("restarts the Codex Desktop idle timeout from ackedAt", () => {
+    const { result } = decision(desktopSession({
+      updatedAt: 1000000 - 120_000,
+      ackedAt: 1000000 - 30_000,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("does not apply the Desktop idle timeout to guardian, remote, or unknown Codex sessions", () => {
+    const staleConfig = { sessionStaleMs: 60_000 };
+    const alivePids = new Set([10]);
+    const updatedAt = 1000000 - 60_001;
+    const cases = [
+      desktopSession({ headless: true, updatedAt }),
+      desktopSession({ host: "remote-box", updatedAt }),
+      desktopSession({ codexOriginator: "codex_exec", updatedAt }),
+      desktopSession({ codexOriginator: null, updatedAt }),
+    ];
+
+    for (const target of cases) {
+      assert.deepStrictEqual(decision(target, { alivePids, staleConfig }).result, { action: null });
+    }
+  });
+
+  it("deletes an idle local ZCode conversation after timeout even while shared pids are alive", () => {
+    const { result, calls } = decision(zcodeDesktopSession({
+      updatedAt: 1000000 - 60_001,
+    }), {
+      alivePids: new Set([30, 31]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.strictEqual(isLocalZcodeDesktopIdleSession(zcodeDesktopSession()), true);
+    assert.deepStrictEqual(result, { action: "delete", reason: "zcode-desktop-idle-timeout" });
+    assert.deepStrictEqual(calls, [30]);
+  });
+
+  it("keeps ZCode conversations before the cutoff or when the cutoff is disabled", () => {
+    const alivePids = new Set([30, 31]);
+    assert.deepStrictEqual(decision(zcodeDesktopSession({
+      updatedAt: 1000000 - 59_999,
+    }), {
+      alivePids,
+      staleConfig: { sessionStaleMs: 60_000 },
+    }).result, { action: null });
+    assert.deepStrictEqual(decision(zcodeDesktopSession({
+      updatedAt: 1000000 - 24 * 60 * 60 * 1000,
+    }), {
+      alivePids,
+      staleConfig: { sessionStaleMs: 0 },
+    }).result, { action: null });
+  });
+
+  it("does not apply the ZCode idle timeout to remote, headless, or working sessions", () => {
+    const updatedAt = 1000000 - 60_001;
+    const alivePids = new Set([30, 31]);
+    const staleConfig = { sessionStaleMs: 60_000 };
+    const cases = [
+      zcodeDesktopSession({ host: "remote-box", updatedAt }),
+      zcodeDesktopSession({ headless: true, updatedAt }),
+      zcodeDesktopSession({ state: "working", updatedAt }),
+    ];
+    for (const target of cases) {
+      const result = decision(target, { alivePids, staleConfig }).result;
+      assert.notStrictEqual(result.reason, "zcode-desktop-idle-timeout");
+    }
+  });
+
+  it("deletes an idle local TraeCode conversation after timeout even while the IDE pid is alive", () => {
+    const { result, calls } = decision(traeDesktopSession({
+      updatedAt: 1000000 - 60_001,
+    }), {
+      alivePids: new Set([40, 41]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.strictEqual(isLocalTraeDesktopIdleSession(traeDesktopSession()), true);
+    assert.deepStrictEqual(result, { action: "delete", reason: "traecode-desktop-idle-timeout" });
+    assert.deepStrictEqual(calls, [40]);
+  });
+
+  it("keeps TraeCode conversations before the cutoff or when the cutoff is disabled", () => {
+    const alivePids = new Set([40, 41]);
+    assert.deepStrictEqual(decision(traeDesktopSession({
+      updatedAt: 1000000 - 59_999,
+    }), {
+      alivePids,
+      staleConfig: { sessionStaleMs: 60_000 },
+    }).result, { action: null });
+    assert.deepStrictEqual(decision(traeDesktopSession({
+      updatedAt: 1000000 - 24 * 60 * 60 * 1000,
+    }), {
+      alivePids,
+      staleConfig: { sessionStaleMs: 0 },
+    }).result, { action: null });
+  });
+
+  it("does not apply the TraeCode idle timeout to remote, headless, or working sessions", () => {
+    const updatedAt = 1000000 - 60_001;
+    const alivePids = new Set([40, 41]);
+    const staleConfig = { sessionStaleMs: 60_000 };
+    const cases = [
+      traeDesktopSession({ host: "remote-box", updatedAt }),
+      traeDesktopSession({ headless: true, updatedAt }),
+      traeDesktopSession({ state: "working", updatedAt }),
+      // Not traecode — e.g. claude-code idling in the same directory.
+      session({ agentId: "claude-code", agentPid: 40, sourcePid: 41, updatedAt }),
+    ];
+    for (const target of cases) {
+      const result = decision(target, { alivePids, staleConfig }).result;
+      assert.notStrictEqual(result.reason, "traecode-desktop-idle-timeout");
+    }
+  });
+
   it("treats sessionStaleMs=0 as disabled — does not delete by age", () => {
     // 10h-old idle remote session, sessionStaleMs disabled -> stays alive.
     const { result } = decision(session({
@@ -188,16 +371,246 @@ describe("state stale cleanup decisions", () => {
   });
 
   it("keeps local Codex working through the default short stale windows", () => {
-    const { result } = decision(session({
+    const { result } = decision(desktopSession({
       state: "working",
-      agentId: "codex",
       updatedAt: 1000000 - 11 * 60 * 1000,
-      agentPid: 10,
-      sourcePid: 20,
     }), {
-      alivePids: new Set([10, 20]),
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000, workingStaleMs: 60_000 },
     });
     assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("uses the explicit local Codex timeout independently of idle retention", () => {
+    const now = 2_000_000;
+    const alivePids = new Set([10]);
+    const target = desktopSession({
+      state: "working",
+      updatedAt: now - 30 * 60 * 1000,
+    });
+
+    const kept = decision(target, {
+      now,
+      alivePids,
+      staleConfig: {
+        sessionStaleMs: 10 * 60 * 1000,
+        workingStaleMs: 5 * 60 * 1000,
+        codexWorkingStaleMs: 60 * 60 * 1000,
+      },
+    }).result;
+    assert.deepStrictEqual(kept, { action: null });
+
+    const expired = decision(target, {
+      now,
+      alivePids,
+      staleConfig: {
+        sessionStaleMs: 10 * 60 * 1000,
+        workingStaleMs: 5 * 60 * 1000,
+        codexWorkingStaleMs: 20 * 60 * 1000,
+      },
+    }).result;
+    assert.deepStrictEqual(expired, {
+      action: "idle",
+      reason: "working-timeout",
+      updateTimestamp: true,
+    });
+  });
+
+  it("allows local Codex silence expiry to be disabled without masking process death", () => {
+    const now = 100 * 60 * 60 * 1000;
+    const target = desktopSession({
+      state: "thinking",
+      updatedAt: 1,
+    });
+    const staleConfig = { codexWorkingStaleMs: 0 };
+
+    assert.deepStrictEqual(decision(target, {
+      now,
+      alivePids: new Set([10]),
+      staleConfig,
+    }).result, { action: null });
+    assert.deepStrictEqual(decision(target, {
+      now,
+      alivePids: new Set(),
+      staleConfig,
+    }).result, { action: "delete", reason: "agent-exit" });
+  });
+
+  it("starts Codex Desktop idle retention from the stamped timeout transition", () => {
+    const now = 2_000_000;
+    const staleConfig = { sessionStaleMs: 10 * 60 * 1000 };
+    const justIdled = desktopSession({ state: "idle", updatedAt: now });
+
+    assert.deepStrictEqual(decision(justIdled, {
+      now: now + 9 * 60 * 1000,
+      alivePids: new Set([10]),
+      staleConfig,
+    }).result, { action: null });
+    assert.deepStrictEqual(decision(justIdled, {
+      now: now + 10 * 60 * 1000 + 1,
+      alivePids: new Set([10]),
+      staleConfig,
+    }).result, { action: "delete", reason: "codex-desktop-idle-timeout" });
+  });
+
+  it("keeps a local OpenCode tool active at the captured 305-second failure point", () => {
+    const now = 2_000_000;
+    const { result } = decision(session({
+      state: "working",
+      agentId: "opencode",
+      agentPid: 10,
+      sourcePid: 20,
+      pidReachable: true,
+      updatedAt: now - 305_656,
+    }), {
+      now,
+      alivePids: new Set([10, 20]),
+      staleConfig: { sessionStaleMs: 600_000, workingStaleMs: 300_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("keeps local OpenCode thinking active at the captured 305-second failure point", () => {
+    const now = 2_000_000;
+    const { result } = decision(session({
+      state: "thinking",
+      agentId: "opencode",
+      agentPid: 10,
+      sourcePid: 20,
+      pidReachable: true,
+      updatedAt: now - 305_656,
+    }), {
+      now,
+      alivePids: new Set([10, 20]),
+      staleConfig: { sessionStaleMs: 600_000, workingStaleMs: 300_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("preserves a longer configured stale timeout for local OpenCode work", () => {
+    const now = 2_000_000;
+    const configuredStaleMs = 30 * 60 * 1000;
+    const { result } = decision(session({
+      state: "working",
+      agentId: "opencode",
+      agentPid: 10,
+      sourcePid: 20,
+      pidReachable: true,
+      updatedAt: now - 20 * 60 * 1000 - 1,
+    }), {
+      now,
+      alivePids: new Set([10, 20]),
+      staleConfig: {
+        sessionStaleMs: configuredStaleMs,
+        workingStaleMs: configuredStaleMs,
+      },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("keeps local OpenCode work active immediately before the fixed 20-minute stale floor", () => {
+    const now = 2_000_000;
+    const { result } = decision(session({
+      state: "working",
+      agentId: "opencode",
+      agentPid: 10,
+      sourcePid: 20,
+      pidReachable: true,
+      updatedAt: now - (20 * 60 * 1000 - 1),
+    }), {
+      now,
+      alivePids: new Set([10, 20]),
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("retires local OpenCode work after the default 20-minute stale floor", () => {
+    const now = 2_000_000;
+    const { result } = decision(session({
+      state: "working",
+      agentId: "opencode",
+      agentPid: 10,
+      sourcePid: 20,
+      pidReachable: true,
+      updatedAt: now - 20 * 60 * 1000 - 1,
+    }), {
+      now,
+      alivePids: new Set([10, 20]),
+    });
+
+    assert.deepStrictEqual(result, { action: "idle", reason: "working-timeout", updateTimestamp: true });
+  });
+
+  it("deletes local OpenCode work immediately when the agent process dies", () => {
+    const now = 2_000_000;
+    assert.deepStrictEqual(
+      decision(session({
+        state: "working",
+        agentId: "opencode",
+        agentPid: 10,
+        sourcePid: 20,
+        pidReachable: true,
+        updatedAt: now - 305_656,
+      }), {
+        now,
+        alivePids: new Set([20]),
+      }).result,
+      { action: "delete", reason: "agent-exit" },
+    );
+  });
+
+  it("deletes local OpenCode work after the stale floor when the source process dies", () => {
+    const now = 2_000_000;
+    assert.deepStrictEqual(
+      decision(session({
+        state: "working",
+        agentId: "opencode",
+        agentPid: 10,
+        sourcePid: 20,
+        pidReachable: true,
+        updatedAt: now - 20 * 60 * 1000 - 1,
+      }), {
+        now,
+        alivePids: new Set([10]),
+      }).result,
+      { action: "delete", reason: "working-source-exit" },
+    );
+  });
+
+  it("does not extend remote OpenCode or Claude working sessions", () => {
+    const now = 2_000_000;
+    for (const agentId of ["opencode", "claude-code"]) {
+      const { result } = decision(session({
+        state: "working",
+        agentId,
+        host: agentId === "opencode" ? "ssh:example.com" : null,
+        updatedAt: now - WORKING_STALE_MS - 1,
+      }), { now });
+      assert.deepStrictEqual(result, { action: "idle", reason: "working-timeout", updateTimestamp: true });
+    }
+
+    const { result: headlessResult } = decision(session({
+      state: "working",
+      agentId: "opencode",
+      headless: true,
+      updatedAt: now - WORKING_STALE_MS - 1,
+    }), { now });
+    assert.deepStrictEqual(headlessResult, { action: "idle", reason: "working-timeout", updateTimestamp: true });
+  });
+
+  it("does not extend local MiMo Code working sessions", () => {
+    const now = 2_000_000;
+    const { result } = decision(session({
+      state: "working",
+      agentId: "mimocode",
+      updatedAt: now - WORKING_STALE_MS - 1,
+    }), { now });
+
+    assert.deepStrictEqual(result, { action: "idle", reason: "working-timeout", updateTimestamp: true });
   });
 
   it("still downgrades local Codex working after the Codex floor expires", () => {
@@ -211,7 +624,25 @@ describe("state stale cleanup decisions", () => {
       now: 2000000,
       alivePids: new Set([10, 20]),
     });
-    assert.deepStrictEqual(result, { action: "idle", reason: "session-timeout", updateTimestamp: false });
+    assert.deepStrictEqual(result, { action: "idle", reason: "working-timeout", updateTimestamp: true });
+  });
+
+  it("ignores fresh metadataUpdatedAt when lifecycle updatedAt crossed the Codex floor", () => {
+    const now = 2000000;
+    const lifecycleAt = now - CODEX_LOCAL_WORKING_STALE_FLOOR_MS - 1;
+    const { result } = decision(session({
+      state: "working",
+      agentId: "codex",
+      updatedAt: lifecycleAt,
+      metadataUpdatedAt: now,
+      agentPid: 10,
+      sourcePid: 20,
+    }), {
+      now,
+      alivePids: new Set([10, 20]),
+    });
+
+    assert.deepStrictEqual(result, { action: "idle", reason: "working-timeout", updateTimestamp: true });
   });
 
   it("does not extend remote Codex working sessions", () => {
