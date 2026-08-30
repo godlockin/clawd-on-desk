@@ -17,7 +17,6 @@ const SERVER_ID = "clawd-on-desk";
 
 const {
   buildAllowOutput,
-  buildAskOutput,
   buildDenyOutput,
   buildNoDecisionOutput,
   buildPermissionBody,
@@ -72,7 +71,7 @@ describe("clawd-permission-hook pure helpers", () => {
     assert.strictEqual(typeof body.tool_input_fingerprint, "string");
   });
 
-  it("translateServerResponse maps allow → permissionDecision:allow", () => {
+  it("translateServerResponse maps allow → decision: { behavior: 'allow' }", () => {
     const out = translateServerResponse(
       JSON.stringify({
         hookSpecificOutput: {
@@ -85,12 +84,14 @@ describe("clawd-permission-hook pure helpers", () => {
     assert.deepStrictEqual(JSON.parse(out), {
       hookSpecificOutput: {
         hookEventName: "PermissionRequest",
-        permissionDecision: "allow",
+        decision: {
+          behavior: "allow",
+        },
       },
     });
   });
 
-  it("translateServerResponse maps deny+message → deny+reason", () => {
+  it("translateServerResponse maps deny+message → deny+message", () => {
     const out = translateServerResponse(
       JSON.stringify({
         hookSpecificOutput: {
@@ -101,8 +102,8 @@ describe("clawd-permission-hook pure helpers", () => {
       200
     );
     const parsed = JSON.parse(out);
-    assert.strictEqual(parsed.hookSpecificOutput.permissionDecision, "deny");
-    assert.strictEqual(parsed.hookSpecificOutput.permissionDecisionReason, "Blocked by user");
+    assert.strictEqual(parsed.hookSpecificOutput.decision.behavior, "deny");
+    assert.strictEqual(parsed.hookSpecificOutput.decision.message, "Blocked by user");
   });
 
   it("translateServerResponse maps deny w/o message → fallback reason", () => {
@@ -116,7 +117,7 @@ describe("clawd-permission-hook pure helpers", () => {
       200
     );
     const parsed = JSON.parse(out);
-    assert.strictEqual(parsed.hookSpecificOutput.permissionDecisionReason, "Denied by Clawd bubble");
+    assert.strictEqual(parsed.hookSpecificOutput.decision.message, "Denied by Clawd bubble");
   });
 
   it("translateServerResponse: empty decision object → no-decision {}", () => {
@@ -153,14 +154,13 @@ describe("clawd-permission-hook pure helpers", () => {
     assert.strictEqual(getDecisionWaitMs(7000), 1000);
   });
 
-  it("buildAllowOutput / buildDenyOutput / buildAskOutput / buildNoDecisionOutput shapes", () => {
+  it("buildAllowOutput / buildDenyOutput / buildNoDecisionOutput shapes", () => {
     assert.strictEqual(buildNoDecisionOutput(), "{}");
-    assert.deepStrictEqual(JSON.parse(buildAllowOutput()).hookSpecificOutput.permissionDecision, "allow");
-    assert.deepStrictEqual(JSON.parse(buildDenyOutput("x")).hookSpecificOutput.permissionDecision, "deny");
-    assert.deepStrictEqual(JSON.parse(buildAskOutput("ask reason")).hookSpecificOutput.permissionDecision, "ask");
+    assert.deepStrictEqual(JSON.parse(buildAllowOutput()).hookSpecificOutput.decision.behavior, "allow");
+    assert.deepStrictEqual(JSON.parse(buildDenyOutput("x")).hookSpecificOutput.decision.behavior, "deny");
   });
 
-  it("translateServerResponse forwards updatedPermissions on allow/deny/ask", () => {
+  it("translateServerResponse forwards updatedPermissions on allow", () => {
     const ups = [
       { type: "addRules", destination: "localSettings", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "ls *" }] },
     ];
@@ -171,18 +171,18 @@ describe("clawd-permission-hook pure helpers", () => {
       },
     });
     const out = JSON.parse(translateServerResponse(allowBody, 200));
-    assert.strictEqual(out.hookSpecificOutput.permissionDecision, "allow");
-    assert.deepStrictEqual(out.hookSpecificOutput.updatedPermissions, ups);
+    assert.strictEqual(out.hookSpecificOutput.decision.behavior, "allow");
+    assert.deepStrictEqual(out.hookSpecificOutput.decision.updatedPermissions, ups);
 
     const denyBody = JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PermissionRequest",
-        decision: { behavior: "deny", message: "nope", updatedPermissions: ups },
+        decision: { behavior: "deny", message: "nope" },
       },
     });
     const denyOut = JSON.parse(translateServerResponse(denyBody, 200));
-    assert.strictEqual(denyOut.hookSpecificOutput.permissionDecision, "deny");
-    assert.deepStrictEqual(denyOut.hookSpecificOutput.updatedPermissions, ups);
+    assert.strictEqual(denyOut.hookSpecificOutput.decision.behavior, "deny");
+    assert.strictEqual(denyOut.hookSpecificOutput.decision.message, "nope");
 
     // Empty / non-array updatedPermissions must NOT appear in output.
     const allowNoUps = JSON.stringify({
@@ -293,7 +293,7 @@ describe("clawd-permission-hook process behaviour", () => {
       );
       assert.strictEqual(result.code, 0);
       const parsed = JSON.parse(result.stdout.trim());
-      assert.strictEqual(parsed.hookSpecificOutput.permissionDecision, "allow");
+      assert.strictEqual(parsed.hookSpecificOutput.decision.behavior, "allow");
       const reqJson = JSON.parse(capturedBody);
       assert.strictEqual(reqJson.agent_id, "claude-code");
       assert.strictEqual(reqJson.hook_source, "claude-code-wrapper");
@@ -306,7 +306,7 @@ describe("clawd-permission-hook process behaviour", () => {
     }
   });
 
-  it("server deny+message → permissionDecision:deny + reason verbatim", async () => {
+  it("server deny+message → decision:deny + message verbatim", async () => {
     const { server, port } = await startStubServer((req, res) => {
       res.writeHead(200, { [SERVER_HEADER]: SERVER_ID, "Content-Type": "application/json" });
       res.end(
@@ -330,8 +330,8 @@ describe("clawd-permission-hook process behaviour", () => {
       );
       assert.strictEqual(result.code, 0);
       const parsed = JSON.parse(result.stdout.trim());
-      assert.strictEqual(parsed.hookSpecificOutput.permissionDecision, "deny");
-      assert.strictEqual(parsed.hookSpecificOutput.permissionDecisionReason, "Blocked by Clawd bubble");
+      assert.strictEqual(parsed.hookSpecificOutput.decision.behavior, "deny");
+      assert.strictEqual(parsed.hookSpecificOutput.decision.message, "Blocked by Clawd bubble");
     } finally {
       server.close();
     }

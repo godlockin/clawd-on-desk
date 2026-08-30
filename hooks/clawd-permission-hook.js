@@ -136,59 +136,43 @@ function buildNoDecisionOutput() {
 function sanitizeUpdatedPermissions(value) {
   if (!Array.isArray(value) || value.length === 0) return null;
   // Pass through as-is; server already shaped it (src/permission.js:642).
-  // CC's PermissionRequest stdout schema accepts updatedPermissions at
-  // hookSpecificOutput level, same as the prior direct-HTTP response path.
   return value;
 }
 
-function buildAllowOutput(message, updatedPermissions) {
+function buildAllowOutput(message, updatedPermissions, updatedInput) {
+  const decision = { behavior: "allow" };
+  const ups = sanitizeUpdatedPermissions(updatedPermissions);
+  if (ups) decision.updatedPermissions = ups;
+  if (updatedInput && typeof updatedInput === "object" && !Array.isArray(updatedInput)) {
+    decision.updatedInput = updatedInput;
+  }
   const out = {
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
-      permissionDecision: "allow",
+      decision,
     },
   };
-  if (typeof message === "string" && message) {
-    out.hookSpecificOutput.permissionDecisionReason = message.slice(0, DENY_REASON_MAX);
-  }
-  const ups = sanitizeUpdatedPermissions(updatedPermissions);
-  if (ups) out.hookSpecificOutput.updatedPermissions = ups;
   return JSON.stringify(out);
 }
 
-function buildDenyOutput(message, updatedPermissions) {
+function buildDenyOutput(message) {
   let reason =
     typeof message === "string" && message ? message : "Denied by Clawd bubble";
   if (reason.length > DENY_REASON_MAX) reason = reason.slice(0, DENY_REASON_MAX);
   const out = {
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
+      decision: {
+        behavior: "deny",
+        message: reason,
+      },
     },
   };
-  const ups = sanitizeUpdatedPermissions(updatedPermissions);
-  if (ups) out.hookSpecificOutput.updatedPermissions = ups;
   return JSON.stringify(out);
 }
 
-function buildAskOutput(message, updatedPermissions) {
-  const out = {
-    hookSpecificOutput: {
-      hookEventName: "PermissionRequest",
-      permissionDecision: "ask",
-    },
-  };
-  if (typeof message === "string" && message) {
-    out.hookSpecificOutput.permissionDecisionReason = message.slice(0, DENY_REASON_MAX);
-  }
-  const ups = sanitizeUpdatedPermissions(updatedPermissions);
-  if (ups) out.hookSpecificOutput.updatedPermissions = ups;
-  return JSON.stringify(out);
-}
-
-// Translate server response (sendPermissionResponse, src/permission.js:718-735)
-// → CC stdout schema (permissionDecision / permissionDecisionReason).
+// Translate server response (sendPermissionResponse, src/permission.js)
+// → CC stdout schema (hookSpecificOutput.decision.{behavior, message, ...}).
 function translateServerResponse(rawBody, statusCode) {
   if (typeof statusCode === "number" && (statusCode < 200 || statusCode >= 300)) {
     return buildNoDecisionOutput();
@@ -208,9 +192,9 @@ function translateServerResponse(rawBody, statusCode) {
       : null;
   if (!decision || typeof decision !== "object") return buildNoDecisionOutput();
   const ups = decision.updatedPermissions;
-  if (decision.behavior === "allow") return buildAllowOutput(decision.message, ups);
-  if (decision.behavior === "deny") return buildDenyOutput(decision.message, ups);
-  if (decision.behavior === "ask") return buildAskOutput(decision.message, ups);
+  const updatedInput = decision.updatedInput;
+  if (decision.behavior === "allow") return buildAllowOutput(decision.message, ups, updatedInput);
+  if (decision.behavior === "deny") return buildDenyOutput(decision.message);
   return buildNoDecisionOutput();
 }
 
@@ -402,7 +386,6 @@ if (require.main === module) {
 // Surface internals for unit tests.
 module.exports = {
   buildAllowOutput,
-  buildAskOutput,
   buildDenyOutput,
   buildNoDecisionOutput,
   buildPermissionBody,
