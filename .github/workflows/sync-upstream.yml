@@ -124,7 +124,7 @@ jobs:
       - name: Open PR for clean merge
         if: steps.compare.outputs.status == 'diverged' && steps.merge.outputs.merge_status == 'clean'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           BRANCH:  ${{ steps.merge.outputs.branch }}
           AHEAD:   ${{ steps.compare.outputs.ahead }}
           BEHIND:  ${{ steps.compare.outputs.behind }}
@@ -160,7 +160,7 @@ jobs:
       - name: Open PR for conflicting merge
         if: steps.compare.outputs.status == 'diverged' && steps.merge.outputs.merge_status == 'conflict'
         env:
-          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           BRANCH:    ${{ steps.merge.outputs.branch }}
           AHEAD:     ${{ steps.compare.outputs.ahead }}
           BEHIND:    ${{ steps.compare.outputs.behind }}
