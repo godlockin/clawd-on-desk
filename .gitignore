@@ -106,6 +106,8 @@ logs/
 scripts/*
 # Deterministic source-backed macOS tray asset generator
 !scripts/generate-mac-tray-icons.js
+# Fork-maintenance: delete stale sync/upstream-* branches already merged into main
+!scripts/cleanup-sync-branches.sh
 !scripts/manual/
 scripts/manual/*
 !scripts/manual/README.md
