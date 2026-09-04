@@ -40,6 +40,7 @@ jobs:
           test/spawned-hook-helper.test.js
           test/claude-recovery-lease-hook.test.js
           test/codex-hook.test.js
+          test/codex-install.test.js
           test/qwen-code-hook.test.js
           test/workbuddy-hook.test.js
       - run: npm run audit:assets

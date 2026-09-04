@@ -947,9 +947,24 @@ function getOverflowHotkeyTarget() {
 }
 
 function getHotkeyTargetPermission() {
-  if (overflowPresentation.mode === "overflow") return getOverflowHotkeyTarget();
-  const targets = getHotkeyActionablePermissions();
-  return targets.length > 0 ? targets[targets.length - 1] : null;
+  let target;
+  if (overflowPresentation.mode === "overflow") target = getOverflowHotkeyTarget();
+  else {
+    const targets = getHotkeyActionablePermissions();
+    target = targets.length > 0 ? targets[targets.length - 1] : null;
+  }
+  // Preserve the existing normal-mode fallback for requests without a window.
+  if (!target || !target.bubble) return target;
+  // isVisible() only means the native window was shown. In the ACK/failure
+  // fallback a tall stack can extend past the display, and macOS may clamp
+  // just its top edge while leaving the decision buttons below the screen.
+  // Protected expanded cards can also retain crowded normal-mode bounds.
+  // Validate the original target in both modes, never switch to another card.
+  try {
+    if (!isLiveBrowserWindow(target.bubble) || !target.bubble.isVisible()) return null;
+    if (!areBubbleBoundsSafe([target.bubble.getBounds()], getAnchorWorkArea(), getHudAvoidRects())) return null;
+  } catch { return null; }
+  return target;
 }
 
 function syncSingle(actionId, current, target, handler, setState) {

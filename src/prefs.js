@@ -920,6 +920,18 @@ function migrate(raw) {
     out.recapEnabled = typeof out.recapEnabled === "boolean" ? out.recapEnabled : true;
     out.version = 19;
   }
+  // Field-level migration also covers development snapshots that already have
+  // the current schema. Preserve the old effective Codex timeout only when no
+  // explicit independent value exists; fresh installs do not run migrate().
+  if (!Object.prototype.hasOwnProperty.call(out, "codexWorkingStaleMs")) {
+    const legacy = normalizeStaleTriple({
+      workingStaleMs: isValidValue(SCHEMA.workingStaleMs, out.workingStaleMs)
+        ? out.workingStaleMs : SCHEMA.workingStaleMs.default,
+      sessionStaleMs: isValidValue(SCHEMA.sessionStaleMs, out.sessionStaleMs)
+        ? out.sessionStaleMs : SCHEMA.sessionStaleMs.default,
+    });
+    out.codexWorkingStaleMs = Math.max(SCHEMA.codexWorkingStaleMs.default, legacy.workingStaleMs);
+  }
   if ((typeof out.version === "number" ? out.version : 0) < CURRENT_VERSION) {
     out.version = CURRENT_VERSION;
   }

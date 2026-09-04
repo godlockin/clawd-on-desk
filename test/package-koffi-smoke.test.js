@@ -14,6 +14,7 @@ const {
   assertFullscreenProbeValue,
   nativeWindowHandleId,
   runWindowsFullscreenIdentityProbe,
+  runHitWindowNoActivateRoundTrip,
 } = require("../src/package-koffi-smoke");
 const {
   parseArgs: parseRunnerArgs,
@@ -218,4 +219,25 @@ test("packaged native HWND proof survives a runner that cannot foreground Browse
   assert.equal(result.invalidRejected, true);
   assert.equal(result.foregroundControllable, false);
   assert.equal(result.fullscreenObserved, false);
+});
+
+test("packaged hit-window smoke proves initial, clear, enable, and final restore states", () => {
+  let nonActivating = true;
+  const calls = [];
+  const result = runHitWindowNoActivateRoundTrip({
+    isNonActivating: () => nonActivating,
+    setFocusable: (_win, focusable) => {
+      calls.push(focusable);
+      nonActivating = !focusable;
+      return true;
+    },
+  }, {});
+
+  assert.deepEqual(calls, [true, false, true]);
+  assert.deepEqual(result, {
+    initialNonActivating: true,
+    afterInitialClear: false,
+    afterFullscreenEnable: true,
+    afterFinalRestore: false,
+  });
 });

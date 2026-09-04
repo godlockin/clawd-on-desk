@@ -238,6 +238,7 @@ async function waitForSmokeCondition(check, label, { timeoutMs = 8_000, sleepFn 
 async function runWindowsFullscreenAutoHideRuntimeProbe({
   BrowserWindow,
   fullscreenProbe,
+  hitActivation,
   timeoutMs = 8_000,
 } = {}) {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -252,6 +253,7 @@ async function runWindowsFullscreenAutoHideRuntimeProbe({
       alwaysOnTop: true,
       skipTaskbar: true,
       backgroundColor,
+      focusable: false,
     });
     win.showInactive();
     win.setAlwaysOnTop(true, "pop-up-menu");
@@ -284,7 +286,7 @@ async function runWindowsFullscreenAutoHideRuntimeProbe({
       getFullscreenOverlay: () => false,
       setFullscreenAutoHidden: (...args) => petWindowRuntime.setFullscreenAutoHidden(...args),
       isFullscreenAutoHidden: () => petWindowRuntime.isFullscreenAutoHidden(),
-      setHitWinFocusable: (focusable) => hitWin.setFocusable(focusable),
+      setHitWinFocusable: (focusable) => hitActivation.setFocusable(hitWin, focusable),
     });
     topmostRuntime.startFocusablePoll();
 
@@ -397,15 +399,45 @@ async function runWindowsFullscreenAutoHideRuntimeProbe({
   }
 }
 
+function runHitWindowNoActivateRoundTrip(hitActivation, win, errors = []) {
+  const describeErrors = () => errors.join(" | ");
+  const initialNonActivating = hitActivation.isNonActivating(win);
+  if (initialNonActivating !== true) {
+    throw new Error(`Packaged WS_EX_NOACTIVATE initial state missing: ${describeErrors()}`);
+  }
+  if (!hitActivation.setFocusable(win, true) || hitActivation.isNonActivating(win) !== false) {
+    throw new Error(`Packaged WS_EX_NOACTIVATE initial clear failed: ${describeErrors()}`);
+  }
+  if (!hitActivation.setFocusable(win, false) || hitActivation.isNonActivating(win) !== true) {
+    throw new Error(`Packaged WS_EX_NOACTIVATE enable failed: ${describeErrors()}`);
+  }
+  if (!hitActivation.setFocusable(win, true) || hitActivation.isNonActivating(win) !== false) {
+    throw new Error(`Packaged WS_EX_NOACTIVATE final restore failed: ${describeErrors()}`);
+  }
+  return {
+    initialNonActivating: true,
+    afterInitialClear: false,
+    afterFullscreenEnable: true,
+    afterFinalRestore: false,
+  };
+}
+
 async function runPlatformProbe({ BrowserWindow, target, koffi }) {
   if (target.runtimePlatform === "win32") {
-    const win = new BrowserWindow({ show: false, width: 80, height: 80, skipTaskbar: true });
+    const win = new BrowserWindow({
+      show: false,
+      width: 80,
+      height: 80,
+      skipTaskbar: true,
+      focusable: false,
+    });
     try {
       win.showInactive();
       await new Promise((resolve) => setTimeout(resolve, 100));
       const { createCloakInspector } = require("./win-cloak-recovery");
       const { createForegroundFullscreenProbe } = require("./win-fullscreen-detect");
       const { createForegroundWindowsTerminalProbe } = require("./win-foreground-terminal");
+      const { createHitWindowActivationController } = require("./win-hit-window-activation");
       const logs = [];
       const cloak = createCloakInspector({ isWin: true, log: (line) => logs.push(line) });
       try {
@@ -426,8 +458,26 @@ async function runPlatformProbe({ BrowserWindow, target, koffi }) {
           fullscreenProbe,
           koffi,
         });
+        const hitActivationErrors = [];
+        const hitActivation = createHitWindowActivationController({
+          isWin: true,
+          koffi,
+          onError: (err) => hitActivationErrors.push(err && err.message ? err.message : String(err)),
+        });
+        if (!hitActivation.available) {
+          throw new Error(`Hit-window activation controller unavailable: ${hitActivationErrors.join(" | ")}`);
+        }
+        const hitWindowNoActivateRoundTrip = runHitWindowNoActivateRoundTrip(
+          hitActivation,
+          win,
+          hitActivationErrors,
+        );
         const fullscreenAutoHideRuntime = fullscreenIdentity.foregroundControllable
-          ? await runWindowsFullscreenAutoHideRuntimeProbe({ BrowserWindow, fullscreenProbe })
+          ? await runWindowsFullscreenAutoHideRuntimeProbe({
+            BrowserWindow,
+            fullscreenProbe,
+            hitActivation,
+          })
           : {
             skipped: true,
             reason: "packaged-runner-cannot-focus-browser-windows",
@@ -461,6 +511,7 @@ async function runPlatformProbe({ BrowserWindow, target, koffi }) {
           foregroundFullscreen: fullscreen,
           fullscreenIdentity,
           fullscreenAutoHideRuntime,
+          hitWindowNoActivateRoundTrip,
           foregroundTerminalHwnd,
           foregroundTerminalExpectedMiss: foregroundTerminalHwnd === null,
           logs,
@@ -600,6 +651,7 @@ module.exports = {
   runWindowsFullscreenIdentityProbe,
   waitForSmokeCondition,
   runWindowsFullscreenAutoHideRuntimeProbe,
+  runHitWindowNoActivateRoundTrip,
   runPlatformProbe,
   runPackageKoffiSmoke,
   writeResult,
