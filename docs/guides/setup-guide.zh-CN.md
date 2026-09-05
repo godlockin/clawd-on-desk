@@ -252,13 +252,15 @@ node hooks/openclaw-install.js
 ## macOS 说明
 
 - **源码运行**（`npm start`）：Intel 和 Apple Silicon 均可直接使用。
-- **正式 DMG 安装包**：GitHub 正式 Release 同时提供 x64 与 arm64 DMG；发布工作流会用 Developer ID 签名、Apple 公证并 stapled。手动 `workflow_dispatch` 在没有签名凭据时可能只生成 ad-hoc 验证 artifact，不能当作正式安装包分发。
+- **Homebrew**：`brew install --cask clawd-on-desk` 会从对应当前架构的官方 DMG 中安装已签名并公证的应用。之后可用 `brew upgrade --cask clawd-on-desk` 升级。
+- **正式 DMG 安装包**：GitHub 正式 Release 同时提供 x64 与 arm64 DMG，其中的应用已使用 Developer ID 签名、通过 Apple 公证并附有公证票据；DMG 容器本身不单独签名。手动 `workflow_dispatch` 在没有签名凭据时可能只生成 ad-hoc 验证 artifact，不能当作正式安装包分发。
 - **自动更新桥接**：旧版 DMG 没有 ZIP 更新载荷，不能把自己自动升级到首个支持应用内更新的版本。现有用户需要从 GitHub Releases 手动安装一次首个桥接版 DMG；装上桥接版后，后续正式版本可在 Clawd 内下载，选择“立即重启”安装，或选择“稍后”并在退出、重新打开后完成。真实能力仍以同一 Developer ID 的 A→B 真机升级记录为准，不能用单元测试代替。
 - **源码自动更新**：源码运行时，“检查更新”会执行 `git pull` + `npm install`（依赖有变化时）并自动重启。
 
 ## Linux 说明
 
 - **源码运行**（`npm start`）：默认启用 Electron sandbox。如果你的 Linux 开发环境仍然遇到 chrome-sandbox 初始化失败，可临时使用 `CLAWD_DISABLE_SANDBOX=1 npm start` 作为兼容方案。
+- **Homebrew**：`brew install --cask clawd-on-desk` 会安装 x86_64 AppImage；目前没有 Linux ARM 的 cask 产物。之后可用 `brew upgrade --cask clawd-on-desk` 升级。
 - **安装包**：AppImage 和 `.deb` 可从 [GitHub Releases](https://github.com/rullerzhou-afk/clawd-on-desk/releases) 下载。deb 安装后应用图标会出现在 GNOME 应用菜单。
 - **终端聚焦**：依赖 `wmctrl` 或 `xdotool`（有一个就行）。安装：`sudo apt install wmctrl` 或 `sudo apt install xdotool`。
-- **自动更新**：AppImage / deb 安装包仍需从 GitHub Releases 手动下载；源码运行时，“检查更新”会执行 `git pull` + `npm install`（依赖有变化时）并自动重启。
+- **自动更新**：Clawd 不会自行更新 Linux 安装包。Homebrew 管理的安装可用 `brew upgrade --cask clawd-on-desk` 升级；直接安装的 AppImage / deb 仍需从 GitHub Releases 手动下载。源码运行时，“检查更新”会执行 `git pull` + `npm install`（依赖有变化时）并自动重启。
