@@ -162,6 +162,12 @@ For normal use, download the latest prebuilt installer from **[GitHub Releases](
 - **macOS**: `.dmg`
 - **Linux**: `.AppImage` or `.deb`
 
+On macOS, or on Linux x86_64, you can also install with Homebrew:
+
+```bash
+brew install --cask clawd-on-desk
+```
+
 Launch Clawd after installing it. Fresh installs auto-sync Claude Code and Codex only; install other local agent integrations from **Settings → Agents** when you need them.
 
 Run from source only if you're contributing, testing unreleased code, or debugging integrations. Source installs download Electron/build tooling and can create a large `node_modules` tree.
