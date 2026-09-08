@@ -156,6 +156,12 @@ Clawd 适配多显示器场景：按启动时所在显示器做等比缩放，�
 - **macOS**：`.dmg`
 - **Linux**：`.AppImage` 或 `.deb`
 
+macOS 以及 Linux x86_64 也可以用 Homebrew 安装：
+
+```bash
+brew install --cask clawd-on-desk
+```
+
 安装后启动 Clawd。全新安装只会自动同步 Claude Code 和 Codex；其他本机 agent 需要用到时，再到 **Settings → Agents** 安装对应集成。
 
 只有在参与开发、测试未发布代码或调试集成时，才建议从源码运行。源码安装会下载 Electron / 打包工具，并生成较大的 `node_modules`。
