@@ -56,10 +56,24 @@ function createHarness(overrides = {}) {
   const dashboardMainFrame = {
     url: pathToFileURL(path.join(__dirname, "..", "src", "dashboard.html")).toString(),
   };
-  const dashboardWebContents = { mainFrame: dashboardMainFrame };
-  const dashboardWindow = {
-    webContents: dashboardWebContents,
+  // The page's WebContents belongs to a WebContentsView on darwin/win32, so
+  // the trust check must resolve it directly and never through a window.
+  const dashboardWebContents = {
+    mainFrame: dashboardMainFrame,
     isDestroyed: () => false,
+  };
+  // A supported-platform quick mode by default, so the shared channel set
+  // reflects a darwin/win32 install.
+  const quickMode = {
+    isSupported: () => overrides.quickSupported !== false,
+    getPendingRevision: () => 7,
+    enter: (payload) => { calls.push(["quickEnter", payload]); return { status: "ok" }; },
+    ready: (payload) => { calls.push(["quickReady", payload]); return { status: "ok" }; },
+    activate: (payload) => { calls.push(["quickActivate", payload]); return { status: "submitted" }; },
+    dismissFromRenderer: (payload) => {
+      calls.push(["quickDismiss", payload]);
+      return { status: "ok" };
+    },
   };
   const runtime = registerSessionIpc({
     ipcMain,
@@ -98,7 +112,11 @@ function createHarness(overrides = {}) {
       calls.push(["clearSessionAutomationGrant", payload]);
       return { status: "applied" };
     }),
-    getDashboardWindow: overrides.getDashboardWindow || (() => dashboardWindow),
+    getDashboardWebContents: overrides.getDashboardWebContents
+      || (() => dashboardWebContents),
+    quickMode: Object.prototype.hasOwnProperty.call(overrides, "quickMode")
+      ? overrides.quickMode
+      : quickMode,
     getKimiQuotaStatus: overrides.getKimiQuotaStatus || (() => ({
       status: "ok",
       configured: true,
@@ -132,6 +150,11 @@ test("session IPC registers owned channels and disposes them", () => {
     "dashboard:get-snapshot",
     "dashboard:hide-session",
     "dashboard:open-session-folder",
+    "dashboard:quick-activate",
+    "dashboard:quick-dismiss",
+    "dashboard:quick-enter",
+    "dashboard:quick-pending",
+    "dashboard:quick-ready",
     "dashboard:refresh-kimi-quota",
     "dashboard:set-session-alias",
     "dashboard:set-session-automation",
@@ -152,6 +175,56 @@ test("session IPC registers owned channels and disposes them", () => {
 
   assert.strictEqual(ipcMain.handlers.size, 0);
   assert.strictEqual(ipcMain.listeners.size, 0);
+});
+
+test("an unsupported platform never registers the keyboard-mode channels", () => {
+  const { ipcMain } = createHarness({ quickSupported: false });
+  const quickChannels = [...ipcMain.handlers.keys()].filter((c) => c.startsWith("dashboard:quick-"));
+
+  // Not registered at all: there is no capability to reach, rather than a
+  // handler that politely answers "unsupported".
+  assert.deepStrictEqual(quickChannels, []);
+  // The rest of the Dashboard is untouched.
+  assert.ok(ipcMain.handlers.has("dashboard:get-snapshot"));
+  assert.ok(ipcMain.handlers.has("dashboard:get-kimi-quota-status"));
+  assert.ok(ipcMain.listeners.has("dashboard:focus-session"));
+});
+
+test("keyword-mode channels reach the owner only from the trusted page", async () => {
+  const { ipcMain, calls, trustedDashboardEvent } = createHarness();
+
+  assert.deepStrictEqual(
+    await ipcMain.invokeFrom(trustedDashboardEvent, "dashboard:quick-pending"),
+    { status: "ok", revision: 7 }
+  );
+  await ipcMain.invokeFrom(trustedDashboardEvent, "dashboard:quick-enter", { revision: 7 });
+  await ipcMain.invokeFrom(trustedDashboardEvent, "dashboard:quick-ready", { revision: 7 });
+  await ipcMain.invokeFrom(
+    trustedDashboardEvent,
+    "dashboard:quick-activate",
+    { sessionId: "s1", revision: 7 }
+  );
+  await ipcMain.invokeFrom(trustedDashboardEvent, "dashboard:quick-dismiss", { revision: 7 });
+  assert.deepStrictEqual(calls.map(([name]) => name), [
+    "quickEnter",
+    "quickReady",
+    "quickActivate",
+    "quickDismiss",
+  ]);
+
+  // An untrusted sender is refused before the owner is consulted.
+  calls.length = 0;
+  for (const channel of [
+    "dashboard:quick-pending",
+    "dashboard:quick-enter",
+    "dashboard:quick-ready",
+    "dashboard:quick-activate",
+    "dashboard:quick-dismiss",
+  ]) {
+    const result = await ipcMain.invoke(channel, { revision: 7 });
+    assert.strictEqual(result.reason, "untrusted-dashboard-sender", channel);
+  }
+  assert.deepStrictEqual(calls, []);
 });
 
 test("session IPC delegates dashboard and HUD behavior", async () => {
