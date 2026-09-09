@@ -1794,6 +1794,25 @@ test("remoteSsh:cleanup stays ok when the remote uninstall fails (best-effort)",
   ipc.dispose();
 });
 
+test("remoteSsh:cleanup reports the precise Hermes residual path to the delete dialog", async () => {
+  const ipcMain = mockIpcMain();
+  const { BrowserWindow } = mockBrowserWindow();
+  const detail = "/home/pi/.hermes/plugins/clawd-on-desk/foreign.txt: ownership conflict";
+  const ipc = registerRemoteSshIpc({
+    ipcMain,
+    settingsController: mockSettingsController([{ ...baseProfile, managedDeployTargets: [ownedTarget()] }]),
+    remoteSshRuntime: mockRuntime(), BrowserWindow, spawn: makeSucceedingSpawn().spawn,
+    uninstallRemoteIntegrationsFn: async () => ({ ok: false, reason: "hermes_cleanup_incomplete", stderr: detail }),
+  });
+  try {
+    const result = await ipcMain.invoke("remoteSsh:cleanup", "p1");
+    assert.equal(result.status, "ok");
+    assert.equal(result.uninstalled, false);
+    assert.equal(result.message, detail);
+    assert.deepEqual(result.warnings, [detail]);
+  } finally { ipc.dispose(); }
+});
+
 test("remoteSsh:cleanup never mutates a never-deployed remote", async () => {
   const ipcMain = mockIpcMain();
   const { BrowserWindow } = mockBrowserWindow();
