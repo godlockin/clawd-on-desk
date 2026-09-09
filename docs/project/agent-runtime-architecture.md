@@ -248,6 +248,40 @@ DeepSeek Harness 权限气泡（approval waterfall，阻塞）：
     → DND / disabled / bubble hidden / Clawd unavailable 时 stdout "{}"，Codex 回到原生审批提示
 ```
 
+## Local Permission HTTP Boundary
+
+The local `POST /permission` endpoint is a native hook/plugin interface. Before
+reading the body or recording a hook event, `src/server.js` rejects any `Origin`
+header (including empty or `null`), an HTTP Host other than explicit
+`127.0.0.1`, `localhost`, or `[::1]` with an optional valid port, and a media type
+other than `application/json` (parameters such as `charset=utf-8` are allowed).
+Duplicate Host or Content-Type fields are rejected. Forwarded headers do not
+grant access, and OPTIONS does not enable cross-origin preflight.
+
+These are browser-request guards: loopback binding and CORS response restrictions
+alone do not prevent a simple cross-origin POST from creating approval UI.
+Rejected requests receive an empty 400/403/415 response and a closed connection,
+without a Clawd success marker or an agent approval/denial. Native hooks retain
+their own no-decision fallback. Custom proxies targeting the local endpoint must
+preserve this native request contract; a browser frontend is not supported here.
+
+This does not authenticate unrestricted same-user processes, which can construct
+the permitted headers. A token stored in a same-user-readable runtime file would
+not provide that isolation either. Receiving an `allow` on a caller's own HTTP
+request does not establish authority over another pending request. Pi's legacy
+state-only response and Task passthrough semantics remain unchanged.
+
+Authenticated Remote SSH traffic retains its separate profile-bound nonce
+ingress and trusted profile stamping; these local checks do not replace that
+contract. `/state` is outside this permission-specific guard.
+
+Regression evidence uses the real HTTP router and permission ownership module
+in `test/server-permission-ingress.test.js`. The Electron fixture additionally
+checks a cross-origin loopback webpage and real approval windows with isolated
+user data, no installed hooks, no remote clients, and no executed agent tools.
+It does not establish public-Internet reachability across browser-specific local
+network access controls or replace real agent/OS compatibility checks.
+
 ## Local Recap Projection
 
 The recap is a local projection of accepted runtime activity, not a second observer at the HTTP or `updateSession()` entry. After agent gates, Codex source/replay arbitration, permission provenance handling, subagent filtering, and completion arbitration settle, `src/state.js` maps the accepted boundary through `src/recap-metrics.js` and sends an allowlisted canonical event to `src/recap-runtime.js`.

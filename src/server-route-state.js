@@ -530,6 +530,7 @@ function handleStatePost(req, res, options) {
             metaUpdate.contextUsage = contextUsage;
             metaUpdate.contextUsageOrigin = resolveMetadataContextUsageOrigin(agentId, contextUsage);
           }
+          if (model && localClaudeStatuslineMetadataAllowed) metaUpdate.model = model;
           // OpenCode title changes ride the same metadata-only channel (the
           // placeholder → real title swap arrives on session.updated, which
           // maps to no Clawd state). Not gated on the Claude telemetry flag —

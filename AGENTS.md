@@ -119,7 +119,9 @@ Copilot CLI 同步走 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json`，marker-
 | `src/permission.js` + `src/permission-automation-policy.js` + `src/session-automation-coordinator.js` | 权限气泡、自动化策略、per-session 授权与决策回包；远程 client 由 `main.js` 注入 |
 | `src/pet-window-runtime.js` + `src/floating-window-runtime.js` + `src/topmost-runtime.js` | 双窗口 owner、浮层重排、z-order / fullscreen / focusability |
 | `src/update-bubble.js` | 更新气泡创建、测高、跟随桌宠定位，避让 HUD / permission stack |
-| `src/dashboard.js` + `src/dashboard-renderer.js` | Sessions Dashboard 窗口、会话列表、别名编辑、终端跳转 |
+| `src/dashboard.js` + `src/dashboard-renderer.js` | Sessions Dashboard 唯一 owner：会话列表、别名编辑、终端跳转、几何持久化，以及同一页面的临时键盘模式 |
+| `src/dashboard-host.js` | Dashboard 普通宿主的平台封装：darwin/win32 用 `BaseWindow + WebContentsView`（无 `ready-to-show`），Linux 保留 `BrowserWindow` |
+| `src/dashboard-quick-mode.js` | 完整 Dashboard 的 1–9 键盘模式（**macOS/Windows only**）：quick 宿主、opacity/input parking、轮次栅栏与冻结数字映射；Windows 显式取消与页面失效的来源恢复在 `src/quick-select-origin-focus.js`，quick 宿主的退出清理挂在 `before-quit` |
 | `src/session-hud.js` + `src/session-hud-renderer.js` | 桌宠旁轻量会话 HUD、折叠行、点击跳转 |
 | `src/session-alias.js` | session alias key 规范化、TTL pruning、Kiro cwd scope |
 | `src/theme-loader.js` + `src/theme-runtime.js` | stateless 主题加载/消毒与唯一 active-theme owner |
@@ -206,6 +208,7 @@ Copilot CLI 同步走 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json`，marker-
 - `assets/source/cloudling-pointer-bridge/` 是 Cloudling 指针桥素材的保留源文件目录；运行时逻辑已内联进主题 SVG，不要把这个 source 目录当临时文件清理
 - 主题状态、sleep/DND、mini mode、状态映射的细节在 `docs/project/theme-state-ui.md`
 - Settings 体系里，store 是唯一真相，controller 是唯一写入者；不要绕开 `settings-controller.js`
+- Dashboard 数字快选是**完整 Dashboard 同一页面的临时键盘模式，仅 macOS/Windows**；Linux 明确 NOT SUPPORTED（不是待验证）。平台 gate 的唯一真相是 `shortcut-actions.js` 的 `supportedPlatforms` + `isShortcutActionSupported()`，Settings 展示、globalShortcut 注册/录制、设置命令和冲突占用都必须服从它；遗留的不支持绑定只忽略执行，不删用户 prefs、不占其他快捷键。darwin/win32 的 Dashboard 页面活在 `WebContentsView` 里，`BrowserWindow.fromWebContents()` 对它返回 null、BaseWindow 不触发 `ready-to-show`；页面 WC 一律从 owner 取。禁止用 `hide()`+`showInactive()` 归还已显示的普通宿主（实测会遮挡来源窗口），只能 opacity/input parking 并幂等恢复捕获值。详见 `docs/project/theme-state-ui.md`
 
 ## Testing
 

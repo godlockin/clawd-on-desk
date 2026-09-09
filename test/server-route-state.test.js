@@ -1268,6 +1268,42 @@ describe("server-route-state POST", () => {
     assert.strictEqual(metadataCalls[0][1].contextUsageOrigin, "claude-statusline");
   });
 
+  it("forwards the statusline model so a /model switch relabels the card", async () => {
+    const metadataCalls = [];
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      preserve_state: true,
+      metadata_only: true,
+      session_id: "sid",
+      agent_id: "claude-code",
+      model: "claude-opus-5",
+    }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(res.calls.updateSession.length, 0);
+    assert.strictEqual(metadataCalls.length, 1);
+    assert.deepStrictEqual(metadataCalls[0][1], { model: "claude-opus-5" });
+  });
+
+  it("drops the statusline model while the telemetry gate is closed", async () => {
+    const metadataCalls = [];
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      metadata_only: true,
+      session_id: "sid",
+      agent_id: "claude-code",
+      model: "claude-opus-5",
+    }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+      options: { isClaudeStatuslineMetadataAllowed: () => false },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.deepStrictEqual(metadataCalls, []);
+  });
+
   it("keeps ordinary Claude lifecycle context when only statusline telemetry is gated", async () => {
     const res = await callStatePost(JSON.stringify({
       state: "working",
