@@ -15,6 +15,7 @@ const {
   applyOrcaPaneKey,
   processAlive,
 } = require("./shared-process");
+const { resolveSessionTitle } = require("./cursor-session-title");
 
 const HOOK_TO_STATE = {
   sessionStart: { state: "idle", event: "SessionStart" },
@@ -151,6 +152,8 @@ readStdinJson()
 
     const body = { state, session_id: sessionId, event };
     body.agent_id = "cursor-agent";
+    const sessionTitle = resolveSessionTitle(payload, hookNameResolved, { readDatabase: !remote });
+    if (sessionTitle) body.session_title = sessionTitle;
     const hint = displaySvgFromToolHook(hookNameResolved, payload);
     if (hint !== undefined) body.display_svg = hint;
     if (cwd) body.cwd = cwd;

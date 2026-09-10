@@ -10,6 +10,7 @@ const { fitStateBodyToByteBudget } = require("./state-payload-size");
 const { extractClaudeContextUsageFromEntries } = require("./context-usage");
 const { createPidResolver, readStdinJsonDetailed, getPlatformConfig, applyOrcaPaneKey } = require("./shared-process");
 const { updateRecoveryLeaseFromStateBody } = require("./session-recovery-lease");
+const { normalizeModelId } = require("./claude-rate-limits");
 // #634: the pid cache + lifecycle orchestration is owned by the shared resolver
 // now (hooks/shared-process.js); this adapter no longer touches pid-cache,
 // processAlive, or isWin directly.
@@ -617,6 +618,10 @@ function buildStateBody(event, payload, resolve) {
     }
   }
   if (cwd) body.cwd = cwd;
+  // Only SessionStart carries a model, and even there it is optional (`clear`
+  // omits it). state.js merges it stickily, so one report is enough.
+  const model = normalizeModelId(payload.model);
+  if (model) body.model = model;
   const toolName = typeof payload.tool_name === "string" && payload.tool_name ? payload.tool_name : null;
   const toolUseId = normalizeToolUseId(payload.tool_use_id ?? payload.toolUseId ?? payload.toolUseID);
   const toolInputFingerprint = buildToolInputFingerprint(
