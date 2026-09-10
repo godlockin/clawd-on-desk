@@ -1033,6 +1033,7 @@ function registerRemoteSshIpc(options = {}) {
       let uninstalled = true;
       let attempted = 0;
       let shared = 0;
+      const cleanupWarnings = [];
       const orderedTargets = ownedTargets.slice().sort((a, b) =>
         remoteOwnershipDomainKey(a).localeCompare(remoteOwnershipDomainKey(b))
       );
@@ -1091,6 +1092,7 @@ function registerRemoteSshIpc(options = {}) {
           }
           const stderr = redactTransportDiagnostic(result && result.stderr, cleanupProfile);
           log("remote uninstall incomplete for", target.host, stderr.slice(0, 200));
+          if (stderr) cleanupWarnings.push(stderr);
         }
       }
       return {
@@ -1098,6 +1100,7 @@ function registerRemoteSshIpc(options = {}) {
         uninstalled,
         attempted,
         shared,
+        ...(cleanupWarnings.length ? { warnings: cleanupWarnings, message: cleanupWarnings.join("\n") } : {}),
         skipped: attempted === 0 ? "shared-owner" : undefined,
       };
     } catch (err) {
@@ -1555,8 +1558,44 @@ function registerRemoteSshIpc(options = {}) {
             message: (committed && committed.message) || "identity transaction was not committed",
           };
         }
+        // The remote deployment is now fully verified, stamped and committed.
+        // If the Hermes phase actually ran, enable Hermes locally through the
+        // SAME Settings controller command the Settings → Agents toggle uses
+        // (setAgentFlag), so the local ingress/state/permission gates accept
+        // the events the remote plugin will send. Never write the settings
+        // file directly and never add UI for it.
+        //
+        // integrationInstalled is preserved exactly: it is excluded from
+        // SETTABLE_AGENT_FLAGS, so this path cannot set it — a remote-only
+        // deployment leaves a local `false` as `false` and never claims the
+        // plugin was installed on this machine. setAgentFlag is a no-op when
+        // the flag already holds the value, so repeat deploys are idempotent.
+        //
+        // A not-applicable, failed or unknown-result deploy never reaches this
+        // line, so no local flag is touched in those cases. A failure to flip
+        // the local flag is logged, not fatal: the remote side is already
+        // verified and the user can still toggle Hermes in Settings.
+        if (result.hermes && (result.hermes.status === "ok" || result.hermes.status === "warning")) {
+          let localEnable = null;
+          try {
+            localEnable = await settingsController.applyCommand("setAgentFlag", {
+              agentId: "hermes",
+              flag: "enabled",
+              value: true,
+            });
+          } catch (err) {
+            localEnable = { status: "error", message: (err && err.message) || "setAgentFlag threw" };
+          }
+          if (transportContext) transportContext.assertActive();
+          if (!localEnable || localEnable.status !== "ok") {
+            log(
+              "remote-ssh: Hermes deployed remotely but could not be enabled locally:",
+              (localEnable && localEnable.message) || "setAgentFlag returned non-ok",
+            );
+          }
+        }
         refreshRuntimeProfile(profile.id);
-        return { status: "ok", ...(stampWarning || {}) };
+        return { status: "ok", hermes: result.hermes || null, ...(stampWarning || {}) };
       }
       return {
         status: "error",

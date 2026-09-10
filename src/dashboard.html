@@ -374,6 +374,60 @@ h1 {
   justify-content: flex-start;
 }
 
+/* Keyboard mode. The banner lives in the header and the digit badge is
+   absolutely positioned, so entering the mode changes no card height and the
+   user's scroll position survives the next one-second rebuild. */
+.quick-banner {
+  margin-top: 10px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--surface-alt);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.quick-banner[hidden] { display: none; }
+
+.quick-banner.is-active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.quick-digit-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: var(--accent);
+  color: #ffffff;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
+#content:not(.is-quick-capture) .quick-digit-badge {
+  visibility: hidden;
+}
+
+.card-quick-tombstone {
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
+  padding-left: 34px;
+  opacity: 0.55;
+}
+
+.card-quick-tombstone .quick-digit-badge {
+  background: var(--subtle);
+}
+
 .session-id-badge {
   position: absolute;
   top: 8px;
@@ -443,6 +497,7 @@ h1 {
 
 .meta,
 .path,
+.model-row,
 .event-row,
 .context-usage-row {
   overflow: hidden;
@@ -520,6 +575,10 @@ h1 {
 }
 
 .event-row {
+  color: var(--muted);
+}
+
+.model-row {
   color: var(--muted);
 }
 
@@ -712,6 +771,7 @@ button:disabled {
         <h1 id="title">Sessions</h1>
         <span id="count" class="count"></span>
       </div>
+      <div id="quickBanner" class="quick-banner" role="status" aria-live="polite" hidden></div>
       <div id="quotaSummary" class="quota-summary" hidden></div>
     </header>
     <main id="content" class="content" aria-live="polite"></main>
