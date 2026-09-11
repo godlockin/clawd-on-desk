@@ -221,23 +221,36 @@ test("packaged native HWND proof survives a runner that cannot foreground Browse
   assert.equal(result.fullscreenObserved, false);
 });
 
-test("packaged hit-window smoke proves initial, clear, enable, and final restore states", () => {
+test("packaged hit-window smoke preserves the style round trip and delivers both mouse-activation modes", async () => {
   let nonActivating = true;
   const calls = [];
-  const result = runHitWindowNoActivateRoundTrip({
+  let mouseActivateCalls = 0;
+  const win = {
+    isFocusable: () => false,
+    isWindowMessageHooked: () => true,
+  };
+  const result = await runHitWindowNoActivateRoundTrip({
     isNonActivating: () => nonActivating,
     setFocusable: (_win, focusable) => {
       calls.push(focusable);
       nonActivating = !focusable;
       return true;
     },
-  }, {});
+  }, win, [], () => {
+    mouseActivateCalls += 1;
+    return { result: 3, ignorePropertyConsumed: true };
+  });
 
   assert.deepEqual(calls, [true, false, true]);
+  assert.equal(mouseActivateCalls, 3);
   assert.deepEqual(result, {
+    electronFocusable: false,
     initialNonActivating: true,
     afterInitialClear: false,
-    afterFullscreenEnable: true,
+    desktopMouseActivate: 3,
+    afterFullscreenRequest: true,
+    fullscreenMouseActivate: 3,
     afterFinalRestore: false,
+    restoredMouseActivate: 3,
   });
 });

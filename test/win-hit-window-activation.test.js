@@ -10,6 +10,8 @@ const {
   createHitWindowActivationRuntime,
   createHitWindowFocusableSetter,
   WS_EX_NOACTIVATE,
+  WM_MOUSEACTIVATE,
+  MA_NOACTIVATE,
   STYLE_REFRESH_FLAGS,
 } = require("../src/win-hit-window-activation");
 
@@ -17,11 +19,14 @@ function makeHarness({
   initialStyle = 0n,
   electronFocusable = false,
   refreshResult = true,
+  armResult = true,
   onError,
 } = {}) {
   let style = initialStyle;
   const nativeCalls = [];
   const electronCalls = [];
+  const windowMessageCalls = [];
+  const windowMessageHooks = new Map();
   const hwnd = { id: 42 };
   const win = {
     isDestroyed: () => false,
@@ -29,6 +34,14 @@ function makeHarness({
     setFocusable(value) {
       electronFocusable = !!value;
       electronCalls.push(value);
+    },
+    hookWindowMessage(message, callback) {
+      windowMessageCalls.push(["hookWindowMessage", message]);
+      windowMessageHooks.set(message, callback);
+    },
+    unhookWindowMessage(message) {
+      windowMessageCalls.push(["unhookWindowMessage", message]);
+      windowMessageHooks.delete(message);
     },
   };
   const controller = createHitWindowActivationController({
@@ -52,6 +65,16 @@ function makeHarness({
         nativeCalls.push(["refreshStyle", STYLE_REFRESH_FLAGS]);
         return typeof refreshResult === "function" ? refreshResult() : refreshResult;
       },
+      armMouseActivate(candidate) {
+        assert.strictEqual(candidate, hwnd);
+        nativeCalls.push(["armMouseActivate"]);
+        return typeof armResult === "function" ? armResult() : armResult;
+      },
+      clearMouseActivate(candidate) {
+        assert.strictEqual(candidate, hwnd);
+        nativeCalls.push(["clearMouseActivate"]);
+        return null;
+      },
     },
     onError,
   });
@@ -60,24 +83,34 @@ function makeHarness({
     win,
     nativeCalls,
     electronCalls,
+    windowMessageCalls,
+    dispatchWindowMessage(message) {
+      return windowMessageHooks.get(message)?.(Buffer.alloc(8), Buffer.alloc(8));
+    },
     getStyle: () => style,
   };
 }
 
 describe("Windows hit-window activation controller", () => {
-  it("adds WS_EX_NOACTIVATE without calling Electron setFocusable(false)", () => {
+  it("guards fullscreen mouse activation without calling Electron setFocusable(false)", () => {
     const h = makeHarness({ initialStyle: 0x00080088n });
+    assert.equal(MA_NOACTIVATE, 3);
 
     assert.equal(h.controller.setFocusable(h.win, false), true);
 
     assert.equal((h.getStyle() & WS_EX_NOACTIVATE) !== 0n, true);
     assert.deepStrictEqual(h.electronCalls, []);
+    assert.deepStrictEqual(h.windowMessageCalls, [["hookWindowMessage", WM_MOUSEACTIVATE]]);
     assert.deepStrictEqual(h.nativeCalls, [
+      ["armMouseActivate"],
       ["getStyle"],
       ["setStyle", 0x08080088n],
       ["refreshStyle", STYLE_REFRESH_FLAGS],
       ["getStyle"],
     ]);
+
+    assert.equal(h.dispatchWindowMessage(WM_MOUSEACTIVATE), undefined);
+    assert.deepStrictEqual(h.nativeCalls.at(-1), ["armMouseActivate"]);
   });
 
   it("is idempotent while the hit window is already non-activating", () => {
@@ -85,20 +118,34 @@ describe("Windows hit-window activation controller", () => {
 
     assert.equal(h.controller.setFocusable(h.win, false), true);
 
-    assert.deepStrictEqual(h.nativeCalls, [["getStyle"]]);
+    assert.deepStrictEqual(h.nativeCalls, [["armMouseActivate"], ["getStyle"]]);
     assert.deepStrictEqual(h.electronCalls, []);
+    assert.deepStrictEqual(h.windowMessageCalls, [["hookWindowMessage", WM_MOUSEACTIVATE]]);
   });
 
-  it("removes only WS_EX_NOACTIVATE when fullscreen ends", () => {
-    const h = makeHarness({ initialStyle: WS_EX_NOACTIVATE | 0x00080088n });
+  it("keeps the hook while restoring desktop activation semantics", () => {
+    const h = makeHarness({ initialStyle: 0x00080088n });
+
+    assert.equal(h.controller.setFocusable(h.win, false), true);
 
     assert.equal(h.controller.setFocusable(h.win, true), true);
 
     assert.equal(h.getStyle(), 0x00080088n);
     assert.deepStrictEqual(h.electronCalls, []);
+    assert.deepStrictEqual(h.windowMessageCalls, [["hookWindowMessage", WM_MOUSEACTIVATE]]);
+    assert.equal(h.dispatchWindowMessage(WM_MOUSEACTIVATE), undefined);
+    assert.deepStrictEqual(h.nativeCalls.at(-1), ["armMouseActivate"]);
+
+    assert.equal(h.controller.dispose(), true);
+    assert.equal(h.controller.dispose(), true);
+    assert.deepStrictEqual(h.windowMessageCalls, [
+      ["hookWindowMessage", WM_MOUSEACTIVATE],
+      ["unhookWindowMessage", WM_MOUSEACTIVATE],
+    ]);
+    assert.deepStrictEqual(h.nativeCalls.at(-1), ["clearMouseActivate"]);
   });
 
-  it("keeps Electron focusability disabled when native activation is restored", () => {
+  it("clears native non-activation on desktop while retaining the delivery hook", () => {
     const h = makeHarness({
       initialStyle: WS_EX_NOACTIVATE | 0x88n,
       electronFocusable: false,
@@ -108,6 +155,37 @@ describe("Windows hit-window activation controller", () => {
 
     assert.deepStrictEqual(h.electronCalls, []);
     assert.equal((h.getStyle() & WS_EX_NOACTIVATE) !== 0n, false);
+    assert.deepStrictEqual(h.windowMessageCalls, [["hookWindowMessage", WM_MOUSEACTIVATE]]);
+    assert.equal(h.dispatchWindowMessage(WM_MOUSEACTIVATE), undefined);
+    assert.deepStrictEqual(h.nativeCalls.at(-1), ["armMouseActivate"]);
+  });
+
+  it("prepares only the delivery hook before first show", () => {
+    const h = makeHarness({ initialStyle: WS_EX_NOACTIVATE | 0x88n });
+
+    assert.equal(h.controller.prepare(h.win), true);
+
+    assert.equal(h.getStyle(), WS_EX_NOACTIVATE | 0x88n);
+    assert.deepStrictEqual(h.nativeCalls, [["armMouseActivate"]]);
+    assert.deepStrictEqual(h.windowMessageCalls, [["hookWindowMessage", WM_MOUSEACTIVATE]]);
+  });
+
+  it("latches a failed pre-show guard into the legacy fallback", () => {
+    let armAllowed = false;
+    const h = makeHarness({ armResult: () => armAllowed });
+
+    assert.equal(h.controller.prepare(h.win), false);
+    armAllowed = true;
+    assert.equal(h.controller.setFocusable(h.win, false), false);
+
+    assert.deepStrictEqual(h.nativeCalls, [
+      ["armMouseActivate"],
+      ["clearMouseActivate"],
+    ]);
+    assert.deepStrictEqual(h.windowMessageCalls, [
+      ["hookWindowMessage", WM_MOUSEACTIVATE],
+      ["unhookWindowMessage", WM_MOUSEACTIVATE],
+    ]);
   });
 
   it("never falls back to the focus-stealing Electron false call when native refresh fails", () => {
@@ -115,6 +193,38 @@ describe("Windows hit-window activation controller", () => {
 
     assert.equal(h.controller.setFocusable(h.win, false), false);
     assert.deepStrictEqual(h.electronCalls, []);
+  });
+
+  it("deduplicates repeated arm failures until the same window recovers", () => {
+    const errors = [];
+    let armAllowed = false;
+    const h = makeHarness({
+      armResult: () => armAllowed,
+      onError: (error) => errors.push(error.message),
+    });
+
+    assert.equal(h.controller.setFocusable(h.win, true), false);
+    assert.equal(h.controller.setFocusable(h.win, true), false);
+    assert.deepStrictEqual(h.windowMessageCalls, [
+      ["hookWindowMessage", WM_MOUSEACTIVATE],
+      ["unhookWindowMessage", WM_MOUSEACTIVATE],
+      ["hookWindowMessage", WM_MOUSEACTIVATE],
+      ["unhookWindowMessage", WM_MOUSEACTIVATE],
+    ]);
+    assert.deepStrictEqual(
+      h.nativeCalls.filter((call) => call[0] === "armMouseActivate"),
+      [["armMouseActivate"], ["armMouseActivate"]],
+    );
+    assert.deepStrictEqual(errors, ["Windows hit-window mouse activation guard failed"]);
+
+    armAllowed = true;
+    assert.equal(h.controller.setFocusable(h.win, true), true);
+    armAllowed = false;
+    h.dispatchWindowMessage(WM_MOUSEACTIVATE);
+    assert.deepStrictEqual(errors, [
+      "Windows hit-window mouse activation guard failed",
+      "Windows hit-window mouse activation guard failed",
+    ]);
   });
 
   it("retries an owed native style refresh even when the style bit already matches", () => {
@@ -170,13 +280,25 @@ describe("Windows hit-window activation controller", () => {
       mainSource,
       /const setHitWinFocusable = _hitWindowActivationRuntime\.setHitWinFocusable/,
     );
+    assert.match(
+      mainSource,
+      /prepareActivation:\s*\(createdHitWin\)\s*=>[\s\S]*?_hitWindowActivationRuntime\.controller\.prepare\(createdHitWin\)/,
+    );
     assert.doesNotMatch(mainSource, /hitWin\.setFocusable\(/);
     assert.match(mainSource, /setHitWinFocusable,\s*\n/);
+
+    const disposeIndex = mainSource.indexOf("_hitWindowActivationRuntime.controller.dispose()");
+    const destroyIndex = mainSource.indexOf("hitWin.destroy()", disposeIndex);
+    assert.ok(disposeIndex >= 0 && destroyIndex > disposeIndex);
   });
 
   it("composes controller availability, fallback construction, and the live setter", () => {
     let style = WS_EX_NOACTIVATE;
-    const hitWin = { isDestroyed: () => false };
+    const hitWin = {
+      isDestroyed: () => false,
+      hookWindowMessage: () => {},
+      unhookWindowMessage: () => {},
+    };
     const runtime = createHitWindowActivationRuntime({
       isWin: true,
       pointerBits: 64,
@@ -186,6 +308,8 @@ describe("Windows hit-window activation controller", () => {
         getStyle: () => style,
         setStyle: (_hwnd, next) => { style = BigInt.asUintN(64, BigInt(next)); },
         refreshStyle: () => true,
+        armMouseActivate: () => true,
+        clearMouseActivate: () => null,
       },
     });
 
