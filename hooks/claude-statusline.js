@@ -26,7 +26,11 @@ const {
   readHostPrefix,
 } = require("./server-config");
 const { readStdinJson } = require("./shared-process");
-const { resolveClaudeRateLimitQuota, resolveClaudeModelLabel } = require("./claude-rate-limits");
+const {
+  resolveClaudeRateLimitQuota,
+  resolveClaudeModelLabel,
+  resolveClaudeModelId,
+} = require("./claude-rate-limits");
 const { extractClaudeStatuslineContextUsage } = require("./context-usage");
 
 const STATE_POST_TIMEOUT_MS = 150;
@@ -125,7 +129,8 @@ function buildStatusLineText(payload, quota, modelLabel) {
 
 function buildStateBody(payload, quota, contextUsage, options = {}) {
   const sessionId = payload && payload.session_id;
-  if (!sessionId || (!quota && !contextUsage)) return null;
+  const model = resolveClaudeModelId(payload);
+  if (!sessionId || (!quota && !contextUsage && !model)) return null;
 
   // metadata_only routes this around the updateSession lifecycle machine:
   // quota is annotated onto an existing session and dropped otherwise -
@@ -141,6 +146,7 @@ function buildStateBody(payload, quota, contextUsage, options = {}) {
   };
   if (quota) body.claude_quota = quota;
   if (contextUsage) body.context_usage = contextUsage;
+  if (model) body.model = model;
   const cwd = payload && payload.workspace && typeof payload.workspace.current_dir === "string"
     ? payload.workspace.current_dir
     : "";

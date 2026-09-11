@@ -419,11 +419,13 @@
       try {
         ops.requestRender({ content: true });
         let cleanupSucceeded = true;
+        let cleanupMessage = "";
         if (window.remoteSsh) {
           if (typeof window.remoteSsh.cleanup === "function") {
             try {
               const cleanup = await window.remoteSsh.cleanup(profile.id);
               cleanupSucceeded = !!(cleanup && cleanup.status === "ok" && cleanup.uninstalled !== false);
+              cleanupMessage = cleanup && typeof cleanup.message === "string" ? cleanup.message : "";
             } catch {
               cleanupSucceeded = false;
             }
@@ -431,7 +433,7 @@
             window.remoteSsh.disconnect(profile.id);
           }
         }
-        if (!cleanupSucceeded && !confirm(t("remoteSshDeleteCleanupFailedConfirm"))) return;
+        if (!cleanupSucceeded && !confirm([t("remoteSshDeleteCleanupFailedConfirm"), cleanupMessage].filter(Boolean).join("\n\n"))) return;
         const r = await callCommand("remoteSsh.delete", profile.id);
         if (!r || r.status !== "ok") return;
         if (view.selectedProfileId === profile.id) view.selectedProfileId = null;

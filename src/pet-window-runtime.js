@@ -2277,6 +2277,7 @@ function createPetWindowRuntime(options = {}) {
     }
     const initialHitWindowBounds = getInitialHitWindowBounds();
     const hitWin = new BrowserWindow({
+      ...(isWin ? { show: false } : {}),
       width: initialHitWindowBounds.width,
       height: initialHitWindowBounds.height,
       x: initialHitWindowBounds.x,
@@ -2291,14 +2292,10 @@ function createPetWindowRuntime(options = {}) {
       enableLargerThanScreen: true,
       ...(isLinux ? { type: linuxWindowType } : {}),
       ...(isMac ? { type: "panel", roundedCorners: false } : {}),
-      // Windows normally starts with Electron's activation path disabled. The
-      // native controller removes WS_EX_NOACTIVATE outside fullscreen, while
-      // Electron remains non-focusable so Chromium does not explicitly
-      // activate Clawd on a fullscreen click/drag. If that controller could
-      // not initialize, main opts into the legacy focusable construction so
-      // desktop pointer interaction is not stranded behind an FFI failure.
-      // Linux keeps its existing non-focusable behavior; macOS is normalized
-      // immediately after construction below.
+      // Windows normally starts with Electron activation disabled. The native
+      // controller installs the click-delivery guard and toggles only
+      // WS_EX_NOACTIVATE. If setup is unavailable, retain the legacy focusable
+      // path so desktop click/drag still works.
       focusable: isWin ? windowsHitWindowFocusable : !isLinux,
       webPreferences: {
         preload: optionsArg.preloadPath,
@@ -2318,6 +2315,10 @@ function createPetWindowRuntime(options = {}) {
     // window until createHitWindow() returns and the caller assigns it.
     applyHitInputState(hitWin);
     if (isMac) hitWin.setFocusable(false);
+    if (isWin && typeof optionsArg.prepareActivation === "function") {
+      const prepared = optionsArg.prepareActivation(hitWin);
+      if (prepared === false && !windowsHitWindowFocusable) hitWin.setFocusable(true);
+    }
     hitWin.showInactive();
     keepOutOfTaskbar(hitWin);
     if (isWin) hitWin.setAlwaysOnTop(true, topmostLevel);

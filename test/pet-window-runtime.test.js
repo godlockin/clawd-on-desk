@@ -2806,18 +2806,29 @@ describe("pet-window-runtime", () => {
     assert.doesNotMatch(petRuntimeOptions, /[,{]\s*isNearWorkAreaEdge\s*,/);
   });
 
-  it("creates the Windows hit window with Electron activation disabled", () => {
+  it("prepares the Windows non-focusable hit window before its first show", () => {
     const instances = [];
     const harness = createRuntime();
+    let preparedWindow = null;
     harness.runtime.createHitWindow({
       BrowserWindow: makeBrowserWindow(instances),
       preloadPath: "preload-hit.js",
       loadFilePath: "hit.html",
       hitThemeConfig: { ok: true },
       guardAlwaysOnTop: (win) => harness.calls.push(["guard", win]),
+      prepareActivation: (win) => {
+        preparedWindow = win;
+        win.calls.push(["prepareActivation"]);
+      },
     });
 
+    assert.equal(instances[0].options.show, false);
     assert.equal(instances[0].options.focusable, false);
+    assert.strictEqual(preparedWindow, instances[0]);
+    assert.ok(
+      instances[0].calls.findIndex((call) => call[0] === "prepareActivation")
+        < instances[0].calls.findIndex((call) => call[0] === "showInactive"),
+    );
     assert.deepStrictEqual(instances[0].calls.filter((call) => call[0] === "setIgnoreMouseEvents"), [
       ["setIgnoreMouseEvents", false],
     ]);
@@ -2839,6 +2850,24 @@ describe("pet-window-runtime", () => {
     });
 
     assert.equal(instances[0].options.focusable, true);
+  });
+
+  it("falls back before show when per-window activation preparation fails", () => {
+    const instances = [];
+    const harness = createRuntime();
+    harness.runtime.createHitWindow({
+      BrowserWindow: makeBrowserWindow(instances),
+      preloadPath: "preload-hit.js",
+      loadFilePath: "hit.html",
+      hitThemeConfig: { ok: true },
+      prepareActivation: () => false,
+    });
+
+    const focusableIndex = instances[0].calls.findIndex(
+      (call) => call[0] === "setFocusable" && call[1] === true,
+    );
+    const showIndex = instances[0].calls.findIndex((call) => call[0] === "showInactive");
+    assert.ok(focusableIndex >= 0 && focusableIndex < showIndex);
   });
 
   it("reloadWindowWebContents ignores destroyed windows and webContents", () => {
