@@ -160,6 +160,12 @@ Para un uso normal, descarga el instalador precompilado más reciente desde **[G
 - **macOS**: `.dmg`
 - **Linux**: `.AppImage` o `.deb`
 
+En macOS, o en Linux x86_64, también puedes instalarlo con Homebrew:
+
+```bash
+brew install --cask clawd-on-desk
+```
+
 Inicia Clawd después de instalarlo. Las instalaciones nuevas solo sincronizan automáticamente Claude Code y Codex; instala las demás integraciones locales desde **Ajustes → Agentes** cuando las necesites.
 
 Ejecuta desde el código fuente únicamente si vas a contribuir, probar código aún no publicado o depurar integraciones. Las instalaciones desde el código fuente descargan Electron y herramientas de compilación, y pueden crear un árbol `node_modules` grande.

@@ -1232,4 +1232,17 @@ describe("agent-runtime-main", () => {
     assert.strictEqual(runtime.getCodexOfficialActivitySnapshot("local-session"), null);
     assert.deepStrictEqual(clearCalls, [["codex"]]);
   });
+
+  it("clears the Qoder title tracker on disable and shutdown", () => {
+    let clears = 0;
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {},
+      qoderSessionTitleTracker: { clear: () => { clears++; return 1; } },
+      getStateRuntime: () => ({ clearSessionsByAgent: () => 2 }),
+    });
+    assert.strictEqual(runtime.clearSessionsByAgent("qoder"), 2);
+    assert.strictEqual(clears, 1);
+    runtime.cleanup();
+    assert.strictEqual(clears, 2);
+  });
 });
