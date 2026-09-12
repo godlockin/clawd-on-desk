@@ -82,6 +82,15 @@ for (const mode of ["malformed", "locked", "future", "normal", "off", "unavailab
     const tab = context.ClawdSettingsTabRecap;
     tab.init({ state: { snapshot, activeTab: "recap" }, runtime: {}, tabs: {},
       ops: { requestRender() {}, showToast() {} }, helpers: { t: key => key,
+        buildSwitch: ({ checked }) => {
+          switchOn = checked;
+          return {
+            element: new Element("button"),
+            setState() {},
+            setOnToggle() {},
+            dispose() {},
+          };
+        },
         setSwitchVisual: (_sw, value) => { switchOn = value; }, buildSection: (_title, rows) => rows } });
     Object.assign(tab.__test.view, { status: data.status, data });
     const row = tab.__test.buildRecordingControls()[0];
