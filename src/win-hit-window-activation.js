@@ -3,14 +3,15 @@
 // Electron's BrowserWindow.setFocusable(false) calls Focus(false) on Windows.
 // That deactivates whichever application currently owns the foreground, so
 // using it when a fullscreen game/video is detected makes Clawd itself take
-// foreground. When available, this controller lets the hit BrowserWindow stay
-// Electron-non-focusable for its lifetime and toggles only WS_EX_NOACTIVATE.
-// Desktop pointer delivery is validated independently; clearing the native
-// style restores ordinary activation semantics but is not claimed as the
-// cause of input routing.
+// foreground. Keep Electron non-focusability fixed for the window's lifetime,
+// toggle only WS_EX_NOACTIVATE, and intercept WM_MOUSEACTIVATE so Chromium uses
+// MA_NOACTIVATE instead of eating the click with MA_NOACTIVATEANDEAT.
 
 const GWL_EXSTYLE = -20;
 const WS_EX_NOACTIVATE = 0x08000000n;
+const WM_MOUSEACTIVATE = 0x0021;
+const MA_NOACTIVATE = 3;
+const MOUSE_ACTIVATE_PROP = "Chrome.IgnoreMouseActivate";
 const SWP_NOSIZE = 0x0001;
 const SWP_NOMOVE = 0x0002;
 const SWP_NOZORDER = 0x0004;
@@ -39,6 +40,9 @@ function createHitWindowActivationController(options = {}) {
   let pointerBits = Number(options.pointerBits) || 0;
   let styleRefreshPending = false;
   let refreshFailureReported = false;
+  let hookedWindow = null;
+  let hookArmFailureWindow = null;
+  let legacyFallbackWindow = null;
 
   if (isWin && !bindings) {
     try {
@@ -55,10 +59,18 @@ function createHitWindowActivationController(options = {}) {
       const SetWindowPos = user32.func(
         "bool __stdcall SetWindowPos(void* hWnd, void* hWndInsertAfter, int X, int Y, int cx, int cy, uint32 uFlags)",
       );
+      const SetPropW = user32.func(
+        "bool __stdcall SetPropW(void* hWnd, str16 lpString, void* hData)",
+      );
+      const RemovePropW = user32.func(
+        "void* __stdcall RemovePropW(void* hWnd, str16 lpString)",
+      );
       bindings = {
         getStyle: (hwnd) => GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
         setStyle: (hwnd, value) => SetWindowLongPtrW(hwnd, GWL_EXSTYLE, value),
         refreshStyle: (hwnd) => SetWindowPos(hwnd, null, 0, 0, 0, 0, STYLE_REFRESH_FLAGS),
+        armMouseActivate: (hwnd) => SetPropW(hwnd, MOUSE_ACTIVATE_PROP, hwnd),
+        clearMouseActivate: (hwnd) => RemovePropW(hwnd, MOUSE_ACTIVATE_PROP),
       };
       hwndOf = (win) => {
         if (!win || typeof win.getNativeWindowHandle !== "function") return null;
@@ -80,6 +92,8 @@ function createHitWindowActivationController(options = {}) {
     && typeof bindings.getStyle === "function"
     && typeof bindings.setStyle === "function"
     && typeof bindings.refreshStyle === "function"
+    && typeof bindings.armMouseActivate === "function"
+    && typeof bindings.clearMouseActivate === "function"
     && typeof hwndOf === "function"
   );
 
@@ -143,31 +157,103 @@ function createHitWindowActivationController(options = {}) {
     }
   }
 
+  function removeMouseActivateHook(win = hookedWindow) {
+    if (!hookedWindow) return true;
+    if (win && hookedWindow !== win) return false;
+    const current = hookedWindow;
+    if (typeof current.isDestroyed === "function" && current.isDestroyed()) {
+      hookedWindow = null;
+      return true;
+    }
+    if (typeof current.unhookWindowMessage !== "function") return false;
+    try {
+      const hwnd = liveHwnd(current);
+      current.unhookWindowMessage(WM_MOUSEACTIVATE);
+      hookedWindow = null;
+      if (hwnd) bindings.clearMouseActivate(hwnd);
+      return true;
+    } catch (error) {
+      reportError(error);
+      return false;
+    }
+  }
+
+  function armMouseActivate(hwnd, win) {
+    try {
+      if (bindings.armMouseActivate(hwnd)) {
+        hookArmFailureWindow = null;
+        return true;
+      }
+      if (hookArmFailureWindow !== win) {
+        hookArmFailureWindow = win;
+        reportError(new Error("Windows hit-window mouse activation guard failed"));
+      }
+    } catch (error) {
+      if (hookArmFailureWindow !== win) {
+        hookArmFailureWindow = win;
+        reportError(error);
+      }
+    }
+    return false;
+  }
+
+  function ensureMouseActivateHook(win) {
+    if (hookedWindow === win) return true;
+    if (hookedWindow && !removeMouseActivateHook()) return false;
+    const hwnd = liveHwnd(win);
+    if (!hwnd || typeof win.hookWindowMessage !== "function") return false;
+    try {
+      win.hookWindowMessage(WM_MOUSEACTIVATE, () => { armMouseActivate(hwnd, win); });
+      hookedWindow = win;
+      if (!armMouseActivate(hwnd, win)) {
+        removeMouseActivateHook(win);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      reportError(error);
+      return false;
+    }
+  }
+
+  function prepare(win) {
+    if (!isWin || !win) return false;
+    if (typeof win.isDestroyed === "function" && win.isDestroyed()) return false;
+    if (legacyFallbackWindow === win) return false;
+    const prepared = ensureMouseActivateHook(win);
+    legacyFallbackWindow = prepared ? null : win;
+    return prepared;
+  }
+
   function setFocusable(win, focusable) {
     if (!isWin || !win) return false;
     if (typeof win.isDestroyed === "function" && win.isDestroyed()) return false;
+    // A failed pre-show guard falls back to Electron focusability and must not
+    // later drift into a mixed Electron-focusable/native-controlled state.
+    if (legacyFallbackWindow === win) return false;
+
+    const hookReady = ensureMouseActivateHook(win);
+    // Do not short-circuit: fullscreen style safety still matters if the
+    // delivery guard cannot be re-armed on an already visible window.
     const next = !!focusable;
+    const styleReady = next
+      ? available && setNoActivate(win, false)
+      : setNoActivate(win, true);
+    return hookReady && styleReady;
+  }
 
-    if (!next) {
-      // Do not fall back to BrowserWindow.setFocusable(false): that exact call
-      // deactivates the user's fullscreen foreground window. If native style
-      // control is unavailable, main uses the legacy focusable construction
-      // instead. This method stays a no-op rather than mixing Electron and
-      // native activation paths after the window has been created.
-      return setNoActivate(win, true);
-    }
-
-    // Never call BrowserWindow.setFocusable(true). Electron must continue to
-    // consider the hit layer non-focusable, otherwise Chromium explicitly
-    // activates it on pointerdown even while WS_EX_NOACTIVATE is present.
-    // Clearing the native style restores ordinary desktop activation behavior;
-    // the Electron-level non-focusable contract remains intact.
-    return available && setNoActivate(win, false);
+  function dispose() {
+    const removed = removeMouseActivateHook();
+    hookArmFailureWindow = null;
+    legacyFallbackWindow = null;
+    return removed;
   }
 
   return {
     available,
+    dispose,
     isNonActivating: readNoActivate,
+    prepare,
     setFocusable,
   };
 }
@@ -205,5 +291,8 @@ module.exports = {
   createHitWindowFocusableSetter,
   GWL_EXSTYLE,
   WS_EX_NOACTIVATE,
+  WM_MOUSEACTIVATE,
+  MA_NOACTIVATE,
+  MOUSE_ACTIVATE_PROP,
   STYLE_REFRESH_FLAGS,
 };
