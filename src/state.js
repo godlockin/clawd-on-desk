@@ -1505,7 +1505,8 @@ function updateSessionMetadata(sessionId, opts = {}) {
   const incomingTitle = typeof opts.sessionTitle === "string"
     ? normalizeTitle(opts.sessionTitle)
     : null;
-  if (!incomingContextUsage && !incomingTitle) return false;
+  const incomingModel = typeof opts.model === "string" ? opts.model.trim() : "";
+  if (!incomingContextUsage && !incomingTitle && !incomingModel) return false;
   let applied = false;
   if (incomingContextUsage) {
     const resolved = resolveContextUsageUpdate(
@@ -1537,6 +1538,13 @@ function updateSessionMetadata(sessionId, opts = {}) {
   // signature, so emitSessionSnapshot below fans it out.
   if (incomingTitle && incomingTitle !== session.sessionTitle) {
     session.sessionTitle = incomingTitle;
+    applied = true;
+  }
+  // Deliberately NOT stamping metadataUpdatedAt: that field is context/quota
+  // telemetry freshness, and a model switch must not make stale telemetry
+  // look fresh.
+  if (incomingModel && incomingModel !== session.model) {
+    session.model = incomingModel;
     applied = true;
   }
   if (applied) emitSessionSnapshot();

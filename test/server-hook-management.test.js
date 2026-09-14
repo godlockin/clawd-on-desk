@@ -661,6 +661,22 @@ describe("server Claude hook operation queue (default, non-injected implementati
     });
   });
 
+  it("confirmed local coexistence passes the inspected digest through the same operation queue", async () => {
+    const calls = [];
+    await withPatchedInstallModule({
+      registerClaudeStatusline: (opts) => { calls.push(opts); return { installed: true, changed: true, localChained: true }; },
+    }, async () => {
+      const { api } = makeServer({ syncClawdHooksImpl: undefined });
+      const digest = "a".repeat(64);
+      const refused = await api.setClaudeQuotaCollectionEnabled({ enabled: true, chainExisting: true });
+      assert.strictEqual(refused.status, "error");
+      assert.strictEqual(calls.length, 0);
+      const result = await api.setClaudeQuotaCollectionEnabled({ enabled: true, chainExisting: true, expectedStatuslineFingerprint: digest });
+      assert.strictEqual(result.status, "ok");
+      assert.deepStrictEqual(calls, [{ backup: true, silent: true, chainExisting: true, expectedStatuslineFingerprint: digest }]);
+    });
+  });
+
   it("restores local statusline ingress when an explicit opt-out mutation fails", async () => {
     await withPatchedInstallModule({
       unregisterClaudeStatusline: () => { throw new Error("statusline remove failed"); },
