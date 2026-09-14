@@ -443,6 +443,10 @@ const SCHEMA = {
       "qoderwork": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
       // QwenWork (千问办公) is state-only (Phase 1) — permission bubbles default off.
       "qwenwork": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      // Grok Build is state + Notification only: it has no PermissionRequest
+      // hook, so permission bubbles default off. Opt-in like other non-default
+      // agents — agent-gate fail-opens missing entries.
+      "grok-build": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
   },
