@@ -151,6 +151,12 @@ Clawd는 멀티 모니터 환경에 맞춰 동작합니다: 실행된 디스플�
 - **macOS**: `.dmg`
 - **Linux**: `.AppImage` 또는 `.deb`
 
+macOS 또는 Linux x86_64에서는 Homebrew로도 설치할 수 있습니다.
+
+```bash
+brew install --cask clawd-on-desk
+```
+
 설치 후 Clawd를 실행하면 지원되는 agent hooks / plugins가 시작 시 자동으로 동기화됩니다.
 
 소스에서 실행하는 방식은 기여, 미릴리스 코드 테스트, 통합 디버깅이 필요할 때만 권장합니다. 소스 설치는 Electron / 패키징 도구를 다운로드하며 큰 `node_modules` 트리를 만들 수 있습니다.
