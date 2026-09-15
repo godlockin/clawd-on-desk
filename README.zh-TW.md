@@ -157,6 +157,12 @@ Clawd 支援多螢幕場景：按啟動時所在螢幕做等比縮放，直立�
 - **macOS**：`.dmg`
 - **Linux**：`.AppImage` 或 `.deb`
 
+macOS 以及 Linux x86_64 也可以用 Homebrew 安裝：
+
+```bash
+brew install --cask clawd-on-desk
+```
+
 安裝後啟動 Clawd；支援的 agent hooks 或外掛會在啟動時自動同步。
 
 只有參與開發、測試還沒發布的程式碼或除錯整合時，才建議從原始碼跑。從原始碼安裝會下載 Electron 和打包工具，並產生比較大的 `node_modules`。
