@@ -24,6 +24,9 @@ on:
       - "src/settings-actions.js"
       - "src/settings-i18n.js"
       - "src/settings-ui-core.js"
+      - "src/language-picker.js"
+      - "src/language-picker.css"
+      - "src/settings-tab-theme.js"
       - "src/settings-tab-recap.js"
       - "src/telegram-*"
       - "src/settings-tab-telegram-approval.js"
@@ -68,6 +71,8 @@ on:
       - "test/win-foreground-terminal.test.js"
       - "test/win-fullscreen-detect.test.js"
       - "test/settings-renderer-browser-env.test.js"
+      - "test/settings-picker-layout-electron.test.js"
+      - "test/fixtures/settings-picker-layout-electron.js"
       - "test/settings-recap.test.js"
       - "test/telegram-legacy-retirement.test.js"
       - "test/telegram-migration-*.test.js"
@@ -128,6 +133,8 @@ jobs:
           node --test
           test/recap*.test.js
           test/settings-recap.test.js
+      - name: Run Settings picker layout under Electron
+        run: xvfb-run -a node --test test/settings-picker-layout-electron.test.js
       - name: Run native SVG motion audit
         run: xvfb-run -a node --test test/accessory-motion-electron.test.js
 
