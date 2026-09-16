@@ -61,6 +61,8 @@
     "uninstall:traecode-hooks": "node hooks/traecode-install.js --uninstall",
     "install:workbuddy-hooks": "node hooks/workbuddy-install.js",
     "uninstall:workbuddy-hooks": "node hooks/workbuddy-install.js --uninstall",
+    "install:grok-hooks": "node hooks/grok-install.js",
+    "uninstall:grok-hooks": "node hooks/grok-install.js --uninstall",
     "install:dsh": "node hooks/dsh-install.js",
     "uninstall:dsh": "node hooks/dsh-install.js --uninstall",
     "cleanup:integrations": "node hooks/cleanup-integrations.js --apply",
