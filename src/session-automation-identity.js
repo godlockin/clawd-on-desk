@@ -1,6 +1,9 @@
 "use strict";
 
-const { isCodexCliOriginator } = require("../hooks/codex-originator");
+const {
+  CODEX_PLACEHOLDER_SESSION_IDS,
+  isCodexCliOriginator,
+} = require("../hooks/codex-originator");
 
 // Session automation is a security-sensitive opt-in. This table is deliberately
 // small and static: it records only adapter identity facts that have been
@@ -49,7 +52,7 @@ const ADAPTER_POLICY = Object.freeze({
     // unknown identities remain fail-closed.
     eligible: true,
     reason: "codex-local-cli-identity-required",
-    placeholders: Object.freeze(["default", "codex:", "codex:default"]),
+    placeholders: CODEX_PLACEHOLDER_SESSION_IDS,
   }),
   hermes: Object.freeze({
     eligible: false,
