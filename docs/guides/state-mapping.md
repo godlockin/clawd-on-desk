@@ -74,6 +74,30 @@ ZCode uses config-file hooks under `~/.zcode/cli/config.json`:
 
 `PermissionRequest` is a blocking permission approval since Phase 2: the hook waits on Clawd's local bubble or remote approval and answers a manual allow/deny via `hookSpecificOutput` on stdout. Permission automation deliberately defers for ZCode until its tool surface and session identity are audited. The `notification` mapping above only fires on the fail-closed path (missing/unknown tool name) or when Clawd is not running; a real decision never posts `/state`. ZCode does not provide a `SessionEnd` hook in this integration, so completion relies on `Stop` plus Clawd's normal process-liveness and stale-session cleanup. When Clawd yields no decision (timeout, disconnect, DND, bubbles off), the hook prints `{}` and ZCode's own permission flow takes over.
 
+## Grok Build Hook Events
+
+Grok Build uses config-file hooks under `<GROK_HOME or ~/.grok>/hooks/clawd-on-desk.json`:
+
+| Grok Hook Event | State | Notes |
+|---|---|---|
+| SessionStart | idle | |
+| UserPromptSubmit | thinking | records the newest turn in the turn fence |
+| PreToolUse / PostToolUse | working | |
+| PostToolUseFailure / StopFailure | error | |
+| Stop (`reason="end_turn"`, no live background tasks/crons, inactive stop hook) | attention | only a genuine unblocked end of turn |
+| Stop (continuation signal) | working with `event=null` | adapter-local; never latches a terminal |
+| Stop (`channel_closed` / `shutdown` / missing / unknown reason) | dropped | never synthesizes Done; the real `SessionEnd` or `idle_prompt` settles |
+| StopCancelled | idle | settles without Done; corrects a same-turn Stop tail |
+| Notification (`notificationType="idle_prompt"`) | notification | plays the one-shot, then stores the session idle; fence settles the turn |
+| Other Notification | notification | presentation only; does not settle the active turn |
+| PreCompact | sweeping | |
+| PostCompact (manual) | idle | never a completion |
+| PostCompact (auto) | thinking | never a completion |
+| PermissionDenied | notification (passive) | no decision; Grok owns permissions |
+| SessionEnd | remove session; idle if no live sessions | clears the turn fence record |
+
+Grok never registers `/permission`; the adapter always emits `{}`. Subagent events (`subagentType`) and `SubagentStart` / `SubagentStop` are out of scope in Phase 1.
+
 ## Pi Extension Events
 
 Pi uses a global extension (`~/.pi/agent/extensions/clawd-on-desk`) and maps interactive-session lifecycle events to shared Clawd states:
@@ -106,3 +130,29 @@ Drag to the right screen edge (or right-click → "Mini Mode") to enter mini mod
 ## Click Reactions
 
 Easter eggs — try double-clicking, rapid 4-clicks, or poking Clawd repeatedly to discover hidden reactions.
+
+## Hash Sage (optional official theme)
+
+Hash Sage (哈希仙人) is **not** bundled with Clawd. It is an optional official theme downloaded on demand from the independent `rullerzhou-afk/clawd-themes` repository (Settings → Theme → Official themes). Once installed it runs as an external APNG theme with the same logical states, the approved SVG effects baked into each APNG, and no cursor eye tracking:
+
+| State | Hash Sage animation |
+|---|---|
+| idle | 空手待机 — standing breath (approved sample; the full idle set is not final yet) |
+| idle random pool (after 20 s without mouse movement) | 小云捉迷藏 — a little cloud flies in, circles her with a gold trail, plays on her fingertip and flies off; starts and ends on the idle pose |
+| thinking | 掐诀推演 — palm compass turns, code glyphs rise |
+| working (1 session) | 执笔制符 — writes the verification talisman |
+| working (2 sessions) / juggling (1 subagent) | 御剑 · 哈希符文 — twin swords with hash runes |
+| working (3+ sessions) / juggling (2+ subagents) | 忙碌协作 — two paper spirits help out |
+| attention | 完成收功 — unrolls the seal scroll |
+| notification | 小铃轻唤 — rings the small bell |
+| error | 怎么又炸了 — the talisman backfires |
+| sweeping / carrying | 拂尘引纸 / 牵云运匣 |
+| yawning → dozing → collapsing → sleeping → waking | 哈欠入盹 → 托腮轻盹 → 云来安睡 → 云上代码梦 → 伸懒腰醒来 |
+| DND sleep transition | 直接安睡 |
+| roam, mini crab-walk | 乘云而行 (drawn heading right, mirrored when heading left) |
+| drag / double-click / annoyed, 4-click | 张手轻摆 / 小小吃惊 / 有点嫌弃 |
+| mini idle / enter / hover peek | 贴边探头 / 从右侧走入 / 探出与呼吸 |
+| mini alert / task complete / working | 摇铃 / 竖卷收功 / 挥符 |
+| mini enter-sleep / sleep (DND) | 闭眼入场 / 贴墙睡眠呼吸 |
+
+Re-downloading after an uninstall is a lossy upgrade: it clears this theme's customizations and Clawd-managed sound overrides.

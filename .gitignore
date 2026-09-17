@@ -128,6 +128,7 @@ scripts/manual/*
 !scripts/export-agent-icons.js
 !scripts/verify-electron-install.js
 !scripts/audit-repository-assets.js
+!scripts/audit-pr-history-assets.js
 !scripts/assert-no-retired-telegram-sidecar.js
 !scripts/verify-release-version.js
 !scripts/verify-release-contributors.js
