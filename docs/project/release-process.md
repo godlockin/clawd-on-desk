@@ -14,6 +14,14 @@ npm test
 npm run audit:assets
 ```
 
+Official downloadable themes (for example Hash Sage) ship as versioned GitHub
+Release assets in the separate `rullerzhou-afk/clawd-themes` repository, never
+inside Clawd. Before tagging, confirm the packaged resources still contain no
+`themes/hash-sage/**` payload and that `npm run audit:assets` reports the
+tracked-tree budget within policy. On a pull request, the
+`audit:pr-history-assets` gate additionally proves no large official-theme
+media entered the PR's reachable history.
+
 4. Run the `Build & Release` workflow manually on `main`.
 
 For macOS Developer ID certificate creation, App Store Connect Team API key

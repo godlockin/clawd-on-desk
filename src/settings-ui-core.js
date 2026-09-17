@@ -45,6 +45,15 @@
   // startsWith("Mac") not /\bMac\b/ — "MacIntel" has \w after "c", fails \b (regression #135).
   const IS_MAC = (navigator.platform || "").startsWith("Mac");
   const IS_WIN = (navigator.platform || "").startsWith("Win");
+  // Renderers have no `process`, so platform-gated shortcut rows resolve their
+  // support from the same navigator probe. Anything we cannot positively
+  // identify as darwin/win32 is treated as unsupported, which is the safe
+  // direction for a gate that must stay closed on Linux.
+  const SHORTCUT_PLATFORM = IS_MAC ? "darwin" : (IS_WIN ? "win32" : "linux");
+  const isShortcutActionSupported = shortcutApi.isShortcutActionSupported
+    || (() => true);
+  const SUPPORTED_SHORTCUT_ACTION_IDS = SHORTCUT_ACTION_IDS.filter((actionId) =>
+    isShortcutActionSupported(actionId, SHORTCUT_PLATFORM));
   const COLLAPSED_GROUPS_STORAGE_KEY = "clawd.settings.collapsedGroups.v1";
   const NAVIGATION_STORAGE_KEY = "clawd.settings.navigation.v1";
   const MAX_PERSISTED_SCROLL_TOP = 10_000_000;
@@ -101,6 +110,12 @@
     nextTransientUiSeq: 1,
   };
 
+  // Native `disabled` cannot distinguish a business rule from a temporary
+  // pending lock. Keep those axes separate so async actions can recover
+  // without accidentally enabling a button that should remain unavailable.
+  const settingsButtonStates = new WeakMap();
+  let nextSettingsSwitchId = 1;
+
   const runtime = {
     agentMetadata: null,
     agentInstallationHints: null,
@@ -108,6 +123,14 @@
     agentInstallationHintsFetched: false,
     agentInstallationHintsPromise: null,
     themeList: null,
+    themeListPromise: null,
+    officialThemeList: null,
+    officialThemePromise: null,
+    officialThemeListFetched: false,
+    officialThemeCatalogStatus: null,
+    officialThemeCatalogVersion: null,
+    officialThemeOperation: null,
+    officialThemePendingThemeId: null,
     codexPetsRefreshPending: false,
     codexPetZipImportPending: false,
     userThemeZipImportPending: false,
@@ -301,27 +324,122 @@
     }, ttl);
   }
 
-  function setSwitchVisual(sw, visualOn, { pending = false } = {}) {
-    sw.classList.toggle("on", !!visualOn);
-    sw.classList.toggle("pending", !!pending);
-    sw.setAttribute("aria-checked", visualOn ? "true" : "false");
+  function buildSwitch(config = {}) {
+    const element = config.element || document.createElement("button");
+    const visualElement = config.visualElement || element;
+    const isButton = String(element.tagName || "").toLowerCase() === "button";
+    if (isButton) element.type = "button";
+    element.setAttribute("role", "switch");
+    visualElement.classList.add("switch");
+    for (const name of String(config.className || "").split(/\s+/).filter(Boolean)) {
+      visualElement.classList.add(name);
+    }
+
+    let checked = config.checked === true;
+    let disabled = config.disabled === true;
+    let pending = config.pending === true;
+    let disposed = false;
+    let onToggle = typeof config.onToggle === "function" ? config.onToggle : null;
+    const enabledTabIndex = Number.isInteger(config.tabIndex) ? config.tabIndex : 0;
+    const stopPropagation = config.stopPropagation === true;
+
+    function syncAccessibleName(patch) {
+      if (Object.prototype.hasOwnProperty.call(patch, "ariaLabel")) {
+        const value = patch.ariaLabel == null ? "" : String(patch.ariaLabel);
+        if (value) element.setAttribute("aria-label", value);
+        else element.removeAttribute("aria-label");
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "ariaLabelledBy")) {
+        const value = patch.ariaLabelledBy == null ? "" : String(patch.ariaLabelledBy);
+        if (value) element.setAttribute("aria-labelledby", value);
+        else element.removeAttribute("aria-labelledby");
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "ariaDescribedBy")) {
+        const value = patch.ariaDescribedBy == null ? "" : String(patch.ariaDescribedBy);
+        if (value) element.setAttribute("aria-describedby", value);
+        else element.removeAttribute("aria-describedby");
+      }
+    }
+
+    function syncState() {
+      visualElement.classList.toggle("on", checked);
+      visualElement.classList.toggle("pending", pending);
+      visualElement.classList.toggle("disabled", disabled);
+      element.setAttribute("aria-checked", checked ? "true" : "false");
+      element.setAttribute("aria-disabled", disabled ? "true" : "false");
+      element.setAttribute("aria-busy", pending ? "true" : "false");
+      element.tabIndex = disabled ? -1 : enabledTabIndex;
+      element.setAttribute("tabindex", String(element.tabIndex));
+      if (isButton) element.disabled = disabled;
+    }
+
+    function requestToggle(event) {
+      if (stopPropagation && event && typeof event.stopPropagation === "function") {
+        event.stopPropagation();
+      }
+      if (disposed || disabled || pending || typeof onToggle !== "function") return;
+      onToggle({ checked, nextChecked: !checked, event, control });
+    }
+
+    function onClick(event) {
+      requestToggle(event);
+    }
+
+    function onKeyDown(event) {
+      if (!event || (event.key !== " " && event.key !== "Enter")) return;
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      requestToggle(event);
+    }
+
+    const control = {
+      element,
+      visualElement,
+      getChecked: () => checked,
+      setState(patch = {}) {
+        if (disposed) return control;
+        if (Object.prototype.hasOwnProperty.call(patch, "checked")) checked = patch.checked === true;
+        if (Object.prototype.hasOwnProperty.call(patch, "disabled")) disabled = patch.disabled === true;
+        if (Object.prototype.hasOwnProperty.call(patch, "pending")) pending = patch.pending === true;
+        syncAccessibleName(patch);
+        syncState();
+        return control;
+      },
+      setOnToggle(handler) {
+        onToggle = typeof handler === "function" ? handler : null;
+        return control;
+      },
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        onToggle = null;
+        element.removeEventListener("click", onClick);
+        element.removeEventListener("keydown", onKeyDown);
+      },
+    };
+
+    syncAccessibleName(config);
+    if (!element.getAttribute("aria-label") && !element.getAttribute("aria-labelledby")) {
+      throw new TypeError("buildSwitch requires ariaLabel or ariaLabelledBy");
+    }
+    syncState();
+    element.addEventListener("click", onClick);
+    element.addEventListener("keydown", onKeyDown);
+    return registerMountedDisposable(control);
   }
 
-  function attachAnimatedSwitch(sw, {
+  function attachOptimisticSwitch(control, {
     getCommittedVisual,
     getTransientState,
     setTransientState,
     clearTransientState,
     invoke,
   }) {
-    const run = () => {
-      if (sw.classList.contains("disabled") || sw.getAttribute("aria-disabled") === "true") return;
-      if (sw.classList.contains("pending")) return;
+    control.setOnToggle(() => {
       const currentVisual = getCommittedVisual();
       const nextVisual = !currentVisual;
       const seq = state.nextTransientUiSeq++;
       setTransientState({ visualOn: nextVisual, pending: true, seq });
-      setSwitchVisual(sw, nextVisual, { pending: true });
+      control.setState({ checked: nextVisual, pending: true });
       Promise.resolve()
         .then(invoke)
         .then((result) => {
@@ -329,30 +447,24 @@
           if (!current || current.seq !== seq) return;
           if (!result || result.status !== "ok" || result.noop) {
             clearTransientState(seq);
-            setSwitchVisual(sw, getCommittedVisual(), { pending: false });
-            if (result && result.noop) return;
+            control.setState({ checked: getCommittedVisual(), pending: false });
+            if (result && (result.noop || result.cancelled)) return;
             const msg = (result && result.message) || "unknown error";
             showToast(t("toastSaveFailed") + msg, { error: true });
             return;
           }
           clearTransientState(seq);
-          setSwitchVisual(sw, nextVisual, { pending: false });
+          control.setState({ checked: nextVisual, pending: false });
         })
         .catch((err) => {
           const current = getTransientState();
           if (!current || current.seq !== seq) return;
           clearTransientState(seq);
-          setSwitchVisual(sw, getCommittedVisual(), { pending: false });
+          control.setState({ checked: getCommittedVisual(), pending: false });
           showToast(t("toastSaveFailed") + (err && err.message), { error: true });
         });
-    };
-    sw.addEventListener("click", run);
-    sw.addEventListener("keydown", (ev) => {
-      if (ev.key === " " || ev.key === "Enter") {
-        ev.preventDefault();
-        run();
-      }
     });
+    return control;
   }
 
   function buildSection(title, rows) {
@@ -371,9 +483,62 @@
     return section;
   }
 
-  // Shared Settings button primitive. Feature tabs keep ownership of business
-  // behavior while tone, sizing and pending/accessibility semantics stay
-  // consistent across the Settings window.
+  function resolveButtonLabel(config = {}) {
+    if (Object.prototype.hasOwnProperty.call(config, "label")) {
+      return config.label == null ? "" : String(config.label);
+    }
+    return config.labelKey ? t(String(config.labelKey)) : "";
+  }
+
+  function isDomNode(value) {
+    if (!value || typeof value !== "object") return false;
+    const NodeCtor = typeof globalThis !== "undefined" ? globalThis.Node : null;
+    if (typeof NodeCtor === "function") return value instanceof NodeCtor;
+    return typeof value.tagName === "string" && typeof value.appendChild === "function";
+  }
+
+  function applyButtonState(button, buttonState) {
+    buttonState.labelElement.textContent = buttonState.label;
+    button.disabled = buttonState.disabled || buttonState.pending;
+    button.classList.toggle("pending", buttonState.pending);
+    button.setAttribute("aria-busy", buttonState.pending ? "true" : "false");
+    if (typeof buttonState.ariaPressed === "boolean") {
+      button.setAttribute("aria-pressed", buttonState.ariaPressed ? "true" : "false");
+    } else {
+      button.removeAttribute("aria-pressed");
+    }
+  }
+
+  // Shared Settings button primitive. Feature tabs keep ownership of commands,
+  // confirmation, persistence and rollback while this layer owns structure and
+  // presentation state. Updating the label never replaces an optional icon.
+  function setButtonState(button, patch = {}) {
+    if (!button || typeof button !== "object") return button;
+    const current = settingsButtonStates.get(button);
+    if (!current) {
+      throw new TypeError("setButtonState requires a button built by buildButton");
+    }
+    const next = { ...current };
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "label")
+      || Object.prototype.hasOwnProperty.call(patch, "labelKey")
+    ) {
+      next.label = resolveButtonLabel(patch);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "disabled")) {
+      next.disabled = patch.disabled === true;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "pending")) {
+      next.pending = patch.pending === true;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "ariaPressed")) {
+      next.ariaPressed = typeof patch.ariaPressed === "boolean" ? patch.ariaPressed : null;
+    }
+    settingsButtonStates.set(button, next);
+    applyButtonState(button, next);
+    return button;
+  }
+
   function buildButton(config = {}) {
     const button = document.createElement("button");
     const tone = ["neutral", "accent", "danger", "quiet"].includes(config.tone)
@@ -390,15 +555,32 @@
       tone === "neutral" ? "" : tone,
       config.className || "",
     ].filter(Boolean).join(" ");
-    button.textContent = config.label != null
-      ? String(config.label)
-      : (config.labelKey ? t(config.labelKey) : "");
+
+    if (config.icon != null) {
+      if (!isDomNode(config.icon)) {
+        throw new TypeError("buildButton icon must be a DOM Node");
+      }
+      const iconElement = document.createElement("span");
+      iconElement.className = "settings-button-icon";
+      iconElement.setAttribute("aria-hidden", "true");
+      iconElement.appendChild(config.icon);
+      button.appendChild(iconElement);
+    }
+    const labelElement = document.createElement("span");
+    labelElement.className = "settings-button-label";
+    button.appendChild(labelElement);
+    const buttonState = {
+      labelElement,
+      label: resolveButtonLabel(config),
+      disabled: config.disabled === true,
+      pending: config.pending === true,
+      ariaPressed: typeof config.ariaPressed === "boolean" ? config.ariaPressed : null,
+    };
+    settingsButtonStates.set(button, buttonState);
     if (config.ariaLabel) button.setAttribute("aria-label", String(config.ariaLabel));
     if (config.title) button.title = String(config.title);
-    if (config.disabled === true || config.pending === true) button.disabled = true;
-    button.classList.toggle("pending", config.pending === true);
-    button.setAttribute("aria-busy", config.pending === true ? "true" : "false");
     if (typeof config.onClick === "function") button.addEventListener("click", config.onClick);
+    applyButtonState(button, buttonState);
     return button;
   }
 
@@ -1013,13 +1195,18 @@
         `<span class="row-label"></span>` +
         `<span class="row-desc"></span>` +
       `</div>` +
-      `<div class="row-control"><div class="switch" role="switch" tabindex="0"></div></div>`;
+      `<div class="row-control"></div>`;
     const labelEl = row.querySelector(".row-label");
     labelEl.textContent = t(labelKey);
+    const controlId = nextSettingsSwitchId++;
+    labelEl.id = `settings-switch-${controlId}-label`;
     if (danger) labelEl.classList.add("row-label-danger");
     const text = row.querySelector(".row-text");
     const desc = row.querySelector(".row-desc");
-    if (descKey) desc.textContent = t(descKey);
+    if (descKey) {
+      desc.textContent = t(descKey);
+      desc.id = `settings-switch-${controlId}-description`;
+    }
     else desc.remove();
     let extraElement = null;
     if (descExtraKey) {
@@ -1029,23 +1216,31 @@
       text.appendChild(extra);
       extraElement = extra;
     }
-    const sw = row.querySelector(".switch");
-    const control = row.querySelector(".row-control");
+    const rowControl = row.querySelector(".row-control");
     const override = state.transientUiState.generalSwitches.get(key);
     const visualOn = override ? override.visualOn : readGeneralSwitchVisual(key, invert);
-    setSwitchVisual(sw, visualOn, { pending: override ? override.pending : false });
-    state.mountedControls.generalSwitches.set(key, { element: sw, invert, row, text, extraElement });
+    const switchControl = buildSwitch({
+      checked: visualOn,
+      pending: override ? override.pending : false,
+      disabled,
+      ariaLabelledBy: labelEl.id,
+      ariaDescribedBy: descKey ? desc.id : null,
+    });
+    rowControl.appendChild(switchControl.element);
+    state.mountedControls.generalSwitches.set(key, {
+      control: switchControl,
+      element: switchControl.element,
+      invert,
+      row,
+      text,
+      extraElement,
+    });
     if (actionButton) {
       const btn = buildButton({ labelKey: actionButton.labelKey, tone: "accent" });
-      control.insertBefore(btn, sw);
+      rowControl.insertBefore(btn, switchControl.element);
       attachActivation(btn, actionButton.invoke);
     }
-    if (disabled) {
-      sw.classList.add("disabled");
-      sw.setAttribute("aria-disabled", "true");
-      sw.tabIndex = -1;
-    }
-    attachAnimatedSwitch(sw, {
+    attachOptimisticSwitch(switchControl, {
       getCommittedVisual: () => readGeneralSwitchVisual(key, invert),
       getTransientState: () => state.transientUiState.generalSwitches.get(key) || null,
       setTransientState: (value) => state.transientUiState.generalSwitches.set(key, value),
@@ -1346,11 +1541,13 @@
     return null;
   }
 
-  function restoreSettingsFocus(rootNode, focusKey) {
+  function focusSettingsTarget(rootNode, focusKey, { onlyIfFocusLost = false } = {}) {
     const target = findSettingsFocusTarget(rootNode, focusKey);
     if (!target || target.disabled === true || typeof target.focus !== "function") return;
-    const active = document.activeElement;
-    if (active && active !== document.body && active.isConnected !== false) return;
+    if (onlyIfFocusLost) {
+      const active = document.activeElement;
+      if (active && active !== document.body && active.isConnected !== false) return;
+    }
     try { target.focus({ preventScroll: true }); } catch (_) { target.focus(); }
   }
 
@@ -1377,7 +1574,9 @@
           && typeof exactTarget.focus === "function"
           ? focusKey
           : fallbackKey;
-        if (restoreKey) restoreSettingsFocus(currentContentRoot, restoreKey);
+        if (restoreKey) {
+          focusSettingsTarget(currentContentRoot, restoreKey, { onlyIfFocusLost: true });
+        }
       }
       if (scrollTop !== null
         && document.getElementById("content") === contentRoot
@@ -1618,12 +1817,26 @@
   }
 
   function fetchThemes() {
+    if (runtime.themeListPromise) return runtime.themeListPromise;
+    // Official metadata is network-backed. Start it beside the local scan, but
+    // never join it to the promise that gates the Theme tab's first paint.
+    void fetchOfficialThemes()
+      .then(() => {
+        // If the official list wins the race, the local-list completion owns
+        // the first paint. Rendering while themeList is still null would
+        // re-enter fetchThemes from renderThemeTab and can starve the pending
+        // listThemes IPC reply with an all-microtask render/fetch loop.
+        if (state.activeTab === "theme" && runtime.themeList !== null) {
+          requestRender({ content: true, preserveScroll: true });
+        }
+      })
+      .catch(() => {});
     if (!window.settingsAPI || typeof window.settingsAPI.listThemes !== "function") {
       runtime.themeList = [];
       return Promise.resolve([]);
     }
     const previousThemeList = Array.isArray(runtime.themeList) ? runtime.themeList : [];
-    return window.settingsAPI.listThemes().then((list) => {
+    const themeListPromise = window.settingsAPI.listThemes().then((list) => {
       const nextThemeList = Array.isArray(list) ? list : [];
       // Built-in themes make an empty successful list impossible in a healthy
       // install. Main also returns [] when enumeration throws, so preserve an
@@ -1638,6 +1851,44 @@
       runtime.themeList = previousThemeList;
       return previousThemeList;
     });
+    runtime.themeListPromise = themeListPromise;
+    void themeListPromise.finally(() => {
+      if (runtime.themeListPromise === themeListPromise) runtime.themeListPromise = null;
+    });
+    return themeListPromise;
+  }
+
+  // The official catalog is fetched independently from the local theme list.
+  // A failed list keeps whatever was rendered before, exactly like listThemes.
+  function fetchOfficialThemes() {
+    if (runtime.officialThemePromise) return runtime.officialThemePromise;
+    if (!window.settingsAPI || typeof window.settingsAPI.listOfficialThemes !== "function") {
+      runtime.officialThemeList = Array.isArray(runtime.officialThemeList) ? runtime.officialThemeList : [];
+      runtime.officialThemeListFetched = true;
+      return Promise.resolve(runtime.officialThemeList);
+    }
+    const previous = Array.isArray(runtime.officialThemeList) ? runtime.officialThemeList : [];
+    const officialThemePromise = window.settingsAPI.listOfficialThemes().then((result) => {
+      const themes = result && Array.isArray(result.themes) ? result.themes : [];
+      runtime.officialThemeList = themes.length === 0 && previous.length > 0 && !(result && result.status === "ok")
+        ? previous
+        : themes;
+      runtime.officialThemeCatalogStatus = (result && result.catalogStatus) || "offline";
+      runtime.officialThemeCatalogVersion = result ? result.catalogVersion : null;
+      runtime.officialThemeListFetched = true;
+      return runtime.officialThemeList;
+    }).catch((err) => {
+      console.warn("settings: listOfficialThemes failed", err);
+      runtime.officialThemeList = previous;
+      runtime.officialThemeCatalogStatus = "offline";
+      runtime.officialThemeListFetched = true;
+      return previous;
+    });
+    runtime.officialThemePromise = officialThemePromise;
+    void officialThemePromise.finally(() => {
+      if (runtime.officialThemePromise === officialThemePromise) runtime.officialThemePromise = null;
+    });
+    return officialThemePromise;
   }
 
   function emptyAnimationOverridesData() {
@@ -1818,6 +2069,14 @@
       showToast(t("shortcutErrorRegistrationFailed"), { error: true });
     }
     if (state.activeTab === "shortcuts") requestRender({ content: true });
+  }
+
+  // main owns the single official-theme operation; the renderer only mirrors
+  // its phase so a Settings reload can never restart or lose a live download.
+  function applyOfficialThemeProgress(progress) {
+    if (!progress || typeof progress !== "object") return;
+    runtime.officialThemeOperation = progress.phase && progress.phase !== "idle" ? progress : null;
+    if (state.activeTab === "theme") requestRender({ content: true, preserveScroll: true });
   }
 
   function clearTransientStateForChanges(changes) {
@@ -2128,11 +2387,12 @@
   core.helpers = {
     t,
     buildButton,
+    setButtonState,
     showSettingsDialog,
     showSettingsConfirmModal,
     escapeHtml,
-    setSwitchVisual,
-    attachAnimatedSwitch,
+    buildSwitch,
+    attachOptimisticSwitch,
     buildSwitchRow,
     buildSection,
     buildSettingsSelect,
@@ -2163,6 +2423,8 @@
     IS_WIN,
     SHORTCUT_ACTIONS,
     SHORTCUT_ACTION_IDS,
+    SUPPORTED_SHORTCUT_ACTION_IDS,
+    SHORTCUT_PLATFORM,
     buildAcceleratorFromEvent,
     formatAcceleratorLabel,
     formatAcceleratorPartial,
@@ -2170,6 +2432,7 @@
 
   core.ops = {
     installRenderHooks,
+    focusSettingsTarget,
     requestRender,
     selectTab,
     persistNavigationState,
@@ -2184,8 +2447,10 @@
     finishShortcutRecording,
     handleShortcutRecordKey,
     applyShortcutFailures,
+    applyOfficialThemeProgress,
     fetchAgentInstallationHints,
     fetchThemes,
+    fetchOfficialThemes,
     fetchAnimationOverridesData,
     applyAnimationPreviewPoster,
     stopAssetPickerPolling,

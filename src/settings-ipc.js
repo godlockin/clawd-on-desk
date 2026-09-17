@@ -33,6 +33,11 @@ const INTERNAL_SETTINGS_COMMANDS = new Set([
   "remoteSsh.markDeployed",
   "remoteSsh.markRemoteNode",
   "feishuApproval.commitResolvedApprover",
+  // Official theme install/uninstall are main-process capabilities. The
+  // renderer can only reach the dedicated, owner-gated IPC handlers; it must
+  // never mint a staging path or target directory through settings:command.
+  "officialTheme.commitInstall",
+  "officialTheme.uninstall",
 ]);
 const SOUND_OVERRIDE_DIALOG_STRINGS = {
   en: { title: "Choose a sound file", filterName: "Audio" },
@@ -103,6 +108,51 @@ function requiredDependency(value, name) {
   if (!value) throw new Error(`registerSettingsIpc requires ${name}`);
   return value;
 }
+
+const UNINSTALL_OFFICIAL_THEME_DIALOG_STRINGS = {
+  en: {
+    uninstall: "Uninstall",
+    cancel: "Cancel",
+    message: (name) => `Uninstall official theme "${name}"?`,
+    detail: (mib) => `This frees about ${mib} MB and cannot be undone. Re-downloading later is not a lossless upgrade: this theme's customizations and Clawd-managed sound overrides will be cleared.`,
+  },
+  zh: {
+    uninstall: "卸载",
+    cancel: "取消",
+    message: (name) => `确认卸载官方主题 "${name}"？`,
+    detail: (mib) => `将释放约 ${mib} MB，且不可撤销。以后重新下载不是无损升级：该主题的自定义设置和 Clawd 管理的声音覆盖会被清除。`,
+  },
+  "zh-TW": {
+    uninstall: "解除安裝",
+    cancel: "取消",
+    message: (name) => `確定要解除安裝官方主題「${name}」？`,
+    detail: (mib) => `將釋放約 ${mib} MB，且無法復原。之後重新下載並非無損升級：此主題的自訂設定與 Clawd 管理的音效覆寫會被清除。`,
+  },
+  ko: {
+    uninstall: "제거",
+    cancel: "취소",
+    message: (name) => `공식 테마 "${name}"을(를) 제거할까요?`,
+    detail: (mib) => `약 ${mib} MB가 확보되며 되돌릴 수 없습니다. 나중에 다시 받는 것은 무손실 업그레이드가 아니며, 이 테마의 사용자 설정과 Clawd가 관리하는 사운드 오버라이드가 지워집니다.`,
+  },
+  ja: {
+    uninstall: "アンインストール",
+    cancel: "キャンセル",
+    message: (name) => `公式テーマ「${name}」をアンインストールしますか？`,
+    detail: (mib) => `約 ${mib} MB 解放され、元に戻せません。後で再ダウンロードしても無損失アップグレードではなく、このテーマのカスタマイズと Clawd 管理のサウンド上書きは消去されます。`,
+  },
+  "pt-BR": {
+    uninstall: "Desinstalar",
+    cancel: "Cancelar",
+    message: (name) => `Desinstalar o tema oficial "${name}"?`,
+    detail: (mib) => `Libera cerca de ${mib} MB e não pode ser desfeito. Baixar de novo depois não é uma atualização sem perdas: as personalizações e os overrides de som gerenciados pelo Clawd deste tema serão apagados.`,
+  },
+  es: {
+    uninstall: "Desinstalar",
+    cancel: "Cancelar",
+    message: (name) => `¿Desinstalar el tema oficial "${name}"?`,
+    detail: (mib) => `Libera unos ${mib} MB y no se puede deshacer. Volver a descargarlo no es una actualización sin pérdidas: se borrarán las personalizaciones y los reemplazos de sonido gestionados por Clawd de este tema.`,
+  },
+};
 
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -187,6 +237,7 @@ function registerSettingsIpc(options = {}) {
   const settingsController = requiredDependency(options.settingsController, "settingsController");
   const themeLoader = requiredDependency(options.themeLoader, "themeLoader");
   const codexPetMain = requiredDependency(options.codexPetMain, "codexPetMain");
+  const officialThemeMain = options.officialThemeMain || null;
   const dialog = requiredDependency(options.dialog, "dialog");
   const shell = requiredDependency(options.shell, "shell");
   const app = requiredDependency(options.app, "app");
@@ -657,17 +708,128 @@ function registerSettingsIpc(options = {}) {
           && isPlainObject(activeTheme._capabilities)
           ? activeTheme._capabilities
           : null;
-        return codexPetMain.decorateThemeMetadata({
+        const decorated = codexPetMain.decorateThemeMetadata({
           ...theme,
           active,
           ...(runtimeCapabilities
             ? { capabilities: { ...(theme.capabilities || {}), ...runtimeCapabilities } }
             : {}),
         });
+        return officialThemeMain
+          ? officialThemeMain.decorateThemeMetadata(decorated)
+          : decorated;
       });
     } catch (err) {
       console.warn("Clawd: settings:list-themes failed:", err && err.message);
       return [];
+    }
+  });
+
+  // Official theme catalog + installed-state list. List-level `catalogStatus`
+  // (offline/invalid) is separate from each card's per-theme state.
+  handle("settings:list-official-themes", async (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (!officialThemeMain) {
+      return {
+        status: "error",
+        catalogStatus: "invalid",
+        catalogVersion: null,
+        checkedAt: null,
+        themes: [],
+        message: "official themes are unavailable",
+      };
+    }
+    try {
+      await officialThemeMain.refreshCatalog();
+      return await officialThemeMain.listOfficialThemes();
+    } catch (err) {
+      return {
+        status: "error",
+        catalogStatus: "offline",
+        catalogVersion: null,
+        checkedAt: null,
+        themes: [],
+        message: (err && err.message) || String(err),
+      };
+    }
+  });
+
+  handle("settings:install-official-theme", async (event, themeId) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (!officialThemeMain) {
+      return { status: "error", message: "official themes are unavailable" };
+    }
+    if (typeof themeId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(themeId)) {
+      return { status: "error", message: "invalid official theme id" };
+    }
+    return officialThemeMain.installTheme(themeId);
+  });
+
+  handle("settings:cancel-official-theme-install", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (!officialThemeMain) {
+      return { status: "error", message: "official themes are unavailable" };
+    }
+    return officialThemeMain.cancelInstall();
+  });
+
+  handle("settings:uninstall-official-theme", async (event, themeId) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (typeof themeId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(themeId)) {
+      return { status: "error", message: "invalid official theme id" };
+    }
+    return settingsController.applyCommand("officialTheme.uninstall", { themeId });
+  });
+
+  handle("settings:confirm-uninstall-official-theme", async (event, themeId) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (typeof themeId !== "string" || !themeId) return { confirmed: false };
+    let displayName = themeId;
+    let bytes = null;
+    if (officialThemeMain) {
+      try {
+        const listing = await officialThemeMain.listOfficialThemes();
+        const card = (listing.themes || []).find((entry) => entry && entry.id === themeId);
+        if (card) {
+          const localize = (value) => {
+            if (typeof value === "string" && value) return value;
+            if (isPlainObject(value)) {
+              const lang = getLang();
+              return value[lang] || value.en || value.zh || Object.values(value)[0] || themeId;
+            }
+            return themeId;
+          };
+          displayName = localize(card.officialThemeName) || localize(card.name) || themeId;
+          if (Number.isFinite(card.officialThemeBytes)) {
+            bytes = card.officialThemeBytes;
+          } else if (Number.isFinite(card.officialThemeUnpackedBytes)) {
+            bytes = card.officialThemeUnpackedBytes;
+          }
+        }
+      } catch {}
+    }
+    const mib = bytes ? Math.max(1, Math.round(bytes / (1024 * 1024))) : null;
+    const lang = getLang();
+    const strings = UNINSTALL_OFFICIAL_THEME_DIALOG_STRINGS[lang] || UNINSTALL_OFFICIAL_THEME_DIALOG_STRINGS.en;
+    try {
+      const { response } = await dialog.showMessageBox(getDialogParent(event), {
+        type: "warning",
+        buttons: [strings.uninstall, strings.cancel],
+        defaultId: 1,
+        cancelId: 1,
+        message: strings.message(displayName),
+        detail: strings.detail(mib || "?"),
+        noLink: true,
+      });
+      return { confirmed: response === 0 };
+    } catch (err) {
+      console.warn("Clawd: confirm-uninstall-official-theme dialog failed:", err && err.message);
+      return { confirmed: false };
     }
   });
 

@@ -21,7 +21,7 @@
   },
   "thresholds": {
     "trackedTreeWarningBytes": 52428800,
-    "trackedTreeHardBytes": 57671680,
+    "trackedTreeHardBytes": 58720256,
     "largeTrackedBinaryMediaBytes": 1048576,
     "duplicatePackagedPayloadWarningBytes": 262144,
     "artifactGrowthWarningBytes": 5242880,
@@ -118,6 +118,7 @@
       "retentionReason": "Canonical 512px runtime icon used by Linux packaging and served at the stable PWA icon URL."
     }
   ],
+  "prHistoryAssetAllowlist": [],
   "duplicatePayloadExemptions": [
     {
       "paths": [

@@ -200,6 +200,7 @@ const MANAGED_CLEANUP_AGENT_IDS = Object.freeze([
   "antigravity-cli",
   "codebuddy",
   "workbuddy",
+  "grok-build",
   "kiro-cli",
   "kimi-cli",
   "qwen-code",
@@ -1052,6 +1053,50 @@ function setSessionAlias(payload, deps) {
   return { status: "ok", commit: { sessionAliases: prunedAliases } };
 }
 
+// Theme-scoped preference deletions shared by the generic removeTheme and the
+// managed official-theme uninstall. Sharing one boundary keeps the two removal
+// paths from drifting apart.
+function buildThemeScopedPrefsCommit(themeId, snapshot) {
+  const current = snapshot || {};
+  const nextCommit = {};
+  if (current.themeOverrides && current.themeOverrides[themeId]) {
+    const nextOverrides = { ...current.themeOverrides };
+    delete nextOverrides[themeId];
+    nextCommit.themeOverrides = nextOverrides;
+  }
+  if (current.themeVariant && current.themeVariant[themeId] !== undefined) {
+    const nextVariantMap = { ...current.themeVariant };
+    delete nextVariantMap[themeId];
+    nextCommit.themeVariant = nextVariantMap;
+  }
+  if (current.idleVisual && current.idleVisual[themeId] !== undefined) {
+    const nextIdleVisual = { ...current.idleVisual };
+    delete nextIdleVisual[themeId];
+    nextCommit.idleVisual = nextIdleVisual;
+  }
+  if (current.petTint && current.petTint[themeId] !== undefined) {
+    const nextPetTint = { ...current.petTint };
+    delete nextPetTint[themeId];
+    nextCommit.petTint = nextPetTint;
+  }
+  if (current.petAccessory && current.petAccessory[themeId] !== undefined) {
+    const nextPetAccessory = { ...current.petAccessory };
+    delete nextPetAccessory[themeId];
+    nextCommit.petAccessory = nextPetAccessory;
+  }
+  if (current.petMouthAccessory && current.petMouthAccessory[themeId] !== undefined) {
+    const nextPetMouthAccessory = { ...current.petMouthAccessory };
+    delete nextPetMouthAccessory[themeId];
+    nextCommit.petMouthAccessory = nextPetMouthAccessory;
+  }
+  if (current.holidayAccessoryEnabled && current.holidayAccessoryEnabled[themeId] !== undefined) {
+    const nextHoliday = { ...current.holidayAccessoryEnabled };
+    delete nextHoliday[themeId];
+    nextCommit.holidayAccessoryEnabled = nextHoliday;
+  }
+  return nextCommit;
+}
+
 const _validateRemoveThemeId = requireString("removeTheme.themeId");
 async function removeTheme(payload, deps) {
   const themeId = typeof payload === "string" ? payload : (payload && payload.themeId);
@@ -1089,6 +1134,14 @@ async function removeTheme(payload, deps) {
       message: `removeTheme: cannot delete managed Codex Pet theme "${themeId}" — remove it from Petdex instead`,
     };
   }
+  if (info.managedOfficialTheme
+    || (deps.officialThemeManager && typeof deps.officialThemeManager.isManagedTheme === "function"
+      && deps.officialThemeManager.isManagedTheme(themeId))) {
+    return {
+      status: "error",
+      message: `removeTheme: cannot delete managed official theme "${themeId}" — use Uninstall in the official themes section`,
+    };
+  }
 
   try {
     await deps.removeThemeDir(themeId);
@@ -1096,54 +1149,56 @@ async function removeTheme(payload, deps) {
     return { status: "error", message: `removeTheme: ${err && err.message}` };
   }
 
-  const snapshot = deps.snapshot || {};
-  const currentOverrides = snapshot.themeOverrides || {};
-  const currentVariantMap = snapshot.themeVariant || {};
-  const currentIdleVisual = snapshot.idleVisual || {};
-  const currentPetTint = snapshot.petTint || {};
-  const currentPetAccessory = snapshot.petAccessory || {};
-  const currentPetMouthAccessory = snapshot.petMouthAccessory || {};
-  const currentHolidayAccessoryEnabled = snapshot.holidayAccessoryEnabled || {};
-  const nextCommit = {};
-  if (currentOverrides[themeId]) {
-    const nextOverrides = { ...currentOverrides };
-    delete nextOverrides[themeId];
-    nextCommit.themeOverrides = nextOverrides;
-  }
-  if (currentVariantMap[themeId] !== undefined) {
-    const nextVariantMap = { ...currentVariantMap };
-    delete nextVariantMap[themeId];
-    nextCommit.themeVariant = nextVariantMap;
-  }
-  if (currentIdleVisual[themeId] !== undefined) {
-    const nextIdleVisual = { ...currentIdleVisual };
-    delete nextIdleVisual[themeId];
-    nextCommit.idleVisual = nextIdleVisual;
-  }
-  if (currentPetTint[themeId] !== undefined) {
-    const nextPetTint = { ...currentPetTint };
-    delete nextPetTint[themeId];
-    nextCommit.petTint = nextPetTint;
-  }
-  if (currentPetAccessory[themeId] !== undefined) {
-    const nextPetAccessory = { ...currentPetAccessory };
-    delete nextPetAccessory[themeId];
-    nextCommit.petAccessory = nextPetAccessory;
-  }
-  if (currentPetMouthAccessory[themeId] !== undefined) {
-    const nextPetMouthAccessory = { ...currentPetMouthAccessory };
-    delete nextPetMouthAccessory[themeId];
-    nextCommit.petMouthAccessory = nextPetMouthAccessory;
-  }
-  if (currentHolidayAccessoryEnabled[themeId] !== undefined) {
-    const nextHolidayAccessoryEnabled = { ...currentHolidayAccessoryEnabled };
-    delete nextHolidayAccessoryEnabled[themeId];
-    nextCommit.holidayAccessoryEnabled = nextHolidayAccessoryEnabled;
-  }
+  const nextCommit = buildThemeScopedPrefsCommit(themeId, deps.snapshot || {});
   if (Object.keys(nextCommit).length > 0) {
     return { status: "ok", commit: nextCommit };
   }
   return { status: "ok" };
+}
+
+// Non-recursive runtime theme selection. Called by both the `setThemeSelection`
+// command and `officialTheme.uninstall` (the latter while already holding the
+// shared `theme` lock, so it must not re-enter the controller). Activates
+// `themeId` with the resolved variant + override map, reads back the variant
+// actually applied (lenient dead-variant fallback), and reports the active
+// theme's fail-closed customization capabilities.
+function applyThemeSelection(themeId, variantIdInput, overrideMap, deps) {
+  if (!deps || typeof deps.activateTheme !== "function") {
+    return { status: "error", message: "theme selection requires activateTheme dep" };
+  }
+  const targetVariant = (typeof variantIdInput === "string" && variantIdInput) ? variantIdInput : "default";
+  const targetOverrideMap = overrideMap === undefined ? null : overrideMap;
+
+  let resolved;
+  try {
+    resolved = deps.activateTheme(themeId, targetVariant, targetOverrideMap);
+  } catch (err) {
+    return { status: "error", message: `setThemeSelection: ${err && err.message}` };
+  }
+  const resolvedVariant = (resolved && typeof resolved === "object" && typeof resolved.variantId === "string")
+    ? resolved.variantId
+    : targetVariant;
+  const activeTheme = typeof deps.getActiveTheme === "function" ? deps.getActiveTheme() : null;
+  const customizationCapabilities = (
+    activeTheme
+    && activeTheme._id === themeId
+    && activeTheme._capabilities
+    && typeof activeTheme._capabilities === "object"
+    && !Array.isArray(activeTheme._capabilities)
+  )
+    ? {
+        petTint: activeTheme._capabilities.petTint === true,
+        accessories: activeTheme._capabilities.accessories === true,
+        mouthAccessories: activeTheme._capabilities.mouthAccessories === true,
+      }
+    : null;
+
+  return {
+    status: "ok",
+    themeId,
+    variantId: resolvedVariant,
+    customizationCapabilities,
+  };
 }
 
 // Phase 3b-swap: atomic theme + variant switch.
@@ -1164,48 +1219,21 @@ function setThemeSelection(payload, deps) {
     return { status: "error", message: "setThemeSelection.variantId must be a non-empty string when provided" };
   }
 
-  if (!deps || typeof deps.activateTheme !== "function") {
-    return { status: "error", message: "setThemeSelection effect requires activateTheme dep" };
-  }
-
-  const snapshot = deps.snapshot || {};
+  const snapshot = deps && deps.snapshot ? deps.snapshot : {};
   const currentVariantMap = snapshot.themeVariant || {};
   const currentOverrides = snapshot.themeOverrides || {};
   const targetVariant = variantIdInput || currentVariantMap[themeId] || "default";
   const targetOverrideMap = currentOverrides[themeId] || null;
 
-  let resolved;
-  try {
-    resolved = deps.activateTheme(themeId, targetVariant, targetOverrideMap);
-  } catch (err) {
-    return { status: "error", message: `setThemeSelection: ${err && err.message}` };
-  }
-  // activateTheme returns { themeId, variantId } — the variantId here reflects
-  // lenient fallback (dead variant → "default"). We commit the resolved value
-  // so prefs self-heal away from stale ids.
-  const resolvedVariant = (resolved && typeof resolved === "object" && typeof resolved.variantId === "string")
-    ? resolved.variantId
-    : targetVariant;
-  const activeTheme = typeof deps.getActiveTheme === "function" ? deps.getActiveTheme() : null;
-  const customizationCapabilities = (
-    activeTheme
-    && activeTheme._id === themeId
-    && activeTheme._capabilities
-    && typeof activeTheme._capabilities === "object"
-    && !Array.isArray(activeTheme._capabilities)
-  )
-    ? {
-        petTint: activeTheme._capabilities.petTint === true,
-        accessories: activeTheme._capabilities.accessories === true,
-        mouthAccessories: activeTheme._capabilities.mouthAccessories === true,
-      }
-    : null;
+  const selection = applyThemeSelection(themeId, targetVariant, targetOverrideMap, deps);
+  if (selection.status !== "ok") return selection;
 
-  const nextVariantMap = { ...currentVariantMap, [themeId]: resolvedVariant };
+  // We commit the resolved value so prefs self-heal away from stale ids.
+  const nextVariantMap = { ...currentVariantMap, [themeId]: selection.variantId };
   return {
     status: "ok",
     commit: { theme: themeId, themeVariant: nextVariantMap },
-    customizationCapabilities,
+    customizationCapabilities: selection.customizationCapabilities,
   };
 }
 
@@ -1252,6 +1280,54 @@ function setIdleVisual(payload, deps) {
   if (nextMap[themeId] === nextFile) return { status: "ok", noop: true };
   nextMap[themeId] = nextFile;
   return { status: "ok", commit: { idleVisual: nextMap } };
+}
+
+// ── Official theme commands (internal; main-only IPC) ──
+//
+// These run under the shared `theme` domain lock. The download/extract work
+// happens outside the lock in official-theme-main; only the final fs commit and
+// the runtime switch/delete run here, re-reading catalog/target/marker inside
+// the lock so a check/delete TOCTOU cannot slip through.
+const _validateOfficialThemeId = requireString("officialTheme.themeId");
+
+async function officialThemeCommitInstall(payload, deps) {
+  const themeId = payload && payload.themeId;
+  const idCheck = _validateOfficialThemeId(themeId);
+  if (idCheck.status !== "ok") return idCheck;
+  const manager = deps && deps.officialThemeManager;
+  if (!manager || typeof manager.commitStagedInstall !== "function") {
+    return { status: "error", message: "officialTheme.commitInstall requires officialThemeManager" };
+  }
+  return manager.commitStagedInstall(payload);
+}
+
+async function officialThemeUninstall(payload, deps) {
+  const themeId = payload && payload.themeId;
+  const idCheck = _validateOfficialThemeId(themeId);
+  if (idCheck.status !== "ok") return idCheck;
+  const manager = deps && deps.officialThemeManager;
+  if (!manager || typeof manager.uninstall !== "function") {
+    return { status: "error", message: "officialTheme.uninstall requires officialThemeManager" };
+  }
+  // Reuse the exact runtime selection helper as setThemeSelection (bound to this
+  // command's deps). The uninstall runs inside the shared `theme` lock, so the
+  // helper must not re-enter the controller.
+  const selectTheme = (targetId, variantId, overrideMap) =>
+    applyThemeSelection(targetId, variantId, overrideMap, deps);
+  const result = await manager.uninstall({ themeId }, deps, { selectTheme });
+  if (!result || result.status !== "ok") {
+    return result || { status: "error", message: "officialTheme.uninstall returned no result" };
+  }
+  // The command owns the preference commit boundary. When the runtime already
+  // switched to clawd, the controller MUST still commit even if the directory
+  // deletion failed, or prefs and runtime disagree.
+  const prefsCommit = buildThemeScopedPrefsCommit(themeId, (deps && deps.snapshot) || {});
+  const commit = { ...prefsCommit, ...(result.commit || {}) };
+  const out = { status: "ok", uninstallStatus: result.uninstallStatus || "ok" };
+  if (Object.keys(commit).length > 0) out.commit = commit;
+  if (result.removed) out.removed = result.removed;
+  if (result.reason) out.reason = result.reason;
+  return out;
 }
 
 function resizePet(payload, deps) {
@@ -2427,6 +2503,16 @@ feishuApprovalSendTest.lockKey = "feishuApproval";
 slackNotifySetSecrets.lockKey = "slackNotify";
 slackNotifySendTest.lockKey = "slackNotify";
 cleanupIntegrationsCommand.lockKey = "agentIntegration";
+// All theme mutations share one domain lock: selection, generic removal, and
+// the managed official install-commit/uninstall. Without a shared key a
+// selection could land between an uninstall's active check and its delete.
+setThemeSelection.lockKey = "theme";
+removeTheme.lockKey = "theme";
+officialThemeCommitInstall.lockKey = "theme";
+officialThemeUninstall.lockKey = "theme";
+// The legacy single-field `theme` update also activates the runtime, so it
+// must share the same domain lock as selection/removal.
+updateRegistry.theme.lockKey = "theme";
 
 const repairDoctorIssue = createRepairDoctorIssue({
   repairAgentIntegration,
@@ -2503,6 +2589,8 @@ const commandRegistry = {
   setWideHitboxOverride,
   setThemeSelection,
   setIdleVisual,
+  "officialTheme.commitInstall": officialThemeCommitInstall,
+  "officialTheme.uninstall": officialThemeUninstall,
   "remoteSsh.add": remoteSshAddProfile,
   "remoteSsh.update": remoteSshUpdateProfile,
   "remoteSsh.delete": remoteSshDeleteProfile,
@@ -2549,4 +2637,6 @@ module.exports = {
   requireString,
   requirePlainObject,
   requireIntegerInRange,
+  buildThemeScopedPrefsCommit,
+  applyThemeSelection,
 };
