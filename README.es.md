@@ -26,14 +26,14 @@
 </p>
 
 <p align="center">
-  <img src="assets/hero.gif" alt="Clawd on Desk: una mascota de escritorio pixelada que reacciona en tiempo real a tu agente de programación con IA. La demostración animada muestra al cangrejo durmiendo, pensando mientras el modelo lee el código, escribiendo cuando se ejecutan herramientas, moviéndose con un subagente, haciendo malabares con varios subagentes, mostrando un globo de permisos y celebrando al completar 14 archivos y 312 pruebas. Funciona con Claude Code, Codex, Cursor, Copilot, Gemini, Antigravity, Qwen, CodeWhale, Pi, OpenClaw y más.">
+  <img src="assets/hero.gif" alt="Clawd on Desk: una mascota de escritorio pixelada que reacciona en tiempo real a tu agente de programación con IA. La demostración animada muestra al cangrejo durmiendo, pensando mientras el modelo lee el código, escribiendo cuando se ejecutan herramientas, moviéndose con un subagente, haciendo malabares con varios subagentes, mostrando un globo de permisos y celebrando al completar 14 archivos y 312 pruebas. Funciona con Claude Code, Codex, Cursor, Copilot, Gemini, Antigravity, Qwen, CodeWhale, Pi, OMP, OpenClaw y más.">
 </p>
 
 Clawd vive en tu escritorio y reacciona en tiempo real a lo que hace tu agente de programación con IA. Inicia una tarea larga, aléjate y vuelve cuando el cangrejo te avise de que terminó.
 
-Piensa cuando envías un prompt, escribe cuando se ejecutan herramientas, se mueve o hace malabares con los subagentes, revisa permisos, celebra al terminar las tareas y duerme cuando te alejas. Incluye tres temas: **Clawd** (cangrejo pixelado), **Calico** (三花猫) y **Cloudling** (云宝), además de compatibilidad completa con temas personalizados y paquetes de animaciones Codex Pet importados.
+Piensa cuando envías un prompt, escribe cuando se ejecutan herramientas, se mueve o hace malabares con los subagentes, revisa permisos, celebra al terminar las tareas y duerme cuando te alejas. Incluye tres temas: **Clawd** (cangrejo pixelado), **Calico** (三花猫) y **Cloudling** (云宝), además de compatibilidad completa con temas personalizados y paquetes de animaciones Codex Pet importados. También puedes descargar el tema oficial opcional **Hash Sage** (哈希仙人) desde Ajustes → Tema.
 
-> Compatible con Windows 11, macOS y Ubuntu/Linux. Las releases de Windows incluyen instaladores x64 y ARM64 separados. Las compilaciones desde el código fuente requieren Node.js. Funciona con **Claude Code**, **Codex CLI**, **Copilot CLI**, **Gemini CLI**, **Antigravity CLI (agy)**, **Cursor Agent**, **CodeBuddy**, **WorkBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, **Qwen Code**, **ZCode**, **CodeWhale**, **opencode**, **MiMo Code**, **Pi**, **OpenClaw**, **Hermes Agent**, **Qoder**, **QoderWork**, **QwenWork (千问办公)**, **Reasonix CLI** y **DeepSeek Harness**.
+> Compatible con Windows 11, macOS y Ubuntu/Linux. Las releases de Windows incluyen instaladores x64 y ARM64 separados. Las compilaciones desde el código fuente requieren Node.js. Funciona con **Claude Code**, **Codex CLI**, **Copilot CLI**, **Gemini CLI**, **Antigravity CLI (agy)**, **Cursor Agent**, **CodeBuddy**, **WorkBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, **Qwen Code**, **ZCode**, **CodeWhale**, **opencode**, **MiMo Code**, **Pi**, **OMP**, **OpenClaw**, **Hermes Agent**, **Qoder**, **QoderWork**, **QwenWork (千问办公)**, **Reasonix CLI** y **DeepSeek Harness**.
 
 ## Funciones
 
@@ -160,6 +160,12 @@ Para un uso normal, descarga el instalador precompilado más reciente desde **[G
 - **macOS**: `.dmg`
 - **Linux**: `.AppImage` o `.deb`
 
+En macOS, o en Linux x86_64, también puedes instalarlo con Homebrew:
+
+```bash
+brew install --cask clawd-on-desk
+```
+
 Inicia Clawd después de instalarlo. Las instalaciones nuevas solo sincronizan automáticamente Claude Code y Codex; instala las demás integraciones locales desde **Ajustes → Agentes** cuando las necesites.
 
 Ejecuta desde el código fuente únicamente si vas a contribuir, probar código aún no publicado o depurar integraciones. Las instalaciones desde el código fuente descargan Electron y herramientas de compilación, y pueden crear un árbol `node_modules` grande.
@@ -176,7 +182,7 @@ npm install
 npm start
 ```
 
-**Claude Code** y **Codex CLI** funcionan directamente con hooks registrados automáticamente. Para **Copilot CLI**, **Gemini CLI**, **Antigravity CLI (agy)**, **Cursor Agent**, **CodeBuddy**, **WorkBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, **Qwen Code**, **ZCode**, **CodeWhale**, **opencode**, **MiMo Code**, **Pi**, **OpenClaw**, **Hermes Agent**, **Qoder**, **QoderWork**, **QwenWork (千问办公)**, **Reasonix CLI** y **DeepSeek Harness**, instala primero la integración desde **Ajustes → Agentes**; Clawd la mantendrá sincronizada mientras siga activada. También incluye SSH remoto, WSL y notas específicas de cada plataforma (macOS / Linux): **[docs/guides/setup-guide.md](docs/guides/setup-guide.md)**
+**Claude Code** y **Codex CLI** funcionan directamente con hooks registrados automáticamente. Para **Copilot CLI**, **Gemini CLI**, **Antigravity CLI (agy)**, **Cursor Agent**, **CodeBuddy**, **WorkBuddy**, **Kiro CLI**, **Kimi Code CLI (Kimi-CLI)**, **Qwen Code**, **ZCode**, **CodeWhale**, **opencode**, **MiMo Code**, **Pi**, **OMP**, **OpenClaw**, **Hermes Agent**, **Qoder**, **QoderWork**, **QwenWork (千问办公)**, **Reasonix CLI** y **DeepSeek Harness**, instala primero la integración desde **Ajustes → Agentes**; Clawd la mantendrá sincronizada mientras siga activada. También incluye SSH remoto, WSL y notas específicas de cada plataforma (macOS / Linux): **[docs/guides/setup-guide.md](docs/guides/setup-guide.md)**
 
 ¿Quieres ejecutar Claude Code / Codex CLI en un servidor remoto y mostrar el estado y los globos de permisos en tu Clawd local? Usa **Ajustes → Hosts SSH → Desplegar / Reparar hooks** dentro de la aplicación. Guía completa, límite de aislamiento en servidores compartidos, alcance de Doctor y preguntas frecuentes: **[docs/guides/guide-remote-ssh.md](docs/guides/guide-remote-ssh.md)**
 

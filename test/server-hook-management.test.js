@@ -16,7 +16,47 @@ const EXPECTED_HOOK_SCRIPT_PATH = getClaudeHookScriptPath();
 const EXPECTED_AUTO_START_SCRIPT_PATH = getClaudeAutoStartScriptPath();
 const missingFakeImpls = [];
 
+// src/server.js hands the runtime `{...ctx}`, and a spread copies only OWN
+// ENUMERABLE properties. A seam this Proxy answers virtually is therefore
+// dropped before integration-sync reads it: `typeof ctx.syncXExtensionImpl
+// === "function"` turns false, the real installer runs instead, and the
+// tripwire below never fires. That is not hypothetical — it is how running
+// this file once wrote a real ~/.omp/agent/extensions/clawd-on-desk tree onto
+// a developer machine while every assertion in it stayed green.
+//
+// So the seam list is read from the runtime's own source rather than copied
+// here: a new agent added to integration-sync.js becomes an own enumerable
+// property of this fixture too, the spread carries the tripwire through, and
+// the afterEach assertion names the seam that has no fake.
+function integrationSyncSeamNames() {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(
+    path.join(__dirname, "..", "src", "integration-sync.js"),
+    "utf8"
+  );
+  const names = new Set();
+  for (const match of source.matchAll(/\bctx\.((?:sync|repair)[A-Z][A-Za-z0-9]*Impl)\b/g)) {
+    names.add(match[1]);
+  }
+  return [...names];
+}
+
+const INTEGRATION_SYNC_SEAM_NAMES = integrationSyncSeamNames();
+
 function createGuardedIntegrationCtx(target, calls) {
+  const tripwires = new Map();
+  const tripwire = (prop) => {
+    if (!tripwires.has(prop)) {
+      tripwires.set(prop, () => {
+        calls.push(`missing-fake:${prop}`);
+        missingFakeImpls.push(prop);
+        throw new Error(`Missing server test fake: ${prop}`);
+      });
+    }
+    return tripwires.get(prop);
+  };
+
   return new Proxy(target, {
     get(obj, prop, receiver) {
       if (Object.prototype.hasOwnProperty.call(obj, prop)) {
@@ -25,11 +65,23 @@ function createGuardedIntegrationCtx(target, calls) {
       if (typeof prop !== "string" || !/^(sync|repair)[A-Z]\w*Impl$/.test(prop)) {
         return Reflect.get(obj, prop, receiver);
       }
-      return () => {
-        calls.push(`missing-fake:${prop}`);
-        missingFakeImpls.push(prop);
-        throw new Error(`Missing server test fake: ${prop}`);
-      };
+      return tripwire(prop);
+    },
+    getOwnPropertyDescriptor(obj, prop) {
+      const own = Reflect.getOwnPropertyDescriptor(obj, prop);
+      if (own) return own;
+      if (typeof prop === "string" && INTEGRATION_SYNC_SEAM_NAMES.includes(prop)) {
+        return { value: tripwire(prop), enumerable: true, configurable: true, writable: true };
+      }
+      return undefined;
+    },
+    ownKeys(obj) {
+      const keys = Reflect.ownKeys(obj);
+      const seen = new Set(keys);
+      for (const name of INTEGRATION_SYNC_SEAM_NAMES) {
+        if (!seen.has(name)) keys.push(name);
+      }
+      return keys;
     },
   });
 }
@@ -180,14 +232,18 @@ function makeServer(overrides = {}) {
     syncCopilotHooksImpl: () => syncCalls.push("copilot"),
     syncCodeBuddyHooksImpl: () => syncCalls.push("codebuddy"),
     syncWorkBuddyHooksImpl: () => syncCalls.push("workbuddy"),
+    syncGrokBuildHooksImpl: () => syncCalls.push("grok-build"),
     syncKiroHooksImpl: () => syncCalls.push("kiro"),
     syncKimiHooksImpl: () => syncCalls.push("kimi"),
     syncQwenHooksImpl: () => syncCalls.push("qwen"),
+    syncZcodeHooksImpl: () => syncCalls.push("zcode"),
     syncCodexHooksImpl: () => syncCalls.push("codex"),
+    syncDeepSeekHarnessPluginImpl: () => syncCalls.push("deepseek-harness"),
     repairCodexHooksImpl: () => syncCalls.push("codex-repair"),
     syncOpencodePluginImpl: () => syncCalls.push("opencode"),
     syncMimocodePluginImpl: () => syncCalls.push("mimocode"),
     syncPiExtensionImpl: () => syncCalls.push("pi"),
+    syncOmpExtensionImpl: () => syncCalls.push("omp"),
     syncOpenClawPluginImpl: () => syncCalls.push("openclaw"),
     repairOpenClawPluginImpl: () => syncCalls.push("openclaw-repair"),
     syncHermesPluginImpl: () => syncCalls.push("hermes"),
@@ -245,7 +301,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
     assert.ok(getWatcher(), "watcher should start when management is enabled");
   });
 
@@ -262,7 +318,7 @@ describe("server Claude hook management", () => {
 
       api.startHttpServer();
 
-      assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+      assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
       assert.ok(getWatcher(), "watcher should start when management is enabled");
       assert.strictEqual(warnings.some((line) => /Hermes/i.test(line)), false);
     } finally {
@@ -277,7 +333,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
     assert.strictEqual(getWatcher(), null);
   });
 
@@ -289,7 +345,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["claude", "copilot", "codebuddy", "workbuddy", "kimi", "qwen", "codewhale", "codex", "mimocode", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["claude", "copilot", "codebuddy", "workbuddy", "grok-build", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "mimocode", "omp", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
     assert.ok(getWatcher(), "Claude watcher should still start when Claude is enabled");
   });
 
@@ -300,7 +356,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
     assert.strictEqual(getWatcher(), null);
   });
 
@@ -499,8 +555,8 @@ describe("server Claude hook management", () => {
     const second = makeServer({ manageClaudeHooksAutomatically: false });
     second.api.startHttpServer();
 
-    assert.deepStrictEqual(first.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
-    assert.deepStrictEqual(second.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(first.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(second.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
   });
 
   it("repairIntegrationForAgent uses the Codex official hook repair path", () => {
@@ -658,6 +714,22 @@ describe("server Claude hook operation queue (default, non-injected implementati
       assert.deepStrictEqual(calls[1], ["clear-authority", "local"]);
       assert.deepStrictEqual(calls[2], ["clear-local-claude-quota"]);
       assert.strictEqual(api.isClaudeStatuslineMetadataAllowed(), false);
+    });
+  });
+
+  it("confirmed local coexistence passes the inspected digest through the same operation queue", async () => {
+    const calls = [];
+    await withPatchedInstallModule({
+      registerClaudeStatusline: (opts) => { calls.push(opts); return { installed: true, changed: true, localChained: true }; },
+    }, async () => {
+      const { api } = makeServer({ syncClawdHooksImpl: undefined });
+      const digest = "a".repeat(64);
+      const refused = await api.setClaudeQuotaCollectionEnabled({ enabled: true, chainExisting: true });
+      assert.strictEqual(refused.status, "error");
+      assert.strictEqual(calls.length, 0);
+      const result = await api.setClaudeQuotaCollectionEnabled({ enabled: true, chainExisting: true, expectedStatuslineFingerprint: digest });
+      assert.strictEqual(result.status, "ok");
+      assert.deepStrictEqual(calls, [{ backup: true, silent: true, chainExisting: true, expectedStatuslineFingerprint: digest }]);
     });
   });
 
