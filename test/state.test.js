@@ -10,6 +10,7 @@ const themeLoader = require("../src/theme-loader");
 themeLoader.init(path.join(__dirname, "..", "src"));
 const _defaultTheme = themeLoader.loadTheme("clawd");
 const _calicoTheme = themeLoader.loadTheme("calico");
+const _cloudlingTheme = themeLoader.loadTheme("cloudling");
 const { createTranslator } = require("../src/i18n");
 const { makeSessionKey, resolveSessionIdentity } = require("../src/session-key");
 const { isSessionInProgress } = require("../src/state-session-snapshot");
@@ -1692,6 +1693,12 @@ describe("updateSession()", () => {
     assert.strictEqual(api.sessions.get("new1").state, "working");
   });
 
+  it("keeps a known model when a later event reports none (sticky merge)", () => {
+    update(api, { id: "sticky1", state: "working", model: "claude-opus-5" });
+    update(api, { id: "sticky1", state: "working", event: "PostToolUse" });
+    assert.strictEqual(api.sessions.get("sticky1").model, "claude-opus-5");
+  });
+
   it("stores only a normalized route-owned session automation assessment", () => {
     update(api, {
       id: "automation-identity",
@@ -2116,7 +2123,7 @@ describe("updateSession()", () => {
     });
   });
 
-  it("Codex Desktop focus metadata downgrades on Windows", () => {
+  it("Codex Desktop focus metadata uses thread targets on Windows", () => {
     api = require("../src/state")(makeCtx({ focusHostPlatform: "win32" }));
 
     update(api, {
@@ -2139,11 +2146,14 @@ describe("updateSession()", () => {
     const byId = new Map(api.getLastSessionSnapshot().sessions.map((entry) => [entry.id, entry]));
     assert.strictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").canFocus, true);
     assert.deepStrictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").focusTarget, {
-      type: "terminal",
-      url: null,
+      type: "codex-thread",
+      url: "codex://threads/019e115a-4df2-7ed0-b90e-8e6345aca777",
     });
-    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").canFocus, false);
-    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").focusTarget, null);
+    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").canFocus, true);
+    assert.deepStrictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").focusTarget, {
+      type: "codex-thread",
+      url: "codex://threads/019e115b-4df2-7ed0-b90e-8e6345aca777",
+    });
   });
 
   it("keeps wtHwnd sticky when later events do not provide one", () => {
@@ -2667,6 +2677,189 @@ describe("updateSession()", () => {
     // and the one-shot attention is stored as idle.
     assert.strictEqual(api.sessions.get("s1").state, "idle");
     assert.strictEqual(api.getCurrentState(), "attention");
+  });
+
+  it("advances the display revision even when the same state is applied again", () => {
+    api.cleanup();
+    ctx = makeCtx({});
+    api = require("../src/state")(ctx);
+
+    const start = api.getDisplayRevision();
+    api.applyState("working");
+    const afterFirst = api.getDisplayRevision();
+    api.applyState("working");
+    const afterSecond = api.getDisplayRevision();
+
+    // An owner of the current visual (an animation preview) needs to notice a
+    // real event taking over even when it lands on the same state name.
+    assert.ok(afterFirst > start, "applying a state advances the revision");
+    assert.ok(afterSecond > afterFirst, "re-applying the same state advances it too");
+  });
+
+  it("re-applies a state without replaying its cue when muteStateSounds is set", () => {
+    const soundsPlayed = [];
+    const flashes = [];
+    api.cleanup();
+    ctx = makeCtx({
+      playSound: (name) => soundsPlayed.push(name),
+      flashTaskbar: () => flashes.push("flash"),
+    });
+    api = require("../src/state")(ctx);
+
+    api.applyState("attention");
+    assert.deepStrictEqual(soundsPlayed, ["complete"]);
+    assert.strictEqual(flashes.length, 1);
+
+    // Handing an animation preview back re-applies the state the pet is
+    // already in; its cue already played when that state first arrived.
+    api.applyState("attention", undefined, { muteStateSounds: true });
+    assert.deepStrictEqual(soundsPlayed, ["complete"]);
+    assert.strictEqual(flashes.length, 1);
+  });
+
+  it("lets a real Stop take the visual back from a same-state settings preview", () => {
+    const soundsPlayed = [];
+    const flashes = [];
+    api.cleanup();
+    ctx = makeCtx({
+      processKill: () => true,
+      playSound: (name) => soundsPlayed.push(name),
+      flashTaskbar: () => flashes.push("flash"),
+    });
+    api = require("../src/state")(ctx);
+
+    update(api, { id: "s1", state: "working" });
+    mock.timers.tick(1000);
+
+    // Settings open an attention preview under the live state's own name. It
+    // owns the pet's visual; no real event has happened yet.
+    api.applyState("attention", "settings-preview.svg", { settingsPreview: true });
+    assert.strictEqual(api.getCurrentState(), "attention");
+    assert.strictEqual(api.getCurrentSvg(), "settings-preview.svg");
+    assert.strictEqual(api.isSettingsPreviewVisual(), true);
+    const previewRevision = api.getDisplayRevision();
+
+    // Clear the preview's own presentation effects so the assertions below can
+    // only be satisfied by the real event.
+    soundsPlayed.length = 0;
+    flashes.length = 0;
+
+    // The turn really ends while the preview is still up — same state name.
+    update(api, { id: "s1", state: "attention", event: "Stop" });
+
+    assert.ok(
+      api.getDisplayRevision() > previewRevision,
+      "the real event must land and advance the display revision"
+    );
+    assert.notStrictEqual(
+      api.getCurrentSvg(),
+      "settings-preview.svg",
+      "the live attention asset must replace the preview asset"
+    );
+    assert.strictEqual(api.isSettingsPreviewVisual(), false, "the real event must own the visual now");
+    assert.deepStrictEqual(soundsPlayed, ["complete"], "the real completion cue must play");
+    assert.strictEqual(flashes.length, 1, "the real taskbar flash must play");
+    assert.strictEqual(api.sessions.get("s1").state, "idle");
+
+    // Auto-return runs from the real event, not the preview's stale timer.
+    mock.timers.tick(_defaultTheme.timings.autoReturn.attention + 1);
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
+
+  it("lets a real Notification take the visual back from a same-state settings preview", () => {
+    const soundsPlayed = [];
+    api.cleanup();
+    ctx = makeCtx({
+      processKill: () => true,
+      playSound: (name) => soundsPlayed.push(name),
+    });
+    api = require("../src/state")(ctx);
+
+    update(api, { id: "n1", state: "notification", event: "Notification" });
+    assert.strictEqual(api.getCurrentState(), "notification");
+    assert.deepStrictEqual(soundsPlayed, ["confirm"]);
+
+    api.applyState("notification", "settings-preview.svg", { settingsPreview: true });
+    assert.strictEqual(api.isSettingsPreviewVisual(), true);
+    const previewRevision = api.getDisplayRevision();
+    soundsPlayed.length = 0;
+
+    update(api, { id: "n1", state: "notification", event: "Notification" });
+
+    assert.ok(api.getDisplayRevision() > previewRevision, "the real alert must land");
+    assert.notStrictEqual(api.getCurrentSvg(), "settings-preview.svg");
+    assert.strictEqual(api.isSettingsPreviewVisual(), false);
+    assert.deepStrictEqual(soundsPlayed, ["confirm"], "the real alert cue must replay for the new event");
+  });
+
+  it("keeps same-state dedupe for an ordinary repeated event with no preview owner", () => {
+    const soundsPlayed = [];
+    api.cleanup();
+    ctx = makeCtx({
+      playSound: (name) => soundsPlayed.push(name),
+      flashTaskbar: () => {},
+    });
+    api = require("../src/state")(ctx);
+
+    api.applyState("attention");
+    assert.deepStrictEqual(soundsPlayed, ["complete"]);
+
+    soundsPlayed.length = 0;
+    const revision = api.getDisplayRevision();
+    api.setState("attention");
+
+    assert.deepStrictEqual(soundsPlayed, [], "an ordinary duplicate must not replay the cue");
+    assert.strictEqual(api.getDisplayRevision(), revision, "an ordinary duplicate must not churn the revision");
+  });
+
+  it("recaptures the visual in mini mode when a real event matches the previewed state", () => {
+    api.cleanup();
+    ctx = makeCtx({ processKill: () => true });
+    ctx.miniMode = true;
+    api = require("../src/state")(ctx);
+
+    api.applyState("notification", "settings-preview.svg", { settingsPreview: true });
+    assert.strictEqual(api.getCurrentState(), "mini-alert");
+    assert.strictEqual(api.isSettingsPreviewVisual(), true);
+    const previewRevision = api.getDisplayRevision();
+
+    api.setState("notification");
+
+    assert.ok(api.getDisplayRevision() > previewRevision, "the real event must land in mini mode");
+    assert.strictEqual(api.isSettingsPreviewVisual(), false, "a real event must clear the preview owner");
+  });
+
+  it("keeps settings-preview ownership through the mini-working remap", () => {
+    api.cleanup();
+    ctx = makeCtx({ theme: _cloudlingTheme, miniMode: true, processKill: () => true });
+    api = require("../src/state")(ctx);
+
+    // Cloudling has a real mini-working binding, so working lands on it rather
+    // than on the preview file. The remap must forward the preview marker or
+    // the visual ends up owned by nobody and never gets handed back.
+    api.applyState("working", "settings-preview.svg", { settingsPreview: true });
+
+    assert.strictEqual(api.getCurrentState(), "mini-working");
+    assert.strictEqual(api.isSettingsPreviewVisual(), true, "the mini-working remap must keep the preview owner");
+  });
+
+  it("releases settings-preview ownership when the preview is handed back", () => {
+    api.cleanup();
+    ctx = makeCtx({ playSound: () => {}, flashTaskbar: () => {} });
+    api = require("../src/state")(ctx);
+
+    api.applyState("attention", "settings-preview.svg", { settingsPreview: true });
+    assert.strictEqual(api.isSettingsPreviewVisual(), true);
+
+    // restoreDisplayedState hands the pet back with muteStateSounds and no
+    // settingsPreview marker: the preview must stop owning the visual, so a
+    // later ordinary event dedupes instead of re-taking over.
+    api.applyState("idle", undefined, { muteStateSounds: true });
+    assert.strictEqual(api.isSettingsPreviewVisual(), false);
+
+    const revision = api.getDisplayRevision();
+    api.setState("idle");
+    assert.strictEqual(api.getDisplayRevision(), revision, "no stale preview owner may force a re-apply");
   });
 
   it("does not replay the completion animation for a duplicate Stop without progress", () => {
@@ -3690,6 +3883,43 @@ describe("updateSession()", () => {
     assert.strictEqual(session.metadataUpdatedAt, 777);
     assert.strictEqual(session.contextUsage, null);
     assert.strictEqual(session.contextUsageOrigin, null);
+  });
+
+  // The statusline is the only producer that reports the model after
+  // SessionStart, and a hook event carrying one would displace the Stop tail
+  // deriveSessionBadge reads.
+  it("updateSessionMetadata relabels the model without disturbing badge or lifecycle", () => {
+    update(api, { id: "s1", state: "working", model: "claude-sonnet-5" });
+    update(api, { id: "s1", state: "attention", event: "Stop" });
+    const session = api.sessions.get("s1");
+    assert.strictEqual(api.deriveSessionBadge(session), "done");
+    session.updatedAt = 12345;
+    session.metadataUpdatedAt = 777;
+    const recentEventsBefore = JSON.stringify(session.recentEvents);
+
+    const applied = api.updateSessionMetadata("s1", { model: "claude-opus-5" });
+
+    assert.strictEqual(applied, true);
+    assert.strictEqual(session.model, "claude-opus-5");
+    assert.strictEqual(api.deriveSessionBadge(session), "done");
+    assert.strictEqual(session.updatedAt, 12345);
+    assert.strictEqual(session.metadataUpdatedAt, 777);
+    assert.strictEqual(JSON.stringify(session.recentEvents), recentEventsBefore);
+  });
+
+  it("updateSessionMetadata treats an unchanged model as a no-op", () => {
+    update(api, { id: "s1", state: "working", model: "claude-opus-5" });
+    const session = api.sessions.get("s1");
+    session.metadataUpdatedAt = 777;
+
+    assert.strictEqual(api.updateSessionMetadata("s1", { model: "claude-opus-5" }), true);
+    assert.strictEqual(api.updateSessionMetadata("s1", { model: "  claude-opus-5  " }), true);
+    assert.strictEqual(session.model, "claude-opus-5");
+    assert.strictEqual(session.metadataUpdatedAt, 777);
+  });
+
+  it("a model-only metadata payload never creates a ghost session", () => {
+    assert.strictEqual(api.updateSessionMetadata("ghost", { model: "claude-opus-5" }), false);
   });
 
   it("updateSessionMetadata treats a same/normalized-equivalent title as a no-op", () => {

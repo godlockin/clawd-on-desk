@@ -221,6 +221,7 @@ function createHarness(overrides = {}) {
     recapRuntime: overrides.recapRuntime,
     themeLoader,
     codexPetMain,
+    officialThemeMain: overrides.officialThemeMain,
     getSettingsWindow: () => settingsWindow,
     getActiveTheme: () => activeTheme,
     getLang: overrides.getLang || (() => "en"),
@@ -1379,5 +1380,64 @@ test("settings IPC scan examines Codex locally and still withholds Claude", asyn
   } finally {
     runtime.dispose();
     fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("official theme IPC is owner-gated and never reachable through settings:command", async () => {
+  const calls = [];
+  const officialThemeMain = {
+    refreshCatalog: async () => { calls.push(["refreshCatalog"]); return "ok"; },
+    listOfficialThemes: async () => ({ status: "ok", catalogStatus: "ok", catalogVersion: 1, themes: [{ id: "hash-sage" }] }),
+    installTheme: async (themeId) => { calls.push(["install", themeId]); return { status: "ok" }; },
+    cancelInstall: () => { calls.push(["cancel"]); return { status: "ok", cancelled: true }; },
+    decorateThemeMetadata: (theme) => ({ ...theme, officialTheme: true }),
+    isManagedTheme: () => false,
+  };
+  const harness = createHarness({ officialThemeMain });
+
+  const listing = await harness.ipcMain.invoke("settings:list-official-themes");
+  assert.strictEqual(listing.status, "ok");
+  assert.deepStrictEqual(calls[0], ["refreshCatalog"]);
+
+  assert.deepStrictEqual(await harness.ipcMain.invoke("settings:install-official-theme", "hash-sage"), { status: "ok" });
+  assert.deepStrictEqual(calls.find((c) => c[0] === "install"), ["install", "hash-sage"]);
+  assert.strictEqual((await harness.ipcMain.invoke("settings:install-official-theme", "../evil")).status, "error");
+  await harness.ipcMain.invoke("settings:cancel-official-theme-install");
+  assert.ok(calls.some((c) => c[0] === "cancel"));
+  await harness.ipcMain.invoke("settings:uninstall-official-theme", "hash-sage");
+  assert.ok(harness.calls.some((c) => c[0] === "applyCommand"));
+
+  const internal = await harness.ipcMain.invoke("settings:command", { action: "officialTheme.uninstall", payload: { themeId: "hash-sage" } });
+  assert.strictEqual(internal.status, "error");
+  assert.match(internal.message, /internal/);
+  const internalCommit = await harness.ipcMain.invoke("settings:command", { action: "officialTheme.commitInstall", payload: {} });
+  assert.strictEqual(internalCommit.status, "error");
+
+  // An untrusted sender must not reach the download manager through ANY
+  // dedicated official-theme handler.
+  const trustedEvent = harness.ipcMain.invokeEvent;
+  const callsBefore = calls.length;
+  const harnessCallsBefore = harness.calls.length;
+  harness.ipcMain.invokeEvent = { sender: "someone-else", senderFrame: null };
+  try {
+    const channels = [
+      ["settings:list-official-themes"],
+      ["settings:install-official-theme", "hash-sage"],
+      ["settings:cancel-official-theme-install"],
+      ["settings:uninstall-official-theme", "hash-sage"],
+      ["settings:confirm-uninstall-official-theme", "hash-sage"],
+    ];
+    for (const [channel, arg] of channels) {
+      const rejected = arg === undefined
+        ? await harness.ipcMain.invoke(channel)
+        : await harness.ipcMain.invoke(channel, arg);
+      assert.strictEqual(rejected.status, "error", `${channel} should reject`);
+      assert.match(rejected.message, /untrusted/, `${channel} message`);
+    }
+    // The manager/controller must not have been touched by the untrusted calls.
+    assert.strictEqual(calls.length, callsBefore);
+    assert.strictEqual(harness.calls.length, harnessCallsBefore);
+  } finally {
+    harness.ipcMain.invokeEvent = trustedEvent;
   }
 });

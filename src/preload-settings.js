@@ -51,6 +51,7 @@ const agentActivityListeners = new Set();
 const recapChangedListeners = new Set();
 const updateCheckStatusListeners = new Set();
 const requestedTabListeners = new Set();
+const officialThemeProgressListeners = new Set();
 let pendingRequestedTab = null;
 ipcRenderer.on("settings-changed", (_event, payload) => {
   for (const cb of listeners) {
@@ -110,6 +111,11 @@ ipcRenderer.on("settings:select-tab", (_event, tab) => {
   pendingRequestedTab = tab;
   for (const cb of requestedTabListeners) {
     try { cb(tab); } catch (err) { console.warn("settings requested-tab listener threw:", err); }
+  }
+});
+ipcRenderer.on("officialTheme:progress", (_event, payload) => {
+  for (const cb of officialThemeProgressListeners) {
+    try { cb(payload); } catch (err) { console.warn("official theme progress listener threw:", err); }
   }
 });
 
@@ -181,6 +187,17 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   showTutorial: () => ipcRenderer.invoke("settings:show-tutorial"),
   openExternal: (url) => ipcRenderer.invoke("settings:open-external", url),
   listThemes: () => ipcRenderer.invoke("settings:list-themes"),
+  listOfficialThemes: () => ipcRenderer.invoke("settings:list-official-themes"),
+  installOfficialTheme: (themeId) => ipcRenderer.invoke("settings:install-official-theme", themeId),
+  cancelOfficialThemeInstall: () => ipcRenderer.invoke("settings:cancel-official-theme-install"),
+  uninstallOfficialTheme: (themeId) => ipcRenderer.invoke("settings:uninstall-official-theme", themeId),
+  confirmUninstallOfficialTheme: (themeId) =>
+    ipcRenderer.invoke("settings:confirm-uninstall-official-theme", themeId),
+  onOfficialThemeProgress: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    officialThemeProgressListeners.add(cb);
+    return () => officialThemeProgressListeners.delete(cb);
+  },
   openUserThemesDir: () => ipcRenderer.invoke("settings:open-user-themes-dir"),
   importUserThemeZip: () => ipcRenderer.invoke("settings:import-user-theme-zip"),
   refreshCodexPets: () => ipcRenderer.invoke("settings:refresh-codex-pets"),
