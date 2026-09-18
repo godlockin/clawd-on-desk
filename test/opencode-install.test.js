@@ -301,7 +301,15 @@ describe("opencode installer CLI entry (node hooks/opencode-install.js)", () => 
     assert.match(out, /Registered: /);
     const registered = readConfig(configPath).plugin;
     assert.strictEqual(registered.length, 1);
-    assert.ok(registered[0].endsWith("hooks/opencode-plugin"), registered[0]);
+    // #1026: packaged/source paths are no longer registered directly. The
+    // entry must point at a user-writable content-addressed managed generation
+    // under the target home.
+    assert.ok(
+      registered[0].includes("/.clawd/integrations/opencode-family/opencode/homes/"),
+      `expected managed generation path, got ${registered[0]}`
+    );
+    assert.ok(/\/generations\/[0-9a-f]{64}\/opencode-plugin$/.test(registered[0]), registered[0]);
+    assert.ok(fs.existsSync(path.join(registered[0].replace(/\//g, path.sep))), "generation plugin dir must exist");
 
     const out2 = runCli(["--uninstall"], home);
     assert.match(out2, /entries removed: 1/);

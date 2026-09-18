@@ -1,6 +1,10 @@
 "use strict";
 
-const { isCodexDesktopOriginator } = require("../hooks/codex-originator");
+const {
+  isCodexCliOriginator,
+  isCodexDesktopOriginator,
+} = require("../hooks/codex-originator");
+const { deriveCodexHomeFromTranscriptPath } = require("./codex-thread-id");
 
 const SESSION_STALE_MS = 600000;
 const WORKING_STALE_MS = 300000;
@@ -34,6 +38,25 @@ function isLocalCodexDesktopIdleSession(session) {
     && !session.headless
     && session.state === "idle"
     && isCodexDesktopOriginator(session.codexOriginator);
+}
+
+function isLocalQueueableCodexCliIdleSession(session) {
+  return !!session
+    && session.agentId === "codex"
+    && !session.host
+    && !session.headless
+    && session.state === "idle"
+    && isCodexCliOriginator(session.codexOriginator)
+    && !!deriveCodexHomeFromTranscriptPath(session.transcriptPath, process.platform);
+}
+
+function hasReplyableCompletionMapping(session, options) {
+  if (typeof options.hasReplyableCompletionMapping !== "function") return false;
+  try {
+    return options.hasReplyableCompletionMapping(session) === true;
+  } catch {
+    return false;
+  }
 }
 
 function isLocalZcodeDesktopIdleSession(session) {
@@ -114,7 +137,20 @@ function getStaleSessionDecision(session, options = {}) {
     && age > sessionStaleMs
     && isLocalCodexDesktopIdleSession(session)
   ) {
+    if (hasReplyableCompletionMapping(session, options)) return { action: null };
     return { action: "delete", reason: "codex-desktop-idle-timeout" };
+  }
+
+  // A JSONL-only CLI session can be queueable even when this host cannot map
+  // its writer PID. Keep the session identity while the Telegram mapping is
+  // live; otherwise the generic unreachable/no-source rules still retire it.
+  if (
+    sessionStaleMs > 0
+    && age > sessionStaleMs
+    && isLocalQueueableCodexCliIdleSession(session)
+    && hasReplyableCompletionMapping(session, options)
+  ) {
+    return { action: null };
   }
 
   // ZCode desktop conversations have no SessionEnd event and can share the
@@ -167,11 +203,25 @@ function getStaleSessionDecision(session, options = {}) {
   // and stamp that transition. Otherwise a 20-minute-old Codex turn can be
   // changed to idle with its old timestamp, then deleted immediately by the
   // ordinary 10-minute idle cutoff on the next sweep.
+  //
+  // With an age window enabled, only check source liveness after it elapses. A
+  // source_pid frequently belongs to a per-event launcher rather than to the
+  // session host — Windows Claude Code runs every hook through a throwaway
+  // pwsh wrapper, so the pid shipped with an event is already gone when the
+  // next sweep reads it. Probing it while the turn is still reporting deletes
+  // the live session between events, and the following event recreates it.
   if (isWorkingLikeState(session.state)) {
-    if (session.pidReachable && session.sourcePid && !isProcessAlive(session.sourcePid)) {
+    const workingWindowElapsed = workingStaleMs > 0 && age > workingStaleMs;
+    // Zero disables age-based expiry, not process-death cleanup. In particular,
+    // a local Codex session may have only a source PID when agent PID discovery
+    // failed, so the earlier agent-exit check cannot retire it on its own.
+    if (
+      (workingStaleMs === 0 || workingWindowElapsed)
+      && session.pidReachable && session.sourcePid && !isProcessAlive(session.sourcePid)
+    ) {
       return { action: "delete", reason: "working-source-exit" };
     }
-    if (workingStaleMs > 0 && age > workingStaleMs) {
+    if (workingWindowElapsed) {
       return { action: "idle", reason: "working-timeout", updateTimestamp: true };
     }
     return { action: null };
@@ -204,6 +254,7 @@ module.exports = {
   OPENCODE_LOCAL_WORKING_STALE_FLOOR_MS,
   isWorkingLikeState,
   isLocalCodexWorkingLikeSession,
+  isLocalQueueableCodexCliIdleSession,
   isLocalOpencodeWorkingLikeSession,
   isLocalZcodeDesktopIdleSession,
   isLocalTraeDesktopIdleSession,

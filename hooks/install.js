@@ -28,12 +28,21 @@ const {
   writeJsonAtomicAsync,
   writeJsonAtomicWithBackup,
   writeJsonAtomicWithBackupAsync,
+  writeTextAtomic,
+  createBackup,
+  pruneOldBackups,
   asarUnpackedPath,
   buildPortableStatuslineCommand,
   classifyManagedClaudeStateHookCommand,
   extractExistingNodeBin,
   findManagedClaudeEnvNodeBinCandidates,
 } = require("./json-utils");
+const {
+  scanRelativeRequires,
+  planAppImageHookBundle,
+  materializeAppImageHookBundle,
+  isAppImageHookBundleComplete,
+} = require("./appimage-hook-materializer");
 
 function resolveClaudeHome(options = {}) {
   const env = options.env || process.env;
@@ -503,6 +512,343 @@ function getClaudeHookScriptPath() {
 
 function getClaudeAutoStartScriptPath() {
   return asarUnpackedPath(path.resolve(__dirname, "auto-start.js").replace(/\\/g, "/"));
+}
+
+// Source (packaged) path of the statusline script. Its runtime target may be a
+// materialized AppImage generation; resolveClaudeHookPaths() is the only
+// source of truth for what settings should point at.
+function getClaudeStatuslineScriptPath() {
+  return asarUnpackedPath(path.resolve(__dirname, "claude-statusline.js").replace(/\\/g, "/"));
+}
+
+// All three Claude runtime artifacts shipped together in one content-addressed
+// generation. AppImage materialization always plans the full bundle, even when
+// a feature toggle (auto-start / quota statusline) is currently off, so
+// flipping a toggle never migrates the state hook to a different generation.
+function claudeSourceHookPaths() {
+  return {
+    state: getClaudeHookScriptPath(),
+    autoStart: getClaudeAutoStartScriptPath(),
+    statusline: getClaudeStatuslineScriptPath(),
+  };
+}
+
+// Single source of truth for "which source paths is this resolver working
+// with". A partial options.sourcePaths override must be merged identically by
+// every consumer (resolver, AppImage decision, fs guard), otherwise the guard
+// could see a partial object and decide direct while the resolver materializes.
+function mergeClaudeSourcePaths(options = {}) {
+  const override = options && typeof options.sourcePaths === "object" && options.sourcePaths
+    ? options.sourcePaths
+    : null;
+  return override ? { ...claudeSourceHookPaths(), ...override } : claudeSourceHookPaths();
+}
+
+// Accept an absolute path on either platform. This is only for APPDIR/source
+// paths: cross-platform tests synthesize platform:"linux" on a Windows host and
+// feed path.resolve() output (D:\\...). APPIMAGE itself must stay POSIX-absolute
+// because it is the emulated Linux runtime field.
+function isAbsoluteAnyPlatformPath(value) {
+  const text = String(value || "");
+  return path.posix.isAbsolute(text) || path.win32.isAbsolute(text);
+}
+
+// Normalized POSIX containment test used for APPIMAGE ownership. Both sides are
+// converted to forward slashes so a Windows-style separator/drive path cannot
+// sneak past.
+function isPosixPathInside(dir, target) {
+  const root = String(dir || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  const child = String(target || "").replace(/\\/g, "/");
+  if (!root || !child) return false;
+  return child === root || child.startsWith(`${root}/`);
+}
+
+// Pure decision: should this process materialize Claude hooks for a local
+// AppImage? processEnv is intentionally separate from options.env — it only
+// answers "is this host process an AppImage, and where is it?", while
+// options.env still drives CLAUDE_CONFIG_DIR / shell installer semantics.
+//
+// APPIMAGE/APPDIR are plain inherited environment variables: a non-AppImage
+// Clawd launched from another AppImage's shell (e.g. VSCodium) also sees them.
+// Presence alone is therefore NOT evidence that *this* process runs from a
+// Clawd AppImage, and must never be used to write that foreign executable into
+// a marker. Ownership requires APPDIR to contain Clawd's own source scripts;
+// APPDIR is set by the AppImage runtime to this process's mount, so a foreign
+// mount cannot contain our hooks. deb/source/direct all fail this check.
+function claudeSourcesInsideAppDir(sources, appDir) {
+  return isPosixPathInside(appDir, sources.state)
+    && isPosixPathInside(appDir, sources.autoStart)
+    && isPosixPathInside(appDir, sources.statusline);
+}
+
+function evaluateClaudeAppImage(options = {}, sourcePaths) {
+  const platform = options.platform || process.platform;
+  if (platform !== "linux") return { materialize: false };
+  if (options.remote === true) return { materialize: false };
+  const env = options.processEnv || process.env;
+  if (!env || !Object.prototype.hasOwnProperty.call(env, "APPIMAGE")) {
+    return { materialize: false };
+  }
+  const raw = env.APPIMAGE;
+  // A set-but-malformed APPIMAGE is a fail-closed condition (ignored plan
+  // §3.1): a real AppImage host always exposes a non-empty absolute path, so
+  // guessing would risk writing a relative or unrelated target.
+  if (typeof raw !== "string" || !raw.trim()) {
+    return {
+      materialize: false,
+      error: {
+        reason: "invalid-appimage-path",
+        message: "APPIMAGE is set but is not a non-empty string; refusing to materialize Claude hooks",
+      },
+    };
+  }
+  const appImagePath = raw.trim();
+  // APPIMAGE is the emulated Linux runtime field: under platform:"linux" only a
+  // POSIX absolute path is valid. A Windows drive path or UNC is malformed for
+  // Linux and must fail closed, never fall through to a foreign executable.
+  if (!path.posix.isAbsolute(appImagePath)) {
+    return {
+      materialize: false,
+      error: {
+        reason: "invalid-appimage-path",
+        message: "APPIMAGE is set but is not an absolute POSIX path; refusing to materialize Claude hooks",
+      },
+    };
+  }
+  const appDir = env.APPDIR;
+  if (typeof appDir !== "string" || !appDir.trim() || !isAbsoluteAnyPlatformPath(appDir.trim())) {
+    // A valid absolute APPIMAGE without a usable absolute APPDIR cannot prove
+    // this process is the AppImage owner; fall back to direct mode rather than
+    // trusting a foreign executable. APPDIR/source paths accept win32 absolute
+    // so synthetic platform:"linux" tests on a Windows host still work.
+    return { materialize: false };
+  }
+  const override = sourcePaths && typeof sourcePaths === "object"
+    ? sourcePaths
+    : options.sourcePaths;
+  const sources = mergeClaudeSourcePaths({ ...options, sourcePaths: override });
+  if (!claudeSourcesInsideAppDir(sources, appDir.trim())) {
+    return { materialize: false };
+  }
+  return { materialize: true, appImagePath };
+}
+
+// The single Claude source/target resolver. `source` is always the current
+// package/repo script used for preflight and bundle input; `target` is what
+// settings commands and health expectations must use (identical to source in
+// direct mode, the persistent generation in AppImage mode). Total by design:
+// every I/O / plan / environment failure is returned as {ok:false,...}, never
+// thrown, so a lazy caller such as the settings watcher can degrade and keep
+// patrolling instead of dying on one transient error.
+function resolveClaudeHookPaths(options = {}, config = {}) {
+  const shouldMaterialize = config.materialize === true;
+  const source = mergeClaudeSourcePaths(options);
+  let decision;
+  try {
+    decision = evaluateClaudeAppImage(options, source);
+  } catch (err) {
+    return { ok: false, reason: "appimage-eval-failed", message: err && err.message };
+  }
+  if (decision.error) return { ok: false, ...decision.error };
+  if (!decision.materialize) {
+    return {
+      ok: true,
+      mode: "direct",
+      source,
+      target: { ...source },
+      generationDir: null,
+      appImagePath: null,
+      targetGeneration: null,
+    };
+  }
+  try {
+    const platform = options.platform || process.platform;
+    const plan = planAppImageHookBundle(
+      [source.state, source.autoStart, source.statusline],
+      {
+        appImagePath: decision.appImagePath,
+        homeDir: options.homeDir,
+        materializedRoot: options.materializedRoot,
+        platform,
+        rootDir: path.dirname(source.state),
+        fs: options.fs,
+        realpathSync: options.realpathSync,
+      }
+    );
+    if (shouldMaterialize) {
+      materializeAppImageHookBundle(plan, { fs: options.fs });
+    }
+    const targetFor = (sourcePath) => plan.entryTargets.get(path.resolve(sourcePath));
+    const target = {
+      // path.resolve normalizes the injected-fs-independent source string to
+      // the exact key planAppImageHookBundle used (path.resolve on each entry).
+      state: targetFor(source.state),
+      autoStart: targetFor(source.autoStart),
+      statusline: targetFor(source.statusline),
+    };
+    if (!target.state || !target.autoStart || !target.statusline) {
+      return {
+        ok: false,
+        reason: "appimage-plan-incomplete",
+        message: "AppImage hook plan did not resolve all Claude entry targets",
+      };
+    }
+    return {
+      ok: true,
+      mode: "appimage-materialized",
+      source,
+      target,
+      generationDir: plan.generationDir,
+      appImagePath: decision.appImagePath,
+      targetGeneration: {
+        ok: isAppImageHookBundleComplete(plan, { fs: options.fs }),
+        dir: plan.generationDir,
+      },
+    };
+  } catch (err) {
+    const cause = err && err.details && err.details.cause;
+    const reason = err && err.code === "READ_FAILED" && (cause === "ENOENT" || cause === "EACCES")
+      ? "source-script-missing"
+      : ((err && err.code) || "appimage-materialize-failed");
+    return {
+      ok: false,
+      reason,
+      message: err && err.message,
+    };
+  }
+}
+
+// Best-effort, read-only helper for callers that only need the expected target
+// paths (health/watcher/Doctor). Returns the resolver result; callers must
+// treat !ok as degraded and never write.
+function resolveClaudeHookPathsReadOnly(options = {}) {
+  return resolveClaudeHookPaths(options, { materialize: false });
+}
+
+// Shared pure contract for the "injected fs must match the mutation target"
+// hazard. src/server.js deliberately does NOT hand ctx.fs to the installer
+// mutation: mutation always writes through node:fs. Therefore, whenever a local
+// AppImage materialization is in effect, ANY injected fs (even one exposing
+// every read/write method) could plan a different generation than the real
+// installer writes, so it must fail closed. Direct mode never reads files
+// through the seam, so any fs is fine there.
+function checkClaudeMaterializationFs(options = {}) {
+  const fsApi = options.fs;
+  if (!fsApi || fsApi === fs) return { ok: true };
+  let decision;
+  try {
+    // evaluateClaudeAppImage merges partial sourcePaths the same way the
+    // resolver does, so the guard can never see a partial object and decide
+    // direct while the resolver materializes.
+    decision = evaluateClaudeAppImage(options);
+  } catch (err) {
+    return { ok: false, reason: "appimage-eval-failed", message: err && err.message };
+  }
+  if (decision.materialize !== true) return { ok: true };
+  return {
+    ok: false,
+    reason: "resolver-fs-inconsistent",
+    message: "AppImage hook materialization always uses the real filesystem for the settings mutation; an injected fs cannot be shared with it",
+  };
+}
+
+// Production preflight contract shared by server and installer. Resolves and,
+// for a local AppImage, materializes the persistent generation so a caller can
+// prove the whole runtime exists BEFORE writing any settings. `requireStatusline`
+// additionally validates the statusline source closure in direct mode, where
+// resolveClaudeHookPaths does not read files.
+function preflightClaudeRuntime(options = {}) {
+  const resolved = resolveClaudeHookPaths(options, { materialize: true });
+  if (!resolved || resolved.ok !== true) {
+    return resolved || { ok: false, reason: "resolver-failed", message: "Claude hook path resolution failed" };
+  }
+  if (options.requireStatusline === true && resolved.mode === "direct") {
+    const missing = findMissingHookDependencies(["claude-statusline.js"], {
+      hooksDir: path.dirname(resolved.target.statusline),
+    });
+    if (missing.length) {
+      return { ok: false, reason: "source-script-missing", message: formatMissingHookDependencies(missing) };
+    }
+  }
+  return resolved;
+}
+
+// A hooks/ directory copied by hand can be missing a transitive dependency of
+// an entry point. That install still writes a perfectly valid settings.json,
+// so the installer prints success — and then every registered hook dies at
+// require time with MODULE_NOT_FOUND. Claude Code discards the stderr of
+// `async: true` hooks, so the failure is invisible from both ends: the user
+// sees a healthy install and a desktop pet that never moves.
+//
+// Walk the relative-require closure of the entry points we are about to
+// register and refuse to write while anything is missing. This mirrors the
+// manifest closure that test/remote-deploy.test.js enforces for HOOK_FILES,
+// except it runs against the directory actually being installed from. The
+// literal require grammar itself lives in the shared AppImage materializer so
+// this preflight and the closure collector can never disagree.
+function findMissingHookDependencies(entryNames, options = {}) {
+  const hooksDir = path.resolve(options.hooksDir || __dirname);
+  const statSync = options.statSync || fs.statSync;
+  const readFileSync = options.readFileSync || fs.readFileSync;
+  const missing = [];
+  const seen = new Set();
+  const queue = entryNames.map((name) => ({ name, from: null }));
+
+  while (queue.length) {
+    const entry = queue.shift();
+    const absPath = path.resolve(hooksDir, entry.name);
+    const name = path.relative(hooksDir, absPath).split(path.sep).join("/");
+    const { from } = entry;
+    if (seen.has(name)) continue;
+    seen.add(name);
+
+    if (!name || name === ".." || name.startsWith("../") || path.isAbsolute(name)) {
+      missing.push({ name, from, code: "OUTSIDE_HOOKS" });
+      continue;
+    }
+
+    let content;
+    try {
+      if (!statSync(absPath).isFile()) {
+        missing.push({ name, from, code: "NOT_FILE" });
+        continue;
+      }
+      content = readFileSync(absPath, "utf8");
+    } catch (err) {
+      missing.push({ name, from, code: err.code || "READ_FAILED" });
+      continue;
+    }
+
+    for (const spec of scanRelativeRequires(content)) {
+      const target = path.resolve(
+        path.dirname(absPath),
+        path.extname(spec) ? spec : `${spec}.js`
+      );
+      const relative = path.relative(hooksDir, target).split(path.sep).join("/");
+      queue.push({ name: relative, from: name });
+    }
+  }
+
+  return missing;
+}
+
+function formatMissingHookDependencies(missing) {
+  const lines = [
+    "Clawd: refusing to install — required hook files are unavailable.",
+    "",
+  ];
+  for (const { name, from, code } of missing) {
+    lines.push(`  ${name} [${code}]${from ? `  (required by ${from})` : ""}`);
+  }
+  lines.push(
+    "",
+    "Restore missing files from the same complete Clawd source directory.",
+    "For unreadable files, check their permissions; copying alone may not fix them.",
+    "For a manual WSL copy, include every top-level JavaScript file:",
+    "",
+    "  cp /path/to/clawd-on-desk/hooks/*.js ~/.claude/hooks/"
+  );
+  return lines.join("\n");
 }
 
 function buildCommandHookSpec(nodeBin, scriptPath, args = "", options = {}) {
@@ -1130,15 +1476,21 @@ function registerHooks(options = {}) {
   const remoteIdentity = requireRemoteInstallIdentity(options);
   const remotePermissionTransport = resolveRemotePermissionTransport(options);
   const hookPort = remoteIdentity ? remoteIdentity.remotePort : getHookServerPort(options.port);
-  const hookScript = getClaudeHookScriptPath();
   const platform = options.platform || process.platform;
   const wslDistro = resolveInstallWslDistro(options);
 
-  // Read existing settings
+  // Read existing settings. readJsonFile strips a single leading UTF-8 BOM
+  // (#657) so a BOM-prefixed canonical config can be merged instead of
+  // failing to parse. A valid-JSON non-object root is rejected here (thrown
+  // inside the try so the existing catch wraps it as a read failure) rather
+  // than being treated as an empty config and overwritten.
   let settings = {};
   let preExisting = false;
   try {
-    settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    settings = readJsonFile(settingsPath);
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      throw new Error("settings.json root must be a JSON object");
+    }
     preExisting = true;
   } catch (err) {
     if (err.code !== "ENOENT") {
@@ -1147,6 +1499,19 @@ function registerHooks(options = {}) {
   }
 
   if (!settings.hooks) settings.hooks = {};
+
+  // Resolve and (for a local Linux AppImage) materialize the persistent
+  // generation BEFORE any settings mutation. Failure here must abort the whole
+  // registration: writing a command toward a generation that was never
+  // completed would leave a permanently broken hook.
+  const resolvedHookPaths = resolveClaudeHookPaths(options, { materialize: true });
+  if (!resolvedHookPaths.ok) {
+    throw new Error(
+      `Failed to prepare Claude hook runtime: ${resolvedHookPaths.message || resolvedHookPaths.reason}`
+    );
+  }
+  const hookScript = resolvedHookPaths.target.state;
+  const autoStartScript = resolvedHookPaths.target.autoStart;
 
   // Resolve absolute node path — on macOS/Linux, Claude Code runs hooks with
   // a minimal PATH that excludes Homebrew, nvm, volta, etc.
@@ -1247,8 +1612,6 @@ function registerHooks(options = {}) {
 
   // Register auto-start hook for SessionStart (launches app if not running)
   if (options.autoStart) {
-    const autoStartScript = getClaudeAutoStartScriptPath();
-
     if (!Array.isArray(settings.hooks.SessionStart)) {
       settings.hooks.SessionStart = [];
       changed = true;
@@ -1276,17 +1639,18 @@ function registerHooks(options = {}) {
       skipped++;
     }
 
-    // Remove all legacy auto-start.sh entries if present
-    const beforeLen = settings.hooks.SessionStart.length;
-    settings.hooks.SessionStart = settings.hooks.SessionStart.filter((entry) => {
-      if (!entry || typeof entry !== "object") return true;
-      if (typeof entry.command === "string" && entry.command.includes(LEGACY_AUTO_START_MARKER)) return false;
-      if (Array.isArray(entry.hooks)) {
-        if (entry.hooks.some((h) => h && typeof h.command === "string" && h.command.includes(LEGACY_AUTO_START_MARKER))) return false;
-      }
-      return true;
-    });
-    if (settings.hooks.SessionStart.length < beforeLen) changed = true;
+    // Remove all legacy auto-start.sh entries if present. Match per sub-hook so
+    // a mixed wrapper keeps its third-party siblings (unlike the old
+    // whole-entry filter), and count each removal.
+    const legacyAutoStartResult = removeMatchingCommandHooks(
+      settings.hooks.SessionStart,
+      (command) => command.includes(LEGACY_AUTO_START_MARKER)
+    );
+    if (legacyAutoStartResult.changed) {
+      settings.hooks.SessionStart = legacyAutoStartResult.entries;
+      removed += legacyAutoStartResult.removed;
+      changed = true;
+    }
   }
 
   // Clean up stale command hooks for HTTP-only events.
@@ -1542,14 +1906,16 @@ async function registerHooksAsync(options = {}) {
   const remoteIdentity = requireRemoteInstallIdentity(options);
   const remotePermissionTransport = resolveRemotePermissionTransport(options);
   const hookPort = remoteIdentity ? remoteIdentity.remotePort : getHookServerPort(options.port);
-  const hookScript = getClaudeHookScriptPath();
   const platform = options.platform || process.platform;
   const wslDistro = resolveInstallWslDistro(options);
 
   let settings = {};
   let preExisting = false;
   try {
-    settings = JSON.parse(await fs.promises.readFile(settingsPath, "utf-8"));
+    settings = await readJsonFileAsync(settingsPath);
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      throw new Error("settings.json root must be a JSON object");
+    }
     preExisting = true;
   } catch (err) {
     if (err.code !== "ENOENT") {
@@ -1558,6 +1924,17 @@ async function registerHooksAsync(options = {}) {
   }
 
   if (!settings.hooks) settings.hooks = {};
+
+  // Same source/target resolution as registerHooks() — materialize before any
+  // settings mutation, and use the persistent target for every command.
+  const resolvedHookPaths = resolveClaudeHookPaths(options, { materialize: true });
+  if (!resolvedHookPaths.ok) {
+    throw new Error(
+      `Failed to prepare Claude hook runtime: ${resolvedHookPaths.message || resolvedHookPaths.reason}`
+    );
+  }
+  const hookScript = resolvedHookPaths.target.state;
+  const autoStartScript = resolvedHookPaths.target.autoStart;
 
   const nodeResolution = await resolveConfiguredNodeBinAsync(options, settings);
   const { nodeBin } = nodeResolution;
@@ -1644,8 +2021,6 @@ async function registerHooksAsync(options = {}) {
   }
 
   if (options.autoStart) {
-    const autoStartScript = getClaudeAutoStartScriptPath();
-
     if (!Array.isArray(settings.hooks.SessionStart)) {
       settings.hooks.SessionStart = [];
       changed = true;
@@ -1671,16 +2046,18 @@ async function registerHooksAsync(options = {}) {
       skipped++;
     }
 
-    const beforeLen = settings.hooks.SessionStart.length;
-    settings.hooks.SessionStart = settings.hooks.SessionStart.filter((entry) => {
-      if (!entry || typeof entry !== "object") return true;
-      if (typeof entry.command === "string" && entry.command.includes(LEGACY_AUTO_START_MARKER)) return false;
-      if (Array.isArray(entry.hooks)) {
-        if (entry.hooks.some((h) => h && typeof h.command === "string" && h.command.includes(LEGACY_AUTO_START_MARKER))) return false;
-      }
-      return true;
-    });
-    if (settings.hooks.SessionStart.length < beforeLen) changed = true;
+    // Remove all legacy auto-start.sh entries if present. Match per sub-hook so
+    // a mixed wrapper keeps its third-party siblings (unlike the old
+    // whole-entry filter), and count each removal.
+    const legacyAutoStartResult = removeMatchingCommandHooks(
+      settings.hooks.SessionStart,
+      (command) => command.includes(LEGACY_AUTO_START_MARKER)
+    );
+    if (legacyAutoStartResult.changed) {
+      settings.hooks.SessionStart = legacyAutoStartResult.entries;
+      removed += legacyAutoStartResult.removed;
+      changed = true;
+    }
   }
 
   // Migrate legacy HTTP-form Clawd PermissionRequest entries to the new
@@ -1971,35 +2348,25 @@ function unregisterAutoStart(options = {}) {
   const writePath = resolveWritePath(settingsPath);
   let settings;
   try {
-    settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    settings = readJsonFile(settingsPath);
   } catch {
     return false;
   }
 
-  const arr = settings.hooks && settings.hooks.SessionStart;
+  const arr = settings && settings.hooks && settings.hooks.SessionStart;
   if (!Array.isArray(arr)) return false;
 
-  const before = arr.length;
-  settings.hooks.SessionStart = arr.filter((entry) => {
-    if (!entry || typeof entry !== "object") return true;
-    // Remove auto-start.js entries
-    if (typeof entry.command === "string" && entry.command.includes(AUTO_START_MARKER)) return false;
-    if (Array.isArray(entry.hooks)) {
-      if (entry.hooks.some((h) => h && typeof h.command === "string" && h.command.includes(AUTO_START_MARKER))) return false;
-    }
-    // Remove legacy auto-start.sh entries
-    if (typeof entry.command === "string" && entry.command.includes(LEGACY_AUTO_START_MARKER)) return false;
-    if (Array.isArray(entry.hooks)) {
-      if (entry.hooks.some((h) => h && typeof h.command === "string" && h.command.includes(LEGACY_AUTO_START_MARKER))) return false;
-    }
-    return true;
-  });
+  // Remove only the managed sub-hooks. A whole-entry filter would drop a mixed
+  // wrapper's third-party siblings along with the managed command.
+  const result = removeMatchingCommandHooks(
+    arr,
+    (command) => command.includes(AUTO_START_MARKER) || command.includes(LEGACY_AUTO_START_MARKER)
+  );
+  if (!result.changed) return false;
 
-  if (settings.hooks.SessionStart.length < before) {
-    writeJsonAtomic(writePath, settings);
-    return true;
-  }
-  return false;
+  settings.hooks.SessionStart = result.entries;
+  writeJsonAtomic(writePath, settings);
+  return true;
 }
 
 /**
@@ -2009,7 +2376,7 @@ function unregisterAutoStart(options = {}) {
 function isAutoStartRegistered(options = {}) {
   const settingsPath = resolveClaudeSettingsPath(options);
   try {
-    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    const settings = readJsonFile(settingsPath);
     const arr = settings.hooks && settings.hooks.SessionStart;
     if (!Array.isArray(arr)) return false;
     return arr.some((entry) => {
@@ -2027,6 +2394,14 @@ function isAutoStartRegistered(options = {}) {
 
 const STATUSLINE_MARKER = "claude-statusline.js";
 const STATUSLINE_CHAIN_FLAG = "--chain";
+
+function writeLocalStatuslineSettings(file, settings, options) {
+  const mode = fs.statSync(file).mode & 0o777;
+  const backupPath = createBackup(file, options);
+  writeTextAtomic(file, JSON.stringify(settings, null, 2), { encoding: "utf8", mode });
+  if (backupPath) pruneOldBackups(file, options, backupPath);
+  return backupPath;
+}
 
 function hasClaudeSettingsDir(homeDir, options = {}) {
   return fs.existsSync(resolveClaudeHome({ ...options, homeDir }));
@@ -2057,11 +2432,16 @@ function readChainSidecarStatusLine(sidecarPath) {
 
 // Claude Code's statusLine setting is a single slot, not an event-keyed map
 // like hooks - only one script can render the visible status line at a
-// time. We only ever take that slot when it is empty or already ours, and
-// unregister only clears it when the command still carries our marker. A
-// user's own (or a third-party) statusline script is never touched. Mirrors
-// hooks/antigravity-install.js registerAntigravityStatusline.
+// time. Default registration only takes an empty/owned slot. Explicit local
+// coexistence preserves the original before wrapping it; remote --chain keeps
+// its separate historical contract.
 function registerClaudeStatusline(options = {}) {
+  // Lazy load so a partial manual copy can still run the CLI dependency
+  // preflight and report every missing runtime file before any mutation.
+  const {
+    LOCAL_CHAIN_FLAG, LOCAL_CHAIN_FILE, statuslineFingerprint,
+    createLocalChainRecord, requireOwnedLocalChain, resolveLocalChainShell,
+  } = require("./claude-statusline-local-chain");
   const homeDir = options.homeDir || os.homedir();
   const settingsPath = resolveClaudeSettingsPath({ ...options, homeDir });
   const writePath = resolveWritePath(settingsPath);
@@ -2070,6 +2450,47 @@ function registerClaudeStatusline(options = {}) {
   if (!options.settingsPath && !hasClaudeSettingsDir(homeDir, options)) {
     if (!options.silent) console.log("Clawd: Claude Code settings not found - skipping statusline registration");
     return { installed: false, changed: false, skippedExisting: false, settingsPath };
+  }
+
+  // Materialize and byte-verify the persistent generation BEFORE reading or
+  // writing any sidecar / settings.statusLine. A failed materialization must
+  // leave the recovery record and both files exactly as they were.
+  const resolvedHookPaths = resolveClaudeHookPaths({ ...options, homeDir }, { materialize: true });
+  if (!resolvedHookPaths.ok) {
+    return {
+      installed: false,
+      changed: false,
+      skippedExisting: false,
+      settingsPath,
+      error: {
+        reason: resolvedHookPaths.reason,
+        message: resolvedHookPaths.message
+          || "Failed to prepare the Claude statusline runtime",
+      },
+    };
+  }
+  const targetStatuslineScript = resolvedHookPaths.target.statusline;
+  // Direct mode does not materialize, so validate the statusline source and
+  // its static relative closure here before touching any settings or sidecar.
+  // Without this, a partial hand copy could register a command that dies at
+  // require time. (AppImage mode already byte-validated the closure via
+  // materialize.)
+  if (resolvedHookPaths.mode === "direct") {
+    const missingDeps = findMissingHookDependencies(["claude-statusline.js"], {
+      hooksDir: path.dirname(targetStatuslineScript),
+    });
+    if (missingDeps.length) {
+      return {
+        installed: false,
+        changed: false,
+        skippedExisting: false,
+        settingsPath,
+        error: {
+          reason: "source-script-missing",
+          message: formatMissingHookDependencies(missingDeps),
+        },
+      };
+    }
   }
 
   let settings = {};
@@ -2083,9 +2504,64 @@ function registerClaudeStatusline(options = {}) {
   const existing = settings.statusLine && typeof settings.statusLine === "object" ? settings.statusLine : null;
   const existingIsOurs = !!(existing && typeof existing.command === "string" && existing.command.includes(STATUSLINE_MARKER));
 
-  // Chain opt-in is remote-only in v1: the remote deploy path guarantees a
-  // POSIX shell, while a local Windows chain would need a cross-shell
-  // runner - the exact swamp buildPortableStatuslineCommand crawled out of.
+  if (options.expectedStatuslineFingerprint !== undefined
+    && statuslineFingerprint(existing) !== options.expectedStatuslineFingerprint) {
+    throw new Error("Claude statusline changed while confirmation was open; please try again");
+  }
+  const localSidecar = options.localChainSidecarPath
+    || path.join(options.settingsPath ? path.join(path.dirname(settingsPath), "hooks")
+      : resolveClaudeHooksDir({ ...options, homeDir }), LOCAL_CHAIN_FILE);
+  const localChainRequested = options.remote !== true && options.chainExisting === true;
+  if (existingIsOurs && existing.command.includes(` ${LOCAL_CHAIN_FLAG} `)) {
+    // Local consent cannot authorize a remote routing/mode migration. Refuse
+    // before refreshing either file; the two recovery records are independent.
+    if (options.remote === true) {
+      throw new Error("Claude statusline uses local coexistence; turn off local Claude usage collection on this account before remote deployment. "
+        + `Statusline and local recovery record kept unchanged: ${localSidecar}`);
+    }
+    const record = requireOwnedLocalChain(localSidecar, existing);
+    const platform = options.platform || process.platform;
+    if (record.platform !== platform) throw new Error("Statusline recovery record belongs to a different platform");
+    const script = targetStatuslineScript;
+    const nodeBin = options.nodeBin !== undefined ? options.nodeBin : resolveNodeBin();
+    const command = `${buildPortableStatuslineCommand(nodeBin || "node", script, { platform })} ${LOCAL_CHAIN_FLAG} ${record.id}`;
+    if (command === existing.command) {
+      return { installed: true, changed: false, skippedExisting: false, chained: true, localChained: true, settingsPath };
+    }
+    // Keep both exact owned commands during a path refresh so a failed/crashed
+    // settings write can still be restored. The original is never rewritten.
+    writeTextAtomic(localSidecar, JSON.stringify({ ...record, managedCommand: command, previousManagedCommand: existing.command }),
+      { encoding: "utf8", mode: 0o600 });
+    const current = readJsonFile(settingsPath);
+    if (statuslineFingerprint(current.statusLine || null) !== statuslineFingerprint(existing)) {
+      throw new Error("Claude statusline changed during refresh; recovery record was retained");
+    }
+    current.statusLine = { ...existing, command };
+    writeLocalStatuslineSettings(writePath, current, options);
+    return { installed: true, changed: true, skippedExisting: false, chained: true, localChained: true, settingsPath };
+  }
+  if (localChainRequested && existing && !existingIsOurs) {
+    if (existing.type !== "command" || typeof existing.command !== "string" || !existing.command.trim()) {
+      throw new Error("The existing Claude statusline is not a supported command; kept unchanged");
+    }
+    const platform = options.platform || process.platform;
+    resolveLocalChainShell({ platform, env: options.env, exists: options.shellExists });
+    const script = targetStatuslineScript;
+    const nodeBin = options.nodeBin !== undefined ? options.nodeBin : resolveNodeBin();
+    const portable = buildPortableStatuslineCommand(nodeBin || "node", script, { platform });
+    const record = createLocalChainRecord(localSidecar, existing, portable, platform);
+    // Re-read after saving recovery evidence, preserving unrelated changes
+    // made by another application while we prepared this registration.
+    const current = readJsonFile(settingsPath);
+    if (statuslineFingerprint(current.statusLine || null) !== statuslineFingerprint(existing)) {
+      throw new Error("Claude statusline changed during registration; recovery record was retained");
+    }
+    current.statusLine = { ...existing, command: record.managedCommand };
+    writeLocalStatuslineSettings(writePath, current, options);
+    return { installed: true, changed: true, skippedExisting: false, chained: true, localChained: true, settingsPath };
+  }
+
+  // Legacy remote chain is independent from the consent-bound local record.
   const chainRequested = options.remote === true && options.chainExisting === true;
   const chainExplicitlyDisabled = options.remote === true && options.chainExisting === false;
   const sidecarPath = options.chainSidecarPath
@@ -2093,7 +2569,10 @@ function registerClaudeStatusline(options = {}) {
 
   if (existing && !existingIsOurs && !chainRequested) {
     if (!options.silent) console.log(`Clawd: existing Claude Code statusline detected at ${settingsPath} - leaving it in place`);
-    return { installed: true, changed: false, skippedExisting: true, settingsPath };
+    return {
+      installed: true, changed: false, skippedExisting: true, settingsPath,
+      statuslineFingerprint: statuslineFingerprint(existing),
+    };
   }
 
   let chainActive = false;
@@ -2132,7 +2611,7 @@ function registerClaudeStatusline(options = {}) {
     chainActive = !chainExplicitlyDisabled && !!chainedOriginal;
   }
 
-  const scriptPath = asarUnpackedPath(path.resolve(__dirname, "claude-statusline.js").replace(/\\/g, "/"));
+  const scriptPath = targetStatuslineScript;
   const nodeBin = (options.nodeBin !== undefined ? options.nodeBin : resolveNodeBin()) || "node";
   const platform = options.platform || process.platform;
   // No `& "..."` here: statusLine has no shell field, and on Windows Claude
@@ -2172,6 +2651,9 @@ function registerClaudeStatusline(options = {}) {
 }
 
 function unregisterClaudeStatusline(options = {}) {
+  const {
+    LOCAL_CHAIN_FLAG, LOCAL_CHAIN_FILE, statuslineFingerprint, requireOwnedLocalChain,
+  } = require("./claude-statusline-local-chain");
   const homeDir = options.homeDir || os.homedir();
   const settingsPath = resolveClaudeSettingsPath({ ...options, homeDir });
   const writePath = resolveWritePath(settingsPath);
@@ -2188,6 +2670,27 @@ function unregisterClaudeStatusline(options = {}) {
 
   if (!existingIsOurs) {
     return { installed: !!existing, removed: 0, changed: false, settingsPath };
+  }
+
+  if (existing.command.includes(` ${LOCAL_CHAIN_FLAG} `)) {
+    const localSidecar = options.localChainSidecarPath
+      || path.join(options.settingsPath ? path.join(path.dirname(settingsPath), "hooks")
+        : resolveClaudeHooksDir({ ...options, homeDir }), LOCAL_CHAIN_FILE);
+    const record = requireOwnedLocalChain(localSidecar, existing);
+    const current = readJsonFile(settingsPath);
+    if (statuslineFingerprint(current.statusLine || null) !== statuslineFingerprint(existing)) {
+      throw new Error("Claude statusline changed during restoration; recovery record was retained");
+    }
+    current.statusLine = record.statusLine;
+    const backupPath = writeLocalStatuslineSettings(writePath, current, options);
+    // Never delete recovery evidence before the original settings are saved.
+    let recoveryRecordRetained = false;
+    try {
+      if (statuslineFingerprint(readJsonFile(localSidecar)) !== statuslineFingerprint(record)) {
+        recoveryRecordRetained = true;
+      } else fs.unlinkSync(localSidecar);
+    } catch { recoveryRecordRetained = true; }
+    return { installed: true, removed: 1, changed: true, restoredChained: true, recoveryRecordRetained, settingsPath, backupPath };
   }
 
   // A chained slot restores the user's original statusLine object from the
@@ -2231,6 +2734,13 @@ module.exports = {
   CLAUDE_CORE_HOOK_EVENTS: Object.freeze([...CORE_HOOKS]),
   getClaudeHookScriptPath,
   getClaudeAutoStartScriptPath,
+  getClaudeStatuslineScriptPath,
+  claudeSourceHookPaths,
+  evaluateClaudeAppImage,
+  checkClaudeMaterializationFs,
+  preflightClaudeRuntime,
+  resolveClaudeHookPaths,
+  resolveClaudeHookPathsReadOnly,
   resolveClaudeHome,
   resolveClaudeSettingsPath,
   resolveClaudeHooksDir,
@@ -2243,6 +2753,8 @@ module.exports = {
   registerClaudeStatusline,
   unregisterClaudeStatusline,
   __test: {
+    findMissingHookDependencies,
+    formatMissingHookDependencies,
     parseClaudeVersion,
     getWindowsClaudePathSuffixes,
     getClaudePathCandidates,
@@ -2287,13 +2799,21 @@ if (require.main === module) {
   try {
     const { remote, chainExisting, installStatusline } =
       parseClaudeInstallCliOptions(process.argv.slice(2));
-    registerHooks({ remote });
-    if (installStatusline) {
-      // Remote installs register the statusline automatically (with the
-      // CLAWD_REMOTE=1 env prefix) so quota can ride the SSH tunnel. Local
-      // debug/reinstall commands require --statusline and otherwise preserve
-      // the default-off collection preference and the user's visible slot.
-      registerClaudeStatusline({ remote, chainExisting });
+    // Check only what this invocation requests. auto-start.js is opt-in and
+    // is not registered by this CLI, so it must not become a prerequisite.
+    const entryPoints = ["clawd-hook.js"];
+    if (installStatusline) entryPoints.push("claude-statusline.js");
+    const missingDeps = findMissingHookDependencies(entryPoints);
+    if (missingDeps.length) {
+      console.error(formatMissingHookDependencies(missingDeps));
+      process.exitCode = 1;
+    } else {
+      registerHooks({ remote });
+      if (installStatusline) {
+        // Remote installs also register statusline. Local commands opt in
+        // only with --statusline and otherwise preserve the visible slot.
+        registerClaudeStatusline({ remote, chainExisting });
+      }
     }
   } catch (err) {
     console.error(err.message);
