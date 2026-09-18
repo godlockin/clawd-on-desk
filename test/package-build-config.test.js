@@ -55,6 +55,9 @@ describe("package build config", () => {
       const workflow = fs.readFileSync(workflowPath, "utf8");
       assert.match(workflow, /pull_request:/);
       assert.match(workflow, /npm run audit:assets/);
+      assert.match(workflow, /npm run audit:pr-history-assets/);
+      assert.match(workflow, /PR_BASE_SHA:\s*\$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+      assert.match(workflow, /PR_HEAD_SHA:\s*\$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
       assert.match(workflow, /test\/preload-settings\.test\.js/);
       assert.match(workflow, /test\/state-agent-icons\.test\.js/);
       for (const testFile of [
