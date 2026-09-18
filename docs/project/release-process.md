@@ -14,6 +14,14 @@ npm test
 npm run audit:assets
 ```
 
+Official downloadable themes (for example Hash Sage) ship as versioned GitHub
+Release assets in the separate `rullerzhou-afk/clawd-themes` repository, never
+inside Clawd. Before tagging, confirm the packaged resources still contain no
+`themes/hash-sage/**` payload and that `npm run audit:assets` reports the
+tracked-tree budget within policy. On a pull request, the
+`audit:pr-history-assets` gate additionally proves no large official-theme
+media entered the PR's reachable history.
+
 4. Run the `Build & Release` workflow manually on `main`.
 
 For macOS Developer ID certificate creation, App Store Connect Team API key
@@ -186,6 +194,19 @@ Required all-platform checks:
   confirm state + Notification events arrive without Clawd taking over approval.
 - Install MiMo Code into a commented/trailing-comma JSONC config, exercise
   Allow/Always/Deny and DND fallback, then uninstall and confirm user config is preserved.
+- Windows packaged opencode acceptance (#1026, requires a real opencode 1.18.31):
+  install the Program Files Clawd package, confirm the opencode config points at
+  `%USERPROFILE%\.clawd\integrations\...\generations\<hash>\opencode-plugin` (never
+  `app.asar.unpacked`), and that the managed four-file generation bytes/hash match the
+  packaged source with no deny-write ACL. Start a real opencode session and confirm
+  exactly one Clawd state stream and one permission request per interaction (no double
+  load from a duplicate entry). Restart Clawd twice and confirm startup sync is
+  idempotent. Repair a single legacy/missing legacy entry and confirm in-place
+  migration with the source untouched; arrange a modified Clawd-like copy and confirm
+  Install/Repair fail closed with Doctor needs-review and no Fix. Uninstall and confirm
+  proven-owned entries are gone, Settings shows uninstalled/disabled, third-party
+  plugin/tuple/options are unchanged, and residual generation files (if any) no longer
+  emit events after Clawd is removed. Source-level tests do not satisfy this item.
 - Settings -> Agents -> Install Reasonix succeeds on Windows when paths contain
   spaces, and the written command uses the EncodedCommand path when needed.
 - Install TraeCode on Windows with Node under `C:\Program Files`, enable the

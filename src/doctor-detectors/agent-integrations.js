@@ -24,6 +24,7 @@ const {
   KIMI_HOOK_EVENTS,
 } = require("../../hooks/kimi-install");
 const { parseTomlSections: parseCodewhaleTomlSections } = require("../../hooks/codewhale-install");
+const { findStandaloneBridge, listOtherOmpProfileAgentDirs } = require("../../hooks/omp-install");
 const { getAgentDescriptors } = require("./agent-descriptors");
 const {
   commandContainsFragment,
@@ -33,11 +34,21 @@ const {
 const { checkCodexHookTrust, checkCodexHooksFeature } = require("./codex-features-check");
 const { inspectStableCodexHookCommand } = require("../../hooks/codex-install-utils");
 const { validateOpencodeEntry } = require("./opencode-entry-validator");
+const { inspectManagedOpencode } = require("./opencode-managed-inspector");
 const { validateOpenClawEntry } = require("./openclaw-entry-validator");
+const { inspectGrokHookFile } = require("../../hooks/grok-install");
 const { hasIncludeDirective } = require("../../hooks/openclaw-install");
 const { inspectDeepSeekHarnessDiskSync } = require("../../hooks/dsh-install");
 
-const REPAIRABLE_AGENT_STATUSES = new Set(["not-connected", "broken-path"]);
+const REPAIRABLE_AGENT_STATUSES = new Set([
+  "not-connected",
+  "broken-path",
+  // #1026 managed OpenCode: a safe migration (legacy source / verified copy /
+  // owned stale generation / single missing legacy path) and safe duplicate
+  // convergence both have a real Repair path.
+  "legacy-path",
+  "duplicate-entry",
+]);
 const GEMINI_HOOKS_DISABLED_DETAIL = "Gemini hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events";
 const ANTIGRAVITY_HOOKS_DISABLED_DETAIL = "Antigravity Clawd hooks are disabled in hooks.json; Clawd preserves this user setting and will not receive hook events";
 const QWEN_HOOKS_DISABLED_DETAIL = "Qwen Code hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events";
@@ -264,6 +275,16 @@ function withAgentFixAction(detail, descriptor) {
   if (!descriptor.autoInstall || !REPAIRABLE_AGENT_STATUSES.has(detail.status)) return detail;
   if (detail.supplementary && detail.supplementary.key === "hook_group") return detail;
   if (
+    descriptor.agentId === "grok-build"
+    && detail.supplementary
+    && detail.supplementary.key === "grok_hooks"
+    && (detail.supplementary.value === "foreign-file" || detail.supplementary.value === "config-corrupt")
+  ) {
+    // Re-running the installer on a foreign or unparseable file fails closed,
+    // so a Fix button would be an ineffective loop.
+    return detail;
+  }
+  if (
     descriptor.agentId === "gemini-cli"
     && detail.supplementary
     && detail.supplementary.key === "gemini_hooks"
@@ -355,6 +376,8 @@ function statusLevel(status) {
     || status === "broken-path"
     || status === "config-corrupt"
     || status === "needs-review"
+    || status === "legacy-path"
+    || status === "duplicate-entry"
   ) {
     return "warning";
   }
@@ -1449,6 +1472,11 @@ function applyAntigravitySupplementary(detail, descriptor, settings) {
 // miss the live one (#607 review). Only opencode-family JSONC members set
 // configCandidates, so this always funnels into checkOpencodeSettings.
 function checkMergedJsoncConfig(descriptor, options) {
+  // #1026: managed members use the ownership/manifest/generation inspector.
+  // MiMo (managedMaterialization:false) keeps the baseline path below.
+  if (descriptor.managedMaterialization === true) {
+    return inspectManagedOpencode(descriptor, options);
+  }
   const existing = [];
   for (const candidate of descriptor.configCandidates) {
     if (!fileExists(options.fs, candidate)) continue;
@@ -1600,6 +1628,86 @@ function checkCopilotHooksMode(descriptor, options) {
     configFileExists: true,
     configPath: descriptor.configPath,
   };
+}
+
+// Grok Build uses a dedicated inspector: the resolved path depends on
+// GROK_HOME, and ownership is the structured handler marker in `env`, not a
+// filename substring. Doctor and the installation detector share this verdict,
+// so a misreported state can never send Fix to a different path than Install.
+function checkGrokHooksMode(descriptor, options) {
+  const inspected = inspectGrokHookFile({
+    fs: options.fs,
+    env: options.env,
+    homeDir: options.homeDir,
+  });
+  const base = {
+    parentDirExists: inspected.parentDirExists,
+    configFileExists: inspected.configFileExists,
+    configPath: inspected.configPath,
+    grokHealth: inspected.health,
+  };
+  let detail;
+  if (inspected.health === "healthy") {
+    detail = makeDetail(descriptor, "ok", {
+      level: null,
+      detail: `Verified structured Clawd handler in ${inspected.configPath}`,
+      ...base,
+    });
+  } else if (inspected.health === "incomplete") {
+    // Re-running the installer repairs a partial or non-canonical managed set,
+    // so this stays a repairable "broken-path" (with a Fix action).
+    detail = makeDetail(descriptor, "broken-path", {
+      level: "warning",
+      detail: inspected.detail || "Clawd-managed Grok handlers are incomplete",
+      ...base,
+    });
+  } else if (inspected.health === "needs-review") {
+    // Stale PR-preview `clawd.json`: Clawd must not mutate either file, so no
+    // Fix action is offered. Settings Install is blocked by the installer's
+    // needs-review result.
+    detail = makeDetail(descriptor, "needs-review", {
+      level: "warning",
+      detail: inspected.detail || "A stale PR-preview Grok hook file requires manual review",
+      ...base,
+      supplementary: { key: "grok_hooks", value: "stale-preview" },
+      stalePreviewPath: inspected.previewPath,
+    });
+  } else if (inspected.health === "foreign-file") {
+    detail = makeDetail(descriptor, "needs-review", {
+      level: "warning",
+      detail: `${inspected.configPath} exists but is not owned by Clawd; Clawd will not modify it`,
+      ...base,
+      supplementary: { key: "grok_hooks", value: "foreign-file" },
+    });
+  } else if (inspected.health === "config-corrupt") {
+    detail = makeDetail(descriptor, "config-corrupt", {
+      level: "warning",
+      detail: inspected.detail || `${inspected.configPath} could not be parsed`,
+      ...base,
+      supplementary: { key: "grok_hooks", value: "config-corrupt" },
+    });
+  } else if (inspected.health === "not-connected") {
+    detail = makeDetail(descriptor, "not-connected", {
+      level: "warning",
+      detail: `${inspected.configPath} missing`,
+      ...base,
+    });
+  } else {
+    detail = makeDetail(descriptor, "not-installed", {
+      level: "info",
+      detail: `${inspected.grokHome} missing`,
+      ...base,
+    });
+  }
+  if (inspected.stalePreview) {
+    detail = {
+      ...detail,
+      stalePreview: true,
+      stalePreviewPath: inspected.previewPath,
+      detail: `${detail.detail}. ${inspected.warnings.join(" ")}`.trim(),
+    };
+  }
+  return detail;
 }
 
 function checkTomlTextMode(descriptor, options) {
@@ -2309,22 +2417,57 @@ function readJsonIfPresent(fsImpl, filePath) {
   }
 }
 
-function isPiManagedMarker(value) {
+// Pi and OMP install the same shape: a Clawd-managed directory holding the
+// entry file, the core it imports next to it, and an ownership marker. The
+// integration id lives in the config mode ("pi-extension" → "pi",
+// "omp-extension" → "omp"), so one checker serves both instead of a copy per
+// agent. The marker check in particular must not be hard-coded to Pi: an OMP
+// install writes `integration: "omp"`, and a Pi-only validator reports that
+// healthy install as needs-review forever.
+const EXTENSION_CONFIG_MODES = Object.freeze(["pi-extension", "omp-extension"]);
+
+function isExtensionConfigMode(configMode) {
+  return EXTENSION_CONFIG_MODES.includes(configMode);
+}
+
+function extensionIntegrationId(descriptor) {
+  return String(descriptor.configMode || "").replace(/-extension$/, "");
+}
+
+function isExtensionManagedMarker(value, integrationId) {
   return !!(
     value
     && value.app === "clawd-on-desk"
-    && value.integration === "pi"
+    && value.integration === integrationId
     && value.managed === true
   );
 }
 
-function checkPiExtensionMode(descriptor, options) {
+function checkExtensionMode(descriptor, options) {
+  const integrationId = extensionIntegrationId(descriptor);
+  const agentName = descriptor.agentName || integrationId;
   const extensionDir = descriptor.configPath;
   const markerPath = path.join(extensionDir, descriptor.markerFile || ".clawd-managed.json");
   const extensionPath = path.join(extensionDir, descriptor.marker || "index.ts");
-  const corePath = path.join(extensionDir, descriptor.coreFile || "pi-extension-core.js");
+  const corePath = path.join(extensionDir, descriptor.coreFile || `${integrationId}-extension-core.js`);
+  const extensionDirExists = dirExists(options.fs, extensionDir);
+  const standaloneBridge = integrationId === "omp"
+    ? findStandaloneBridge({ extensionDir, fs: options.fs })
+    : null;
 
-  if (!dirExists(options.fs, extensionDir)) {
+  if (!extensionDirExists && standaloneBridge) {
+    return makeDetail(descriptor, "manual-managed", {
+      level: "info",
+      parentDirExists: true,
+      configFileExists: true,
+      configPath: standaloneBridge,
+      extensionDir,
+      standaloneBridge,
+      detail: `${standaloneBridge} community bridge is active; the Clawd-managed OMP extension is intentionally absent`,
+    });
+  }
+
+  if (!extensionDirExists) {
     return makeDetail(descriptor, "not-connected", {
       level: "warning",
       parentDirExists: true,
@@ -2336,7 +2479,19 @@ function checkPiExtensionMode(descriptor, options) {
   }
 
   const marker = readJsonIfPresent(options.fs, markerPath);
-  if (!isPiManagedMarker(marker)) {
+  if (standaloneBridge && isExtensionManagedMarker(marker, integrationId)) {
+    return makeDetail(descriptor, "broken-path", {
+      level: "warning",
+      parentDirExists: true,
+      configFileExists: true,
+      configPath: extensionDir,
+      extensionDir,
+      markerPath,
+      standaloneBridge,
+      detail: `${extensionDir} and ${standaloneBridge} are both active; Fix retires Clawd's managed copy to prevent duplicate OMP events`,
+    });
+  }
+  if (!isExtensionManagedMarker(marker, integrationId)) {
     return makeDetail(descriptor, "needs-review", {
       level: "warning",
       parentDirExists: true,
@@ -2344,7 +2499,10 @@ function checkPiExtensionMode(descriptor, options) {
       configPath: extensionDir,
       extensionDir,
       markerPath,
-      detail: `${extensionDir} exists but is not Clawd-managed`,
+      standaloneBridge,
+      detail: standaloneBridge
+        ? `${extensionDir} is not Clawd-managed and ${standaloneBridge} also exists; OMP may report duplicate events`
+        : `${extensionDir} exists but is not Clawd-managed`,
     });
   }
 
@@ -2362,7 +2520,7 @@ function checkPiExtensionMode(descriptor, options) {
       corePath,
       extensionFileExists,
       coreFileExists,
-      detail: "Pi extension files are missing or incomplete",
+      detail: `${agentName} extension files are missing or incomplete`,
     });
   }
 
@@ -2466,6 +2624,14 @@ function checkAgent(descriptor, options) {
     return withAgentFixAction(withAgentBubbleNote(detail, prefs, descriptor.agentId), descriptor);
   }
 
+  if (descriptor.configMode === "grok-hooks") {
+    // Dynamic GROK_HOME path + structured ownership are resolved by the shared
+    // inspector, so this branch must not rely on the static descriptor path or
+    // the generic parent-dir check below.
+    const grokDetail = checkGrokHooksMode(descriptor, options);
+    return withAgentFixAction(withAgentBubbleNote(grokDetail, prefs, descriptor.agentId), descriptor);
+  }
+
   // Multi-home agents declare ordered configTargets. Most use the first
   // existing directory; WorkBuddy's legacy target requires a real config file,
   // while Reasonix mirrors its own compatibility loader by preferring an
@@ -2510,8 +2676,8 @@ function checkAgent(descriptor, options) {
     detail = checkCodewhaleHooksTomlMode(descriptor, options);
   } else if (descriptor.configMode === "dir") {
     detail = checkKiroDirMode(descriptor, options);
-  } else if (descriptor.configMode === "pi-extension") {
-    detail = checkPiExtensionMode(descriptor, options);
+  } else if (isExtensionConfigMode(descriptor.configMode)) {
+    detail = checkExtensionMode(descriptor, options);
   } else if (descriptor.configMode === "openclaw-plugin") {
     detail = checkOpenClawPluginMode(descriptor, options);
   } else if (descriptor.configMode === "plugin-dir") {
@@ -2527,6 +2693,9 @@ function checkAgent(descriptor, options) {
 
   if (descriptor.agentId === "kimi-cli") {
     detail = withKimiLegacyPermissionModeSupplement(detail, descriptor, options);
+  }
+  if (descriptor.agentId === "omp") {
+    detail = withOmpProfileNotice(detail, options);
   }
   detail = withClaudeHookGuardNotice(detail, descriptor, options);
   detail = withTraeCodeEnableNotice(detail, descriptor);
@@ -2601,6 +2770,29 @@ function withKimiLegacyPermissionModeSupplement(detail, descriptor, options) {
   };
 }
 
+// Clawd installs into the ONE OMP agent directory it resolves for its own
+// environment. A machine that also runs OMP under another profile (including
+// the default profile) therefore has sessions that load nothing from it — the
+// extension directory is per-profile.
+// Reporting a bare "verified" there is a claim Clawd cannot make, so the note
+// names the unmanaged profiles (setting OMP_PROFILE for Clawd, or re-running
+// the installer from that profile's shell, is the fix). Never masks a finding.
+function withOmpProfileNotice(detail, options) {
+  if (detail.status !== "ok" && detail.status !== "manual-managed") return detail;
+  const unmanaged = listOtherOmpProfileAgentDirs({
+    env: options.env,
+    homeDir: options.homeDir,
+    fs: options.fs,
+  });
+  if (!unmanaged.length) return detail;
+  const names = unmanaged.map((entry) => entry.profile).join(", ");
+  return {
+    ...detail,
+    detail: `${detail.detail}; ${unmanaged.length} other OMP profile(s) are not managed here (${names}) — Clawd resolves one OMP agent directory per environment`,
+    unmanagedOmpProfiles: unmanaged.map((entry) => entry.profile),
+  };
+}
+
 function summarize(details) {
   const counts = {};
   for (const detail of details) {
@@ -2655,7 +2847,7 @@ module.exports = {
     checkFileMode,
     checkKiroDirMode,
     checkOpenClawPluginMode,
-    checkPiExtensionMode,
+    checkExtensionMode,
     checkPluginDirMode,
     checkAntigravityHooksMode,
     findAntigravityHookCommandsForEvent,

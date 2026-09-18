@@ -21,6 +21,7 @@ describe("doctor agent descriptors", () => {
         "antigravity-cli",
         "codebuddy",
         "workbuddy",
+        "grok-build",
         "kiro-cli",
         "kimi-cli",
         "qwen-code",
@@ -29,6 +30,7 @@ describe("doctor agent descriptors", () => {
         "opencode",
         "mimocode",
         "pi",
+        "omp",
         "openclaw",
         "hermes",
         "qoder",
@@ -89,6 +91,12 @@ describe("doctor agent descriptors", () => {
       getAgentDescriptor("workbuddy").configTargets.map((target) => target.configPath),
       [workbuddy.CURRENT_CONFIG_PATH, workbuddy.LEGACY_CONFIG_PATH]
     );
+
+    const grok = require("../hooks/grok-install");
+    assert.strictEqual(getAgentDescriptor("grok-build").parentDir, grok.DEFAULT_PARENT_DIR);
+    assert.strictEqual(getAgentDescriptor("grok-build").configPath, grok.DEFAULT_CONFIG_PATH);
+    assert.strictEqual(getAgentDescriptor("grok-build").marker, grok.MARKER);
+    assert.deepStrictEqual(getAgentDescriptor("grok-build").hookEvents, grok.GROK_HOOK_EVENTS);
 
     assert.strictEqual(getAgentDescriptor("kiro-cli").parentDir, kiro.DEFAULT_PARENT_DIR);
     assert.strictEqual(getAgentDescriptor("kiro-cli").configPath, kiro.DEFAULT_AGENTS_DIR);
@@ -285,6 +293,65 @@ describe("doctor agent descriptors", () => {
     }
   });
 
+  it("checks OMP extensions with the dedicated omp-extension mode", () => {
+    const omp = require("../hooks/omp-install");
+    const descriptor = getAgentDescriptor("omp");
+
+    assert.strictEqual(descriptor.eventSource, "extension");
+    assert.strictEqual(descriptor.configMode, "omp-extension");
+    assert.strictEqual(descriptor.autoInstall, true);
+    assert.strictEqual(descriptor.marker, omp.EXTENSION_FILE);
+    assert.strictEqual(descriptor.coreFile, omp.CORE_FILE);
+    assert.strictEqual(descriptor.markerFile, omp.MARKER_FILE);
+  });
+
+  it("OMP descriptor resolves its agent directory at module-load time", () => {
+    // OMP loads extensions from the ACTIVE agent directory, which
+    // PI_CONFIG_DIR / PI_CODING_AGENT_DIR / OMP_PROFILE move. A descriptor
+    // frozen to the default would have Doctor judge — and the installation
+    // detector look in — a directory OMP never reads.
+    const path = require("node:path");
+    const os = require("node:os");
+    const fs = require("node:fs");
+
+    const tempAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-omp-agent-dir-"));
+    const prevEnv = {
+      PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+      OMP_PROFILE: process.env.OMP_PROFILE,
+      PI_PROFILE: process.env.PI_PROFILE,
+    };
+    process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+    delete process.env.OMP_PROFILE;
+    delete process.env.PI_PROFILE;
+
+    const installerPath = require.resolve("../hooks/omp-install");
+    const descriptorsPath = require.resolve("../src/doctor-detectors/agent-descriptors");
+    const prevInstallerCache = require.cache[installerPath];
+    const prevDescriptorsCache = require.cache[descriptorsPath];
+    delete require.cache[installerPath];
+    delete require.cache[descriptorsPath];
+
+    try {
+      const descriptor = require("../src/doctor-detectors/agent-descriptors").getAgentDescriptor("omp");
+      assert.strictEqual(descriptor.parentDir, tempAgentDir,
+        "descriptor.parentDir should follow PI_CODING_AGENT_DIR");
+      assert.strictEqual(
+        descriptor.configPath,
+        path.join(tempAgentDir, "extensions", "clawd-on-desk")
+      );
+    } finally {
+      if (prevInstallerCache) require.cache[installerPath] = prevInstallerCache;
+      else delete require.cache[installerPath];
+      if (prevDescriptorsCache) require.cache[descriptorsPath] = prevDescriptorsCache;
+      else delete require.cache[descriptorsPath];
+      for (const [key, value] of Object.entries(prevEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
   it("checks Qoder hooks as a state-only nested settings file", () => {
     const qoder = require("../hooks/qoder-install");
     const descriptor = getAgentDescriptor("qoder");
@@ -347,5 +414,17 @@ describe("doctor agent descriptors", () => {
       descriptor.configTargets.map((target) => target.configPath),
       [workbuddy.CURRENT_CONFIG_PATH, workbuddy.LEGACY_CONFIG_PATH]
     );
+  });
+
+  it("checks Grok Build hooks as a state-only nested settings file", () => {
+    const grok = require("../hooks/grok-install");
+    const descriptor = getAgentDescriptor("grok-build");
+
+    assert.strictEqual(descriptor.eventSource, "hook");
+    assert.strictEqual(descriptor.configMode, "grok-hooks");
+    assert.strictEqual(descriptor.nested, true);
+    assert.strictEqual(descriptor.autoInstall, true);
+    assert.strictEqual(descriptor.marker, grok.MARKER);
+    assert.deepStrictEqual(descriptor.hookEvents, grok.GROK_HOOK_EVENTS);
   });
 });
