@@ -132,6 +132,7 @@ function installOptions(harness, cli, overrides = {}) {
     runDshCommand: cli.runDshCommand,
     clawdVersion: "1.2.3",
     dshVersion: SUPPORTED_DSH_VERSION,
+    dshInstallRoot: null,
     silent: true,
     ...overrides,
   };
@@ -142,7 +143,10 @@ test("DSH detection is async and distinguishes the host from the managed plugin"
   t.after(() => fs.rmSync(harness.root, { recursive: true, force: true }));
   assert.strictEqual(await isDshInstalled({ dshHome: harness.dshHome }), true);
   assert.strictEqual(await isBridgeInstalled({ dshHome: harness.dshHome, resolveCommandForInspection: false }), false);
-  assert.strictEqual(inspectDeepSeekHarnessDiskSync({ dshHome: harness.dshHome }).status, "absent");
+  assert.strictEqual(inspectDeepSeekHarnessDiskSync({
+    dshHome: harness.dshHome,
+    dshInstallRoot: null,
+  }).status, "absent");
 });
 
 test("an empty home without a CLI is not a DSH installation", async (t) => {
@@ -608,7 +612,10 @@ test("unsupported DSH versions fail before pnpm or profile mutation", async (t) 
   assert.strictEqual(result.reason, "version-unsupported");
   assert.strictEqual(result.detectedVersion, "0.1.0-rc.7");
   assert.deepStrictEqual(cli.calls, []);
-  assert.strictEqual(inspectDeepSeekHarnessDiskSync({ dshHome: harness.dshHome }).status, "absent");
+  assert.strictEqual(inspectDeepSeekHarnessDiskSync({
+    dshHome: harness.dshHome,
+    dshInstallRoot: null,
+  }).status, "absent");
 });
 
 test("npx-only hosts get an exact manual command and can later pass read-only verification", async (t) => {
@@ -1144,6 +1151,7 @@ test("the official profiles/node_modules fallback participates in health resolut
   const health = inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   });
   assert.strictEqual(health.status, "healthy");
   assert.strictEqual(health.resolved.anchor, "profiles-fallback");
@@ -1163,6 +1171,7 @@ test("a healthy profile-local winner ignores a foreign lower-priority profiles f
   const health = inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   });
   assert.strictEqual(health.status, "healthy");
   assert.strictEqual(health.resolved.anchor, "profile");
@@ -1227,7 +1236,10 @@ test("uninstall uses the official remove command and verifies the resolved packa
   assert.strictEqual(result.skipped, false);
   assert.deepStrictEqual(cli.calls[1], ["plugin", "--profile", "web", "remove", BRIDGE_PACKAGE_NAME]);
   assert.strictEqual(fs.existsSync(packageDir(harness.profileDir)), false);
-  assert.strictEqual(inspectDeepSeekHarnessDiskSync({ dshHome: harness.dshHome }).status, "absent");
+  assert.strictEqual(inspectDeepSeekHarnessDiskSync({
+    dshHome: harness.dshHome,
+    dshInstallRoot: null,
+  }).status, "absent");
 });
 
 test("uninstall models and unlinks the exact managed profile junction observed after real rc.6 pnpm remove", async (t) => {
@@ -1246,6 +1258,7 @@ test("uninstall models and unlinks the exact managed profile junction observed a
   assert.strictEqual(inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   }).status, "absent");
 });
 
@@ -1259,6 +1272,7 @@ test("explicit uninstall cleans an unreferenced generation after a complete manu
   assert.strictEqual(inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   }).status, "absent");
   assert.strictEqual(fs.existsSync(installed.generation), true);
 
@@ -1296,6 +1310,7 @@ test("npx-only uninstall cleans the exact managed junction left by a manual offi
   assert.strictEqual(inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   }).status, "managed-residue");
 
   let lockObservedDuringUnlink = false;
@@ -1320,6 +1335,7 @@ test("npx-only uninstall cleans the exact managed junction left by a manual offi
   assert.strictEqual(inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   }).status, "absent");
 });
 
@@ -1376,6 +1392,7 @@ test("an interrupted managed residue isolation fences retries and preserves ever
   const syncHealth = inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   });
   assert.strictEqual(syncHealth.status, "inspection-required");
   assert.strictEqual(syncHealth.healthReason, "profile-removal-residue");
@@ -1521,6 +1538,7 @@ test("uninstall succeeds when DSH leaves a lower-priority flat fallback behind",
   assert.strictEqual(inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   }).status, "absent");
 });
 
@@ -1638,6 +1656,7 @@ test("a corrupt web profile is never rewritten by install or startup repair", as
   assert.strictEqual(inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   }).status, "profile-corrupt");
   assert.strictEqual(fs.readFileSync(manifestPath, "utf8"), "{ not-json");
 });
@@ -1672,6 +1691,7 @@ test("unknown add results persist an inspection latch and startup never replays 
   assert.strictEqual(inspectDeepSeekHarnessDiskSync({
     dshHome: harness.dshHome,
     managedRoot: harness.managedRoot,
+    dshInstallRoot: null,
   }).status, "inspection-required");
 
   const good = makeOfficialCli(harness);
@@ -1797,7 +1817,10 @@ test("a supported host version change under the lock aborts before plugin mutati
   assert.strictEqual(result.detectedVersion, "0.1.1-rc.2");
   assert.strictEqual(probes, 2);
   assert.deepStrictEqual(cli.calls, []);
-  assert.strictEqual(inspectDeepSeekHarnessDiskSync({ dshHome: harness.dshHome }).status, "absent");
+  assert.strictEqual(inspectDeepSeekHarnessDiskSync({
+    dshHome: harness.dshHome,
+    dshInstallRoot: null,
+  }).status, "absent");
 });
 
 test("newer managed generations win and same-version hash conflicts require explicit repair", async (t) => {
@@ -1899,7 +1922,10 @@ test("rc.6 hosts install, repair, and uninstall under their own contract", async
   const removed = await uninstallDeepSeekHarnessBridge(installOptions(harness, cli, { dshVersion: "0.1.0-rc.6" }));
   assert.strictEqual(removed.status, "ok");
   assert.strictEqual(removed.removed, true);
-  assert.strictEqual(inspectDeepSeekHarnessDiskSync({ dshHome: harness.dshHome }).status, "absent");
+  assert.strictEqual(inspectDeepSeekHarnessDiskSync({
+    dshHome: harness.dshHome,
+    dshInstallRoot: null,
+  }).status, "absent");
 });
 
 test("rc.2 installs record the preferred contract in the marker", async (t) => {

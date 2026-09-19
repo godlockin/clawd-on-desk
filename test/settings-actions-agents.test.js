@@ -557,6 +557,53 @@ test("settings agent actions repair Codex with the forced hooks feature option",
   ]);
 });
 
+test("settings agent actions execute Pi and OMP Doctor repairs", async () => {
+  for (const agentId of ["pi", "omp"]) {
+    const snapshot = prefs.getDefaults();
+    snapshot.agents[agentId] = {
+      ...snapshot.agents[agentId],
+      integrationInstalled: true,
+      enabled: true,
+    };
+    const calls = [];
+    const result = await agentCommands.repairAgentIntegration({ agentId }, {
+      snapshot,
+      repairIntegrationForAgent: async (id, options) => {
+        calls.push({ id, options });
+        return { status: "ok", message: `${id} repaired` };
+      },
+    });
+
+    assert.strictEqual(result.status, "ok", agentId);
+    assert.deepStrictEqual(calls, [{
+      id: agentId,
+      options: { forceCodexHooksFeature: false },
+    }]);
+  }
+});
+
+test("settings agent actions accept an OMP community bridge as a healthy repair result", async () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.omp = {
+    ...snapshot.agents.omp,
+    integrationInstalled: true,
+    enabled: true,
+  };
+
+  const result = await agentCommands.repairAgentIntegration({ agentId: "omp" }, {
+    snapshot,
+    repairIntegrationForAgent: async () => ({
+      status: "skipped",
+      reason: "standalone-bridge-present",
+      message: "clawd-on-desk-omp.ts already bridges OMP; skipped extension sync",
+    }),
+  });
+
+  assert.strictEqual(result.status, "ok");
+  assert.strictEqual(result.reason, "standalone-bridge-present");
+  assert.match(result.message, /already bridges OMP/);
+});
+
 test("settings agent actions repair CodeBuddy with an explicit permission target", async () => {
   const customSnapshot = prefs.getDefaults();
   customSnapshot.agents.codebuddy.integrationInstalled = true;
@@ -1014,6 +1061,13 @@ test("every opencode-family member is installable AND auto-repairable (R10 P3)",
       agentCommands.AUTO_REPAIRABLE_AGENT_IDS.has(agentId),
       `${agentId} missing from AUTO_REPAIRABLE_AGENT_IDS`
     );
+  }
+});
+
+test("every extension-mode agent with a Doctor Fix is auto-repairable", () => {
+  for (const agentId of ["pi", "omp"]) {
+    assert.ok(agentCommands.INSTALLABLE_AGENT_IDS.has(agentId), `${agentId} must be installable`);
+    assert.ok(agentCommands.AUTO_REPAIRABLE_AGENT_IDS.has(agentId), `${agentId} must be auto-repairable`);
   }
 });
 
