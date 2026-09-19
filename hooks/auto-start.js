@@ -79,6 +79,13 @@ function resolveMacBundleExecutable(appBundle, options = {}) {
   return path.posix.join(appBundle, "Contents", "MacOS", executableName);
 }
 
+function isPosixInside(dir, target) {
+  const root = String(dir || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  const child = String(target || "").replace(/\\/g, "/");
+  if (!root || !child) return false;
+  return child === root || child.startsWith(`${root}/`);
+}
+
 function resolveAppImageExecutable(hooksDir, options = {}) {
   const fsApi = options.fs || fs;
   const candidates = [];
@@ -87,21 +94,43 @@ function resolveAppImageExecutable(hooksDir, options = {}) {
       fsApi.readFileSync(path.posix.join(hooksDir, APPIMAGE_HOOK_MARKER_FILE), "utf8")
     );
   } catch {}
-  // APPIMAGE belongs to the running AppImage process, not arbitrary source
-  // shells. Only trust the environment fallback while executing from the
-  // packaged asar tree; materialized hooks use the adjacent marker above.
+  // APPIMAGE/APPDIR belong to the running AppImage process, not arbitrary
+  // source shells: a deb/source Clawd launched from another AppImage's shell
+  // inherits both. Only trust the environment fallback while executing from
+  // this process's own APPDIR-owned asar tree (real Clawd AppImage with no
+  // materialized marker). A foreign APPDIR must never make us spawn an
+  // unrelated executable.
   if (hooksDir.includes("app.asar")) {
     const env = options.env || process.env;
-    candidates.push(
-      typeof options.appImagePath === "string" ? options.appImagePath : "",
-      env && typeof env.APPIMAGE === "string" ? env.APPIMAGE : ""
-    );
+    const appDir = env && typeof env.APPDIR === "string" ? env.APPDIR.trim() : "";
+    if (appDir && path.posix.isAbsolute(appDir) && isPosixInside(appDir, hooksDir)) {
+      candidates.push(
+        typeof options.appImagePath === "string" ? options.appImagePath : "",
+        env && typeof env.APPIMAGE === "string" ? env.APPIMAGE : ""
+      );
+    }
   }
   for (const value of candidates) {
     const candidate = String(value || "").trim();
     if (candidate && path.posix.isAbsolute(candidate)) return candidate;
   }
   return null;
+}
+
+// A materialized AppImage generation lives at
+// <home>/.clawd/appimage-hooks/<generation>/. The layout name is the durable
+// signal that this directory must never be treated as a source checkout: if
+// the marker is missing/corrupt we must fail closed instead of falling through
+// to the dev `require("electron")` branch (which would crash inside Claude).
+function isMaterializedAppImageHooksDir(hooksDir, options = {}) {
+  const fsApi = options.fs || fs;
+  const normalized = String(hooksDir || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (/\/\.clawd\/appimage-hooks\/[^/]+$/.test(normalized)) return true;
+  try {
+    return fsApi.existsSync(path.posix.join(hooksDir, APPIMAGE_HOOK_MARKER_FILE));
+  } catch {
+    return false;
+  }
 }
 
 function spawnDetached(spawnProcess, command, args, options, onError) {
@@ -115,10 +144,30 @@ function spawnDetached(spawnProcess, command, args, options, onError) {
   return child;
 }
 
+function isGrokCompatibilityHookEnv(env = process.env) {
+  // Only the runner-injected official GROK_HOOK_EVENT activates the guard.
+  // GROK_HOME, an unrelated GROK_* variable, or the user's shell config must
+  // not suppress the Claude auto-start hook, and GROK_SESSION_ID alone is not
+  // official evidence that Grok invoked this process.
+  return Boolean(env && env.GROK_HOOK_EVENT && String(env.GROK_HOOK_EVENT).trim());
+}
+
 function main(deps = {}) {
+  const env = deps.env || process.env;
+  const exit = deps.exit || ((code) => process.exit(code));
+  // Grok scans Claude settings by default. SessionStart would otherwise cold-
+  // launch Clawd through the Claude auto-start hook even when Grok is not
+  // enabled in Settings. Emit the host-required passive stdout and exit
+  // without discovering a port or launching anything.
+  if (isGrokCompatibilityHookEnv(env)) {
+    const writeStdout = deps.writeStdout || ((text) => process.stdout.write(text));
+    writeStdout("{}\n");
+    exit(0);
+    return;
+  }
+
   const discover = deps.discoverClawdPort || discoverClawdPort;
   const launch = deps.launchApp || launchApp;
-  const exit = deps.exit || ((code) => process.exit(code));
 
   discover({ timeoutMs: INITIAL_DISCOVER_TIMEOUT_MS }, (port) => {
     if (port) {
@@ -149,7 +198,18 @@ function launchApp(options = {}) {
   const appImage = platform === "linux"
     ? resolveAppImageExecutable(hooksDir, options)
     : null;
-  const isPackaged = hooksDir.includes("app.asar") || !!appImage;
+  const materializedAppImageDir = platform === "linux"
+    && isMaterializedAppImageHooksDir(hooksDir, { fs: options.fs });
+  // A materialized generation with a missing/corrupt/non-absolute marker must
+  // fail closed. Falling back to the source/dev branch here would attempt
+  // require("electron") from inside a Claude hook and throw MODULE_NOT_FOUND.
+  if (materializedAppImageDir && !appImage) {
+    process.stderr.write(
+      "clawd auto-start: AppImage marker is missing or invalid; refusing to launch from a materialized hook directory\n"
+    );
+    return;
+  }
+  const isPackaged = hooksDir.includes("app.asar") || !!appImage || materializedAppImageDir;
 
   try {
     if (isPackaged) {
@@ -243,7 +303,9 @@ module.exports = {
   STARTUP_POLL_INTERVAL_MS,
   waitForClawdPort,
   resolveAppImageExecutable,
+  isMaterializedAppImageHooksDir,
   resolveMacBundleExecutable,
   launchApp,
+  isGrokCompatibilityHookEnv,
   main,
 };

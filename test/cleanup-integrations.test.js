@@ -59,6 +59,7 @@ describe("cleanupIntegrations", () => {
       assert.notStrictEqual(plan.byAgent[agentId], plan.common, `${agentId} must not fall back to common options`);
     }
     assert.strictEqual(plan.byAgent["claude-code"].settingsPath, path.join(homeDir, ".claude", "settings.json"));
+    assert.strictEqual(plan.byAgent["cursor-agent"].homeDir, homeDir);
     assert.strictEqual(plan.byAgent.codex.hooksPath, path.join(homeDir, ".codex", "hooks.json"));
     assert.strictEqual(plan.byAgent.codewhale.configPath, path.join(homeDir, ".codewhale", "config.toml"));
     assert.strictEqual(plan.byAgent.opencode.configPath, path.join(homeDir, ".config", "opencode", "opencode.json"));
@@ -221,7 +222,7 @@ describe("cleanupIntegrations", () => {
     }
   });
 
-  it("removes managed hooks/plugins safely, backs up once, and is idempotent", async () => {
+  it("removes proven managed hooks, preserves ambiguous plugin paths, and is idempotent", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-cleanup-"));
     const homeDir = path.join(root, "home");
     const pluginDir = resolvePluginDir();
@@ -285,7 +286,7 @@ describe("cleanupIntegrations", () => {
 
     try {
       const result = await cleanupIntegrations({ homeDir, backup: true, silent: true, hermesCommand: false });
-      assert.strictEqual(result.summary.failed, 0);
+      assert.strictEqual(result.summary.failed, 1);
       assert.ok(result.summary.entriesRemoved >= 5);
 
       const codex = readJson(codexPath);
@@ -299,14 +300,13 @@ describe("cleanupIntegrations", () => {
       assert.ok(codewhale.includes('command = "echo user-hook"'));
 
       const opencode = readJson(opencodePath);
-      // #825 behavior change: opencode now routes through the shared JSONC
-      // editor, so uninstall claims exactly what install claims — an exact
-      // path match OR an ABSOLUTE path whose basename is the managed plugin
-      // dir. "/somewhere/opencode-plugin" is a stale Clawd install location
-      // (register rewrites it in place, hooks/opencode-family-install.js:150),
-      // so leaving it behind was residue Clawd itself created. Third-party
-      // npm specifiers are never absolute paths and stay untouched.
-      assert.deepStrictEqual(opencode.plugin, ["opencode-wakatime"]);
+      // Batch A ownership hardening removes the exact current source entry but
+      // never claims a missing same-basename path without owner history.
+      assert.deepStrictEqual(opencode.plugin, ["/somewhere/opencode-plugin", "opencode-wakatime"]);
+      const opencodeAgent = result.agents.find((agent) => agent.agentId === "opencode");
+      assert.strictEqual(opencodeAgent.status, "failed");
+      assert.strictEqual(opencodeAgent.registrationRemoved, false);
+      assert.match(opencodeAgent.error, /active Clawd entry remains/);
       assert.strictEqual(listCleanupBackups(path.dirname(opencodePath)).length, 1);
 
       const kiroTeam = readJson(kiroTeamPath);
@@ -326,7 +326,7 @@ describe("cleanupIntegrations", () => {
         kiro: listCleanupBackups(path.dirname(kiroTeamPath)).length,
       };
       const second = await cleanupIntegrations({ homeDir, backup: true, silent: true, hermesCommand: false });
-      assert.strictEqual(second.summary.failed, 0);
+      assert.strictEqual(second.summary.failed, 1);
       assert.strictEqual(second.summary.entriesRemoved, 0);
       assert.deepStrictEqual({
         codex: listCleanupBackups(path.dirname(codexPath)).length,

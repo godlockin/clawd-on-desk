@@ -37,6 +37,7 @@ const {
 } = require("./codex-assistant-output");
 const { readCodexThreadName } = require("./codex-session-index");
 const {
+  CODEX_DEFAULT_SESSION_ID,
   isCodexCliOriginator,
   isCodexDesktopOriginator,
 } = require("./codex-originator");
@@ -148,8 +149,9 @@ function getCodexPermissionTimeoutMs() {
 function extractCodexSessionIdFromTranscriptPath(transcriptPath) {
   if (typeof transcriptPath !== "string" || !transcriptPath.trim()) return null;
   const fileName = path.basename(transcriptPath.replace(/\\/g, "/"));
+  const uuid = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})";
   const match = fileName.match(
-    /^rollout-.+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
+    new RegExp(`^rollout-.+-${uuid}(?:_${uuid})?\\.jsonl$`, "i")
   );
   return match ? match[1] : null;
 }
@@ -157,7 +159,7 @@ function extractCodexSessionIdFromTranscriptPath(transcriptPath) {
 function normalizeCodexSessionId(value, transcriptPath = "") {
   const transcriptSessionId = extractCodexSessionIdFromTranscriptPath(transcriptPath);
   const raw = transcriptSessionId
-    || (typeof value === "string" && value.trim() ? value.trim() : "default");
+    || (typeof value === "string" && value.trim() ? value.trim() : CODEX_DEFAULT_SESSION_ID);
   return raw.startsWith("codex:") ? raw : `codex:${raw}`;
 }
 

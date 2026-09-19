@@ -161,6 +161,10 @@ if (window.settingsAPI && typeof window.settingsAPI.onUpdateCheckStatus === "fun
   });
 }
 
+if (window.settingsAPI && typeof window.settingsAPI.onOfficialThemeProgress === "function") {
+  window.settingsAPI.onOfficialThemeProgress((progress) => core.ops.applyOfficialThemeProgress(progress));
+}
+
 if (window.settingsAPI && typeof window.settingsAPI.getShortcutFailures === "function") {
   window.settingsAPI.getShortcutFailures().then((failures) => {
     core.ops.applyShortcutFailures(failures);
