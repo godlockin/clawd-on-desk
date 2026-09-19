@@ -14,6 +14,14 @@ npm test
 npm run audit:assets
 ```
 
+Official downloadable themes (for example Hash Sage) ship as versioned GitHub
+Release assets in the separate `rullerzhou-afk/clawd-themes` repository, never
+inside Clawd. Before tagging, confirm the packaged resources still contain no
+`themes/hash-sage/**` payload and that `npm run audit:assets` reports the
+tracked-tree budget within policy. On a pull request, the
+`audit:pr-history-assets` gate additionally proves no large official-theme
+media entered the PR's reachable history.
+
 4. Run the `Build & Release` workflow manually on `main`.
 
 For macOS Developer ID certificate creation, App Store Connect Team API key
@@ -62,7 +70,7 @@ Download and smoke-test the draft release assets before publishing the draft.
 If the draft is wrong, fix the issue before publishing; do not publish a known
 bad draft release.
 
-### v1.0.0 Draft Smoke Checklist
+### v1.1.0 Draft Smoke Checklist
 
 Use the draft release installer or package artifact, not `npm start`. Windows
 required items are the primary publish gate. If macOS or Linux hardware is not
@@ -75,7 +83,7 @@ Before launching:
 - On macOS, download each DMG through a browser so it carries quarantine
   metadata. Confirm it opens without a Privacy & Security override, then verify
   the copied app with `spctl` and `stapler` as documented in the signing guide.
-- Confirm the packaged app shows `1.0.0` metadata.
+- Confirm the packaged app shows `1.1.0` metadata.
 - Confirm packaged resources include `app.asar.unpacked/hooks`,
   `app.asar.unpacked/agents`, `app.asar.unpacked/extensions`,
   and `app.asar.unpacked/themes`.
@@ -86,7 +94,7 @@ Before launching:
 - Download the native-package, Koffi prune/smoke, and updater metadata manifests.
   Confirm the target has one matching `koffi.node`, no foreign native payload,
   and no unreviewed exception. Confirm each updater metadata `version` and every
-  listed artifact filename identify `1.0.0`.
+  listed artifact filename identify `1.1.0`.
 - For migration smoke, install v0.16.0 first and save a copy of the old
   `clawd-prefs.json` before upgrading.
 - For legacy Feishu/Lark migration smoke, enable remote approval in v0.15.0 with saved
@@ -118,9 +126,9 @@ Required all-platform checks:
   an active task alive. Upgrade a profile with a long generic working timeout
   and no Codex-specific value: preserve its previous effective Codex duration.
 
-- Upgrade install over v0.16.0, launch, pet appears, no error dialog. Existing
+- Upgrade install over v1.0.0, launch, pet appears, no error dialog. Existing
   agent installation/enabled flags and user theme/animation choices remain intact.
-- Settings -> About shows `v1.0.0`, sourced from `app.getVersion()`.
+- Settings -> About shows `v1.1.0`, sourced from `app.getVersion()`.
 - First-run tutorial opens once for a fresh profile; Finish, Skip, and OS close
   each persist `tutorialSeen=true` and do not reopen on restart.
 - Upgrade profile with no `tutorialSeen` sees the tutorial once; an already-seen
@@ -129,9 +137,8 @@ Required all-platform checks:
   macOS installs default to pet + menu-bar accessory with no Dock tile.
 - Settings -> General / Agents / Animation & Sound render correctly in all supported
   languages, including sidebar SVG icons and the folded Animation Map subtab.
-- Settings -> About contributors include the three v1.0.0 first-time
-  contributors: `eugenewang5425`, `draintovmasyan783-creator`, and `Yueh-H`,
-  while preserving all previous contributors.
+- Settings -> About contributors include every v1.1.0 contributor named in the
+  release note while preserving all previous contributors.
 - Make `clawd-prefs.json` temporarily unreadable and launch once. Confirm the
   startup warning and Doctor critical item both explain that agent events and
   approvals are paused; restore access and restart before continuing.
@@ -186,6 +193,19 @@ Required all-platform checks:
   confirm state + Notification events arrive without Clawd taking over approval.
 - Install MiMo Code into a commented/trailing-comma JSONC config, exercise
   Allow/Always/Deny and DND fallback, then uninstall and confirm user config is preserved.
+- Windows packaged opencode acceptance (#1026, requires a real opencode 1.18.31):
+  install the Program Files Clawd package, confirm the opencode config points at
+  `%USERPROFILE%\.clawd\integrations\...\generations\<hash>\opencode-plugin` (never
+  `app.asar.unpacked`), and that the managed four-file generation bytes/hash match the
+  packaged source with no deny-write ACL. Start a real opencode session and confirm
+  exactly one Clawd state stream and one permission request per interaction (no double
+  load from a duplicate entry). Restart Clawd twice and confirm startup sync is
+  idempotent. Repair a single legacy/missing legacy entry and confirm in-place
+  migration with the source untouched; arrange a modified Clawd-like copy and confirm
+  Install/Repair fail closed with Doctor needs-review and no Fix. Uninstall and confirm
+  proven-owned entries are gone, Settings shows uninstalled/disabled, third-party
+  plugin/tuple/options are unchanged, and residual generation files (if any) no longer
+  emit events after Clawd is removed. Source-level tests do not satisfy this item.
 - Settings -> Agents -> Install Reasonix succeeds on Windows when paths contain
   spaces, and the written command uses the EncodedCommand path when needed.
 - Install TraeCode on Windows with Node under `C:\Program Files`, enable the
@@ -241,7 +261,7 @@ Recommended all-platform checks:
 - Right-click Hide pet / Show pet still works; while hidden, a newly arriving
   permission request still shows a bubble, by design.
 - Settings -> About -> Check for updates completes without an error.
-- Update labels never show a duplicated prefix such as `vv1.0.0`.
+- Update labels never show a duplicated prefix such as `vv1.1.0`.
 - Telegram approval cards show the final outcome for decisions made on Telegram
   and for approvals resolved elsewhere.
 - Scan the mobile PWA pairing URL on a phone and confirm session cards appear.
@@ -274,8 +294,8 @@ Windows checks:
 
 macOS checks:
 
-- Required when macOS hardware is available: manually install the signed v1.0.0
-  DMG over v0.16.0 once, preserving app data. Validate a signed A→B updater pair
+- Required when macOS hardware is available: manually install the signed v1.1.0
+  DMG over v1.0.0 once, preserving app data. Validate a signed A→B updater pair
   from an update-capable build on each available architecture, including
   Restart Now and Later/quit/reopen; record exact versions and asset hashes.
   A source run or a mocked updater does not complete this gate.
@@ -491,6 +511,6 @@ token.
   the validated artifact, then track validation, merge and the publish-pipeline
   result. A successful prepare run alone does **not** publish the release.
 - v0.15.0 is present upstream, but its locale still points `LicenseUrl` and
-  `ReleaseNotesUrl` at v0.14.0. Do not copy those stale values into v1.0.0.
+  `ReleaseNotesUrl` at v0.14.0. Do not copy those stale values into v1.1.0.
 - After the catalog refreshes, run an independent Windows `winget install` or
   `winget upgrade` smoke test before documenting the command in the READMEs.

@@ -24,8 +24,21 @@ on:
       - package.json
       - package-lock.json
       - scripts/verify-appimage-apprun.js
-      - test/appimage-apprun.test.js
       - test/fixtures/appimage-apprun/**
+      # AppImage Claude/Codex hook persistence (#1027): the packaged smoke is
+      # the only place that exercises a real FUSE mount -> persistent generation
+      # transition. Use the whole hooks/** closure (it evolves) instead of a
+      # hand-enumerated list that silently misses new dependency files, plus the
+      # server-side files that decide the mutation/verify path.
+      - hooks/**
+      - src/claude-hook-health.js
+      - src/claude-settings-watcher.js
+      - src/claude-hook-operations.js
+      - src/prefs.js
+      - src/integration-sync.js
+      - src/server.js
+      - src/remote-ssh-deploy.js
+      - test/**
 
 permissions:
   contents: read
@@ -154,5 +167,43 @@ jobs:
         with:
           name: wayland-smoke-native-wayland-diagnostics
           path: wayland-smoke-artifacts/native-wayland-contract/
+          if-no-files-found: warn
+          retention-days: 7
+
+  appimage-claude-hooks:
+    name: AppImage / persistent Claude hooks
+    needs: build-appimage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-installer
+          path: dist
+
+      - name: Install isolated headless Wayland stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus-x11 weston xwayland libfuse2t64 x11-utils
+
+      - name: Allow Chromium userns sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Verify packaged Claude hooks persist outside the FUSE mount
+        run: |
+          dbus-run-session -- \
+            bash ci/wayland-smoke.sh appimage-claude-hooks dist/*.AppImage
+
+      - name: Upload AppImage Claude hook diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-smoke-appimage-claude-hooks-diagnostics
+          path: wayland-smoke-artifacts/appimage-claude-hooks/
           if-no-files-found: warn
           retention-days: 7
