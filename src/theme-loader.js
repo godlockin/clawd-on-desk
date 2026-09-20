@@ -125,10 +125,19 @@ function discoverThemes() {
   return themes;
 }
 
+// Any direct child whose name starts with "." is manager-owned scratch
+// (staging, backups, lock files), never a real theme. Enforced symmetrically in
+// _scanThemesDir, theme-metadata.scanMetadata and _readThemeJson so a dotted
+// directory can be neither scanned, selected by id, nor read directly.
+function isScannableThemeDirName(name) {
+  return typeof name === "string" && name.length > 0 && !name.startsWith(".");
+}
+
 function _scanThemesDir(dir, builtin, themes, seen) {
   try {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
+      if (!isScannableThemeDirName(entry.name)) continue;
       if (seen.has(entry.name)) continue;
       const jsonPath = path.join(dir, entry.name, "theme.json");
       let cfg;
@@ -262,6 +271,12 @@ function _resolveSoundOverrideFiles(themeId, userOverrides) {
  * Read theme.json from built-in or user themes directory.
  */
 function _readThemeJson(themeId) {
+  // Manager-owned scratch directories (staging/backup) are dotted direct
+  // children of the themes dir. They must never be readable as a theme by id,
+  // even though they may contain a perfectly valid theme.json.
+  if (!isScannableThemeDirName(themeId)) {
+    return { raw: null, isBuiltin: false, themeDir: null };
+  }
   // Built-in first
   if (builtinThemesDir) {
     const builtinPath = path.resolve(builtinThemesDir, themeId, "theme.json");
@@ -394,10 +409,32 @@ function ensureUserThemesDir() {
 
 // ── Validation ──
 
+/**
+ * Read `theme.json` from an explicit external theme directory (used by the
+ * official-theme installer to validate a staging directory that does not yet
+ * live under `<userData>/themes/`).
+ */
+function _readThemeJsonFromDir(themeDir) {
+  if (typeof themeDir !== "string" || !themeDir) return { raw: null, isBuiltin: false, themeDir: null };
+  if (!isScannableThemeDirName(path.basename(themeDir))) {
+    return { raw: null, isBuiltin: false, themeDir: null };
+  }
+  const jsonPath = path.join(themeDir, "theme.json");
+  try {
+    const raw = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+    return { raw, isBuiltin: false, themeDir };
+  } catch (e) {
+    return { raw: null, isBuiltin: false, themeDir: null };
+  }
+}
+
 function validateThemeShape(themeId, opts = {}) {
   const variant = typeof opts.variant === "string" && opts.variant ? opts.variant : "default";
   const overrides = _isPlainObject(opts.overrides) ? opts.overrides : null;
-  const { raw, isBuiltin, themeDir } = _readThemeJson(themeId);
+  const explicitThemeDir = typeof opts.themeDir === "string" && opts.themeDir ? opts.themeDir : null;
+  const { raw, isBuiltin, themeDir } = explicitThemeDir
+    ? _readThemeJsonFromDir(explicitThemeDir)
+    : _readThemeJson(themeId);
   if (!raw) {
     return {
       ok: false,
@@ -502,6 +539,7 @@ module.exports = {
   _resolveAssetPath,
   _externalAssetsSourceDir,
   _validateRequiredAssets,
+  isScannableThemeDirName,
   // Schema constants + helpers are re-exported for backward compatibility with
   // scripts/validate-theme.js and tests. New direct callers should require
   // "./theme-schema".
