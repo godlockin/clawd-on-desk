@@ -13,6 +13,13 @@ const CODEX_CLI_ORIGINATORS = new Set([
   "codex-tui",
   "codex_cli_rs",
 ]);
+const CODEX_DEFAULT_SESSION_ID = "default";
+const CODEX_PLACEHOLDER_SESSION_IDS = Object.freeze([
+  CODEX_DEFAULT_SESSION_ID,
+  "codex:",
+  `codex:${CODEX_DEFAULT_SESSION_ID}`,
+]);
+const CODEX_PLACEHOLDER_SESSION_ID_SET = new Set(CODEX_PLACEHOLDER_SESSION_IDS);
 
 function normalizeCodexOriginator(value) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -26,7 +33,15 @@ function isCodexCliOriginator(value) {
   return CODEX_CLI_ORIGINATORS.has(normalizeCodexOriginator(value));
 }
 
+function isCodexPlaceholderSessionId(value) {
+  if (typeof value !== "string") return false;
+  return CODEX_PLACEHOLDER_SESSION_ID_SET.has(value.trim().toLowerCase());
+}
+
 module.exports = {
+  CODEX_DEFAULT_SESSION_ID,
+  CODEX_PLACEHOLDER_SESSION_IDS,
   isCodexCliOriginator,
   isCodexDesktopOriginator,
+  isCodexPlaceholderSessionId,
 };

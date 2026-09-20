@@ -11,6 +11,7 @@ const path = require("path");
 const { builtinModules } = require("node:module");
 const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
+const { spawnSync } = require("node:child_process");
 
 const {
   HERMES_RESULT_SENTINEL,
@@ -63,6 +64,10 @@ describe("wsl-deploy", () => {
       assert.strictEqual(getAgentInstallScriptName("hermes"), "hermes-install.js");
       assert.strictEqual(getAgentInstallScriptName("opencode"), null);
       assert.strictEqual(getAgentInstallScriptName("openclaw"), null);
+    });
+
+    it("excludes grok-build (Phase 1 has no WSL support)", () => {
+      assert.strictEqual(getAgentInstallScriptName("grok-build"), null);
     });
 
     it("excludes workbuddy (no standalone Linux/WSL runtime)", () => {
@@ -164,6 +169,26 @@ describe("wsl-deploy", () => {
         resolveHooksDir({ isPackaged: true, resourcesPath: "C:\\Clawd\\resources" }),
         path.join("C:\\Clawd\\resources", "app.asar.unpacked", "hooks")
       );
+    });
+  });
+
+  describe("Kimi hooks-only WSL payload", () => {
+    it("loads the copied runtime entry without an agents tree", (t) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-wsl-kimi-"));
+      t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+      const dir = path.join(root, "hooks");
+      fs.mkdirSync(dir);
+      const entries = collectAgentWslFiles(HOOKS_DIR, "kimi-cli");
+      for (const entry of entries) fs.writeFileSync(path.join(dir, entry.relativePath), entry.content);
+
+      assert.strictEqual(fs.existsSync(path.join(root, "agents")), false);
+      const result = spawnSync(
+        process.execPath,
+        ["-e", "require(process.argv[1])", path.join(dir, "kimi-hook.js")],
+        { cwd: dir, encoding: "utf8", timeout: 20000 }
+      );
+      assert.ifError(result.error);
+      assert.strictEqual(result.status, 0, result.stdout + result.stderr);
     });
   });
 
