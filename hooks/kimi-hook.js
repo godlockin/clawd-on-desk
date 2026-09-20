@@ -6,7 +6,7 @@
 
 const { postStateToRunningServer, readHostPrefix, applyWslSourceFields } = require("./server-config");
 const { createPidResolver, readStdinJson, getPlatformConfig, applyOrcaPaneKey } = require("./shared-process");
-const { processNames: kimiProcessNames } = require("../agents/kimi-cli");
+const { KIMI_PROCESS_NAMES: kimiProcessNames } = require("./kimi-process-names");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
