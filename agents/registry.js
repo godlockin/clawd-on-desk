@@ -17,6 +17,7 @@ const codewhale = require("./codewhale");
 const opencode = require("./opencode");
 const mimocode = require("./mimocode");
 const pi = require("./pi");
+const omp = require("./omp");
 const openclaw = require("./openclaw");
 const hermes = require("./hermes");
 const qoder = require("./qoder");
@@ -25,6 +26,7 @@ const qoderwork = require("./qoderwork");
 const qwenwork = require("./qwenwork");
 const workbuddy = require("./workbuddy");
 const traecode = require("./traecode");
+const grokBuild = require("./grok-build");
 
 const AGENTS = [
   claudeCode,
@@ -43,6 +45,7 @@ const AGENTS = [
   opencode,
   mimocode,
   pi,
+  omp,
   openclaw,
   hermes,
   qoder,
@@ -51,6 +54,7 @@ const AGENTS = [
   qwenwork,
   workbuddy,
   traecode,
+  grokBuild,
 ];
 const AGENT_MAP = new Map(AGENTS.map((a) => [a.id, a]));
 

@@ -88,7 +88,7 @@ describe("opencode plugin installer", () => {
     assert.strictEqual(config.plugin.length, 1);
   });
 
-  it("updates stale plugin paths in place by directory basename match", () => {
+  it("fails closed on an unproven stale-looking plugin path", () => {
     const stalePath = "/old/install/location/hooks/opencode-plugin";
     const configPath = makeTempConfigDir({
       plugin: ["opencode-wakatime", stalePath],
@@ -101,10 +101,10 @@ describe("opencode plugin installer", () => {
       pluginDir: newPath,
     });
 
-    assert.strictEqual(result.added, true);
+    assert.strictEqual(result.status, "error");
+    assert.strictEqual(result.reason, "unknown");
     const config = readConfig(configPath);
-    // Order preserved, stale path replaced in place
-    assert.deepStrictEqual(config.plugin, ["opencode-wakatime", newPath]);
+    assert.deepStrictEqual(config.plugin, ["opencode-wakatime", stalePath]);
   });
 
   it("does not stomp third-party plugins whose name contains opencode-plugin", () => {
@@ -140,18 +140,17 @@ describe("opencode plugin installer", () => {
     assert.deepStrictEqual(config.plugin, [scoped, bareNpm, pluginDir]);
   });
 
-  it("updates stale Windows absolute plugin paths", () => {
-    // Config files can roam between machines; a Windows-style absolute path
-    // (C:/...) should still be recognized as stale even when tests run on POSIX.
+  it("fails closed on an unproven stale-looking Windows plugin path", () => {
     const staleWin = "C:/old/clawd/hooks/opencode-plugin";
     const configPath = makeTempConfigDir({ plugin: [staleWin] });
     const pluginDir = "/new/clawd/hooks/opencode-plugin";
 
     const result = registerOpencodePlugin({ silent: true, configPath, pluginDir });
 
-    assert.strictEqual(result.added, true);
+    assert.strictEqual(result.status, "error");
+    assert.strictEqual(result.reason, "unknown");
     const config = readConfig(configPath);
-    assert.deepStrictEqual(config.plugin, [pluginDir]);
+    assert.deepStrictEqual(config.plugin, [staleWin]);
   });
 
   it("skips silently when ~/.config/opencode/ does not exist (no configPath override)", () => {
@@ -301,7 +300,15 @@ describe("opencode installer CLI entry (node hooks/opencode-install.js)", () => 
     assert.match(out, /Registered: /);
     const registered = readConfig(configPath).plugin;
     assert.strictEqual(registered.length, 1);
-    assert.ok(registered[0].endsWith("hooks/opencode-plugin"), registered[0]);
+    // #1026: packaged/source paths are no longer registered directly. The
+    // entry must point at a user-writable content-addressed managed generation
+    // under the target home.
+    assert.ok(
+      registered[0].includes("/.clawd/integrations/opencode-family/opencode/homes/"),
+      `expected managed generation path, got ${registered[0]}`
+    );
+    assert.ok(/\/generations\/[0-9a-f]{64}\/opencode-plugin$/.test(registered[0]), registered[0]);
+    assert.ok(fs.existsSync(path.join(registered[0].replace(/\//g, path.sep))), "generation plugin dir must exist");
 
     const out2 = runCli(["--uninstall"], home);
     assert.match(out2, /entries removed: 1/);
