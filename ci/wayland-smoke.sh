@@ -5,19 +5,24 @@
 #   wayland-smoke.sh manual-x11 <AppImage>
 #   wayland-smoke.sh auto-xwayland <AppImage>
 #   wayland-smoke.sh native-wayland-contract <AppImage>
+#   wayland-smoke.sh appimage-claude-hooks <AppImage>
 #
 # manual-x11 and auto-xwayland are full health checks: /state answers and an X
 # client window exists. native-wayland-contract deliberately checks only the
 # escape-hatch contract (no relaunch, no X11 browser, process remains alive).
-# weston --backend=headless has no real input seat or DRM render node, so it is
-# not a deterministic environment for full native-Wayland Electron health.
+# appimage-claude-hooks boots the packaged AppImage, then asserts the Claude
+# hook commands persisted into the isolated HOME are content-addressed
+# persistent targets (never the transient FUSE mount) and still load after the
+# AppImage exits. weston --backend=headless has no real input seat or DRM
+# render node, so it is not a deterministic environment for full native-Wayland
+# Electron health.
 
 set -euo pipefail
 
-SCENARIO="${1:?usage: wayland-smoke.sh <manual-x11|auto-xwayland|native-wayland-contract> <AppImage>}"
-APPIMAGE_ARG="${2:?usage: wayland-smoke.sh <manual-x11|auto-xwayland|native-wayland-contract> <AppImage>}"
+SCENARIO="${1:?usage: wayland-smoke.sh <manual-x11|auto-xwayland|native-wayland-contract|appimage-claude-hooks> <AppImage>}"
+APPIMAGE_ARG="${2:?usage: wayland-smoke.sh <manual-x11|auto-xwayland|native-wayland-contract|appimage-claude-hooks> <AppImage>}"
 case "$SCENARIO" in
-  manual-x11 | auto-xwayland | native-wayland-contract) ;;
+  manual-x11 | auto-xwayland | native-wayland-contract | appimage-claude-hooks) ;;
   *) printf 'Unknown scenario: %s\n' "$SCENARIO" >&2; exit 2 ;;
 esac
 
@@ -119,6 +124,32 @@ has_browser() { [ -n "$(browser_pids)" ]; }
 has_x11_browser() { [ -n "$(browser_pids x11)" ]; }
 no_x11_browser() { [ -z "$(browser_pids x11)" ]; }
 no_owned_processes() { [ -z "$(owned_pids)" ]; }
+
+# Exact env value from this invocation's own processes. The AppImage runtime
+# exports APPIMAGE/APPDIR to the launched process; reading them back from
+# /proc/<owned pid>/environ attributes them to THIS mount instead of whatever
+# `ls /tmp/.mount_*` happened to see before launch.
+proc_env_value() {
+  local key="$1" pid line
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    line="$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/environ" | grep -m1 "^${key}=" || true)"
+    if [ -n "$line" ]; then printf '%s' "${line#${key}=}"; return 0; fi
+  done < <(owned_pids)
+  return 1
+}
+
+appimage_mount_dir() {
+  local mount pid
+  mount="$(proc_env_value APPDIR || true)"
+  if [ -n "$mount" ]; then printf '%s' "$mount"; return 0; fi
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    mount="$(grep -m1 -oE '/tmp/\.mount_[^ /]+' "/proc/$pid/maps" 2>/dev/null || true)"
+    if [ -n "$mount" ]; then printf '%s' "$mount"; return 0; fi
+  done < <(owned_pids)
+  return 1
+}
 
 x_has_clawd() {
   xlsclients -display "$XDISPLAY" -l 2>/dev/null | grep -qi clawd ||
@@ -316,6 +347,127 @@ case "$SCENARIO" in
     no_x11_browser ||
       fail "native Wayland override produced a browser with --ozone-platform=x11"
     ok "packaged native-Wayland override stays alive without relaunching to X11"
+    ;;
+
+  appimage-claude-hooks)
+    note "packaged Claude hooks must persist outside the FUSE mount"
+    # Deterministic Claude Code version so the versioned hooks (PreCompact /
+    # PostCompact / StopFailure) are always registered: exactly 14 managed
+    # state commands under default prefs.
+    CLAUDE_FIXTURE_BIN="$ISOLATION_ROOT/claude-fixture-bin"
+    mkdir -p "$CLAUDE_FIXTURE_BIN"
+    printf '#!/bin/sh\nprintf "2.1.274 (Claude Code)\\n"\n' >"$CLAUDE_FIXTURE_BIN/claude"
+    chmod +x "$CLAUDE_FIXTURE_BIN/claude"
+    export PATH="$CLAUDE_FIXTURE_BIN:$PATH"
+
+    launch_app "$APPIMAGE"
+    poll 90 state_ok || fail "appimage-claude-hooks: state server from runtime.json never answered"
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    poll 60 test -f "$CLAUDE_SETTINGS" ||
+      fail "appimage-claude-hooks: isolated Claude settings.json was never written"
+    ok "isolated Claude settings.json written"
+
+    # Attribute the marker/mount assertions to THIS launch, not a pre-existing
+    # /tmp/.mount_* directory: read APPIMAGE/APPDIR back from an owned pid.
+    poll 30 proc_env_value APPIMAGE >/dev/null ||
+      fail "appimage-claude-hooks: could not read APPIMAGE from an owned process"
+    APPIMAGE_RUN_VALUE="$(proc_env_value APPIMAGE)"
+    [ -n "$APPIMAGE_RUN_VALUE" ] || fail "appimage-claude-hooks: APPIMAGE env value was empty"
+    MOUNT_DIR="$(appimage_mount_dir || true)"
+    [ -n "$MOUNT_DIR" ] || fail "appimage-claude-hooks: could not locate this launch's FUSE mount"
+    [ -d "$MOUNT_DIR" ] || fail "appimage-claude-hooks: FUSE mount $MOUNT_DIR is not a directory"
+
+    if ! node - "$CLAUDE_SETTINGS" "$APPIMAGE_RUN_VALUE" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const [settingsPath, appImageValue] = process.argv.slice(2);
+const CORE = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+  "PostToolUseFailure", "Stop", "SubagentStart", "SubagentStop", "Notification",
+  "Elicitation",
+];
+const VERSIONED = ["PreCompact", "PostCompact", "StopFailure"];
+const EXPECTED = new Set([...CORE, ...VERSIONED]);
+const fail = (message) => { process.stderr.write(`smoke: ${message}\n`); process.exit(1); };
+let settings;
+try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")); }
+catch (err) { fail(`settings.json unreadable: ${err.message}`); }
+const hooks = settings.hooks || {};
+const commands = [];
+for (const [event, entries] of Object.entries(hooks)) {
+  if (!Array.isArray(entries)) continue;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    for (const hook of Array.isArray(entry.hooks) ? entry.hooks : [entry]) {
+      if (hook && hook.type === "command" && typeof hook.command === "string" && hook.command.includes("clawd-hook.js")) {
+        commands.push({ event, command: hook.command });
+      }
+    }
+  }
+}
+const events = [...new Set(commands.map((c) => c.event))].sort();
+const expectedEvents = [...EXPECTED].sort();
+if (commands.length !== 14) fail(`expected exactly 14 managed state commands, got ${commands.length}: ${events.join(", ")}`);
+if (JSON.stringify(events) !== JSON.stringify(expectedEvents)) {
+  fail(`managed state event set drifted: ${events.join(", ")}`);
+}
+const generations = new Set();
+for (const { event, command } of commands) {
+  if (command.includes(".mount_")) fail(`${event} command still points at a FUSE mount: ${command}`);
+  if (command.includes("app.asar.unpacked")) fail(`${event} command points into app.asar.unpacked: ${command}`);
+  const match = command.match(/appimage-hooks[\\/]([a-f0-9]{20})[\\/]/);
+  if (!match) fail(`${event} command is not in ~/.clawd/appimage-hooks/<generation>: ${command}`);
+  generations.add(match[1]);
+  const script = command.match(/"([^"]+clawd-hook\.js)"/);
+  if (!script || !fs.existsSync(script[1])) fail(`${event} target script is missing: ${command}`);
+}
+if (generations.size !== 1) fail(`expected one shared generation, got ${generations.size}`);
+const generation = path.join(process.env.HOME, ".clawd", "appimage-hooks", [...generations][0]);
+const marker = fs.readFileSync(path.join(generation, ".clawd-appimage-path"), "utf8").trim();
+// The materializer hashes and records the exact (trimmed) APPIMAGE value the
+// process saw; it is not realpath-canonicalized.
+if (marker !== appImageValue) fail(`marker ${marker} != APPIMAGE value ${appImageValue}`);
+// auto-start and statusline are opt-in defaults: their absence must not be
+// misread as a smoke gap, but whatever managed command does exist must be persistent.
+if (settings.statusLine && typeof settings.statusLine.command === "string"
+  && settings.statusLine.command.includes("claude-statusline.js")
+  && !settings.statusLine.command.includes("appimage-hooks")) {
+  fail(`statusLine is not on the persistent generation: ${settings.statusLine.command}`);
+}
+for (const name of ["clawd-hook.js", "auto-start.js", "claude-statusline.js"]) {
+  if (!fs.existsSync(path.join(generation, name))) fail(`generation is missing ${name}`);
+}
+process.stdout.write(`${generation}\n`);
+NODE
+    then
+      fail "appimage-claude-hooks: settings inspection failed"
+    fi
+    ok "exactly the 14 core+versioned commands share one persistent generation"
+
+    kill_owned_processes
+    poll 15 server_ports_clear || fail "Clawd state port remained occupied after teardown"
+    poll 15 test ! -d "$MOUNT_DIR" || fail "this launch's FUSE mount $MOUNT_DIR survived teardown"
+    ok "this launch's FUSE mount is gone"
+
+    SETTINGS_GEN="$(node -e '
+const fs=require("fs");
+const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+const first=(s.hooks&&s.hooks.UserPromptSubmit||[]).flatMap((e)=>Array.isArray(e.hooks)?e.hooks:[]).find((h)=>typeof h.command==="string"&&h.command.includes("clawd-hook.js"));
+const m=first&&first.command.match(/"([^"]+clawd-hook\.js)"/);
+if(!m){process.exit(1)}process.stdout.write(m[1]);
+' "$CLAUDE_SETTINGS")"
+    [ -n "$SETTINGS_GEN" ] || fail "appimage-claude-hooks: could not locate the persistent hook script"
+    OFFLINE_LOG="$ARTIFACT_DIR/offline-hook.log"
+    set +e
+    printf '{"session_id":"ci-smoke","hook_event_name":"UserPromptSubmit","cwd":"/tmp"}\n' |
+      timeout 30 node "$SETTINGS_GEN" UserPromptSubmit >"$OFFLINE_LOG" 2>&1
+    OFFLINE_RC=$?
+    set -e
+    [ "$OFFLINE_RC" -eq 0 ] || fail "offline state hook exited $OFFLINE_RC"
+    [ ! -s "$OFFLINE_LOG" ] ||
+      fail "offline state hook wrote output: $(head -c 400 "$OFFLINE_LOG")"
+    ok "state hook closure loads offline with exit 0 and empty output"
     ;;
 esac
 
