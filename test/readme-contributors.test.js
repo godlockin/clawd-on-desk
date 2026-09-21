@@ -72,6 +72,18 @@ const VERIFIED_GITHUB_CONTRIBUTORS = [
   "CheeseAgent",
   "RS-Nocsi",
   "Cobb04",
+  "TalexDreamSoul",
+  "FuZoe",
+  "undefined-moe",
+  "pu-1205",
+  "Free-LZJ",
+  "easyhak",
+  "jlimcode",
+  "xfurqan0",
+  "brantshin",
+  "mantertius",
+  "VonSdite",
+  "sunnyswag",
 ];
 
 function loadSettingsContributors() {
@@ -108,7 +120,15 @@ function extractContributorTable(markdown, filename) {
   return tables[0].table;
 }
 
-function getRows(table) {
+function getRows(table, filename) {
+  const openingRows = (table.match(/<tr>/g) || []).length;
+  const closingRows = (table.match(/<\/tr>/g) || []).length;
+  assert.strictEqual(
+    closingRows,
+    openingRows,
+    `${filename} should close every contributor row`,
+  );
+  assert.match(table, /<\/tr>\s*<\/table>$/, `${filename} should close its final contributor row`);
   return [...table.matchAll(/<tr>([\s\S]*?)<\/tr>/g)].map((match) => match[1]);
 }
 
@@ -118,7 +138,7 @@ function countCells(row) {
 
 function getContributorShape(filename) {
   const markdown = fs.readFileSync(path.join(ROOT, filename), "utf8");
-  const rows = getRows(extractContributorTable(markdown, filename));
+  const rows = getRows(extractContributorTable(markdown, filename), filename);
   const cellCounts = rows.map(countCells);
   const totalCells = cellCounts.reduce((sum, count) => sum + count, 0);
 
