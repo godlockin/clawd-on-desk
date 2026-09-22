@@ -21,7 +21,23 @@ function resolveTimeoutArgs(env = process.env) {
   return timeoutMs > 0 ? [`--test-timeout=${timeoutMs}`] : [];
 }
 
-module.exports = { DEFAULT_TEST_TIMEOUT_MS, resolveTimeoutArgs };
+function resolveTestRunnerInvocation(env = process.env) {
+  // Node expands this single glob itself (Node 24 is pinned in .nvmrc).
+  // Passing every absolute filename exceeded Windows' command-line limit once
+  // the suite grew past 500 files and failed with ENAMETOOLONG before a single
+  // assertion ran. Default recursive discovery is intentionally not used: it
+  // would also execute helper scripts under test/fixtures/.
+  return {
+    args: ["--test", ...resolveTimeoutArgs(env), "test/*.test.js"],
+    cwd: path.join(__dirname, ".."),
+  };
+}
+
+module.exports = {
+  DEFAULT_TEST_TIMEOUT_MS,
+  resolveTimeoutArgs,
+  resolveTestRunnerInvocation,
+};
 
 // Requiring this file must not scan the directory or exit the process.
 if (require.main !== module) return;
@@ -43,7 +59,9 @@ if (files.length === 0) {
 // locally and as a stalled job in CI. A generous ceiling turns that into a
 // normal red. Raise it with CLAWD_TEST_TIMEOUT_MS if a legitimately slow test
 // ever needs more; 0 disables it.
-const result = spawnSync(process.execPath, ["--test", ...resolveTimeoutArgs(), ...files], {
+const invocation = resolveTestRunnerInvocation();
+const result = spawnSync(process.execPath, invocation.args, {
+  cwd: invocation.cwd,
   stdio: "inherit",
 });
 

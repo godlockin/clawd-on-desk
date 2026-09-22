@@ -134,3 +134,26 @@ test("release and Wayland workflows gate the final AppImage before artifact hand
     /needs: \[build-windows, build-mac, build-linux, native-package-audit\]/,
   );
 });
+
+test("Wayland smoke PR paths cover the hook closure by pattern instead of a drifting hand list", () => {
+  const wayland = fs.readFileSync(path.join(ROOT, ".github", "workflows", "wayland-smoke.yml"), "utf8");
+  const start = wayland.indexOf("  pull_request:");
+  const end = wayland.indexOf("\npermissions:");
+  assert.ok(start !== -1 && end > start, "pull_request paths block present");
+  const pathsBlock = wayland.slice(start, end);
+
+  assert.match(pathsBlock, /- hooks\/\*\*/, "hooks/** must trigger the packaged gate");
+  for (const required of [
+    "src/claude-hook-health.js",
+    "src/claude-settings-watcher.js",
+    "src/claude-hook-operations.js",
+    "src/prefs.js",
+    "src/integration-sync.js",
+    "src/server.js",
+    "src/remote-ssh-deploy.js",
+  ]) {
+    assert.ok(pathsBlock.includes(`- ${required}`), `${required} must trigger the packaged gate`);
+  }
+  // A hand-enumerated hook file would silently miss a newly added dependency.
+  assert.doesNotMatch(pathsBlock, /- hooks\/[^/*\s]+\.js/, "hook files must be covered by hooks/**");
+});
