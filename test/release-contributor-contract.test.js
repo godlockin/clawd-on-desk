@@ -31,3 +31,25 @@ test("release contributor audit maps noreply, direct-email, and co-author identi
 test("unknown direct-email authors cannot silently bypass contributor credit", () => {
   assert.strictEqual(githubHandleForIdentity("New Person", "new@example.com"), undefined);
 });
+
+test("v1.1 contributor email identities map to their reviewed pull request authors", () => {
+  const identities = [
+    ["TalexDreamSoul", "TalexDreamSoul@Gmail.com"],
+    ["FuZoe", "fxq4533@163.com"],
+    ["undefined-moe", "i@undefined.moe"],
+    ["pu-1205", "a1-6@1-6deMacBook-Air.local"],
+    ["Tsdsj", "fucdd1946523@163.com"],
+    ["mantertius", "mpat@ic.ufal.br"],
+    ["Free-LZJ", "252015170@qq.com"],
+    ["Free-LZJ", "zejian.li@exe.com"],
+    ["PeterShanxin", "shanxin@u.nus.edu"],
+    ["easyhak", "zhzhk17@gmail.com"],
+    ["jlimcode", "jason.lim@decagon.ai"],
+    ["xfurqan0", "yldzfurkann0@gmail.com"],
+    ["brantshin", "shiji.shi@taobao.com"],
+    ["VonSdite", "vonsdite@gmail.com"],
+  ];
+  for (const [handle, email] of identities) {
+    assert.strictEqual(githubHandleForIdentity(handle, email), handle);
+  }
+});
