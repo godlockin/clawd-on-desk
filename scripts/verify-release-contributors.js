@@ -22,6 +22,20 @@ const IDENTITY_OVERRIDES = new Map(Object.entries({
   "a1330661071@gmail.com": "xiaoshidefeng",
   "draintovmasyan783@gmail.com": "draintovmasyan783-creator",
   "264600648+draintovmasryan783-creator@users.noreply.github.com": "draintovmasyan783-creator",
+  "talexdreamsoul@gmail.com": "TalexDreamSoul",
+  "fxq4533@163.com": "FuZoe",
+  "i@undefined.moe": "undefined-moe",
+  "a1-6@1-6demacbook-air.local": "pu-1205",
+  "fucdd1946523@163.com": "Tsdsj",
+  "mpat@ic.ufal.br": "mantertius",
+  "252015170@qq.com": "Free-LZJ",
+  "shanxin@u.nus.edu": "PeterShanxin",
+  "zhzhk17@gmail.com": "easyhak",
+  "jason.lim@decagon.ai": "jlimcode",
+  "zejian.li@exe.com": "Free-LZJ",
+  "yldzfurkann0@gmail.com": "xfurqan0",
+  "shiji.shi@taobao.com": "brantshin",
+  "vonsdite@gmail.com": "VonSdite",
 }));
 
 function parseVersion(value) {

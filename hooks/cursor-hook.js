@@ -15,6 +15,22 @@ const {
   applyOrcaPaneKey,
   processAlive,
 } = require("./shared-process");
+const { resolveSessionTitle } = require("./cursor-session-title");
+const { CURSOR_HOOK_SENTINEL } = require("./json-utils");
+
+// Grok scans Claude-compatible settings by default and must never produce a
+// phantom cursor-agent session. Only the runner-injected official
+// GROK_HOOK_EVENT activates this guard; GROK_HOME / an unrelated GROK_*
+// variable must not. Cursor hooks execute at require time, so the passive
+// response and exit happen before any resolver or POST work.
+function launchedByGrok(env = process.env) {
+  return Boolean(env && env.GROK_HOOK_EVENT && String(env.GROK_HOOK_EVENT).trim());
+}
+
+if (launchedByGrok()) {
+  process.stdout.write("{}\n");
+  process.exit(0);
+}
 
 const HOOK_TO_STATE = {
   sessionStart: { state: "idle", event: "SessionStart" },
@@ -106,7 +122,7 @@ safetyTimer = setTimeout(() => finish("{}"), SAFETY_TIMEOUT_MS);
 
 readStdinJson()
   .then((payload) => {
-    const argvOverride = process.argv[2];
+    const argvOverride = process.argv[2] === CURSOR_HOOK_SENTINEL ? process.argv[3] : process.argv[2];
     const hookNameResolved = argvOverride || (payload && payload.hook_event_name) || "";
     const mapped = resolveStateAndEvent(payload, hookNameResolved);
     const outLine = stdoutForCursorHook(hookNameResolved);
@@ -151,6 +167,8 @@ readStdinJson()
 
     const body = { state, session_id: sessionId, event };
     body.agent_id = "cursor-agent";
+    const sessionTitle = resolveSessionTitle(payload, hookNameResolved, { readDatabase: !remote });
+    if (sessionTitle) body.session_title = sessionTitle;
     const hint = displaySvgFromToolHook(hookNameResolved, payload);
     if (hint !== undefined) body.display_svg = hint;
     if (cwd) body.cwd = cwd;
