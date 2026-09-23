@@ -14,6 +14,14 @@ npm test
 npm run audit:assets
 ```
 
+Official downloadable themes (for example Hash Sage) ship as versioned GitHub
+Release assets in the separate `rullerzhou-afk/clawd-themes` repository, never
+inside Clawd. Before tagging, confirm the packaged resources still contain no
+`themes/hash-sage/**` payload and that `npm run audit:assets` reports the
+tracked-tree budget within policy. On a pull request, the
+`audit:pr-history-assets` gate additionally proves no large official-theme
+media entered the PR's reachable history.
+
 4. Run the `Build & Release` workflow manually on `main`.
 
 For macOS Developer ID certificate creation, App Store Connect Team API key
@@ -62,7 +70,7 @@ Download and smoke-test the draft release assets before publishing the draft.
 If the draft is wrong, fix the issue before publishing; do not publish a known
 bad draft release.
 
-### v1.0.0 Draft Smoke Checklist
+### v1.1.0 Draft Smoke Checklist
 
 Use the draft release installer or package artifact, not `npm start`. Windows
 required items are the primary publish gate. If macOS or Linux hardware is not
@@ -75,7 +83,7 @@ Before launching:
 - On macOS, download each DMG through a browser so it carries quarantine
   metadata. Confirm it opens without a Privacy & Security override, then verify
   the copied app with `spctl` and `stapler` as documented in the signing guide.
-- Confirm the packaged app shows `1.0.0` metadata.
+- Confirm the packaged app shows `1.1.0` metadata.
 - Confirm packaged resources include `app.asar.unpacked/hooks`,
   `app.asar.unpacked/agents`, `app.asar.unpacked/extensions`,
   and `app.asar.unpacked/themes`.
@@ -86,7 +94,7 @@ Before launching:
 - Download the native-package, Koffi prune/smoke, and updater metadata manifests.
   Confirm the target has one matching `koffi.node`, no foreign native payload,
   and no unreviewed exception. Confirm each updater metadata `version` and every
-  listed artifact filename identify `1.0.0`.
+  listed artifact filename identify `1.1.0`.
 - For migration smoke, install v0.16.0 first and save a copy of the old
   `clawd-prefs.json` before upgrading.
 - For legacy Feishu/Lark migration smoke, enable remote approval in v0.15.0 with saved
@@ -118,9 +126,9 @@ Required all-platform checks:
   an active task alive. Upgrade a profile with a long generic working timeout
   and no Codex-specific value: preserve its previous effective Codex duration.
 
-- Upgrade install over v0.16.0, launch, pet appears, no error dialog. Existing
+- Upgrade install over v1.0.0, launch, pet appears, no error dialog. Existing
   agent installation/enabled flags and user theme/animation choices remain intact.
-- Settings -> About shows `v1.0.0`, sourced from `app.getVersion()`.
+- Settings -> About shows `v1.1.0`, sourced from `app.getVersion()`.
 - First-run tutorial opens once for a fresh profile; Finish, Skip, and OS close
   each persist `tutorialSeen=true` and do not reopen on restart.
 - Upgrade profile with no `tutorialSeen` sees the tutorial once; an already-seen
@@ -129,9 +137,8 @@ Required all-platform checks:
   macOS installs default to pet + menu-bar accessory with no Dock tile.
 - Settings -> General / Agents / Animation & Sound render correctly in all supported
   languages, including sidebar SVG icons and the folded Animation Map subtab.
-- Settings -> About contributors include the three v1.0.0 first-time
-  contributors: `eugenewang5425`, `draintovmasyan783-creator`, and `Yueh-H`,
-  while preserving all previous contributors.
+- Settings -> About contributors include every v1.1.0 contributor named in the
+  release note while preserving all previous contributors.
 - Make `clawd-prefs.json` temporarily unreadable and launch once. Confirm the
   startup warning and Doctor critical item both explain that agent events and
   approvals are paused; restore access and restart before continuing.
@@ -186,6 +193,19 @@ Required all-platform checks:
   confirm state + Notification events arrive without Clawd taking over approval.
 - Install MiMo Code into a commented/trailing-comma JSONC config, exercise
   Allow/Always/Deny and DND fallback, then uninstall and confirm user config is preserved.
+- Windows packaged opencode acceptance (#1026, requires a real opencode 1.18.31):
+  install the Program Files Clawd package, confirm the opencode config points at
+  `%USERPROFILE%\.clawd\integrations\...\generations\<hash>\opencode-plugin` (never
+  `app.asar.unpacked`), and that the managed four-file generation bytes/hash match the
+  packaged source with no deny-write ACL. Start a real opencode session and confirm
+  exactly one Clawd state stream and one permission request per interaction (no double
+  load from a duplicate entry). Restart Clawd twice and confirm startup sync is
+  idempotent. Repair a single legacy/missing legacy entry and confirm in-place
+  migration with the source untouched; arrange a modified Clawd-like copy and confirm
+  Install/Repair fail closed with Doctor needs-review and no Fix. Uninstall and confirm
+  proven-owned entries are gone, Settings shows uninstalled/disabled, third-party
+  plugin/tuple/options are unchanged, and residual generation files (if any) no longer
+  emit events after Clawd is removed. Source-level tests do not satisfy this item.
 - Settings -> Agents -> Install Reasonix succeeds on Windows when paths contain
   spaces, and the written command uses the EncodedCommand path when needed.
 - Install TraeCode on Windows with Node under `C:\Program Files`, enable the
@@ -241,7 +261,7 @@ Recommended all-platform checks:
 - Right-click Hide pet / Show pet still works; while hidden, a newly arriving
   permission request still shows a bubble, by design.
 - Settings -> About -> Check for updates completes without an error.
-- Update labels never show a duplicated prefix such as `vv1.0.0`.
+- Update labels never show a duplicated prefix such as `vv1.1.0`.
 - Telegram approval cards show the final outcome for decisions made on Telegram
   and for approvals resolved elsewhere.
 - Scan the mobile PWA pairing URL on a phone and confirm session cards appear.
@@ -274,8 +294,8 @@ Windows checks:
 
 macOS checks:
 
-- Required when macOS hardware is available: manually install the signed v1.0.0
-  DMG over v0.16.0 once, preserving app data. Validate a signed A→B updater pair
+- Required when macOS hardware is available: manually install the signed v1.1.0
+  DMG over v1.0.0 once, preserving app data. Validate a signed A→B updater pair
   from an update-capable build on each available architecture, including
   Restart Now and Later/quit/reopen; record exact versions and asset hashes.
   A source run or a mocked updater does not complete this gate.
@@ -319,12 +339,23 @@ module is a hard failure.
 
 ## WinGet Publishing
 
-Publishing the draft release fires `.github/workflows/winget.yml`. **It currently
-prepares only** — it generates the manifest komac would submit and uploads it as
-an artifact. It holds no long-lived PAT or repository secret; the ambient job
-`GITHUB_TOKEN` it uses has `contents: read` and cannot write to this repository or
-to winget-pkgs. Automatic submission is deliberately not enabled yet; see the
-staged plan below.
+Publishing the draft release fires `.github/workflows/winget.yml`. The `prepare`
+job generates a manifest with Komac, normalizes the locale metadata, validates
+the complete generated tree, and uploads the exact files that may be submitted.
+It receives only the ambient read-only `GITHUB_TOKEN`.
+
+An optional `submit` job can then open a one-version PR in
+`microsoft/winget-pkgs`. It is disabled unless the repository variable
+`WINGET_AUTO_SUBMIT` compares equal to `true` (GitHub expression comparisons are
+case-insensitive). Only the final step receives the classic PAT stored as the
+`winget-submit` environment secret `WINGET_TOKEN`. The workflow's ambient
+`GITHUB_TOKEN` remains read-only; the PAT separately carries every permission of
+its owner, so a dedicated account is the minimum-blast-radius configuration.
+The job re-downloads and revalidates the artifact, checks that the version is not
+already in the catalog or an open PR, and submits the four verified files without
+asking Komac to regenerate them. This opens the PR only: Microsoft validation,
+moderator approval, merge, catalog publication, and native Windows acceptance
+remain external gates.
 
 As of 2026-08-23, the upstream 0.14.0 manifest has been repaired and published by
 [`microsoft/winget-pkgs#416019`](https://github.com/microsoft/winget-pkgs/pull/416019),
@@ -342,9 +373,8 @@ winmatsch, so their publication does not validate this repository's komac output
 The first v0.15.0 prepare run
 [`31654717731`](https://github.com/rullerzhou-afk/clawd-on-desk/actions/runs/31654717731)
 also predates the upstream repair and reproduced the old two-x64 shape. The
-workflow therefore stays prepare-only until its **generated output** is validated
-automatically; a correct upstream installer matrix alone is not sufficient reason
-to expose a submission token.
+generated-output validator exists because a correct upstream installer matrix
+alone is not sufficient reason to expose a submission token.
 
 **The workflow must already be on `main` before the tag is created.** For
 `release` events GitHub reads the workflow definition from the tagged ref, so a
@@ -390,7 +420,7 @@ installer supports (`build.nsis` sets `oneClick: false` and no `perMachine`).
 
 ### Staged plan
 
-1. **Prepare-only plumbing — complete; still the current execution mode.** Hosted
+1. **Prepare-only plumbing — complete.** Hosted
    run
    [`31549249655`](https://github.com/rullerzhou-afk/clawd-on-desk/actions/runs/31549249655)
    successfully exercised the workflow, token, installer downloads and artifact
@@ -400,9 +430,8 @@ installer supports (`build.nsis` sets `oneClick: false` and no `perMachine`).
    to the four entries above, changed the license to `AGPL-3.0-only`, passed the
    full validation pipeline and was published on 2026-08-17. The competing
    Dumplings tracker has also been removed.
-3. **Validate komac's output — next.** Run prepare against the current four-entry
-   upstream shape to retain an unmodified sample. Then extend the gate to parse
-   the generated YAML and assert the package identifier/version; exact
+3. **Validate Komac's output — complete.** The generated-output gate parses the
+   YAML and asserts the package identifier/version; exact
    `{x64, arm64} x {user, machine}` set; each entry's URL, SHA256 and `Custom`
    switch; `InstallerType: nullsoft`; `UpgradeBehavior: install`; top-level
    `InstallerSwitches.Upgrade: --updated`; and ProductCode
@@ -411,15 +440,18 @@ installer supports (`build.nsis` sets `oneClick: false` and no `perMachine`).
    `License: AGPL-3.0-only` plus version-pinned `LicenseUrl` and `ReleaseNotesUrl`.
    Komac overwrites `License` from the repository's current `licenseInfo.spdxId`,
    which GitHub reports as `AGPL-3.0`, not the `AGPL-3.0-only` in `package.json`,
-   so the gate must rewrite and then assert these fields rather than accepting the
-   raw output. Until this gate lands, the per-release manual review must enforce
-   the same contract; the published v0.15.0 manifest is not evidence that komac's
-   generated output is safe.
-4. **Enable submission — optional and not started.** Split into `prepare` and
-   `submit` jobs so the PAT exists only in the final step, and pin every `uses:`
-   to a commit SHA at that point. Prefer a dedicated account for the token:
-   `public_repo` grants write access to every public repository its owner can
-   write to, this one included.
+   so the gate rewrites and then asserts these fields rather than accepting the
+   raw output. It writes normalization only after the complete tree passes, emits
+   a SHA256 evidence report, rejects unsupported root/nested keys, and is
+   byte-for-byte idempotent. The submission process recalculates all four hashes
+   against that report immediately before copying the files.
+4. **Enable submission — implemented, disabled pending configuration.** The
+   workflow is split into `prepare` and `submit`, every third-party `uses:` is
+   pinned to a commit SHA, and the PAT exists only in the final submission step.
+   Set up the account, secret and opt-in variable below as a separate repository
+   configuration change. Prefer a dedicated account for the token: `public_repo`
+   grants write access to every public repository its owner can write to, this
+   one included.
 
 ### Why the installer filename is a contract
 
@@ -437,9 +469,9 @@ a filename stops matching the workflow's `INSTALLERS_REGEX`, if the release
 carries a stray asset that regex would also select, if the release tag disagrees
 with `package.json`, or if both installers share a digest.
 
-**This gate checks komac's input, not its output.** It cannot detect the
-shape-preservation problem described above; validating the generated YAML is a
-separate step (stage 3).
+This first gate checks Komac's input, not its output. The separate
+`verify:winget-manifest` gate validates and normalizes the generated YAML before
+the artifact is uploaded or the submission job can start.
 
 This guard exists because the third-party bot that previously owned the manifest
 forwarded only the first matching `.exe`. That was harmless while we shipped one
@@ -461,36 +493,46 @@ itself from a release archive whose SHA-256 is pinned in `env`.
 Bumping `KOMAC_VERSION` requires bumping `KOMAC_SHA256` in the same edit; the
 checksum is asserted in `test/winget-arch-contract.test.js`.
 
-Note that `actions/checkout@v4` and friends are still mutable tags. That is
-acceptable while this workflow holds no secret, and matches the rest of the
-repository's workflows; it must be resolved to commit SHAs before stage 4 adds a
-token.
+All third-party Actions used by this workflow are pinned to full commit SHAs.
+When updating an Action, resolve and review the new tag target and change the SHA
+explicitly; do not replace it with a mutable major-version tag.
 
-### Setup, when stage 4 is reached
+### Optional automatic-submission setup
 
-1. A `rullerzhou-afk/winget-pkgs` fork now exists from the manual repair. Before
-   reusing it, decide whether a dedicated low-privilege account should own the
-   submission token instead.
-2. Create a **classic** PAT for that account with `public_repo` scope and store
-   it as the `WINGET_TOKEN` repository secret. Fine-grained tokens do not work
-   with komac's fork flow.
-3. The former `SpecterShell/Dumplings` tracker was removed in
+1. Choose the account that will submit. A dedicated low-privilege account is
+   preferred; a PAT owned by `rullerzhou-afk` can also write to this source
+   repository. The chosen account's `winget-pkgs` repository must be a fork of
+   `microsoft/winget-pkgs`, and the account must complete Microsoft's CLA when
+   prompted.
+2. Create the `winget-submit` GitHub environment. Add a required reviewer only
+   if opening each PR should require a human gate; keep any deployment-ref rule
+   compatible with release tags.
+3. Create a **classic** PAT for that account with `public_repo` scope and store
+   it as the `WINGET_TOKEN` secret in the `winget-submit` environment, not as a
+   repository-wide secret. Fine-grained tokens can write a fork but cannot open
+   the required PR against the upstream repository.
+4. Set the required repository variable `WINGET_FORK_OWNER` to the submitting
+   account's login. The workflow deliberately has no owner fallback.
+5. The former `SpecterShell/Dumplings` tracker was removed in
    [`a21ff13d`](https://github.com/SpecterShell/Dumplings/commit/a21ff13d2243afa0f58e9569a2f69e9903d726e2).
    Reconfirm it has not returned before enabling submission.
+6. Set the repository variable `WINGET_AUTO_SUBMIT` to `true` (comparison is
+   case-insensitive). Removing it or changing it to another value returns the
+   workflow to prepare-and-upload mode without deleting the secret.
 
 ### Per-release checks
 
-- Download the `winget-generated-manifest` artifact and confirm it carries
-  **four** installer entries — `x64` and `arm64`, each in `user` and `machine`
-  scope — with the right filename and `Custom` switch in each.
-- Confirm `License` reads `AGPL-3.0-only`, and that `LicenseUrl` and
-  `ReleaseNotesUrl` are pinned to the release being submitted. The live v0.14.0
-  manifest is corrected; versions v0.6.2 through v0.13.0 still carry the stale
-  `MIT` value from before `3b6277ff` relicensed the project on 2026-04-25.
-- Until stage 4 is enabled, open a one-version PR in `microsoft/winget-pkgs` from
-  the validated artifact, then track validation, merge and the publish-pipeline
-  result. A successful prepare run alone does **not** publish the release.
-- v0.15.0 is present upstream, but its locale still points `LicenseUrl` and
-  `ReleaseNotesUrl` at v0.14.0. Do not copy those stale values into v1.0.0.
+- Confirm `prepare` passed both `verify:winget-arch` and
+  `verify:winget-manifest`. The uploaded `winget-generated-manifest` artifact is
+  the normalized, validated four-file tree plus its evidence report.
+- If automatic submission is disabled, open a one-version PR from that exact
+  artifact. If it is enabled, confirm the `submit` job reports either the new PR
+  URL or an intentional `already-published` / `open-pull-request` skip.
+- Track Microsoft's validation, moderator review, merge, and catalog-publish
+  result. A successful Clawd workflow or an opened PR alone does **not** publish
+  the release.
+- Historical v0.15.0 locale links pointed at v0.14.0. The output gate rewrites
+  both links to the current release tag; never copy metadata from a prior
+  version by hand.
 - After the catalog refreshes, run an independent Windows `winget install` or
   `winget upgrade` smoke test before documenting the command in the READMEs.

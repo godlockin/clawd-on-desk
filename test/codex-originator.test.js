@@ -4,8 +4,11 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert");
 
 const {
+  CODEX_DEFAULT_SESSION_ID,
+  CODEX_PLACEHOLDER_SESSION_IDS,
   isCodexCliOriginator,
   isCodexDesktopOriginator,
+  isCodexPlaceholderSessionId,
 } = require("../hooks/codex-originator");
 
 describe("Codex originator classification", () => {
@@ -43,6 +46,21 @@ describe("Codex originator classification", () => {
     }
     for (const value of ["codex_exec", "codex_work_desktop", "cli", "", null, {}]) {
       assert.strictEqual(isCodexCliOriginator(value), false, String(value));
+    }
+  });
+
+  it("exports the exact frozen Codex placeholder identity contract", () => {
+    assert.strictEqual(CODEX_DEFAULT_SESSION_ID, "default");
+    assert.deepStrictEqual(
+      CODEX_PLACEHOLDER_SESSION_IDS,
+      ["default", "codex:", "codex:default"],
+    );
+    assert.strictEqual(Object.isFrozen(CODEX_PLACEHOLDER_SESSION_IDS), true);
+    for (const value of ["default", " DEFAULT ", "codex:", " CODEX:DEFAULT "]) {
+      assert.strictEqual(isCodexPlaceholderSessionId(value), true, value);
+    }
+    for (const value of ["codex:real", "real", "", null, {}]) {
+      assert.strictEqual(isCodexPlaceholderSessionId(value), false, String(value));
     }
   });
 });
