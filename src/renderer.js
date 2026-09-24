@@ -1249,6 +1249,7 @@ function releaseImg(el) {
 // --- Reaction state (visual side) ---
 let isReacting = false;
 let reactTimer = null;
+let isSettingsPreviewReaction = false;
 let currentIdleSvg = null;    // tracks which SVG is currently showing
 let currentState = null;      // last state name received from main (for re-pulse)
 let lastCloudlingPointerPayload = null;
@@ -1505,11 +1506,26 @@ function getAssetUrl(file) {
 // --- IPC-triggered reactions (from hit window via main relay) ---
 window.electronAPI.onStartDragReaction((requestOrDirection, legacyDirection) => startDragReaction(requestOrDirection, legacyDirection));
 window.electronAPI.onEndDragReaction(() => endDragReaction());
-window.electronAPI.onPlayClickReaction((svg, duration) => playReaction(svg, duration));
+window.electronAPI.onPlayClickReaction((svg, duration, options) => playReaction(svg, duration, options));
+// Settings cancels its own reaction preview when it closes; without this the
+// pet would hold the reaction visual, and its paused cursor polling, until the
+// clip's own timer fired. A reaction the user started by clicking the pet runs
+// on the same channel and must survive Settings closing, so only a preview is
+// cancelled here.
+window.electronAPI.onCancelClickReaction(() => {
+  if (!isSettingsPreviewReaction) return;
+  if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
+  endReaction();
+});
 
-function playReaction(requestOrFile, durationMs) {
+function playReaction(requestOrFile, durationMs, options) {
+  // A reaction preview now runs as long as the clip, so the next one can start
+  // while this timer is still pending. Clearing it first keeps the old timer
+  // from firing mid-clip and ending the new reaction early.
+  if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
   const visualRequest = normalizeVisualRequest(requestOrFile);
   const svgFile = visualRequest ? visualRequest.file : requestOrFile;
+  isSettingsPreviewReaction = !!(options && options.settingsPreview);
   isReacting = true;
   detachEyeTracking();
   resumeCurrentSvgForLowPower();
@@ -1525,7 +1541,11 @@ function playReaction(requestOrFile, durationMs) {
 function endReaction() {
   if (!isReacting) return;
   isReacting = false;
+  isSettingsPreviewReaction = false;
   reactTimer = null;
+  // A drag reaction holds the same cursor-polling pause and is still running;
+  // endDragReaction() releases it when the drag itself ends.
+  if (isDragReacting) return;
   window.electronAPI.resumeFromReaction();
 }
 
@@ -1533,6 +1553,7 @@ function cancelReaction() {
   if (isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
+    isSettingsPreviewReaction = false;
   }
   if (isDragReacting) {
     isDragReacting = false;
@@ -1697,6 +1718,7 @@ function startDragReaction(requestOrDirection, legacyDirection) {
   if (!isDragReacting && isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
+    isSettingsPreviewReaction = false;
   }
 
   isDragReacting = true;
@@ -1712,7 +1734,9 @@ function endDragReaction() {
   isDragReacting = false;
   currentDragSvg = null;
   currentDragDirection = null;
-  if (!wasDragReacting) return;
+  // A click reaction that started during the drag holds the same cursor-polling
+  // pause and is still running; endReaction() releases it when that one ends.
+  if (!wasDragReacting || isReacting) return;
   window.electronAPI.resumeFromReaction();
 }
 

@@ -1,8 +1,12 @@
-name: Prepare WinGet manifest
+name: Publish WinGet manifest
 
-# PREPARE ONLY — this workflow submits nothing and holds no long-lived
-# credential. It uses the ephemeral job GITHUB_TOKEN with `contents: read`, which
-# cannot write to this repository or to winget-pkgs.
+# Prepare and, when explicitly enabled, submit a WinGet manifest PR.
+#
+# The prepare job never receives the long-lived submission token. It validates
+# both Komac's inputs and its generated YAML, normalizes the locale metadata, and
+# publishes the exact four-file tree as an artifact. The submit job is disabled
+# unless WINGET_AUTO_SUBMIT is the string "true"; only its final step receives
+# WINGET_TOKEN and copies those already-verified files into a winget-pkgs fork.
 #
 # Historical background: a third-party release-tracking bot originally owned
 # `rullerzhou-afk.clawd-on-desk` in microsoft/winget-pkgs. From v0.6.2, when the
@@ -17,15 +21,11 @@ name: Prepare WinGet manifest
 # but its locale still points LicenseUrl and ReleaseNotesUrl at v0.14.0.
 # SpecterShell/Dumplings#130 removed the competing tracker.
 #
-# Why this still cannot submit automatically: `komac update` inherits one output
+# Why generated output is validated: `komac update` inherits one output
 # entry per PREVIOUS installer (Komac src/commands/update_version.rs ->
-# src/match_installers.rs). The corrected upstream shape should now preserve both
-# architectures, but the first v0.15.0 prepare run happened before that repair and
-# reproduced the old two-x64 output. The later published v0.15.0 files were
-# generated with winmatsch, so they do not validate this workflow's komac output.
-# More importantly, this workflow does not yet parse, normalize and reject an
-# unsafe GENERATED manifest. Until that output gate lands and passes, it only
-# uploads the manifest komac WOULD submit for inspection.
+# src/match_installers.rs). A correct pair of URLs is therefore not sufficient.
+# The output gate below rejects any shape except x64/arm64 x user/machine and
+# binds each entry to the release-asset contract before submission can run.
 #
 # See docs/project/release-process.md for the staged plan.
 
@@ -35,7 +35,7 @@ on:
   workflow_dispatch:
     inputs:
       release-tag:
-        description: "Release tag to prepare, e.g. v0.15.0"
+        description: "Release tag to publish, e.g. v1.1.0"
         required: true
         type: string
 
@@ -43,7 +43,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: winget-prepare
+  group: winget-publish
   cancel-in-progress: false
 
 env:
@@ -58,6 +58,8 @@ env:
 
 jobs:
   prepare:
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     runs-on: ubuntu-latest
     # komac downloads both installers in full (~258 MB) to analyse them; it has
     # no range or header-only mode. Bound the job so a stalled CDN cannot hold
@@ -103,13 +105,16 @@ jobs:
         # actions/checkout takes the ref that triggered the run — for a release
         # event that is the tag, which for older releases does not contain this
         # tooling at all. The build config is read from the tag separately below.
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
+
+      - name: Install manifest validation dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Fetch the tagged build configuration
         # Installer filenames come from the package.json that produced the
@@ -191,6 +196,16 @@ jobs:
             --dry-run \
             --output generated
 
+      - name: Normalize and verify generated manifest
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          npm run verify:winget-manifest -- \
+            --generated-root generated \
+            --architecture-contract winget-arch-contract.json \
+            --release-tag "$TAG" \
+            --output winget-generated-manifest-report.json
+
       - name: Summarize generated installers
         if: always() && hashFiles('generated/**') != ''
         run: |
@@ -201,14 +216,85 @@ jobs:
           find generated -name '*installer.yaml' -exec cat {} + >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always() && hashFiles('winget-arch-contract.json') != ''
         with:
           name: winget-arch-contract
           path: winget-arch-contract.json
 
-      - uses: actions/upload-artifact@v4
-        if: always() && hashFiles('generated/**') != ''
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: success() && hashFiles('generated/**') != ''
         with:
           name: winget-generated-manifest
-          path: generated/
+          path: |
+            generated/
+            winget-generated-manifest-report.json
+
+  submit:
+    needs: prepare
+    if: needs.prepare.result == 'success' && vars.WINGET_AUTO_SUBMIT == 'true'
+    environment: winget-submit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out submission tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install manifest validation dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download validated manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: winget-generated-manifest
+          path: validated-artifact
+
+      - name: Download architecture contract
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: winget-arch-contract
+          path: evidence
+
+      - name: Reverify downloaded manifest
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          npm run verify:winget-manifest -- \
+            --generated-root validated-artifact/generated \
+            --architecture-contract evidence/winget-arch-contract.json \
+            --release-tag "$TAG" \
+            --output winget-downloaded-manifest-report.json
+
+      - name: Submit validated manifest PR
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          WINGET_FORK_OWNER: ${{ vars.WINGET_FORK_OWNER }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          node scripts/submit-winget-manifest.js \
+            --fork-owner "$WINGET_FORK_OWNER" \
+            --generated-root validated-artifact/generated \
+            --expected-digests winget-downloaded-manifest-report.json \
+            --release-tag "$TAG" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --output winget-submission-report.json
+          status="$(jq -r '.status' winget-submission-report.json)"
+          reason="$(jq -r '.reason // empty' winget-submission-report.json)"
+          url="$(jq -r '.pullRequestUrl // empty' winget-submission-report.json)"
+          echo "### WinGet submission" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: \`$status\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$reason" ]; then
+            echo "- Reason: \`$reason\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "$url" ]; then
+            echo "- Pull request: $url" >> "$GITHUB_STEP_SUMMARY"
+          fi

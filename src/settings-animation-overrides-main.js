@@ -16,6 +16,9 @@ const ASPECT_RATIO_WARN_THRESHOLD = 0.15;
 const PREVIEW_HOLD_MIN_MS = 800;
 const PREVIEW_HOLD_MAX_MS = 3500;
 const TRUSTED_SCRIPTED_PREVIEW_HOLD_MAX_MS = 15000;
+// APNG / GIF frame delays give a file's exact playthrough, so their previews can
+// hold for the whole of it; this ceiling only guards against corrupt delays.
+const FRAME_TIMED_PREVIEW_HOLD_MAX_MS = 60000;
 
 const REACTION_ORDER = [
   { key: "drag", triggerKind: "dragReaction", supportsDuration: false },
@@ -204,6 +207,15 @@ function createSettingsAnimationOverridesMain(options = {}) {
   const sendToRenderer = options.sendToRenderer || (() => {});
 
   let animationOverridePreviewTimer = null;
+  let animationOverridePreviewGeneration = 0;
+  // Whether a preview has overwritten the canonical state. Only that kind of
+  // preview has to be handed back; a reaction preview lives in the renderer,
+  // and main must not guess at its timer from a wall clock.
+  let statePreviewOutstanding = false;
+  // The display revision the preview left behind. A state name cannot answer
+  // "is my preview still up?" — a real task finishing into the same state the
+  // preview is showing looks identical — but the revision moves either way.
+  let statePreviewRevision = null;
   let animationOverridePreviewPosterWindow = null;
   let animationOverridePreviewPosterReady = null;
   let animationOverridePreviewPosterQueue = Promise.resolve();
@@ -213,6 +225,9 @@ function createSettingsAnimationOverridesMain(options = {}) {
   let pendingPostReloadTasks = [];
 
   function clearPreviewTimer() {
+    // Bump the generation too, so a callback that already fired but is still
+    // queued behind this tick cannot restore state after a cancel.
+    animationOverridePreviewGeneration += 1;
     if (animationOverridePreviewTimer) {
       clearTimeout(animationOverridePreviewTimer);
       animationOverridePreviewTimer = null;
@@ -1152,31 +1167,133 @@ function createSettingsAnimationOverridesMain(options = {}) {
     return data;
   }
 
-  function runAnimationOverridePreview(stateKey, file, durationMs) {
-    clearPreviewTimer();
-    const stateRuntime = getStateRuntime();
-    try {
-      stateRuntime.applyState(stateKey, file);
-    } catch (err) {
-      return { status: "error", message: `previewAnimationOverride: ${err && err.message}` };
-    }
-    const activeTheme = getActiveTheme();
-    const trustedScriptedCycleMs = getTrustedScriptedAnimationCycleMs(file, activeTheme, path);
-    const previewMaxMs = isTrustedScriptedAnimationFile(file, activeTheme, path)
-      ? TRUSTED_SCRIPTED_PREVIEW_HOLD_MAX_MS
-      : PREVIEW_HOLD_MAX_MS;
+  function getFrameTimedPreviewCycleMs(file, theme) {
+    const probe = buildAnimationAssetProbe(file, theme);
+    const frameTimed = probe.assetCycleSource === "apng" || probe.assetCycleSource === "gif";
+    return frameTimed && probe.assetCycleStatus === "exact" ? probe.assetCycleMs : null;
+  }
+
+  function resolvePreviewHoldMs(file, durationMs, theme = getActiveTheme()) {
+    const trustedScripted = isTrustedScriptedAnimationFile(file, theme, path);
+    const cycleMs = trustedScripted
+      ? getTrustedScriptedAnimationCycleMs(file, theme, path)
+      : getFrameTimedPreviewCycleMs(file, theme);
+    let previewMaxMs = PREVIEW_HOLD_MAX_MS;
+    if (trustedScripted) previewMaxMs = TRUSTED_SCRIPTED_PREVIEW_HOLD_MAX_MS;
+    else if (cycleMs != null) previewMaxMs = FRAME_TIMED_PREVIEW_HOLD_MAX_MS;
     const requested = (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0)
       ? durationMs
-      : (trustedScriptedCycleMs != null ? trustedScriptedCycleMs : PREVIEW_HOLD_MIN_MS);
-    const holdMs = Math.max(PREVIEW_HOLD_MIN_MS, Math.min(previewMaxMs, requested));
-    animationOverridePreviewTimer = setTimeout(() => {
-      animationOverridePreviewTimer = null;
-      const latestStateRuntime = getStateRuntime();
-      try {
-        latestStateRuntime.applyState("idle", latestStateRuntime.getSvgOverride("idle"));
-      } catch {}
-    }, holdMs);
-    return { status: "ok" };
+      : (cycleMs != null ? cycleMs : PREVIEW_HOLD_MIN_MS);
+    return Math.max(PREVIEW_HOLD_MIN_MS, Math.min(previewMaxMs, requested));
+  }
+
+  // A preview is a temporary visual, so hand the pet back to the state the live
+  // sessions actually want when it ends. A preview now holds for a whole
+  // playthrough, so a real session can easily start working while one is up;
+  // forcing "idle" here would silently downgrade it.
+  // A preview only owns the pet until a real event takes the state over — a
+  // task finishing into attention, say. Handing back after that would cut the
+  // live animation short, so the hand-back is dropped instead.
+  function statePreviewStillShowing() {
+    const stateRuntime = getStateRuntime();
+    if (!stateRuntime || typeof stateRuntime.getDisplayRevision !== "function") return true;
+    try {
+      return stateRuntime.getDisplayRevision() === statePreviewRevision;
+    } catch {
+      return true;
+    }
+  }
+
+  function releaseStatePreview() {
+    if (!statePreviewOutstanding) return false;
+    const stillShowing = statePreviewStillShowing();
+    statePreviewOutstanding = false;
+    statePreviewRevision = null;
+    return stillShowing;
+  }
+
+  function restoreDisplayedState() {
+    const stateRuntime = getStateRuntime();
+    if (!stateRuntime
+      || typeof stateRuntime.resolveDisplayState !== "function"
+      || typeof stateRuntime.applyState !== "function") return;
+    try {
+      const state = stateRuntime.resolveDisplayState();
+      // Muted: the pet is being handed back to a state it is already in, and
+      // its cue already played when that state first arrived.
+      stateRuntime.applyState(state, typeof stateRuntime.getSvgOverride === "function"
+        ? stateRuntime.getSvgOverride(state)
+        : undefined, { muteStateSounds: true });
+    } catch {}
+  }
+
+  function runAnimationOverridePreview(stateKey, file, durationMs) {
+    // A previous preview may still own the visual. Its timer is dropped below
+    // by clearPreviewTimer(); if this attempt fails to land, that previous
+    // preview has no recovery path left, so it must be handed back here.
+    clearPreviewTimer();
+    const stateRuntime = getStateRuntime();
+    const readRevision = () => (typeof stateRuntime.getDisplayRevision === "function"
+      ? stateRuntime.getDisplayRevision()
+      : null);
+    const beforeRevision = readRevision();
+    let applyError = null;
+    try {
+      // The settingsPreview marker is what lets state.js tell "a preview owns
+      // this visual" from "the pet is really in this state" — without it a
+      // real event on the same state name would be deduped away and never take
+      // the visual back.
+      stateRuntime.applyState(stateKey, file, { settingsPreview: true });
+    } catch (err) {
+      applyError = err;
+    }
+    // "Landed" means THIS apply advanced the display revision and now holds a
+    // settings-preview owner. A bare isSettingsPreviewVisual() === true is not
+    // enough: a previous preview that is still up would read true even though
+    // this attempt early-returned, and its old visual would then be held under
+    // the new duration. When the runtime cannot report a revision, fall back to
+    // the marker alone.
+    const afterRevision = readRevision();
+    const revisionAdvanced = beforeRevision === null
+      || afterRevision === null
+      || afterRevision !== beforeRevision;
+    const ownedByThisPreview = typeof stateRuntime.isSettingsPreviewVisual !== "function"
+      || stateRuntime.isSettingsPreviewVisual() === true;
+    // A "partial landing" is the same visual takeover as a landing, except the
+    // apply threw after taking it (revision advanced + preview owner set). It
+    // is judged from THIS apply's revision, never the outstanding preview's:
+    // the attempt replaced whatever was up, so it must be handed back now.
+    const tookVisual = revisionAdvanced && ownedByThisPreview;
+
+    if (!applyError && tookVisual) {
+      const holdMs = resolvePreviewHoldMs(file, durationMs);
+      const generation = animationOverridePreviewGeneration;
+      statePreviewOutstanding = true;
+      statePreviewRevision = afterRevision;
+      animationOverridePreviewTimer = setTimeout(() => {
+        animationOverridePreviewTimer = null;
+        if (generation !== animationOverridePreviewGeneration) return;
+        if (releaseStatePreview()) restoreDisplayedState();
+      }, holdMs);
+      return { status: "ok", applied: true };
+    }
+
+    if (tookVisual) {
+      // applyState took the visual and only then threw: there is no timer and
+      // no valid owner, so hand the authoritative state back immediately.
+      statePreviewOutstanding = false;
+      statePreviewRevision = null;
+      restoreDisplayedState();
+    } else if (statePreviewOutstanding) {
+      // No visual was taken by this attempt; a previous preview that is still
+      // shown just lost its timer, so hand it back. Ownership is always dropped.
+      if (releaseStatePreview()) restoreDisplayedState();
+    }
+
+    if (applyError) {
+      return { status: "error", message: `previewAnimationOverride: ${applyError && applyError.message}` };
+    }
+    return { status: "ok", applied: false };
   }
 
   function previewAnimationOverride(payload) {
@@ -1195,7 +1312,14 @@ function createSettingsAnimationOverridesMain(options = {}) {
       return { status: "error", message: "previewAnimationOverride requires state runtime" };
     }
     if (getThemeReloadInProgress()) {
-      pendingPostReloadTasks.push(() => runAnimationOverridePreview(stateKey, file, durationMs));
+      // Only the newest deferred preview should survive the reload, and a
+      // cancel in between has to void it: both ride the same generation.
+      const generation = ++animationOverridePreviewGeneration;
+      const task = () => {
+        if (generation !== animationOverridePreviewGeneration) return;
+        runAnimationOverridePreview(stateKey, file, durationMs);
+      };
+      pendingPostReloadTasks.push(task);
       return { status: "ok", deferred: true };
     }
     return runAnimationOverridePreview(stateKey, file, durationMs);
@@ -1209,12 +1333,26 @@ function createSettingsAnimationOverridesMain(options = {}) {
     if (typeof file !== "string" || !file) {
       return { status: "error", message: "previewReaction.file must be a non-empty string" };
     }
-    const requested = (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0)
-      ? durationMs
-      : PREVIEW_HOLD_MIN_MS;
-    const clamped = Math.max(PREVIEW_HOLD_MIN_MS, Math.min(PREVIEW_HOLD_MAX_MS, requested));
-    sendToRenderer("play-click-reaction", file, clamped);
+    // Marked as a Settings preview so closing Settings cancels this reaction
+    // and not one the user started by clicking the pet on the same channel.
+    sendToRenderer("play-click-reaction", file, resolvePreviewHoldMs(file, durationMs), { settingsPreview: true });
     return { status: "ok" };
+  }
+
+  // Closing Settings, or reloading the theme under one, must not leave a
+  // preview on the pet: a state preview holds for the clip's whole length, and
+  // a reaction preview keeps the renderer's cursor polling paused until its own
+  // timer fires. The renderer cancel is idempotent, so it always goes out
+  // instead of being gated on main's guess about the renderer's timer; only the
+  // state hand-back is conditional, because applyState is not a free redraw.
+  function cancelAnimationPreview() {
+    // clearPreviewTimer() bumps the generation, which is also what voids a
+    // preview still queued behind a theme reload.
+    clearPreviewTimer();
+    const handBack = releaseStatePreview();
+    sendToRenderer("cancel-click-reaction");
+    if (handBack) restoreDisplayedState();
+    return { status: "ok", restoredState: handBack };
   }
 
   function getSettingsDialogParent(event) {
@@ -1331,6 +1469,7 @@ function createSettingsAnimationOverridesMain(options = {}) {
     buildAnimationAssetProbe,
     previewAnimationOverride,
     previewReaction,
+    cancelAnimationPreview,
     openThemeAssetsDir,
     exportAnimationOverrides,
     importAnimationOverrides,
@@ -1352,6 +1491,7 @@ createSettingsAnimationOverridesMain.__test = {
   PREVIEW_HOLD_MIN_MS,
   PREVIEW_HOLD_MAX_MS,
   TRUSTED_SCRIPTED_PREVIEW_HOLD_MAX_MS,
+  FRAME_TIMED_PREVIEW_HOLD_MAX_MS,
   isTrustedScriptedAnimationFile,
   isObjectChannelSvgAnimationFile,
   needsScriptedAnimationPreviewPoster,

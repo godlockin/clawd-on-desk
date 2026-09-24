@@ -377,6 +377,7 @@ globalThis.__rendererTest = {
   get currentDragSvg() { return currentDragSvg; },
   get currentDragDirection() { return currentDragDirection; },
   get isDragReacting() { return isDragReacting; },
+  get isReacting() { return isReacting; },
   get accessoryAssetLoadTimer() { return _accessorySlots.head.assetLoadTimer; },
   get accessoryAssetSettled() { return _accessorySlots.head.assetSettled; },
   get accessorySlots() { return _accessorySlots; },
@@ -3294,5 +3295,100 @@ describe("renderer viewport offset X (#690)", () => {
     } finally {
       loader.restore();
     }
+  });
+});
+
+describe("renderer reaction preview lifecycle", () => {
+  it("clears a pending reaction timer before the next reaction starts", () => {
+    const harness = createRendererHarness();
+    harness.electronHandlers.onPlayClickReaction("react-drag.apng", 5600);
+    const first = harness.timers.find((timer) => timer.ms === 5600);
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600);
+    const second = harness.timers.find((timer) => timer.ms === 4600);
+
+    assert.ok(first, "first reaction timer");
+    assert.ok(second, "second reaction timer");
+    // Without the clear, the first timer would fire mid-clip and end the
+    // second reaction early — settings previews now last as long as the clip.
+    assert.strictEqual(first.cleared, true);
+    assert.strictEqual(second.cleared, false);
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      0
+    );
+  });
+
+  it("cancels a reaction preview and resumes cursor polling when settings asks", () => {
+    const harness = createRendererHarness();
+    harness.electronHandlers.onPlayClickReaction("react-drag.apng", 5600, { settingsPreview: true });
+    const timer = harness.timers.find((entry) => entry.ms === 5600);
+    harness.electronHandlers.onCancelClickReaction();
+
+    assert.ok(timer);
+    assert.strictEqual(timer.cleared, true);
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      1
+    );
+  });
+});
+
+describe("renderer reaction pause ownership", () => {
+  it("keeps the pause a drag reaction holds when a click preview is cancelled", () => {
+    const harness = createRendererHarness({
+      themeConfig: { dragSvgs: { left: "drag-left.svg", right: "drag-right.svg" } },
+    });
+    harness.electronHandlers.onStartDragReaction("right");
+    assert.strictEqual(harness.api.isDragReacting, true);
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600, { settingsPreview: true });
+    harness.electronHandlers.onCancelClickReaction();
+
+    // The drag is still running and still wants the cursor polling paused.
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      0
+    );
+
+    harness.electronHandlers.onEndDragReaction();
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      1
+    );
+  });
+});
+
+describe("renderer reaction preview scope", () => {
+  const resumes = (harness) =>
+    harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length;
+
+  it("leaves a reaction the user started alone when settings cancels its preview", () => {
+    const harness = createRendererHarness();
+    // No settingsPreview marker: this is a click on the pet, on the same channel.
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600);
+    const timer = harness.timers.find((entry) => entry.ms === 4600);
+    harness.electronHandlers.onCancelClickReaction();
+
+    assert.ok(timer);
+    assert.strictEqual(timer.cleared, false);
+    assert.strictEqual(harness.api.isReacting, true);
+    assert.strictEqual(resumes(harness), 0);
+
+    timer.callback();
+    assert.strictEqual(resumes(harness), 1);
+  });
+
+  it("leaves the pause to a click reaction when the drag ends first", () => {
+    const harness = createRendererHarness({
+      themeConfig: { dragSvgs: { left: "drag-left.svg", right: "drag-right.svg" } },
+    });
+    harness.electronHandlers.onStartDragReaction("right");
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600, { settingsPreview: true });
+    harness.electronHandlers.onEndDragReaction();
+
+    // The click reaction is still running and still wants polling paused.
+    assert.strictEqual(resumes(harness), 0);
+
+    harness.timers.find((entry) => entry.ms === 4600).callback();
+    assert.strictEqual(resumes(harness), 1);
   });
 });
