@@ -41,6 +41,15 @@ Read the file for every new sender process, verify `app === "clawd-on-desk"`, an
 
 Send JSON to `http://127.0.0.1:<runtime-port>/state` with `Content-Type: application/json`.
 
+The local hook endpoint is for native adapters, not browser pages. Each request
+must use a literal loopback authority (`127.0.0.1`, `localhost`, or `[::1]`,
+with an optional valid port), omit the `Origin` header, and contain exactly one
+`Host` header and one `Content-Type` header whose media type is
+`application/json`. A charset parameter is allowed. Clawd rejects an unsafe or
+ambiguous transport before reading the JSON body, so do not route this endpoint
+through a browser fetch, hostname alias, or proxy that adds `Origin` or duplicate
+authority/media-type headers.
+
 Minimum payload:
 
 ```json
@@ -126,7 +135,9 @@ curl --fail-with-body -X POST "http://127.0.0.1:${PORT}/state" \
 
 - **200 `ok`** — the state payload was valid and passed the agent gate. During Do Not Disturb, Clawd can still return success while suppressing the visible reaction; do not treat HTTP 200 as proof that an animation was shown.
 - **204 No Content** — the custom agent is disabled, its registration was removed/does not exist, or the request used an unsupported custom route. No new state session is created for a disabled or rejected custom ID.
-- **400** — malformed JSON, an unknown state, or an invalid state-specific payload.
+- **400** — malformed JSON, an unknown state, an invalid state-specific payload, or duplicate `Host` / `Content-Type` headers.
+- **403** — the request included `Origin` or used a non-loopback/invalid `Host` authority.
+- **415** — `Content-Type` was missing or its media type was not `application/json`.
 - **413** — the JSON body exceeded 16 KiB.
 - **Connection failure** — Clawd is not running or the runtime file is stale. The sender should fail open and continue its own workflow.
 
