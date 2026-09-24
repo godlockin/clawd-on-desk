@@ -18,6 +18,7 @@ const {
   buildShadowComparison,
   processMetadataForState,
 } = require("./server-windows-process-metadata");
+const { stripRemoteProcessMetadata } = require("./remote-process-metadata");
 const {
   normalizeHookToolUseId,
   findPendingPermissionForStateEvent,
@@ -63,6 +64,21 @@ const RECAP_PERMISSION_BOUNDARY_AGENT_IDS = new Set([
 // metadata drop; only this header allows a metadata sender to advance its
 // application-level dedup baseline.
 const CLAWD_METADATA_ACCEPTED_HEADER = "X-Clawd-Metadata-Accepted";
+const MAX_PERMISSION_LIFECYCLE_SESSION_ID_LENGTH = 512;
+
+function hasExplicitPermissionLifecycleSessionIdentity(rawSessionId, agentId) {
+  if (typeof rawSessionId !== "string") return false;
+  const normalized = rawSessionId.trim();
+  if (!normalized || normalized.length > MAX_PERMISSION_LIFECYCLE_SESSION_ID_LENGTH) return false;
+  if (/[\u0000-\u001f\u007f]/u.test(normalized)) return false;
+  const lowered = normalized.toLowerCase();
+  if (lowered === "default") return false;
+  const normalizedAgentId = typeof agentId === "string" ? agentId.trim().toLowerCase() : "";
+  if (normalizedAgentId && (lowered === `${normalizedAgentId}:default` || lowered === `${normalizedAgentId}:`)) {
+    return false;
+  }
+  return true;
+}
 
 function normalizeHwndString(value) {
   if (value === null || value === undefined) return null;
@@ -184,6 +200,7 @@ function handleStatePost(req, res, options) {
     shouldDropForDnd,
     codexOfficialTurns,
     dshStateSequenceFence = null,
+    grokTurnFence = null,
     pathApi = path,
     // #627 residual: injectable so unit tests never load the real koffi FFI.
     // Defaults to the real host OS check / a probe that never samples.
@@ -230,17 +247,36 @@ function handleStatePost(req, res, options) {
       if (data.display_svg === null) display_svg = null;
       else if (typeof data.display_svg === "string") display_svg = pathApi.basename(data.display_svg);
       else display_svg = undefined;
-      const source_pid = Number.isFinite(data.source_pid) && data.source_pid > 0 ? Math.floor(data.source_pid) : null;
-      const wtHwnd = normalizeHwndString(data.wt_hwnd ?? data.wtHwnd);
+      const rawWtHwnd = normalizeHwndString(data.wt_hwnd ?? data.wtHwnd);
       const cwd = typeof data.cwd === "string" ? data.cwd : "";
-      const editor = (data.editor === "code" || data.editor === "cursor") ? data.editor : null;
-      const pidChain = Array.isArray(data.pid_chain) ? data.pid_chain.filter(n => Number.isFinite(n) && n > 0) : null;
-      const tmuxSocket = normalizeTmuxSocket(data.tmux_socket);
-      const tmuxClient = normalizeTmuxClient(data.tmux_client);
-      const orcaPaneKey = normalizeOrcaPaneKey(data.orca_pane_key);
       const rawAgentPid = data.agent_pid ?? data.claude_pid ?? data.cursor_pid;
-      const agentPid = Number.isFinite(rawAgentPid) && rawAgentPid > 0 ? Math.floor(rawAgentPid) : null;
+      // Stripped at the parse boundary rather than at the updateSession call so
+      // that no downstream consumer (legacy metadata, the Windows chain gate,
+      // the codex user-input bubble) has to remember the rule. `orcaPaneKey`,
+      // `cwd` and `host` are untouched by design — see remote-process-metadata.js.
+      const {
+        sourcePid: source_pid,
+        wtHwnd,
+        agentPid,
+        pidChain,
+        editor,
+        tmuxSocket,
+        tmuxClient,
+      } = stripRemoteProcessMetadata({
+        sourcePid: Number.isFinite(data.source_pid) && data.source_pid > 0 ? Math.floor(data.source_pid) : null,
+        wtHwnd: rawWtHwnd,
+        agentPid: Number.isFinite(rawAgentPid) && rawAgentPid > 0 ? Math.floor(rawAgentPid) : null,
+        pidChain: Array.isArray(data.pid_chain) ? data.pid_chain.filter(n => Number.isFinite(n) && n > 0) : null,
+        editor: (data.editor === "code" || data.editor === "cursor") ? data.editor : null,
+        tmuxSocket: normalizeTmuxSocket(data.tmux_socket),
+        tmuxClient: normalizeTmuxClient(data.tmux_client),
+      }, remoteProfile);
+      const orcaPaneKey = normalizeOrcaPaneKey(data.orca_pane_key);
       const agentId = agentIdentity.agentId;
+      const hasExplicitPermissionLifecycleSession = hasExplicitPermissionLifecycleSessionIdentity(
+        session_id,
+        agentId,
+      );
       const trustedProfileId = remoteProfile && typeof remoteProfile.profileId === "string"
         ? remoteProfile.profileId
         : "local";
@@ -270,6 +306,11 @@ function handleStatePost(req, res, options) {
       const subagentType = agentIdentity.source === "subagent"
         ? agentIdentity.subagentType
         : reportedSubagentType;
+      // Invalid wire identities may still contribute bounded lifecycle state,
+      // but they must not create attacker-chosen state buckets. Permission
+      // cleanup remains gated by the original verdict captured above.
+      if (!hasExplicitPermissionLifecycleSession) session_id = undefined;
+      const usesBuiltInDefaultStateBucket = !session_id && agentIdentity.source !== "custom";
       // State sessions share one process-wide Map keyed only by session id.
       // Registered custom applications commonly send generic ids such as
       // "default" or "project-a", so namespace them at the trust boundary to
@@ -284,7 +325,17 @@ function handleStatePost(req, res, options) {
           ? rawCustomSessionId
           : `${customSessionPrefix}${rawCustomSessionId}`;
       }
+      // Missing/default built-in identities are deliberately ineligible for
+      // permission cleanup, but their lifecycle state still needs a bounded
+      // bucket. Namespace that fallback by agent so one agent cannot replace
+      // or end another agent's `default` state. Keep the public raw id below
+      // as `default` so Kiro's cwd-scoped aliases and existing UI contracts do
+      // not acquire the internal namespace.
+      if (!session_id) session_id = `${agentId}:default`;
       const sessionIdentity = resolveSessionIdentity(session_id, trustedProfileId, "default");
+      const rawStateSessionId = usesBuiltInDefaultStateBucket
+        ? "default"
+        : sessionIdentity.rawSessionId;
       session_id = sessionIdentity.sessionId;
       const host = remoteProfile && typeof remoteProfile.displayHost === "string"
         ? remoteProfile.displayHost
@@ -476,6 +527,30 @@ function handleStatePost(req, res, options) {
           ...(trustedProfileId === "local" ? {} : { displayHost: host }),
         });
       }
+      // Local Codex archive lifecycle (#655): once the local task's rollout is
+      // confirmed archived, a late lifecycle hook or passive user-input request
+      // must not recreate its card/focus entry. Quota/context above already
+      // landed, so this only drops session lifecycle. Remote SSH and WSL
+      // sessions are excluded even when their raw id collides.
+      const codexArchiveSuppressed = agentId === "codex"
+        && trustedProfileId === "local"
+        && !host
+        && !wslDistro
+        && !metadataOnly
+        && !(codexUserInput && codexUserInput.phase === "resolved")
+        && typeof ctx.shouldSuppressCodexArchive === "function"
+        && ctx.shouldSuppressCodexArchive(sessionIdentity.rawSessionId, {
+          agentId,
+          profileId: trustedProfileId,
+          host,
+          wslDistro,
+        });
+      if (codexArchiveSuppressed) {
+        recordRequestHookEvent.droppedUnsupported();
+        res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+        res.end();
+        return;
+      }
       if (agentId === "codex" && codexUserInput) {
         const sid = session_id || "default";
         if (codexUserInput.phase === "resolved") {
@@ -530,6 +605,7 @@ function handleStatePost(req, res, options) {
             metaUpdate.contextUsage = contextUsage;
             metaUpdate.contextUsageOrigin = resolveMetadataContextUsageOrigin(agentId, contextUsage);
           }
+          if (model && localClaudeStatuslineMetadataAllowed) metaUpdate.model = model;
           // OpenCode title changes ride the same metadata-only channel (the
           // placeholder → real title swap arrives on session.updated, which
           // maps to no Clawd state). Not gated on the Claude telemetry flag —
@@ -545,6 +621,27 @@ function handleStatePost(req, res, options) {
         });
         res.end();
         return;
+      }
+      // Grok Build turn-order fence. Assessed before any lifecycle mutation but
+      // committed only after the synchronous state update succeeds, so a
+      // dropped event returns immediately (no state / recentEvents touched) and
+      // a state-update exception can never mark an un-applied terminal event as
+      // handled.
+      let grokFenceDecision = null;
+      if (agentId === "grok-build" && grokTurnFence && typeof grokTurnFence.assess === "function") {
+        grokFenceDecision = grokTurnFence.assess({
+          sessionId: sessionIdentity.sessionId,
+          event,
+          state,
+          promptId: typeof data.prompt_id === "string" ? data.prompt_id : null,
+          notificationType: typeof data.notification_type === "string" ? data.notification_type : null,
+        });
+        if (!grokFenceDecision.accept) {
+          recordRequestHookEvent.droppedUnsupported();
+          res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+          res.end();
+          return;
+        }
       }
       if (ctx.STATE_SVGS[state]) {
         const sid = session_id || "default";
@@ -793,7 +890,18 @@ function handleStatePost(req, res, options) {
             : behaviorFor;
           ctx.resolvePermissionEntry(candidates[0], behavior, message);
         };
-        if (event === "PostToolUse" || event === "PostToolUseFailure" || event === "Stop") {
+        const permissionLifecycleEvent = event === "PostToolUse"
+          || event === "PostToolUseFailure"
+          || event === "Stop"
+          || event === "SessionEnd"
+          || event === "UserPromptSubmit"
+          || event === "PreToolUse";
+        if (!hasExplicitPermissionLifecycleSession && permissionLifecycleEvent
+          && typeof ctx.debugLog === "function") {
+          ctx.debugLog("state-permission-cleanup-skipped reason=missing-or-invalid-session-id");
+        }
+        if (hasExplicitPermissionLifecycleSession
+          && (event === "PostToolUse" || event === "PostToolUseFailure" || event === "Stop")) {
           const perm = findPendingPermissionForStateEvent(ctx.pendingPermissions, {
             sessionId: sid,
             agentId,
@@ -829,7 +937,7 @@ function handleStatePost(req, res, options) {
         // change"); PreToolUse(non-ExitPlanMode) = Claude started executing after
         // plan approval. SessionEnd is authoritative and clears both plan and
         // human-question entries without inventing a user decision.
-        if (event === "SessionEnd") {
+        if (hasExplicitPermissionLifecycleSession && event === "SessionEnd") {
           // A main-thread SessionEnd is authoritative for the whole agent
           // session and must clear requests from every subagent. A SessionEnd
           // emitted by a subagent only closes that subagent's own requests; its
@@ -842,13 +950,13 @@ function handleStatePost(req, res, options) {
           ))) {
             ctx.resolvePermissionEntry(stale, "no-decision", "Session ended");
           }
-        } else if (
+        } else if (hasExplicitPermissionLifecycleSession && (
           event === "UserPromptSubmit"
           || (
             event === "PreToolUse"
             && stateEventInteraction.intent !== INTERACTION_INTENT.PLAN_REVIEW
           )
-        ) {
+        )) {
           const stalePlans = pendingForSource().filter((entry) => (
             entry.interaction
             && entry.interaction.intent === INTERACTION_INTENT.PLAN_REVIEW
@@ -860,11 +968,12 @@ function handleStatePost(req, res, options) {
           );
         }
         recordRequestHookEvent.acceptedUnlessDnd(shouldDropForDnd());
+        let sessionUpdateApplied = true;
         if (svg) {
           const safeSvg = pathApi.basename(svg);
           ctx.setState(state, safeSvg);
         } else {
-          ctx.updateSession(sid, state, event, {
+          sessionUpdateApplied = ctx.updateSession(sid, state, event, {
             sourcePid: effectiveProcessMetadata.sourcePid,
             wtHwnd: effectiveWtHwnd,
             cwd,
@@ -882,7 +991,7 @@ function handleStatePost(req, res, options) {
             ...(recapBoundary ? { recapBoundary } : {}),
             ...((recapIsSubagent || codexHookState.headless === true) ? { recapIsSubagent: true } : {}),
             profileId: sessionIdentity.profileId,
-            rawSessionId: sessionIdentity.rawSessionId,
+            rawSessionId: rawStateSessionId,
             host,
             wslDistro,
             headless: headless || codexHookState.headless === true,
@@ -921,7 +1030,10 @@ function handleStatePost(req, res, options) {
             ...(codexUserInput ? { transientPermissionEvent: true } : {}),
             ...(agentIdentity.defaulted ? { agentIdDefaulted: true } : {}),
             ...(replaceProcessMetadata ? { replaceProcessMetadata: true } : {}),
-          });
+          }) !== false;
+        }
+        if (grokFenceDecision && typeof grokFenceDecision.commit === "function" && sessionUpdateApplied) {
+          grokFenceDecision.commit();
         }
         // Decorative only: the lifecycle update above remains authoritative.
         // Main owns the opt-in / DND / visibility / mini / drag gate; a visual
