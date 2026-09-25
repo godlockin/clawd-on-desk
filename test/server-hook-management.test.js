@@ -16,7 +16,47 @@ const EXPECTED_HOOK_SCRIPT_PATH = getClaudeHookScriptPath();
 const EXPECTED_AUTO_START_SCRIPT_PATH = getClaudeAutoStartScriptPath();
 const missingFakeImpls = [];
 
+// src/server.js hands the runtime `{...ctx}`, and a spread copies only OWN
+// ENUMERABLE properties. A seam this Proxy answers virtually is therefore
+// dropped before integration-sync reads it: `typeof ctx.syncXExtensionImpl
+// === "function"` turns false, the real installer runs instead, and the
+// tripwire below never fires. That is not hypothetical — it is how running
+// this file once wrote a real ~/.omp/agent/extensions/clawd-on-desk tree onto
+// a developer machine while every assertion in it stayed green.
+//
+// So the seam list is read from the runtime's own source rather than copied
+// here: a new agent added to integration-sync.js becomes an own enumerable
+// property of this fixture too, the spread carries the tripwire through, and
+// the afterEach assertion names the seam that has no fake.
+function integrationSyncSeamNames() {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(
+    path.join(__dirname, "..", "src", "integration-sync.js"),
+    "utf8"
+  );
+  const names = new Set();
+  for (const match of source.matchAll(/\bctx\.((?:sync|repair)[A-Z][A-Za-z0-9]*Impl)\b/g)) {
+    names.add(match[1]);
+  }
+  return [...names];
+}
+
+const INTEGRATION_SYNC_SEAM_NAMES = integrationSyncSeamNames();
+
 function createGuardedIntegrationCtx(target, calls) {
+  const tripwires = new Map();
+  const tripwire = (prop) => {
+    if (!tripwires.has(prop)) {
+      tripwires.set(prop, () => {
+        calls.push(`missing-fake:${prop}`);
+        missingFakeImpls.push(prop);
+        throw new Error(`Missing server test fake: ${prop}`);
+      });
+    }
+    return tripwires.get(prop);
+  };
+
   return new Proxy(target, {
     get(obj, prop, receiver) {
       if (Object.prototype.hasOwnProperty.call(obj, prop)) {
@@ -25,11 +65,23 @@ function createGuardedIntegrationCtx(target, calls) {
       if (typeof prop !== "string" || !/^(sync|repair)[A-Z]\w*Impl$/.test(prop)) {
         return Reflect.get(obj, prop, receiver);
       }
-      return () => {
-        calls.push(`missing-fake:${prop}`);
-        missingFakeImpls.push(prop);
-        throw new Error(`Missing server test fake: ${prop}`);
-      };
+      return tripwire(prop);
+    },
+    getOwnPropertyDescriptor(obj, prop) {
+      const own = Reflect.getOwnPropertyDescriptor(obj, prop);
+      if (own) return own;
+      if (typeof prop === "string" && INTEGRATION_SYNC_SEAM_NAMES.includes(prop)) {
+        return { value: tripwire(prop), enumerable: true, configurable: true, writable: true };
+      }
+      return undefined;
+    },
+    ownKeys(obj) {
+      const keys = Reflect.ownKeys(obj);
+      const seen = new Set(keys);
+      for (const name of INTEGRATION_SYNC_SEAM_NAMES) {
+        if (!seen.has(name)) keys.push(name);
+      }
+      return keys;
     },
   });
 }
@@ -180,14 +232,18 @@ function makeServer(overrides = {}) {
     syncCopilotHooksImpl: () => syncCalls.push("copilot"),
     syncCodeBuddyHooksImpl: () => syncCalls.push("codebuddy"),
     syncWorkBuddyHooksImpl: () => syncCalls.push("workbuddy"),
+    syncGrokBuildHooksImpl: () => syncCalls.push("grok-build"),
     syncKiroHooksImpl: () => syncCalls.push("kiro"),
     syncKimiHooksImpl: () => syncCalls.push("kimi"),
     syncQwenHooksImpl: () => syncCalls.push("qwen"),
+    syncZcodeHooksImpl: () => syncCalls.push("zcode"),
     syncCodexHooksImpl: () => syncCalls.push("codex"),
+    syncDeepSeekHarnessPluginImpl: () => syncCalls.push("deepseek-harness"),
     repairCodexHooksImpl: () => syncCalls.push("codex-repair"),
     syncOpencodePluginImpl: () => syncCalls.push("opencode"),
     syncMimocodePluginImpl: () => syncCalls.push("mimocode"),
     syncPiExtensionImpl: () => syncCalls.push("pi"),
+    syncOmpExtensionImpl: () => syncCalls.push("omp"),
     syncOpenClawPluginImpl: () => syncCalls.push("openclaw"),
     repairOpenClawPluginImpl: () => syncCalls.push("openclaw-repair"),
     syncHermesPluginImpl: () => syncCalls.push("hermes"),
@@ -197,6 +253,7 @@ function makeServer(overrides = {}) {
     syncQoderWorkHooksImpl: () => syncCalls.push("qoderwork"),
     syncTraeCodeHooksImpl: () => syncCalls.push("traecode"),
     syncQwenWorkHooksImpl: () => syncCalls.push("qwenwork"),
+    syncMinimaxHooksImpl: () => syncCalls.push("minimax"),
     ...overrides,
   }, syncCalls);
 
@@ -245,7 +302,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork", "minimax"]);
     assert.ok(getWatcher(), "watcher should start when management is enabled");
   });
 
@@ -262,7 +319,7 @@ describe("server Claude hook management", () => {
 
       api.startHttpServer();
 
-      assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+      assert.deepStrictEqual(syncCalls, ["claude", "gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork", "minimax"]);
       assert.ok(getWatcher(), "watcher should start when management is enabled");
       assert.strictEqual(warnings.some((line) => /Hermes/i.test(line)), false);
     } finally {
@@ -277,7 +334,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork", "minimax"]);
     assert.strictEqual(getWatcher(), null);
   });
 
@@ -289,7 +346,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["claude", "copilot", "codebuddy", "workbuddy", "kimi", "qwen", "codewhale", "codex", "mimocode", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["claude", "copilot", "codebuddy", "workbuddy", "grok-build", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "mimocode", "omp", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork", "minimax"]);
     assert.ok(getWatcher(), "Claude watcher should still start when Claude is enabled");
   });
 
@@ -300,7 +357,7 @@ describe("server Claude hook management", () => {
 
     api.startHttpServer();
 
-    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork", "minimax"]);
     assert.strictEqual(getWatcher(), null);
   });
 
@@ -499,8 +556,8 @@ describe("server Claude hook management", () => {
     const second = makeServer({ manageClaudeHooksAutomatically: false });
     second.api.startHttpServer();
 
-    assert.deepStrictEqual(first.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
-    assert.deepStrictEqual(second.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "kiro", "kimi", "qwen", "codewhale", "codex", "opencode", "mimocode", "pi", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork"]);
+    assert.deepStrictEqual(first.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork", "minimax"]);
+    assert.deepStrictEqual(second.syncCalls, ["gemini", "antigravity", "cursor", "copilot", "codebuddy", "workbuddy", "grok-build", "kiro", "kimi", "qwen", "zcode", "codewhale", "codex", "deepseek-harness", "opencode", "mimocode", "pi", "omp", "openclaw", "hermes", "qoder", "reasonix", "qoderwork", "traecode", "qwenwork", "minimax"]);
   });
 
   it("repairIntegrationForAgent uses the Codex official hook repair path", () => {
@@ -661,6 +718,30 @@ describe("server Claude hook operation queue (default, non-injected implementati
     });
   });
 
+  it("confirmed local coexistence passes the inspected digest through the same operation queue", async () => {
+    const calls = [];
+    await withPatchedInstallModule({
+      registerClaudeStatusline: (opts) => { calls.push(opts); return { installed: true, changed: true, localChained: true }; },
+    }, async () => {
+      const { api } = makeServer({ syncClawdHooksImpl: undefined });
+      const digest = "a".repeat(64);
+      const refused = await api.setClaudeQuotaCollectionEnabled({ enabled: true, chainExisting: true });
+      assert.strictEqual(refused.status, "error");
+      assert.strictEqual(calls.length, 0);
+      const result = await api.setClaudeQuotaCollectionEnabled({ enabled: true, chainExisting: true, expectedStatuslineFingerprint: digest });
+      assert.strictEqual(result.status, "ok");
+      assert.deepStrictEqual(calls, [{
+        backup: true,
+        silent: true,
+        // The injected server context is forwarded so preflight and mutation
+        // resolve the same platform/target.
+        platform: "win32",
+        chainExisting: true,
+        expectedStatuslineFingerprint: digest,
+      }]);
+    });
+  });
+
   it("restores local statusline ingress when an explicit opt-out mutation fails", async () => {
     await withPatchedInstallModule({
       unregisterClaudeStatusline: () => { throw new Error("statusline remove failed"); },
@@ -774,6 +855,353 @@ describe("server Claude hook operation queue (default, non-injected implementati
 
       assert.deepStrictEqual(result, { status: "ok", added: 1, updated: 0, removed: 0 });
     });
+  });
+
+  it("uses the injected AppImage resolver context for preflight, mutation, and verify", {
+    skip: process.platform === "win32" ? "requires POSIX AppImage executable semantics" : false,
+  }, async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-server-appimage-"));
+    const home = path.join(root, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const settingsPath = path.join(root, "settings.json");
+    const materializedRoot = path.join(root, "appimage-hooks");
+    try {
+      const { api } = makeServer({
+        syncClawdHooksImpl: undefined,
+        claudeQuotaCollectionEnabled: false,
+        clearClaudeStatuslineAuthority: () => {},
+        clearLocalClaudeQuota: () => {},
+        platform: "linux",
+        processEnv: { APPIMAGE: "/opt/Clawd-on-Desk.AppImage", APPDIR: path.resolve(__dirname, "..") },
+        homeDir: home,
+        materializedRoot,
+        claudeSettingsPath: settingsPath,
+        fs: undefined, // real fs against the isolated temp paths
+      });
+
+      const result = await api.syncClawdHooks({ source: "startup", automatic: true });
+      assert.strictEqual(result.status, "ok", JSON.stringify(result));
+
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      const commands = [];
+      for (const entries of Object.values(settings.hooks || {})) {
+        if (!Array.isArray(entries)) continue;
+        for (const entry of entries) {
+          for (const hook of Array.isArray(entry.hooks) ? entry.hooks : [entry]) {
+            if (hook && typeof hook.command === "string" && hook.command.includes("clawd-hook.js")) {
+              commands.push(hook.command);
+            }
+          }
+        }
+      }
+      assert.ok(commands.length > 0);
+      for (const command of commands) {
+        assert.ok(command.includes(materializedRoot), command);
+        assert.ok(!command.includes(".mount_"), command);
+        assert.ok(!command.includes("app.asar.unpacked"), command);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes and verifies only the controlled Claude settings path", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-server-home-"));
+    const home = path.join(root, "home");
+    const settingsPath = path.join(root, "settings.json");
+    try {
+      const { api } = makeServer({
+        syncClawdHooksImpl: undefined,
+        claudeQuotaCollectionEnabled: false,
+        homeDir: home,
+        claudeSettingsPath: settingsPath,
+        fs: undefined, // real fs: ambient default would escape to the real config
+      });
+
+      const result = await api.syncClawdHooks({ source: "doctor", automatic: false });
+      assert.strictEqual(result.status, "ok", JSON.stringify(result));
+      // Reaching "ok" means the post-write verify read the same file the
+      // mutation wrote (an ambient verify would have found no hooks and failed).
+      assert.ok(fs.existsSync(settingsPath), "hooks must be written to the controlled settings path");
+      assert.ok(!fs.existsSync(path.join(home, ".claude", "settings.json")));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never touches an ambient CLAUDE_CONFIG_DIR when a controlled settings path is injected", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-server-ambient-"));
+    const ambientConfig = path.join(root, "ambient-claude");
+    fs.mkdirSync(ambientConfig, { recursive: true });
+    const ambientSettings = path.join(ambientConfig, "settings.json");
+    const sentinel = '{\n  "hooks": {}\n}\n';
+    fs.writeFileSync(ambientSettings, sentinel);
+    const settingsPath = path.join(root, "controlled", "settings.json");
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = ambientConfig;
+    try {
+      const { api } = makeServer({
+        syncClawdHooksImpl: undefined,
+        claudeQuotaCollectionEnabled: false,
+        platform: "win32",
+        claudeSettingsPath: settingsPath,
+        fs: undefined,
+      });
+
+      const result = await api.syncClawdHooks({ source: "doctor", automatic: false });
+      assert.strictEqual(result.status, "ok", JSON.stringify(result));
+      assert.strictEqual(fs.readFileSync(ambientSettings, "utf8"), sentinel, "ambient CLAUDE_CONFIG_DIR must be untouched");
+      assert.ok(fs.existsSync(settingsPath));
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards the controlled context into unregisterHooks/statusline", async () => {
+    const captured = [];
+    await withPatchedInstallModule({
+      unregisterHooksAsync: async (opts) => {
+        captured.push(["hooks", opts]);
+        return { removed: 0, changed: false };
+      },
+      unregisterClaudeStatusline: (opts) => {
+        captured.push(["statusline", opts]);
+        return { removed: 0, changed: false };
+      },
+    }, async () => {
+      const { api } = makeServer({
+        syncClawdHooksImpl: undefined,
+        homeDir: "/tmp/clawd-controlled-home",
+        claudeSettingsPath: "/tmp/clawd-controlled-home/.claude/settings.json",
+        platform: "linux",
+        clearClaudeStatuslineAuthority: () => {},
+        clearLocalClaudeQuota: () => {},
+      });
+
+      const result = await api.uninstallClaudeHooks({ source: "settings-agent-uninstall", automatic: false });
+      assert.strictEqual(result.status, "ok");
+      assert.deepStrictEqual(captured.map((entry) => entry[0]), ["hooks", "statusline"]);
+      for (const [, opts] of captured) {
+        assert.strictEqual(opts.settingsPath, "/tmp/clawd-controlled-home/.claude/settings.json");
+        assert.strictEqual(opts.homeDir, "/tmp/clawd-controlled-home");
+        assert.strictEqual(opts.platform, "linux");
+      }
+    });
+  });
+
+  it("unregisters only the controlled settings file", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-server-unregister-"));
+    const home = path.join(root, "home");
+    const settingsPath = path.join(root, "settings.json");
+    try {
+      fs.mkdirSync(home, { recursive: true });
+      fs.writeFileSync(settingsPath, JSON.stringify({
+        hooks: {
+          Stop: [{ matcher: "", hooks: [{ type: "command", command: `node "${EXPECTED_HOOK_SCRIPT_PATH}" Stop` }] }],
+        },
+      }));
+
+      const { api } = makeServer({
+        syncClawdHooksImpl: undefined,
+        homeDir: home,
+        claudeSettingsPath: settingsPath,
+        fs: undefined,
+        clearClaudeStatuslineAuthority: () => {},
+        clearLocalClaudeQuota: () => {},
+      });
+
+      const result = await api.uninstallClaudeHooks({ source: "settings", automatic: false });
+      assert.strictEqual(result.status, "ok");
+      const after = fs.readFileSync(settingsPath, "utf8");
+      assert.ok(!after.includes("clawd-hook.js"), "managed hook must be removed from the controlled file");
+      assert.ok(!fs.existsSync(path.join(home, ".claude", "settings.json")));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards the controlled context into setClaudeAutoStart(false)", async () => {
+    const captured = [];
+    await withPatchedInstallModule({
+      unregisterAutoStart: (opts) => {
+        captured.push(opts);
+        return true;
+      },
+    }, async () => {
+      const { api } = makeServer({
+        syncClawdHooksImpl: undefined,
+        homeDir: "/tmp/clawd-autostart-home",
+        claudeSettingsPath: "/tmp/clawd-autostart-home/.claude/settings.json",
+        platform: "linux",
+      });
+
+      const result = await api.setClaudeAutoStart({ enabled: false, source: "auto-start" });
+      assert.deepStrictEqual(result, { status: "ok", enabled: false });
+      assert.strictEqual(captured.length, 1);
+      assert.strictEqual(captured[0].settingsPath, "/tmp/clawd-autostart-home/.claude/settings.json");
+      assert.strictEqual(captured[0].homeDir, "/tmp/clawd-autostart-home");
+      assert.strictEqual(captured[0].platform, "linux");
+    });
+  });
+
+  it("fails closed instead of preflighting on a read-only injected fs for AppImage materialization", async () => {
+    const path = require("node:path");
+    const calls = [];
+    await withPatchedInstallModule({
+      registerHooksAsync: async () => {
+        calls.push("register");
+        return { added: 0, updated: 0, removed: 0 };
+      },
+    }, async () => {
+      const { api } = makeServer({
+        syncClawdHooksImpl: undefined,
+        platform: "linux",
+        processEnv: { APPIMAGE: "/opt/Clawd-on-Desk.AppImage", APPDIR: path.resolve(__dirname, "..") },
+        homeDir: "/tmp/clawd-injected-fs-home",
+        materializedRoot: "/tmp/clawd-injected-fs-home/appimage-hooks",
+        // Default makeServer fs is a read-only fake; it must never be used to
+        // preflight a target while the real installer materializes another.
+      });
+
+      const result = await api.syncClawdHooks({ source: "doctor", automatic: false });
+      assert.strictEqual(result.status, "error");
+      assert.strictEqual(result.reason, "resolver-fs-inconsistent");
+      assert.deepStrictEqual(calls, [], "must not mutate after an inconsistent-fs preflight");
+    });
+  });
+
+  it("fails closed for a full-capability injected fs that could diverge from the real installer", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-server-divergent-fs-"));
+    const settingsPath = path.join(root, "settings.json");
+    const registerCalls = [];
+    const divergentFs = {
+      ...fs,
+      readFileSync(target, ...rest) {
+        const value = String(target).replace(/\\/g, "/");
+        if (value.endsWith("/clawd-hook.js")) return Buffer.from("module.exports = 'divergent';\n");
+        return fs.readFileSync(target, ...rest);
+      },
+    };
+    try {
+      await withPatchedInstallModule({
+        registerHooksAsync: async () => {
+          registerCalls.push("register");
+          return { added: 0, updated: 0, removed: 0 };
+        },
+      }, async () => {
+        const { api } = makeServer({
+          syncClawdHooksImpl: undefined,
+          platform: "linux",
+          processEnv: { APPIMAGE: "/opt/Clawd-on-Desk.AppImage", APPDIR: path.resolve(__dirname, "..") },
+          homeDir: root,
+          materializedRoot: path.join(root, "appimage-hooks"),
+          claudeSettingsPath: settingsPath,
+          fs: divergentFs,
+        });
+
+        const result = await api.syncClawdHooks({ source: "doctor", automatic: false });
+        assert.strictEqual(result.status, "error");
+        assert.strictEqual(result.reason, "resolver-fs-inconsistent");
+        assert.deepStrictEqual(registerCalls, [], "must not mutate with a divergent fs");
+        assert.strictEqual(fs.existsSync(settingsPath), false, "zero settings mutation");
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed with zero settings mutation for a malformed APPIMAGE value", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-server-bad-appimage-"));
+    const settingsPath = path.join(root, "settings.json");
+    const registerCalls = [];
+    try {
+      await withPatchedInstallModule({
+        registerHooksAsync: async () => {
+          registerCalls.push("register");
+          return { added: 0, updated: 0, removed: 0 };
+        },
+      }, async () => {
+        const { api } = makeServer({
+          syncClawdHooksImpl: undefined,
+          platform: "linux",
+          processEnv: { APPIMAGE: "   " },
+          homeDir: root,
+          claudeSettingsPath: settingsPath,
+        });
+
+        const result = await api.syncClawdHooks({ source: "doctor", automatic: false });
+        assert.strictEqual(result.status, "error");
+        assert.strictEqual(result.reason, "invalid-appimage-path");
+        assert.deepStrictEqual(registerCalls, []);
+        assert.strictEqual(fs.existsSync(settingsPath), false, "zero settings mutation");
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails before any settings mutation when the statusline runtime preflight fails", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-server-statusline-preflight-"));
+    const settingsPath = path.join(root, "settings.json");
+    const original = JSON.stringify({
+      statusLine: { type: "command", command: "~/third-party.sh" },
+      hooks: {},
+    }, null, 2);
+    fs.writeFileSync(settingsPath, original);
+    const registerCalls = [];
+    try {
+      await withPatchedInstallModule({
+        registerHooksAsync: async () => {
+          registerCalls.push("register");
+          return { added: 15, updated: 0, removed: 0 };
+        },
+        preflightClaudeRuntime: () => ({
+          ok: false,
+          reason: "source-script-missing",
+          message: "statusline dependency missing",
+        }),
+      }, async () => {
+        const { api } = makeServer({
+          syncClawdHooksImpl: undefined,
+          claudeQuotaCollectionEnabled: true,
+          claudeSettingsPath: settingsPath,
+          fs: undefined,
+          clearClaudeStatuslineAuthority: () => {},
+          clearLocalClaudeQuota: () => {},
+        });
+
+        const result = await api.syncClawdHooks({ source: "startup", automatic: true });
+        assert.strictEqual(result.status, "error");
+        assert.strictEqual(result.reason, "source-script-missing");
+        assert.deepStrictEqual(registerCalls, [], "must not install hooks before the statusline preflight");
+        assert.strictEqual(fs.readFileSync(settingsPath, "utf8"), original, "zero settings mutation");
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("syncClawdHooks (Doctor Fix / Settings Install path) reports failure, not a blind ok, when an unparseable Clawd command remains after write", async () => {

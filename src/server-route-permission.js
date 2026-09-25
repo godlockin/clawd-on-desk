@@ -12,6 +12,7 @@ const {
   buildShadowComparison,
   processMetadataForState,
 } = require("./server-windows-process-metadata");
+const { stripRemoteProcessMetadata } = require("./remote-process-metadata");
 const {
   CODEX_OFFICIAL_HOOK_SOURCE,
   CODEX_SESSION_ROLE_SUBAGENT,
@@ -29,6 +30,7 @@ const {
   normalizeCodexPermissionToolInput,
   buildToolInputFingerprint,
 } = require("./server-permission-utils");
+const { preparePermissionReminder, NOT_INSPECTED_TAG } = require("./permission-reminder");
 const { resolveHookAgentId } = require("./server-agent-id");
 const { getAgent } = require("../agents/registry");
 const { isOpencodeFamily, getFamilyConfig } = require("../agents/opencode-family");
@@ -247,7 +249,12 @@ function applyTerminalSessionOptions(options, data) {
   if (orcaPaneKey) options.orcaPaneKey = orcaPaneKey;
 }
 
-function buildCodexPermissionSessionOptions(data) {
+// Every build*PermissionSessionOptions below takes `remoteProfile` for one
+// reason: their result is spread straight into ctx.updateSession (and into the
+// permEntry that focus/liveness reads), so this is the single choke point where
+// a PID from the Remote SSH ingress would otherwise become local session state.
+// See remote-process-metadata.js for why `orcaPaneKey`/`cwd`/`host` survive.
+function buildCodexPermissionSessionOptions(data, remoteProfile) {
   const sourcePid = normalizePositiveInteger(data.source_pid);
   const rawAgentPid = data.agent_pid ?? data.claude_pid ?? data.cursor_pid;
   const agentPid = normalizePositiveInteger(rawAgentPid);
@@ -285,10 +292,10 @@ function buildCodexPermissionSessionOptions(data) {
   if (codexAgentNickname) options.codexAgentNickname = codexAgentNickname;
   if (codexAgentRole) options.codexAgentRole = codexAgentRole;
   if (codexParentThreadId) options.codexParentThreadId = codexParentThreadId;
-  return options;
+  return stripRemoteProcessMetadata(options, remoteProfile);
 }
 
-function buildQwenCodePermissionSessionOptions(data) {
+function buildQwenCodePermissionSessionOptions(data, remoteProfile) {
   const sourcePid = normalizePositiveInteger(data.source_pid);
   const rawAgentPid = data.agent_pid ?? data.claude_pid ?? data.cursor_pid;
   const agentPid = normalizePositiveInteger(rawAgentPid);
@@ -309,10 +316,10 @@ function buildQwenCodePermissionSessionOptions(data) {
   if (host) options.host = host;
   if (platform) options.platform = platform;
   if (model) options.model = model;
-  return options;
+  return stripRemoteProcessMetadata(options, remoteProfile);
 }
 
-function buildCopilotPermissionSessionOptions(data) {
+function buildCopilotPermissionSessionOptions(data, remoteProfile) {
   const sourcePid = normalizePositiveInteger(data.source_pid);
   const agentPid = normalizePositiveInteger(data.agent_pid);
   const pidChain = Array.isArray(data.pid_chain)
@@ -328,10 +335,10 @@ function buildCopilotPermissionSessionOptions(data) {
   const host = normalizeString(data.host);
   if (cwd) options.cwd = cwd;
   if (host) options.host = host;
-  return options;
+  return stripRemoteProcessMetadata(options, remoteProfile);
 }
 
-function buildHermesPermissionSessionOptions(data) {
+function buildHermesPermissionSessionOptions(data, remoteProfile) {
   const sourcePid = normalizePositiveInteger(data.source_pid);
   const agentPid = normalizePositiveInteger(data.agent_pid);
   const pidChain = Array.isArray(data.pid_chain)
@@ -347,10 +354,10 @@ function buildHermesPermissionSessionOptions(data) {
   if (cwd) options.cwd = cwd;
   const editor = normalizeString(data.editor);
   if (editor) options.editor = editor;
-  return options;
+  return stripRemoteProcessMetadata(options, remoteProfile);
 }
 
-function buildZcodePermissionSessionOptions(data) {
+function buildZcodePermissionSessionOptions(data, remoteProfile) {
   const sourcePid = normalizePositiveInteger(data.source_pid);
   const agentPid = normalizePositiveInteger(data.agent_pid);
   const pidChain = Array.isArray(data.pid_chain)
@@ -368,10 +375,10 @@ function buildZcodePermissionSessionOptions(data) {
   if (cwd) options.cwd = cwd;
   if (host) options.host = host;
   if (model) options.model = model;
-  return options;
+  return stripRemoteProcessMetadata(options, remoteProfile);
 }
 
-function buildDshPermissionSessionOptions(data) {
+function buildDshPermissionSessionOptions(data, remoteProfile) {
   const sourcePid = normalizePositiveInteger(data.source_pid);
   const agentPid = normalizePositiveInteger(data.agent_pid);
   const pidChain = Array.isArray(data.pid_chain)
@@ -384,7 +391,7 @@ function buildDshPermissionSessionOptions(data) {
   applyTerminalSessionOptions(options, data);
   const cwd = normalizeString(data.cwd);
   if (cwd) options.cwd = cwd;
-  return options;
+  return stripRemoteProcessMetadata(options, remoteProfile);
 }
 
 function sendCodexPermissionNoDecision(res) {
@@ -556,6 +563,16 @@ function startRemoteApproval(ctx, permEntry) {
 }
 
 function addPendingPermission(ctx, permEntry) {
+  // Safety net for the destructive-action reminder: every path above derives a
+  // view from the accepted request, and a runtime test asserts that none of them
+  // land here without one. If a path added later does, it must fail toward the
+  // human -- an absent view is "not inspected", never "unmatched".
+  if (permEntry && permEntry.permissionReminder === undefined) {
+    permEntry.permissionReminder = { hold: true, tag: NOT_INSPECTED_TAG };
+    if (typeof ctx.permLog === "function") {
+      ctx.permLog(`destructive reminder: no view derived for tool=${permEntry.toolName || "(missing)"} agent=${permEntry.agentId || "unknown"} — treating as not inspected`);
+    }
+  }
   if (typeof ctx.addPendingPermission === "function") {
     return ctx.addPendingPermission(permEntry);
   }
@@ -757,6 +774,7 @@ function handlePermissionPost(req, res, options) {
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const toolInput = truncateDeep(rawInput);
         const permissionDetail = preparePermissionDetail(toolName, rawInput);
+        const permissionReminder = preparePermissionReminder(toolName, rawInput);
         const sessionIdentity = resolvePermissionSession(data.session_id, "default");
         const sessionId = sessionIdentity.sessionId;
         const requestId = typeof data.request_id === "string" ? data.request_id : null;
@@ -816,6 +834,7 @@ function handlePermissionPost(req, res, options) {
           toolName,
           toolInput,
           ...permissionDetail,
+          ...permissionReminder,
           resolvedSuggestion: null,
           createdAt: Date.now(),
           interaction,
@@ -900,8 +919,26 @@ function handlePermissionPost(req, res, options) {
           : (typeof rawInput.description === "string" ? rawInput.description : "");
         const toolInput = normalizeCodexPermissionToolInput(rawInput, description);
         const permissionDetail = preparePermissionDetail(toolName, rawInput, { description });
+        const permissionReminder = preparePermissionReminder(toolName, rawInput);
         const sessionIdentity = resolvePermissionSession(data.session_id, "codex:default");
         const sessionId = sessionIdentity.sessionId;
+        // Local Codex archive lifecycle (#655): an archived task's approval is
+        // handed back to Codex's native flow BEFORE any bubble, state or
+        // automation is created. Always no-decision, never allow/deny, and only
+        // for the exact local codex/profile boundary (remote SSH and WSL are
+        // excluded even on a raw-id collision).
+        if (typeof ctx.shouldSuppressCodexArchive === "function"
+          && ctx.shouldSuppressCodexArchive(sessionIdentity.rawSessionId, {
+            agentId: "codex",
+            profileId: trustedProfileId,
+            host: trustedDisplayHost || normalizeString(data.host),
+            wslDistro: normalizeString(data.wsl_distro),
+          })) {
+          recordRequestHookEvent.droppedUnsupported();
+          ctx.permLog(`codex archived session=${sessionId} -> no decision, native prompt fallback (tool=${toolName})`);
+          sendCodexPermissionNoDecision(res);
+          return;
+        }
         const toolUseId = normalizeHookToolUseId(
           data.tool_use_id ?? data.toolUseId ?? data.toolUseID
         );
@@ -909,7 +946,7 @@ function handlePermissionPost(req, res, options) {
           ? data.tool_input_fingerprint
           : buildToolInputFingerprint(rawInput);
         const legacyCodexSessionOptions = {
-          ...buildCodexPermissionSessionOptions(data),
+          ...buildCodexPermissionSessionOptions(data, remoteProfile),
           sessionAutomationIdentity,
           ...trustedSessionFields(sessionIdentity),
         };
@@ -1074,6 +1111,7 @@ function handlePermissionPost(req, res, options) {
           toolName,
           toolInput,
           ...permissionDetail,
+          ...permissionReminder,
           toolUseId,
           toolInputFingerprint,
           resolvedSuggestion: null,
@@ -1145,6 +1183,7 @@ function handlePermissionPost(req, res, options) {
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const toolInput = truncateDeep(rawInput);
         const permissionDetail = preparePermissionDetail(toolName, rawInput);
+        const permissionReminder = preparePermissionReminder(toolName, rawInput);
         const sessionIdentity = resolvePermissionSession(data.session_id, "qwen-code:default");
         const sessionId = sessionIdentity.sessionId;
         const toolUseId = normalizeHookToolUseId(
@@ -1154,7 +1193,7 @@ function handlePermissionPost(req, res, options) {
           ? data.tool_input_fingerprint
           : buildToolInputFingerprint(rawInput);
         const qwenSessionOptions = {
-          ...buildQwenCodePermissionSessionOptions(data),
+          ...buildQwenCodePermissionSessionOptions(data, remoteProfile),
           sessionAutomationIdentity,
           ...trustedSessionFields(sessionIdentity),
         };
@@ -1201,6 +1240,7 @@ function handlePermissionPost(req, res, options) {
           toolName,
           toolInput,
           ...permissionDetail,
+          ...permissionReminder,
           toolUseId,
           toolInputFingerprint,
           resolvedSuggestion: null,
@@ -1263,6 +1303,7 @@ function handlePermissionPost(req, res, options) {
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const toolInput = truncateDeep(rawInput);
         const permissionDetail = preparePermissionDetail(toolName, rawInput);
+        const permissionReminder = preparePermissionReminder(toolName, rawInput);
         const sessionIdentity = resolvePermissionSession(data.session_id, "zcode:default");
         const sessionId = sessionIdentity.sessionId;
         const toolUseId = normalizeHookToolUseId(
@@ -1272,7 +1313,7 @@ function handlePermissionPost(req, res, options) {
           ? data.tool_input_fingerprint
           : buildToolInputFingerprint(rawInput);
         const zcodeSessionOptions = {
-          ...buildZcodePermissionSessionOptions(data),
+          ...buildZcodePermissionSessionOptions(data, remoteProfile),
           sessionAutomationIdentity,
           ...trustedSessionFields(sessionIdentity),
         };
@@ -1336,6 +1377,7 @@ function handlePermissionPost(req, res, options) {
             host: zcodeSessionOptions.host || null,
             model: zcodeSessionOptions.model || null,
             ...trustedSessionFields(sessionIdentity),
+            ...permissionReminder,
           });
           if (remoteOnlyResult.handled) return;
           ctx.permLog(`permission bubbles disabled, no remote approval available -> no decision, native prompt fallback (tool=${toolName})`);
@@ -1360,6 +1402,7 @@ function handlePermissionPost(req, res, options) {
           toolName,
           toolInput,
           ...permissionDetail,
+          ...permissionReminder,
           toolUseId,
           toolInputFingerprint,
           resolvedSuggestion: null,
@@ -1450,6 +1493,7 @@ function handlePermissionPost(req, res, options) {
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const toolInput = truncateDeep(rawInput);
         const permissionDetail = preparePermissionDetail(toolName, rawInput);
+        const permissionReminder = preparePermissionReminder(toolName, rawInput);
         const sessionIdentity = resolvePermissionSession(data.session_id, "copilot-cli:default");
         const sessionId = sessionIdentity.sessionId;
         const toolUseId = normalizeHookToolUseId(
@@ -1459,7 +1503,7 @@ function handlePermissionPost(req, res, options) {
           ? data.tool_input_fingerprint
           : buildToolInputFingerprint(rawInput);
         const copilotSessionOptions = {
-          ...buildCopilotPermissionSessionOptions(data),
+          ...buildCopilotPermissionSessionOptions(data, remoteProfile),
           sessionAutomationIdentity,
           ...trustedSessionFields(sessionIdentity),
         };
@@ -1506,6 +1550,7 @@ function handlePermissionPost(req, res, options) {
           toolName,
           toolInput,
           ...permissionDetail,
+          ...permissionReminder,
           toolUseId,
           toolInputFingerprint,
           resolvedSuggestion: null,
@@ -1632,8 +1677,11 @@ function handlePermissionPost(req, res, options) {
           data.tool_use_id ?? data.toolUseId ?? data.toolUseID
         );
         const toolInputFingerprint = buildToolInputFingerprint(rawInput);
+        // DSH exposes no tool arguments, so there is nothing in rawInput to scan.
+        // The view is still derived so that every accepted request carries one.
+        const permissionReminder = preparePermissionReminder(toolName, rawInput);
         const sessionOptions = {
-          ...buildDshPermissionSessionOptions(data),
+          ...buildDshPermissionSessionOptions(data, remoteProfile),
           sessionAutomationIdentity,
           ...trustedSessionFields(sessionIdentity),
         };
@@ -1654,6 +1702,7 @@ function handlePermissionPost(req, res, options) {
               sessionAutomationIdentity,
               isDsh: true,
               ...sessionOptions,
+              ...permissionReminder,
             });
             if (remoteOnlyResult.handled) return;
           }
@@ -1674,6 +1723,7 @@ function handlePermissionPost(req, res, options) {
           toolInput,
           toolUseId,
           toolInputFingerprint,
+          ...permissionReminder,
           resolvedSuggestion: null,
           createdAt: Date.now(),
           interaction,
@@ -1744,6 +1794,7 @@ function handlePermissionPost(req, res, options) {
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const toolInput = truncateDeep(rawInput);
         const permissionDetail = preparePermissionDetail(toolName, rawInput);
+        const permissionReminder = preparePermissionReminder(toolName, rawInput);
         const sessionIdentity = resolvePermissionSession(data.session_id, "hermes:default");
         const sessionId = sessionIdentity.sessionId;
         const toolUseId = normalizeHookToolUseId(
@@ -1794,7 +1845,7 @@ function handlePermissionPost(req, res, options) {
           }
           const elicitationInput = elicitation.displayInput;
           const hermesSessionOptions = {
-            ...buildHermesPermissionSessionOptions(data),
+            ...buildHermesPermissionSessionOptions(data, remoteProfile),
             sessionAutomationIdentity,
             ...trustedSessionFields(sessionIdentity),
           };
@@ -1864,7 +1915,7 @@ function handlePermissionPost(req, res, options) {
 
         // General permission request
         const hermesSessionOptions = {
-          ...buildHermesPermissionSessionOptions(data),
+          ...buildHermesPermissionSessionOptions(data, remoteProfile),
           sessionAutomationIdentity,
           ...trustedSessionFields(sessionIdentity),
         };
@@ -1882,6 +1933,7 @@ function handlePermissionPost(req, res, options) {
           toolName,
           toolInput,
           ...permissionDetail,
+          ...permissionReminder,
           toolUseId,
           toolInputFingerprint,
           resolvedSuggestion: null,
@@ -1986,6 +2038,7 @@ function handlePermissionPost(req, res, options) {
         ? rawInput
         : null;
       const permissionDetail = preparePermissionDetail(toolName, rawInput);
+      const permissionReminder = preparePermissionReminder(toolName, rawInput);
       const toolUseId = normalizeHookToolUseId(
         data.tool_use_id ?? data.toolUseId ?? data.toolUseID
       );
@@ -2044,6 +2097,7 @@ function handlePermissionPost(req, res, options) {
             agentId: permAgentId, subagentId, subagentType, suggestions, interaction,
             sessionAutomationIdentity,
             ...trustedSessionFields(sessionIdentity),
+            ...permissionReminder,
           });
           if (remoteOnlyResult.handled) return;
           ctx.permLog(`permission bubbles disabled, no remote approval available → destroy connection, chat fallback (tool=${toolName})`);
@@ -2177,6 +2231,7 @@ function handlePermissionPost(req, res, options) {
         toolInput,
         planReviewWireInput,
         ...permissionDetail,
+        ...permissionReminder,
         toolUseId,
         toolInputFingerprint,
         resolvedSuggestion: null,

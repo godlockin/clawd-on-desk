@@ -39,6 +39,10 @@ const AGENT_METRIC_POLICIES = Object.freeze({
   opencode: policy(null, STANDARD_COMPLETION, null),
   mimocode: policy(null, STANDARD_COMPLETION, null),
   pi: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
+  // OMP records a main-session completion candidate at session_stop and emits
+  // Stop only after the following agent_end proves willContinue !== true, so
+  // accepted Stop remains a completed-turn boundary here.
+  omp: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   openclaw: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   // Hermes normalizes both post_llm_call and on_session_end to Stop. The first
   // can be an intermediate model boundary before a tool call, so Stop is not a
@@ -50,6 +54,10 @@ const AGENT_METRIC_POLICIES = Object.freeze({
   qwenwork: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   workbuddy: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   traecode: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
+  // MiniMax Code maps SessionStart→Stop turn boundaries exactly like the
+  // Claude-compatible adapters; PreToolUse/PostToolUse bracket tool calls.
+  minimax: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
+  "grok-build": policy(null, null, STANDARD_TOOL_START),
 });
 
 function policy(sessionStart, turnCompleteEvents, toolCallEvents) {
