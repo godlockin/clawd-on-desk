@@ -113,6 +113,17 @@ describe("i18n locales", () => {
     assertLocaleObjectParity(loadSettingsI18nStrings(), "settings");
   });
 
+  it("describes Codex CLI queue delivery in every Settings locale", () => {
+    const strings = loadSettingsI18nStrings();
+    for (const lang of SUPPORTED_LANGS) {
+      assert.match(
+        strings[lang].telegramApprovalDirectSendDesc,
+        /Codex Desktop.*Codex CLI/,
+        `settings.${lang}.telegramApprovalDirectSendDesc should name both queue routes`,
+      );
+    }
+  });
+
   it("localizes every Feishu provenance, lookup lifecycle, and persistence outcome", () => {
     const strings = loadSettingsI18nStrings();
     const keys = [
