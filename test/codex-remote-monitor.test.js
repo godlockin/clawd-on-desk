@@ -10,6 +10,11 @@ const { __test } = require("../hooks/codex-remote-monitor");
 
 const ROLLOUT_NAME =
   "rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl";
+const DESKTOP_THREAD_ID = "019f894f-34b8-7d81-96c9-b9a0fc87eb24";
+const DESKTOP_TURN_ROLLOUT_NAME =
+  `rollout-2026-09-12T22-22-36-${DESKTOP_THREAD_ID}_01a095ff-ad3a-7e41-a97f-a70c6dcb7b3c.jsonl`;
+const DESKTOP_SECOND_TURN_ROLLOUT_NAME =
+  `rollout-2026-09-12T22-24-00-${DESKTOP_THREAD_ID}_02b095ff-ad3a-7e41-a97f-a70c6dcb7b3c.jsonl`;
 
 function uniqueRolloutName(index) {
   return `rollout-2026-03-25T15-10-51-${String(index).padStart(8, "0")}-f1a9-7633-b9c7-758327137228.jsonl`;
@@ -437,6 +442,216 @@ describe("Codex remote monitor — stale-cleanup re-read dedup", () => {
       postState: (sessionId, state, event) => posted.push({ sessionId, state, event }),
     };
   }
+
+  function writeBackfillRollout(dir, fileName, lines, startedAtMs) {
+    const filePath = path.join(dir, fileName);
+    fs.writeFileSync(filePath, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+    const oldTime = new Date(startedAtMs - __test.BACKFILL_GRACE_MS - 1000);
+    fs.utimesSync(filePath, oldTime, oldTime);
+    return filePath;
+  }
+
+  it("groups a Codex Desktop turn-suffixed rollout under its parent thread", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-desktop-"));
+    tmpDirs.push(dir);
+    const firstPath = path.join(dir, DESKTOP_TURN_ROLLOUT_NAME);
+    const secondPath = path.join(dir, DESKTOP_SECOND_TURN_ROLLOUT_NAME);
+    fs.writeFileSync(firstPath, `${JSON.stringify(META)}\n`);
+    fs.writeFileSync(secondPath, `${JSON.stringify(META)}\n`);
+    const posted = [];
+    const postState = (sessionId, state, event) => posted.push({ sessionId, state, event });
+
+    const first = __test.pollFile(firstPath, DESKTOP_TURN_ROLLOUT_NAME, { postState });
+    const second = __test.pollFile(secondPath, DESKTOP_SECOND_TURN_ROLLOUT_NAME, { postState });
+
+    assert.strictEqual(first.kind, "progress");
+    assert.strictEqual(second.kind, "progress");
+    assert.strictEqual(
+      __test.tracked.get(firstPath).sessionId,
+      `codex:${DESKTOP_THREAD_ID}`
+    );
+    assert.strictEqual(__test.tracked.get(secondPath).sessionId, `codex:${DESKTOP_THREAD_ID}`);
+    assert.deepStrictEqual([...new Set(posted.map((post) => post.sessionId))], [
+      `codex:${DESKTOP_THREAD_ID}`,
+    ]);
+  });
+
+  it("does not stale a shared Desktop thread while a newer sibling is active", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-sibling-live-"));
+    tmpDirs.push(dir);
+    const oldPath = path.join(dir, DESKTOP_TURN_ROLLOUT_NAME);
+    const activePath = path.join(dir, DESKTOP_SECOND_TURN_ROLLOUT_NAME);
+    fs.writeFileSync(oldPath, [META, STARTED, COMPLETE].map((line) => JSON.stringify(line)).join("\n") + "\n");
+    fs.writeFileSync(activePath, [META, STARTED, FUNC].map((line) => JSON.stringify(line)).join("\n") + "\n");
+    const s = spy();
+    __test.pollFile(oldPath, DESKTOP_TURN_ROLLOUT_NAME, { postState: s.postState });
+    __test.pollFile(activePath, DESKTOP_SECOND_TURN_ROLLOUT_NAME, { postState: s.postState });
+
+    const now = Date.now();
+    __test.tracked.get(oldPath).lastEventTime = now - __test.STALE_MS - 1;
+    __test.tracked.get(activePath).lastEventTime = now;
+    s.posted.length = 0;
+    __test.cleanStaleFiles({ postState: s.postState, now: () => now });
+
+    assert.deepStrictEqual(s.posted, []);
+  });
+
+  it("posts one sleeping transition for a fully stale shared Desktop thread", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-sibling-stale-"));
+    tmpDirs.push(dir);
+    const firstPath = path.join(dir, DESKTOP_TURN_ROLLOUT_NAME);
+    const secondPath = path.join(dir, DESKTOP_SECOND_TURN_ROLLOUT_NAME);
+    fs.writeFileSync(firstPath, `${JSON.stringify(META)}\n`);
+    fs.writeFileSync(secondPath, `${JSON.stringify(META)}\n`);
+    const s = spy();
+    __test.pollFile(firstPath, DESKTOP_TURN_ROLLOUT_NAME, { postState: s.postState });
+    __test.pollFile(secondPath, DESKTOP_SECOND_TURN_ROLLOUT_NAME, { postState: s.postState });
+
+    const now = Date.now();
+    for (const entry of __test.tracked.values()) {
+      entry.lastEventTime = now - __test.STALE_MS - 1;
+    }
+    s.posted.length = 0;
+    __test.cleanStaleFiles({ postState: s.postState, now: () => now });
+    __test.cleanStaleFiles({ postState: s.postState, now: () => now });
+
+    assert.strictEqual(s.posted.filter((post) => post.event === "stale-cleanup").length, 1);
+    assert.ok([...__test.tracked.values()].every((entry) => entry.stale === true));
+  });
+
+  it("wakes a shared Desktop thread from any sibling after session-level sleeping", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-sibling-wake-"));
+    tmpDirs.push(dir);
+    const firstPath = path.join(dir, DESKTOP_TURN_ROLLOUT_NAME);
+    const secondPath = path.join(dir, DESKTOP_SECOND_TURN_ROLLOUT_NAME);
+    fs.writeFileSync(firstPath, [META, FUNC].map((line) => JSON.stringify(line)).join("\n") + "\n");
+    fs.writeFileSync(secondPath, [META, FUNC].map((line) => JSON.stringify(line)).join("\n") + "\n");
+    const s = spy();
+    __test.pollFile(firstPath, DESKTOP_TURN_ROLLOUT_NAME, { postState: s.postState });
+    __test.pollFile(secondPath, DESKTOP_SECOND_TURN_ROLLOUT_NAME, { postState: s.postState });
+    const now = Date.now();
+    for (const entry of __test.tracked.values()) {
+      entry.lastEventTime = now - __test.STALE_MS - 1;
+    }
+    __test.cleanStaleFiles({ postState: s.postState, now: () => now });
+    const workingBefore = s.posted.filter((post) => post.state === "working").length;
+
+    appendLines(secondPath, [FUNC]);
+    __test.pollFile(secondPath, DESKTOP_SECOND_TURN_ROLLOUT_NAME, { postState: s.postState });
+
+    assert.strictEqual(
+      s.posted.filter((post) => post.state === "working").length,
+      workingBefore + 1
+    );
+    assert.ok([...__test.tracked.values()].every((entry) => entry.stale === false));
+  });
+
+  it("suppresses an old sibling completion while restoring the active Desktop turn", () => {
+    const startedAtMs = Date.now();
+    __test.resetMonitorStateForTests({ startedAtMs });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-backfill-siblings-"));
+    tmpDirs.push(dir);
+    const oldPath = writeBackfillRollout(
+      dir,
+      DESKTOP_TURN_ROLLOUT_NAME,
+      [META, STARTED, COMPLETE],
+      startedAtMs
+    );
+    const activePath = writeBackfillRollout(
+      dir,
+      DESKTOP_SECOND_TURN_ROLLOUT_NAME,
+      [META, STARTED, FUNC],
+      startedAtMs
+    );
+    const s = spy();
+
+    __test.pollFile(oldPath, DESKTOP_TURN_ROLLOUT_NAME, { postState: s.postState });
+    __test.pollFile(activePath, DESKTOP_SECOND_TURN_ROLLOUT_NAME, { postState: s.postState });
+
+    assert.deepStrictEqual(s.posted.map(({ state, event }) => ({ state, event })), [
+      { state: "working", event: "response_item:function_call" },
+    ]);
+  });
+
+  it("restores one sustained state from a pre-existing active rollout", () => {
+    const startedAtMs = Date.now();
+    __test.resetMonitorStateForTests({ startedAtMs });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-backfill-active-"));
+    tmpDirs.push(dir);
+    const filePath = writeBackfillRollout(
+      dir,
+      DESKTOP_TURN_ROLLOUT_NAME,
+      [META, STARTED, FUNC],
+      startedAtMs
+    );
+    const s = spy();
+
+    __test.pollFile(filePath, DESKTOP_TURN_ROLLOUT_NAME, { postState: s.postState });
+
+    assert.deepStrictEqual(s.posted.map(({ state, event }) => ({ state, event })), [
+      { state: "working", event: "response_item:function_call" },
+    ]);
+  });
+
+  it("restores a pending question without also emitting a backfill state", () => {
+    const startedAtMs = Date.now();
+    __test.resetMonitorStateForTests({ startedAtMs });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-backfill-pending-"));
+    tmpDirs.push(dir);
+    const request = {
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "request_user_input",
+        call_id: "call_backfill_pending",
+        arguments: JSON.stringify({
+          questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }],
+        }),
+      },
+    };
+    const filePath = writeBackfillRollout(
+      dir,
+      DESKTOP_TURN_ROLLOUT_NAME,
+      [META, STARTED, request],
+      startedAtMs
+    );
+    const s = spy();
+
+    __test.pollFile(filePath, DESKTOP_TURN_ROLLOUT_NAME, { postState: s.postState });
+
+    assert.deepStrictEqual(s.posted.map(({ state, event }) => ({ state, event })), [
+      { state: "notification", event: "CodexUserInputRequest" },
+    ]);
+  });
+
+  it("does not resurrect a backfilled question that already completed", () => {
+    const startedAtMs = Date.now();
+    __test.resetMonitorStateForTests({ startedAtMs });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-remote-backfill-complete-"));
+    tmpDirs.push(dir);
+    const request = {
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "request_user_input",
+        call_id: "call_backfill_complete",
+        arguments: JSON.stringify({
+          questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }],
+        }),
+      },
+    };
+    const filePath = writeBackfillRollout(
+      dir,
+      DESKTOP_TURN_ROLLOUT_NAME,
+      [META, STARTED, request, COMPLETE],
+      startedAtMs
+    );
+    const s = spy();
+
+    __test.pollFile(filePath, DESKTOP_TURN_ROLLOUT_NAME, { postState: s.postState });
+
+    assert.deepStrictEqual(s.posted, []);
+  });
 
   it("does not re-emit historical task_complete after a stale window + resume", () => {
     const filePath = track([META, STARTED, COMPLETE]);
