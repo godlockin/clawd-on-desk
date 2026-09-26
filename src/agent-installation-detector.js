@@ -13,8 +13,9 @@ const dsh = require("../hooks/dsh-install");
 const zcode = require("../hooks/zcode-install");
 const codebuddy = require("../hooks/codebuddy-install");
 const openclaw = require("../hooks/openclaw-install");
+const grok = require("../hooks/grok-install");
 const { commandMatchesMarker } = require("../hooks/json-utils");
-const { identifyCustomApplication } = require("./custom-applications");
+const { identifyCustomApplication, isLaunchable } = require("./custom-applications");
 
 // Agents whose detector parent dir the DEFAULT startup sync creates on its own,
 // before the agent has left any evidence of its own. For those, "the directory
@@ -206,6 +207,16 @@ function resolveAgentPaths(descriptor, options) {
       parentDir: dshHome,
       configPath: dsh.resolveDshProfileDir(dshHome),
       commandPaths: dsh.dshCommandPathsSync({ fs: options.fs, env, platform }),
+    }, options);
+  }
+
+  if (descriptor.agentId === "grok-build") {
+    // Dynamic GROK_HOME path + structured ownership both come from the shared
+    // inspector so Doctor, the installation detector, and the installer agree.
+    const inspected = grok.inspectGrokHookFile({ fs: options.fs, env, homeDir });
+    return finalizeAgentPaths(descriptor, {
+      parentDir: inspected.grokHome,
+      configPath: inspected.configPath,
     }, options);
   }
 
@@ -476,6 +487,9 @@ function detectInstallation(descriptor, paths, options) {
       }
       if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
       return notFound();
+    case "grok-build":
+      if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
+      return notFound();
     case "copilot-cli":
     case "cursor-agent":
     case "qwen-code":
@@ -485,6 +499,7 @@ function detectInstallation(descriptor, paths, options) {
     case "qoderwork":
     case "traecode":
     case "qwenwork":
+    case "minimax":
       if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
       return notFound();
     case "zcode":
@@ -503,6 +518,7 @@ function detectInstallation(descriptor, paths, options) {
       if (dirExists(fsImpl, paths.configPath)) return installationResult(true, "medium", "config-dir", `${paths.configPath} exists`);
       return notFound();
     case "pi":
+    case "omp":
       if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
       return notFound();
     case "openclaw":
@@ -565,6 +581,7 @@ function detectCustomTools(options = {}) {
 
 function detectCustomAgents(options = {}) {
   const fsImpl = options.fs || fs;
+  const platform = options.platform || process.platform;
   const applications = Array.isArray(options.snapshot && options.snapshot.customApplications)
     ? options.snapshot.customApplications
     : [];
@@ -574,15 +591,27 @@ function detectCustomAgents(options = {}) {
       ? application.executablePath
       : "";
     const kind = executablePath ? statPath(fsImpl, executablePath) : null;
+    let launchable = false;
+    if (kind === "file") {
+      try { launchable = isLaunchable(executablePath, fsImpl.statSync(executablePath), platform, path, fsImpl); } catch {}
+    }
+    const reason = launchable
+      ? "registered-executable"
+      : (kind === "file" ? "not-executable" : (kind ? "not-file" : "not-found"));
+    const detail = launchable
+      ? `Registered executable exists: ${executablePath} (${kind})`
+      : reason === "not-executable"
+        ? `Registered executable is not launchable: ${executablePath}`
+        : reason === "not-file"
+          ? `Registered executable path is not a regular file: ${executablePath} (${kind})`
+          : `Registered executable was not found: ${executablePath}`;
     return {
       agentId,
       executablePath,
-      detectedInstalled: !!kind,
-      confidence: kind ? "high" : LOW_CONFIDENCE,
-      reason: kind ? "registered-executable" : "not-found",
-      detail: kind
-        ? `Registered executable exists: ${executablePath} (${kind})`
-        : `Registered executable was not found: ${executablePath}`,
+      detectedInstalled: launchable,
+      confidence: launchable ? "high" : LOW_CONFIDENCE,
+      reason,
+      detail,
     };
   }).filter((entry) => entry.agentId && entry.executablePath);
 }
@@ -627,11 +656,12 @@ function detectClawdIntegration(descriptor, paths, options) {
         paths: { profileDir: health.profileDir },
       };
   }
-  if (descriptor.agentId === "pi") {
+  if (descriptor.agentId === "pi" || descriptor.agentId === "omp") {
+    const label = descriptor.agentId === "omp" ? "OMP" : "Pi";
     const markerPath = path.join(paths.configPath, descriptor.markerFile || ".clawd-managed.json");
     return fileExists(fsImpl, markerPath)
       ? { detected: true, reason: "marker-file", detail: `${markerPath} exists`, paths: { markerPath } }
-      : { detected: false, reason: "not-found", detail: "No Clawd-managed Pi extension marker found" };
+      : { detected: false, reason: "not-found", detail: `No Clawd-managed ${label} extension marker found` };
   }
   if (descriptor.agentId === "hermes") {
     const files = Array.isArray(descriptor.managedFiles) ? descriptor.managedFiles : [];
@@ -639,6 +669,33 @@ function detectClawdIntegration(descriptor, paths, options) {
     return found
       ? { detected: true, reason: "managed-files", detail: `${paths.configPath} contains Clawd plugin files`, paths: { pluginDir: paths.configPath } }
       : { detected: false, reason: "not-found", detail: "No Clawd-managed Hermes plugin files found" };
+  }
+  if (descriptor.configMode === "grok-hooks") {
+    const inspected = grok.inspectGrokHookFile({
+      fs: fsImpl,
+      env: options.env,
+      homeDir: options.homeDir,
+      grokHome: paths.parentDir,
+      configPath: paths.configPath,
+    });
+    if (inspected.health === "healthy") {
+      return {
+        detected: true,
+        reason: "structured-marker",
+        detail: `${inspected.configPath} contains the verified Clawd handler marker`,
+        paths: { configPath: inspected.configPath },
+        stalePreview: inspected.stalePreview,
+        warnings: inspected.warnings,
+      };
+    }
+    return {
+      detected: false,
+      reason: inspected.health,
+      detail: inspected.detail || `Grok Build hook file is ${inspected.health}`,
+      paths: { configPath: inspected.configPath },
+      stalePreview: inspected.stalePreview,
+      warnings: inspected.warnings,
+    };
   }
   if (descriptor.configMode === "dir") {
     return markerInDirectoryFiles(fsImpl, paths.configPath, descriptor.marker)

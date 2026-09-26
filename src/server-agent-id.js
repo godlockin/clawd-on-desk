@@ -26,10 +26,12 @@ const HOOK_SOURCE_AGENT_IDS = new Map([
   ["codex-official", "codex"],
   ["copilot-hook", "copilot-cli"],
   ["opencode-plugin", "opencode"],
+  ["opencode-plugin-v2", "opencode"], // opencode 2.x `plugins`-key runtime (issue #1039)
   ["mimocode-plugin", "mimocode"],
   ["openclaw-plugin", "openclaw"],
   ["codewhale-hook", "codewhale"],
   ["pi-extension", "pi"],
+  ["omp-extension", "omp"],
 ]);
 
 function normalizeHookText(value) {
