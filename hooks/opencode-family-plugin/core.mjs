@@ -41,10 +41,11 @@
 //   runtime.json target. This is a same-OS-user trust boundary, not isolation
 //   from another malicious process already running as the same user.
 
-import { readFileSync, writeFileSync, mkdirSync, lstatSync, promises as fsp } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, lstatSync, statSync, realpathSync, promises as fsp } from "fs";
 import { homedir, platform } from "os";
-import { join, posix, win32 } from "path";
-import { randomBytes, timingSafeEqual } from "crypto";
+import { join, dirname, basename, posix, win32 } from "path";
+import { fileURLToPath } from "url";
+import { randomBytes, timingSafeEqual, createHash } from "crypto";
 import { execFileSync, execSync } from "child_process";
 import { createServer as createHttpServer } from "http";
 import {
@@ -70,6 +71,13 @@ const CONTEXT_LIMIT_CACHE_MS = 60 * 1000;
 // tracked, so long-lived hosts (days of sessions) stay bounded even though
 // _lastStatePerSession itself is intentionally unbounded.
 const MAX_CONTEXT_USAGE_ENTRIES = 1024;
+// Resume hydration reads one recent page. Bootstrap examines at most 20
+// directory-owned root sessions; it never creates Clawd lifecycle activity.
+const CONTEXT_HISTORY_LIMIT = 20;
+const CONTEXT_BOOTSTRAP_LIMIT = 20;
+const CONTEXT_HISTORY_TIMEOUT_MS = 2000;
+const CONTEXT_HISTORY_RETRY_MS = 30 * 1000;
+const CONTEXT_HISTORY_MAX_CONCURRENT = 4;
 // Fire-and-forget: the IIFE never blocks the event hook's return value, so a
 // generous timeout is safe. 200ms was too tight when Clawd's IPC roundtrip
 // (main → renderer → main) ran under load and silently timed out.
@@ -102,6 +110,54 @@ export function orcaPaneKeyFromEnv(env = process.env) {
   if (!paneKey || paneKey.length > 256 || !/^[\w-]+:[\w-]+$/.test(paneKey)) return null;
   return paneKey;
 }
+
+// Runtime-port readers are shared verbatim by the v1 event-hook runtime and the
+// v2 service runtime (createOpencodeFamilyPluginV2 below). They live at module
+// scope so the strict permission-target checks cannot drift between the two
+// runtimes. Any change here must keep satisfying the
+// opencode-family-core.test.js owner-only / live-owner fail-closed matrix.
+export function readRuntimePort() {
+  try {
+    const raw = JSON.parse(readFileSync(RUNTIME_CONFIG_PATH, "utf8"));
+    const port = Number(raw && raw.port);
+    if (Number.isInteger(port) && SERVER_PORTS.includes(port)) return port;
+  } catch {}
+  return null;
+}
+
+// Permission payloads contain the one-time reverse-bridge bearer token (v1)
+// and an awaited blocking decision (v2). A full port scan is acceptable for
+// state telemetry, but must never disclose either to an arbitrary listener
+// which merely copies Clawd's static response header. Pin permission delivery
+// to the runtime identity written by a live Clawd process, and require
+// owner-only bytes on POSIX.
+export function readPermissionRuntimePort() {
+  try {
+    const stats = lstatSync(RUNTIME_CONFIG_PATH);
+    if (!stats.isFile() || stats.isSymbolicLink()) return null;
+    if (platform() !== "win32") {
+      if (typeof process.getuid === "function" && stats.uid !== process.getuid()) return null;
+      if ((stats.mode & 0o077) !== 0) return null;
+    }
+
+    const raw = JSON.parse(readFileSync(RUNTIME_CONFIG_PATH, "utf8"));
+    const port = Number(raw && raw.port);
+    const ownerPid = raw && raw.ownerPid;
+    if (raw?.app !== CLAWD_SERVER_ID) return null;
+    if (!Number.isInteger(port) || !SERVER_PORTS.includes(port)) return null;
+    if (!Number.isInteger(ownerPid) || ownerPid <= 0) return null;
+    try {
+      process.kill(ownerPid, 0);
+    } catch (err) {
+      // EPERM still proves that a process owns the PID; ESRCH/unknown does
+      // not prove the runtime writer is alive, so fail closed.
+      if (!err || err.code !== "EPERM") return null;
+    }
+    return port;
+  } catch {}
+  return null;
+}
+
 
 // Process tree walk config — mirrors hooks/clawd-hook.js exactly, minus the
 // Claude-specific detection. See docs/plans/plan-opencode-integration.md Phase 4.
@@ -240,6 +296,151 @@ export function extractContextUsageUsed(tokens) {
   }
   if (parts.length === 0 && cache == null) return null;
   return parts.reduce((a, b) => a + b, 0) + cacheNum;
+}
+
+// #1026 managed-layout inert gate.
+//
+// A managed generation under <home>/.clawd/integrations/opencode-family/<agent>/
+// homes/<configHash>/generations/<bundleHash>/opencode-family-plugin/core.mjs
+// is only "live" while its target owner record exists and points back at a
+// still-present app source marker. If Clawd is deleted/moved without cleanup,
+// the copied core must go inert — BEFORE the debug log is truncated, the PID
+// tree is walked, the reverse bridge is started or any event handler is
+// registered. This runs inside the host-invoked initializer, so the entry
+// module still default-exports exactly one callable function (#413).
+const MANAGED_TARGET_OWNER_LITERAL = "clawd-on-desk.opencode-family.target";
+const MANAGED_CORE_LAYOUT_RE = /\/generations\/([0-9a-f]{64})\/opencode-family-plugin\/core\.mjs$/i;
+const MANAGED_KNOWN_PATH_LIMIT = 16;
+
+function managedIsAbsolute(value) {
+  const normalized = String(value || "").replace(/\\/g, "/");
+  return normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//");
+}
+
+// Full standalone owner validation for the copied runtime gate. Mirrors the
+// installer/Doctor schema: a missing or corrupt record must go inert BEFORE any
+// side effect. Returns null when live, or { reason, released } otherwise.
+function managedOwnerProblem(owner, agentHome, config) {
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return { reason: "owner-record-shape" };
+  if (owner.owner !== MANAGED_TARGET_OWNER_LITERAL || owner.schema !== 1) return { reason: "owner-record-foreign" };
+  if (config.agentId && owner.agentId !== config.agentId) return { reason: "owner-agent-mismatch" };
+
+  const expectedHash = basename(agentHome).toLowerCase();
+  if (typeof owner.configDirHash !== "string" || !/^[0-9a-f]{64}$/.test(owner.configDirHash)) {
+    return { reason: "owner-config-hash-malformed" };
+  }
+  if (owner.configDirHash.toLowerCase() !== expectedHash) {
+    return { reason: "owner-config-hash-mismatch" };
+  }
+  if (typeof owner.canonicalConfigDir !== "string" || !owner.canonicalConfigDir
+      || !managedIsAbsolute(owner.canonicalConfigDir)) {
+    return { reason: "owner-canonical-config-dir" };
+  }
+  if (createHash("sha256").update(owner.canonicalConfigDir).digest("hex") !== owner.configDirHash) {
+    return { reason: "owner-config-hash-inconsistent" };
+  }
+
+  if (!Array.isArray(owner.knownRegisteredPaths)
+      || owner.knownRegisteredPaths.length > MANAGED_KNOWN_PATH_LIMIT) {
+    return { reason: "owner-known-paths" };
+  }
+  const seen = new Set();
+  for (const value of owner.knownRegisteredPaths) {
+    if (typeof value !== "string" || !value || !managedIsAbsolute(value)) {
+      return { reason: "owner-known-path-invalid" };
+    }
+    const canonical = managedCanonicalPath(value);
+    if (canonical === null || seen.has(canonical)) return { reason: "owner-known-path-duplicate" };
+    seen.add(canonical);
+  }
+
+  const root = owner.activeSourceRoot;
+  const marker = owner.activeSourceMarker;
+  if (root === null || root === undefined) {
+    if (marker !== null && marker !== undefined) return { reason: "owner-released-pairing" };
+    return { reason: "owner-record-released", released: true };
+  }
+  if (typeof root !== "string" || !root || !managedIsAbsolute(root)) return { reason: "owner-source-root" };
+  if (typeof marker !== "string" || !marker || !managedIsAbsolute(marker)) return { reason: "owner-source-marker" };
+
+  const pluginDirName = typeof config.pluginDirName === "string" && config.pluginDirName
+    ? config.pluginDirName
+    : (typeof config.hookSource === "string" ? config.hookSource : "");
+  if (!pluginDirName) return { reason: "owner-plugin-dir-unknown" };
+  const fold = platform() === "win32" ? (value) => value.toLowerCase() : (value) => value;
+  const markerSlashed = marker.replace(/\\/g, "/");
+  if (fold(markerSlashed.slice(markerSlashed.lastIndexOf("/") + 1)) !== "index.mjs") {
+    return { reason: "source-marker-shape" };
+  }
+  const markerDir = markerSlashed.slice(0, markerSlashed.lastIndexOf("/"));
+  if (fold(markerDir.slice(markerDir.lastIndexOf("/") + 1)) !== fold(pluginDirName)) {
+    return { reason: "source-marker-plugin-dir" };
+  }
+  const markerRoot = markerDir.slice(0, markerDir.lastIndexOf("/"));
+  if (managedCanonicalPath(markerRoot) !== managedCanonicalPath(root)) {
+    return { reason: "source-marker-root-mismatch" };
+  }
+  return null;
+}
+
+// Standalone canonical identity (the copied core cannot import Clawd modules).
+// realpath resolves aliases; failure falls back to the lexical form, which is
+// fine here because liveness already requires the marker to be a real file.
+function managedCanonicalPath(value) {
+  if (typeof value !== "string" || !value) return null;
+  let resolved = value;
+  try {
+    resolved = typeof realpathSync.native === "function" ? realpathSync.native(value) : realpathSync(value);
+  } catch {
+    resolved = value;
+  }
+  let normalized = String(resolved).replace(/\\/g, "/");
+  while (normalized.length > 1 && normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  return platform() === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+export function evaluateManagedLayoutGate(metaUrl, config = {}) {
+  let corePath;
+  try {
+    corePath = fileURLToPath(metaUrl);
+  } catch {
+    return { mode: "source-direct", reason: "unresolvable-url" };
+  }
+  const normalized = String(corePath).replace(/\\/g, "/");
+  if (!MANAGED_CORE_LAYOUT_RE.test(normalized)) return { mode: "source-direct" };
+
+  // core.mjs → <gen>/opencode-family-plugin/core.mjs; owner.json lives three
+  // parent directories up at homes/<configHash>/owner.json.
+  const pluginDir = dirname(corePath);
+  const genDir = dirname(pluginDir);
+  const generationsDir = dirname(genDir);
+  const agentHome = dirname(generationsDir);
+  const ownerPath = join(agentHome, "owner.json");
+
+  let owner;
+  try {
+    const text = readFileSync(ownerPath, "utf8");
+    owner = JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+  } catch {
+    return { mode: "inert", reason: "owner-record-missing", ownerPath };
+  }
+  // Full owner-schema validation (literal/schema/agent, 64-hex target hash,
+  // absolute self-consistent canonicalConfigDir, bounded absolute history,
+  // source pairing, exact marker structure) BEFORE any side effect.
+  const problem = managedOwnerProblem(owner, agentHome, config);
+  if (problem) return { mode: "inert", reason: problem.reason, ownerPath };
+  // The marker must resolve to the expected regular file. A directory, a
+  // dangling symlink, or any non-file must go inert (statSync follows links,
+  // so a dangling symlink throws and a directory reports isFile()===false).
+  try {
+    const markerStat = statSync(owner.activeSourceMarker);
+    if (!markerStat || typeof markerStat.isFile !== "function" || !markerStat.isFile()) {
+      return { mode: "inert", reason: "source-marker-not-a-file", ownerPath };
+    }
+  } catch {
+    return { mode: "inert", reason: "source-marker-missing", ownerPath };
+  }
+  return { mode: "managed-live", ownerPath };
 }
 
 /**
@@ -409,47 +610,6 @@ export function createOpencodeFamilyPlugin(config) {
       };
       check();
     });
-  }
-
-  function readRuntimePort() {
-    try {
-      const raw = JSON.parse(readFileSync(RUNTIME_CONFIG_PATH, "utf8"));
-      const port = Number(raw && raw.port);
-      if (Number.isInteger(port) && SERVER_PORTS.includes(port)) return port;
-    } catch {}
-    return null;
-  }
-
-  // Permission payloads contain the one-time reverse-bridge bearer token. A
-  // full port scan is acceptable for state telemetry, but must never disclose
-  // that token to an arbitrary listener which merely copies Clawd's static
-  // response header. Pin permission delivery to the runtime identity written
-  // by a live Clawd process, and require owner-only bytes on POSIX.
-  function readPermissionRuntimePort() {
-    try {
-      const stats = lstatSync(RUNTIME_CONFIG_PATH);
-      if (!stats.isFile() || stats.isSymbolicLink()) return null;
-      if (platform() !== "win32") {
-        if (typeof process.getuid === "function" && stats.uid !== process.getuid()) return null;
-        if ((stats.mode & 0o077) !== 0) return null;
-      }
-
-      const raw = JSON.parse(readFileSync(RUNTIME_CONFIG_PATH, "utf8"));
-      const port = Number(raw && raw.port);
-      const ownerPid = raw && raw.ownerPid;
-      if (raw?.app !== CLAWD_SERVER_ID) return null;
-      if (!Number.isInteger(port) || !SERVER_PORTS.includes(port)) return null;
-      if (!Number.isInteger(ownerPid) || ownerPid <= 0) return null;
-      try {
-        process.kill(ownerPid, 0);
-      } catch (err) {
-        // EPERM still proves that a process owns the PID; ESRCH/unknown does
-        // not prove the runtime writer is alive, so fail closed.
-        if (!err || err.code !== "EPERM") return null;
-      }
-      return port;
-    } catch {}
-    return null;
   }
 
   // Ordered: cached → runtime.json → full scan. Only touches runtime.json when
@@ -726,7 +886,7 @@ export function createOpencodeFamilyPlugin(config) {
     return sessions || null;
   }
 
-  function getContextState(instanceToken, sessionId, create = false) {
+  function getContextState(instanceToken, sessionId, create = false, activityObserved = true) {
     const normalized = normalizeSessionId(sessionId);
     if (!normalized) return null;
     const sessions = getContextSessionMap(instanceToken, create);
@@ -739,10 +899,37 @@ export function createOpencodeFamilyPlugin(config) {
         latestSequence: 0,
         inFlight: new Map(),
         delivered: null,
+        liveRevision: 0,
+        hydration: null,
+        nextHydrationAt: 0,
+        pendingHydration: null,
+        undeliveredContext: null,
+        historyController: null,
+        wakeHydration: null,
+        activityObserved,
       };
       sessions.set(normalized, state);
+      if (sessions.size > MAX_CONTEXT_USAGE_ENTRIES) {
+        // Prefer an unserved bootstrap candidate over an explicit selection.
+        const oldest = [...sessions].find(([id, entry]) => (
+          id !== normalized && !entry.activityObserved && entry.pendingHydration
+        ))?.[0] || sessions.keys().next().value;
+        if (oldest !== normalized) {
+          invalidateContextHydration(sessions.get(oldest));
+          sessions.delete(oldest);
+        }
+      }
     }
+    if (state && create && activityObserved) state.activityObserved = true;
     return state || null;
+  }
+
+  function invalidateContextHydration(state) {
+    if (!state) return;
+    state.pendingHydration = null;
+    state.undeliveredContext = null;
+    state.historyController?.abort();
+    state.wakeHydration?.();
   }
 
   function resetContextSession(sessionId, instanceToken) {
@@ -750,6 +937,7 @@ export function createOpencodeFamilyPlugin(config) {
     if (!normalized) return;
     const sessions = getContextSessionMap(instanceToken);
     if (!sessions) return;
+    invalidateContextHydration(sessions.get(normalized));
     sessions.delete(normalized);
     if (sessions.size === 0) _contextStateByInstance.delete(contextInstanceToken(instanceToken));
   }
@@ -760,17 +948,25 @@ export function createOpencodeFamilyPlugin(config) {
       ? _contextStateByInstance.values()
       : [getContextSessionMap(instanceToken)].filter(Boolean);
     for (const sessions of maps) {
-      for (const sessionId of sessions.keys()) ids.add(sessionId);
+      for (const [sessionId, state] of sessions) {
+        if (state.activityObserved) ids.add(sessionId);
+      }
     }
     return ids;
   }
 
   function cleanupContextState(sessionIds, options = {}) {
     if (options.clearAll === true) {
+      for (const sessions of _contextStateByInstance.values()) {
+        for (const state of sessions.values()) invalidateContextHydration(state);
+      }
       _contextStateByInstance.clear();
       return;
     }
     if (options.clearInstance === true && options.instanceToken != null) {
+      for (const state of getContextSessionMap(options.instanceToken)?.values() || []) {
+        invalidateContextHydration(state);
+      }
       _contextStateByInstance.delete(contextInstanceToken(options.instanceToken));
       return;
     }
@@ -780,7 +976,10 @@ export function createOpencodeFamilyPlugin(config) {
       ? _contextStateByInstance.values()
       : [getContextSessionMap(options.instanceToken)].filter(Boolean);
     for (const sessions of maps) {
-      for (const sessionId of ids) sessions.delete(sessionId);
+      for (const sessionId of ids) {
+        invalidateContextHydration(sessions.get(sessionId));
+        sessions.delete(sessionId);
+      }
     }
     for (const [token, sessions] of _contextStateByInstance) {
       if (sessions.size === 0) _contextStateByInstance.delete(token);
@@ -795,7 +994,12 @@ export function createOpencodeFamilyPlugin(config) {
       ..._lastStatePerSession.keys(),
       ..._sessionParentById.keys(),
       ..._sessionParentById.values(),
-      ..._statePostTailBySession.keys(),
+      // A bootstrap-only metadata queue cannot create a session and must not
+      // manufacture SessionEnd ownership during a global disposal.
+      ...[..._statePostQueueBySession].filter(([, queue]) => (
+        (queue.active && queue.active.body.metadata_only !== true)
+        || queue.pending.some((entry) => entry.body.metadata_only !== true)
+      )).map(([sessionId]) => sessionId),
     ]);
     for (const sessionId of collectContextSessionIds()) ids.add(sessionId);
     const root = normalizeSessionId(_rootSessionId);
@@ -925,7 +1129,7 @@ export function createOpencodeFamilyPlugin(config) {
   // Snapshot mutable request data synchronously. session.deleted cleanup runs
   // immediately after enqueue, so cwd/title/process fields must already be
   // frozen before a queued delivery waits behind an older request.
-  function snapshotPost(body, logTag) {
+  function snapshotPost(body, logTag, contextDirectory) {
     const outbound = { ...(body || {}) };
     // Enrich every outbound body with process-tree fields. Cached after first
     // call so this is just a few object assignments per POST.
@@ -941,7 +1145,9 @@ export function createOpencodeFamilyPlugin(config) {
     // walk finds no terminal to report.
     const orcaPaneKey = orcaPaneKeyFromEnv();
     if (orcaPaneKey) outbound.orca_pane_key = orcaPaneKey;
-    const cwd = resolveSessionDirectory(outbound.session_id);
+    const cwd = contextDirectory === undefined
+      ? resolveSessionDirectory(outbound.session_id)
+      : { directory: contextDirectory, source: "context-instance" };
     if (cwd.directory) outbound.cwd = cwd.directory;
     else delete outbound.cwd;
     outbound.agent_pid = process.pid;
@@ -965,6 +1171,9 @@ export function createOpencodeFamilyPlugin(config) {
     debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} cwdSource=${snapshot.cwdSource} start candidates=[${candidates.join(",")}]`);
 
     for (const port of candidates) {
+      if (urlPath === STATE_PATH && !pruneStaleContextSnapshot(snapshot)) {
+        return { recognized: false, metadataAccepted: false };
+      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
       const t0 = Date.now();
@@ -1026,8 +1235,23 @@ export function createOpencodeFamilyPlugin(config) {
     return snapshot;
   }
 
-  function createStatePostSnapshot(body) {
-    const snapshot = snapshotPost(body, `STATE state=${body && body.state}`);
+  function pruneStaleContextSnapshot(snapshot) {
+    if (!snapshot.contextIsCurrent || snapshot.contextIsCurrent()) return true;
+    delete snapshot.body.context_usage;
+    snapshot.contextIsCurrent = null;
+    snapshot.waiters = (snapshot.waiters || []).filter((waiter) => {
+      if (!waiter.kinds.has("context")) return true;
+      waiter.resolve(false);
+      return false;
+    });
+    refreshSnapshotPayload(snapshot);
+    // A title may share this queued POST. Drop only the stale context field
+    // and its acknowledgement waiter, not the independent title update.
+    return metadataFieldKinds(snapshot).size > 0;
+  }
+
+  function createStatePostSnapshot(body, contextDirectory) {
+    const snapshot = snapshotPost(body, `STATE state=${body && body.state}`, contextDirectory);
     let resolve;
     snapshot.completion = new Promise((done) => { resolve = done; });
     snapshot.waiters = [{ resolve, kinds: metadataFieldKinds(snapshot) }];
@@ -1043,6 +1267,7 @@ export function createOpencodeFamilyPlugin(config) {
 
   function mergeQueuedMetadataSnapshot(existing, incoming) {
     const incomingKinds = metadataFieldKinds(incoming);
+    if (!incomingKinds.has("context")) incoming.contextIsCurrent = existing.contextIsCurrent;
     const mergedBody = { ...existing.body, ...incoming.body };
     incoming.body = mergedBody;
     refreshSnapshotPayload(incoming);
@@ -1126,9 +1351,10 @@ export function createOpencodeFamilyPlugin(config) {
     debugLog(`POST[${incoming.reqId}] ${incoming.logTag} overflow=dropped-old req=${dropped.reqId}`);
   }
 
-  function postStateToClawd(body) {
+  function postStateToClawd(body, contextDirectory, contextIsCurrent = null) {
     const sessionId = normalizeSessionId(body && body.session_id) || DEFAULT_SESSION_ID;
-    const snapshot = createStatePostSnapshot(body);
+    const snapshot = createStatePostSnapshot(body, contextDirectory);
+    snapshot.contextIsCurrent = contextIsCurrent;
     const replaceable = isReplaceableStateSnapshot(snapshot);
     const metadata = isMetadataStateSnapshot(snapshot);
     const terminal = !!body && body.event === "SessionEnd";
@@ -1342,6 +1568,7 @@ export function createOpencodeFamilyPlugin(config) {
   // the whole plugin. The entry module must therefore expose exactly one
   // export: the default function. See #413.
   const __testInternals = {
+    evaluateManagedLayoutGate,
     buildStateBody,
     translateEvent,
     captureSessionDirectory,
@@ -1555,7 +1782,7 @@ export function createOpencodeFamilyPlugin(config) {
   // message.updated handler: the session message rides on properties.info
   // (assistant role, tokens populated after the step finishes). The event hook
   // never awaits this path; its returned promise is intentionally detached.
-  function handleContextUsageEvent(event, instance) {
+  function handleContextUsageEvent(event, instance, hydration = null) {
     try {
       // MiMo uses this shared core but its SDK/event contract is not proven to
       // match OpenCode's message.updated/provider.list contract. Keep #830
@@ -1581,17 +1808,21 @@ export function createOpencodeFamilyPlugin(config) {
         debugLog("CTX skip reason=no-session-id");
         return;
       }
+      const previousState = getContextState(instanceToken, clawdSessionId);
+      // Even an unfinished assistant update supersedes a historical read.
+      // Keep the existing valid-sample sequence independent: zero-token live
+      // updates must not change the real-time pipeline's calculation/dedup.
+      if (!hydration && previousState) {
+        previousState.liveRevision += 1;
+        invalidateContextHydration(previousState);
+      }
       const used = extractContextUsageUsed(info.tokens);
       if (!Number.isFinite(used) || used <= 0) {
         debugLog(`CTX skip reason=${Number.isFinite(used) ? "zero-tokens" : "no-tokens"}`);
         return;
       }
-      const state = getContextState(instanceToken, clawdSessionId, true);
-      const sessions = getContextSessionMap(instanceToken);
-      if (sessions && sessions.size > MAX_CONTEXT_USAGE_ENTRIES) {
-        const oldest = sessions.keys().next().value;
-        if (oldest !== undefined && oldest !== clawdSessionId) sessions.delete(oldest);
-      }
+      const state = getContextState(instanceToken, clawdSessionId, true, hydration?.activityObserved !== false);
+      if (!hydration && !previousState) state.liveRevision += 1;
 
       const sequence = ++state.sequence;
       state.latestSequence = sequence;
@@ -1601,7 +1832,8 @@ export function createOpencodeFamilyPlugin(config) {
       const modelID = info.modelID || null;
       return resolveContextLimit(providerID, modelID, instance && instance.client)
         .then((limit) => {
-          if (!isCurrentContextSample(instanceToken, clawdSessionId, state, generation, sequence)) {
+          if (!isCurrentContextSample(instanceToken, clawdSessionId, state, generation, sequence)
+            || (hydration && state.liveRevision !== hydration.liveRevision)) {
             debugLog(`CTX discard session=${clawdSessionId} seq=${sequence} reason=stale`);
             return null;
           }
@@ -1621,23 +1853,222 @@ export function createOpencodeFamilyPlugin(config) {
           // Same serialized metadata delivery as the session-title push
           // (#841): state/event scaffolding is inert on the route side because
           // metadata_only short-circuits lifecycle handling.
-          const body = buildContextUsageBody(clawdSessionId, used, sample.limit);
-          body.state = "idle";
-          body.event = "SessionUpdate";
-          return postStateToClawd(body).then((delivered) => {
-            if (delivered && isCurrentContextSample(instanceToken, clawdSessionId, state, generation, sequence)) {
-              state.delivered = sample;
-            }
-          });
+          const packet = { sample, generation, sequence, liveRevision: hydration?.liveRevision };
+          if (hydration) state.undeliveredContext = packet;
+          return deliverContextSample(instanceToken, clawdSessionId, state, packet,
+            hydration ? instance.directory : undefined);
         })
         .catch((err) => {
           debugLog(`CTX handler ASYNC THROW msg=${err && err.message}`);
         })
         .finally(() => {
           state.inFlight.delete(sequence);
+          state.wakeHydration?.();
         });
     } catch (err) {
       debugLog(`CTX handler THROW msg=${err && err.message}`);
+    }
+  }
+
+  function deliverContextSample(instanceToken, sessionId, state, packet, directory) {
+    const current = () => isCurrentContextSample(instanceToken, sessionId, state,
+      packet.generation, packet.sequence)
+      && (packet.liveRevision === undefined || state.liveRevision === packet.liveRevision);
+    if (!current()) return Promise.resolve();
+    const body = buildContextUsageBody(sessionId, packet.sample.used, packet.sample.limit);
+    body.state = "idle";
+    body.event = "SessionUpdate";
+    return postStateToClawd(body, directory, packet.liveRevision === undefined ? null : current).then((delivered) => {
+      if (delivered && current()) {
+        state.delivered = packet.sample;
+        if (state.undeliveredContext === packet) state.undeliveredContext = null;
+      }
+    });
+  }
+
+  function hydrateContextUsage(event, instance) {
+    if (AGENT_ID !== "opencode" || !instance.directory
+      || !["session.created", "session.updated", "session.status", "session.idle", "tui.session.select"].includes(event.type)
+      || typeof instance.client?.session?.messages !== "function") return;
+
+    const rawId = getEventSessionId(event);
+    const sessionId = normalizeSessionId(rawId);
+    if (!sessionId) return;
+    if (event.type === "session.created" || event.type === "session.updated") {
+      const info = getEventSessionInfo(event);
+      if ((info.infoSessionId && normalizeSessionId(info.infoSessionId) !== sessionId)
+        || (info.directory && normalizeDirectoryOwnershipKey(info.directory)
+          !== normalizeDirectoryOwnershipKey(instance.directory))) return;
+    }
+    return hydrateContextSession(rawId, instance);
+  }
+
+  // Both list and message reads are cancellable and bounded even if an SDK
+  // ignores AbortSignal. Register before yielding so a burst of events cannot
+  // exceed the per-Instance request limit.
+  async function readContextHistory(instance, read, state = null) {
+    const controller = new AbortController();
+    if (state) state.historyController = controller;
+    instance.historyRequests.add(controller);
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(new Error("context history cancelled"));
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const timer = setTimeout(() => controller.abort(), CONTEXT_HISTORY_TIMEOUT_MS);
+    try {
+      return await Promise.race([Promise.resolve().then(() => read(controller.signal)), aborted]);
+    } finally {
+      clearTimeout(timer);
+      controller.signal.removeEventListener("abort", onAbort);
+      instance.historyRequests.delete(controller);
+      if (state?.historyController === controller) state.historyController = null;
+      scheduleContextHydration(instance);
+    }
+  }
+
+  function hydrateContextSession(rawId, instance, activityObserved = true) {
+    if (instance.disposed) return;
+    const sessionId = normalizeSessionId(rawId);
+    const state = getContextState(instance.instanceToken, sessionId, true, activityObserved);
+    if (!state) return;
+    state.wakeHydration = () => scheduleContextHydration(instance);
+    // A signal is an intent, not a best-effort attempt to acquire a slot. Keep
+    // one per state so deletion/eviction also bounds all retained work.
+    state.pendingHydration = {
+      rawId, liveRevision: state.liveRevision,
+      activityObserved: activityObserved || state.pendingHydration?.activityObserved === true,
+    };
+    scheduleContextHydration(instance);
+  }
+
+  function scheduleContextHydration(instance) {
+    if (instance.disposed || instance.hydrationDrainQueued) return;
+    instance.hydrationDrainQueued = true;
+    // The originating event must enqueue its lifecycle POST first.
+    queueMicrotask(() => {
+      instance.hydrationDrainQueued = false;
+      if (!instance.disposed) drainContextHydration(instance);
+    });
+  }
+
+  function drainContextHydration(instance) {
+    clearTimeout(instance.hydrationTimer);
+    instance.hydrationTimer = null;
+    const sessions = getContextSessionMap(instance.instanceToken);
+    if (!sessions) return;
+    let nextWake = Infinity;
+    const now = Date.now();
+    const pending = [...sessions].filter(([, state]) => state.pendingHydration)
+      .sort(([, a], [, b]) => Number(b.pendingHydration.activityObserved) - Number(a.pendingHydration.activityObserved));
+    for (const [sessionId, state] of pending) {
+      const intent = state.pendingHydration;
+      if (state.liveRevision !== intent.liveRevision
+        || (state.delivered && Number.isFinite(state.delivered.limit) && state.delivered.limit > 0)) {
+        state.pendingHydration = null;
+        continue;
+      }
+      if (state.hydration || state.inFlight.size > 0) continue;
+      if (state.undeliveredContext) {
+        state.pendingHydration = null;
+        state.hydration = deliverContextSample(instance.instanceToken, sessionId, state,
+          state.undeliveredContext, instance.directory).finally(() => {
+          state.hydration = null;
+          scheduleContextHydration(instance);
+        });
+        continue;
+      }
+      if (now < state.nextHydrationAt) {
+        nextWake = Math.min(nextWake, state.nextHydrationAt);
+        continue;
+      }
+      if (instance.historyRequests.size >= CONTEXT_HISTORY_MAX_CONCURRENT) continue;
+      state.pendingHydration = null;
+      startContextHydration(intent.rawId, instance, state, intent.activityObserved);
+    }
+    if (Number.isFinite(nextWake)) {
+      instance.hydrationTimer = setTimeout(() => scheduleContextHydration(instance), Math.max(1, nextWake - Date.now()));
+      instance.hydrationTimer.unref?.();
+    }
+  }
+
+  function startContextHydration(rawId, instance, state, activityObserved) {
+    const sessionId = normalizeSessionId(rawId);
+    const liveRevision = state.liveRevision;
+    const current = () => !instance.disposed && getContextState(instance.instanceToken, sessionId) === state
+      && state.liveRevision === liveRevision;
+    const id = rawId.startsWith(sessionIdPrefix) ? rawId.slice(sessionIdPrefix.length) : rawId;
+    state.nextHydrationAt = Date.now() + CONTEXT_HISTORY_RETRY_MS;
+    // Defer SDK entry until after the current event enqueues its lifecycle
+    // POST. Hydrated metadata must never race ahead of that session creation.
+    state.hydration = readContextHistory(instance, (signal) => current()
+      ? instance.client.session.messages({
+        path: { id },
+        query: { directory: instance.directory, limit: CONTEXT_HISTORY_LIMIT },
+        signal,
+      })
+      : null, state).then(async (result) => {
+      if (!current()) return;
+      const messages = Array.isArray(result) ? result : result?.data;
+      if (!Array.isArray(messages)) return;
+      // The SDK returns a chronological page. Use the message timestamp/id
+      // to select the newest usable assistant, never the largest token sum
+      // (compaction can reduce usage). Reject foreign/malformed identities.
+      let latest = null;
+      for (const message of messages.slice(-CONTEXT_HISTORY_LIMIT)) {
+        const info = message?.info;
+        if (info?.role !== "assistant" || info.sessionID !== id
+          || typeof info.id !== "string" || !info.id
+          || !Number.isFinite(info.time?.created)
+          || !(extractContextUsageUsed(info.tokens) > 0)) continue;
+        if (!latest || info.time.created > latest.time.created
+          || (info.time.created === latest.time.created && info.id > latest.id)) latest = info;
+      }
+      if (latest) {
+        await handleContextUsageEvent({ type: "message.updated", properties: { info: latest } }, instance,
+          { liveRevision, activityObserved });
+      }
+    }).catch(() => {
+      // A missing/unsupported SDK route or a timeout leaves usage unknown.
+      // A later resume signal may retry; errors never become lifecycle events.
+      debugLog(`CTX history unavailable session=${sessionId}`);
+    }).finally(() => {
+      state.hydration = null;
+      scheduleContextHydration(instance);
+    });
+    return state.hydration;
+  }
+
+  async function bootstrapContextUsage(instance) {
+    if (AGENT_ID !== "opencode" || !instance.directory
+      || typeof instance.client?.session?.list !== "function"
+      || typeof instance.client?.session?.messages !== "function") return;
+    const revision = instance.lifecycleRevision;
+    const current = () => !instance.disposed && instance.lifecycleRevision === revision;
+    try {
+      const result = await readContextHistory(instance, (signal) => instance.client.session.list({
+        query: { directory: instance.directory, limit: CONTEXT_BOOTSTRAP_LIMIT, roots: true }, signal,
+      }));
+      if (!current()) return;
+      const sessions = Array.isArray(result) ? result : result?.data;
+      if (!Array.isArray(sessions)) return;
+      const candidates = sessions.filter((info) => (
+        typeof info?.id === "string" && info.id.trim() && info.id.trim() === info.id
+        && !info.parentID && !info.time?.archived
+        && normalizeDirectoryOwnershipKey(info.directory) === normalizeDirectoryOwnershipKey(instance.directory)
+      )).sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0)).slice(0, CONTEXT_BOOTSTRAP_LIMIT);
+      for (const info of candidates) {
+        if (!current()) break;
+        // Existing state may own a pending selection, an active query or a
+        // live sample. All pending work now belongs to the same scheduler.
+        const id = normalizeSessionId(info.id);
+        if (getContextState(instance.instanceToken, id)
+          || _sessionDirectoryById.has(id) || _sessionInstanceDirectoryById.has(id)) continue;
+        hydrateContextSession(info.id, instance, false);
+      }
+    } catch {
+      // Hosts without this query contract retain event-driven hydration.
+      debugLog("CTX bootstrap unavailable");
     }
   }
 
@@ -1993,6 +2424,16 @@ export function createOpencodeFamilyPlugin(config) {
 
   // Plugin entrypoint (the host loads this via the entry's default export).
   const plugin = async (ctx) => {
+    // #1026 orphan inert gate: must run before every side effect (log reset,
+    // PID walk, bridge startup, handler registration). Returns an empty
+    // handler object so a stale managed copy can never emit state/permission.
+    const managedGate = evaluateManagedLayoutGate(import.meta.url, {
+      agentId: AGENT_ID,
+      pluginDirName: HOOK_SOURCE,
+    });
+    if (managedGate.mode === "inert") {
+      return { dispose: async () => {}, event: async () => {} };
+    }
     resetDebugLog();
     const instanceServerUrl = normalizeServerUrl(ctx && ctx.serverUrl);
     const instanceClient = ctx && ctx.client ? ctx.client : null;
@@ -2000,13 +2441,36 @@ export function createOpencodeFamilyPlugin(config) {
       ? ctx.directory
       : "";
     const instanceToken = registerInstanceDirectory(instanceDirectory);
+    const contextInstance = {
+      client: instanceClient, instanceToken, directory: instanceDirectory,
+      historyRequests: new Set(), lifecycleRevision: 0, disposed: false,
+      hydrationTimer: null, hydrationDrainQueued: false,
+    };
     let instanceDisposed = false;
     debugLog(`INIT directory=${instanceDirectory} serverUrl=${instanceServerUrl} pid=${process.pid} hasClient=${!!instanceClient}`);
     // Sync init blocks the TUI boot path; later POSTs hit the cached result.
     getStablePid();
     await startBridge();
+    // Never await SDK requests during plugin initialization: the host router
+    // may itself be waiting for this initializer to return.
+    queueMicrotask(() => { void bootstrapContextUsage(contextInstance); });
+
+    function disposeInstance(event) {
+      if (instanceDisposed) return;
+      instanceDisposed = true;
+      contextInstance.disposed = true;
+      clearTimeout(contextInstance.hydrationTimer);
+      contextInstance.hydrationTimer = null;
+      for (const controller of contextInstance.historyRequests) controller.abort();
+      cleanupSessionDirectory(event, "before-send", instanceDirectory, instanceToken);
+      unregisterInstanceDirectory(instanceToken);
+    }
 
     return {
+      // Newer hosts invoke dispose() instead of delivering the legacy event.
+      dispose: async () => disposeInstance({
+        type: "server.instance.disposed", properties: { directory: instanceDirectory },
+      }),
       event: async ({ event }) => {
         try {
           if (!event || typeof event.type !== "string") return;
@@ -2031,15 +2495,14 @@ export function createOpencodeFamilyPlugin(config) {
           // source. Capture before translate/drop because session.updated does
           // not map to a Clawd state and info-only deleted events need its id.
           if (event.type === "server.instance.disposed") {
-            cleanupSessionDirectory(event, "before-send", instanceDirectory, instanceToken);
-            if (!instanceDisposed) {
-              instanceDisposed = true;
-              unregisterInstanceDirectory(instanceToken);
-            }
+            disposeInstance(event);
             // Instance disposal is cleanup-only. Some host versions may attach
             // a session id, but it must never revive fallback pointers or
             // synthesize a SessionEnd for that (possibly unrelated) session.
             return;
+          }
+          if (event.type === "session.created" || event.type === "session.deleted") {
+            contextInstance.lifecycleRevision += 1;
           }
           captureSessionDirectory(event);
           captureSessionInstanceDirectory(event, instanceDirectory);
@@ -2097,6 +2560,7 @@ export function createOpencodeFamilyPlugin(config) {
           }
 
           const mapped = translateEvent(event);
+          if (mapped?.event !== "SessionEnd") hydrateContextUsage(event, contextInstance);
           if (!mapped) {
             // Log ignored session.* events only — they are low-frequency and
             // occasionally useful for diagnosis. message.part.updated ignores
@@ -2139,3 +2603,721 @@ export function createOpencodeFamilyPlugin(config) {
 
   return plugin;
 }
+
+// ============================================================================
+// opencode v2 runtime (OpenCode 2.x, npm @opencode/cli)
+// ============================================================================
+// OpenCode v2 (2026-09 GA) is a different plugin generation: the loader only
+// accepts a default-exported definition `{ id, setup(ctx) }` (a bare function
+// export fails the schema with "Expected object at [\"default\"]" — verified on
+// 2.0.15, see docs/investigations/opencode-v2-e1-evidence.md), events arrive
+// over `ctx.event.subscribe()` instead of the v1 `event` hook, and the plugin
+// runs inside a long-lived shared background service rather than the TUI
+// process. Evidence-verified deltas that shape this runtime:
+//
+//   - Permission has a native evaluate hook: `ctx.permission.hook("evaluate")`
+//     runs for allow/ask rules, its callback may await external work, and it
+//     decides by mutating `event.effect`. That replaces the v1 reverse bridge
+//     entirely: on an `ask` we block on a long POST to Clawd's /permission and
+//     the decision comes back as the HTTP response body
+//     ({ decision: "allow" | "always" | "deny" }). 204 / timeout / any error
+//     leave `effect` untouched, so the host falls back to its native prompt.
+//   - Configured `allow` rules also invoke the hook — we must return WITHOUT
+//     touching the effect so Clawd never downgrades a host-approved action.
+//   - The service process tree is not the user's terminal (ppid=1 daemon), so
+//     every process-derived field (source_pid, pid_chain, editor, tmux, orca)
+//     is intentionally omitted — fail-closed omission instead of wrong values.
+//     Terminal focus degrades for v2 sessions (known limitation).
+//   - Per-event cwd comes from the event envelope `location.directory`; titles
+//     arrive via `session.renamed`; `session.usage.updated` carries session
+//     tokens directly (no SDK provider lookup needed for context usage).
+//   - "Always allow" has no host persistence API (permission domain exposes
+//     only get/hook/list/reply), so an `always` decision records an in-memory
+//     per-session action rule inside the service. It covers the session's
+//     lifetime and dies with the service — documented degradation.
+//   - Unknown event types are ignored (fail-closed): the v1-era event vocabulary
+//     must never be assumed to fire on v2.
+//
+// Registration: v2 hosts read the `plugins` config key (they also tolerate the
+// legacy `plugin` key, where the v1 function entry merely logs a load warning).
+// The installer therefore keeps the v1 entry under `plugin` and registers this
+// entry directory under `plugins`; the two host generations never interfere
+// (verified both directions on 1.18.32 and 2.0.15).
+const V2_PERMISSION_BLOCKING_TIMEOUT_MS = 590 * 1000;
+// /permission bodies carry raw tool resources (shell commands, file paths).
+// Same fail-closed budget as the zcode hook: over budget → skip the POST and
+// leave the effect untouched so the native prompt takes over.
+const V2_PERMISSION_MAX_BODY_BYTES = 512 * 1024;
+const V2_STATE_POST_MAX_PENDING = 32;
+const V2_ALWAYS_ALLOW_MAX_ENTRIES = 128;
+
+/**
+ * Create the opencode v2 plugin definition for a specific agent.
+ *
+ * Identity params MUST stay aligned with agents/opencode-family.js and the v1
+ * entry (drift-lock tests). `markerPluginDirName` is the directory name of the
+ * owner record's activeSourceMarker — the v2 entry shares the v1 generation and
+ * its owner.json, whose marker still points at the v1 entry directory.
+ *
+ * @param {object} config
+ * @param {string} config.agentId             e.g. "opencode"
+ * @param {string} config.hookSource          e.g. "opencode-plugin-v2"
+ * @param {string} config.logFileName         e.g. "opencode-plugin-v2.log"
+ * @param {string} config.sessionIdPrefix     e.g. "opencode:"
+ * @param {string} config.pluginId            stable v2 loader id, e.g. "clawd-on-desk-opencode"
+ * @param {string} config.markerPluginDirName e.g. "opencode-plugin"
+ * @returns {object} `{ id, setup }` — the definition form v2's loader requires
+ */
+export function createOpencodeFamilyPluginV2(config) {
+  const {
+    agentId, hookSource, logFileName, sessionIdPrefix, pluginId, markerPluginDirName,
+  } = config || {};
+  for (const [key, value] of Object.entries({
+    agentId, hookSource, logFileName, sessionIdPrefix, pluginId, markerPluginDirName,
+  })) {
+    if (typeof value !== "string" || !value) {
+      throw new Error(`createOpencodeFamilyPluginV2: ${key} is required`);
+    }
+  }
+
+  const AGENT_ID = agentId;
+  const HOOK_SOURCE = hookSource;
+  const DEBUG_LOG_PATH = join(CLAWD_DIR, logFileName);
+  const { DEFAULT_SESSION_ID, normalizeSessionId } = createSessionIdHelpers(sessionIdPrefix);
+
+  // Per-definition runtime state. The v2 service loads this module once; a host
+  // reload() re-runs setup, so every map here must stay consistent with the
+  // single-subscription invariant enforced below.
+  let _cachedPort = null;
+  const _lastStatePerSession = new Map();
+  const _statePostQueueBySession = new Map();
+  const _sessionTitleById = new Map();
+  const _sessionCwdById = new Map();
+  // "Always allow" decisions: key `${sessionId}\u0000${action}`. Insertion-
+  // ordered; the oldest entry is evicted at the cap.
+  const _alwaysAllowedBySessionAction = new Map();
+  let _reqCounter = 0;
+  let _permissionReqCounter = 0;
+
+  const _debugBuffer = [];
+  let _debugFlushing = false;
+  function debugLog(msg) {
+    _debugBuffer.push(`[${new Date().toISOString()}] ${msg}\n`);
+    scheduleDebugFlush();
+  }
+  function scheduleDebugFlush() {
+    if (_debugFlushing || _debugBuffer.length === 0) return;
+    _debugFlushing = true;
+    setImmediate(async () => {
+      const chunk = _debugBuffer.join("");
+      _debugBuffer.length = 0;
+      try {
+        await fsp.appendFile(DEBUG_LOG_PATH, chunk, "utf8");
+      } catch {}
+      _debugFlushing = false;
+      if (_debugBuffer.length > 0) scheduleDebugFlush();
+    });
+  }
+  function resetDebugLog() {
+    try {
+      mkdirSync(CLAWD_DIR, { recursive: true });
+      writeFileSync(DEBUG_LOG_PATH, "", "utf8");
+    } catch {}
+  }
+  function flushDebugLog() {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (!_debugFlushing && _debugBuffer.length === 0) {
+          resolve();
+          return;
+        }
+        setImmediate(check);
+      };
+      check();
+    });
+  }
+
+  // Ordered: cached → runtime.json → full scan (same bargain as v1).
+  function getPortCandidates() {
+    const ordered = [];
+    const seen = new Set();
+    const add = (p) => {
+      if (p && !seen.has(p) && SERVER_PORTS.includes(p)) {
+        seen.add(p);
+        ordered.push(p);
+      }
+    };
+    add(_cachedPort);
+    if (_cachedPort == null) add(readRuntimePort());
+    SERVER_PORTS.forEach(add);
+    return ordered;
+  }
+
+  function getPermissionPortCandidates() {
+    const port = readPermissionRuntimePort();
+    return port ? [port] : [];
+  }
+
+  // Translate a v2 event (type + data) into a Clawd (state, eventName) pair,
+  // or null when Clawd should ignore it. Pure so tests can lock the mapping
+  // against the evidence table in docs/investigations/opencode-v2-e1-evidence.md.
+  function translateV2Event(type, data) {
+    if (typeof type !== "string") return null;
+    switch (type) {
+      case "session.created":
+        return { state: "idle", event: "SessionStart" };
+
+      case "session.status": {
+        // Defensive: documented v2 vocabulary (session.idle is deprecated in
+        // favor of status.type). Shape not yet observed on a real stream; any
+        // mismatch falls through to null and is ignored.
+        const statusType = data && data.status && data.status.type;
+        if (statusType === "idle") return { state: "attention", event: "Stop" };
+        if (statusType === "busy") return { state: "thinking", event: "UserPromptSubmit" };
+        return null;
+      }
+
+      case "session.step.started":
+      case "session.reasoning.started":
+        return { state: "thinking", event: "UserPromptSubmit" };
+
+      case "session.tool.called":
+        return { state: "working", event: "PreToolUse" };
+
+      case "session.tool.success":
+        return { state: "working", event: "PostToolUse" };
+
+      case "session.tool.error":
+        return { state: "error", event: "PostToolUseFailure" };
+
+      case "session.step.ended":
+        // Per-step teardown only ends the turn when the model stopped on its
+        // own; "tool-calls" steps continue into the next step.
+        return data && data.finish === "stop"
+          ? { state: "attention", event: "Stop" }
+          : null;
+
+      case "session.execution.succeeded":
+        return { state: "attention", event: "Stop" };
+
+      case "session.execution.failed":
+      case "session.error":
+        return { state: "error", event: "StopFailure" };
+
+      case "session.deleted":
+        return { state: "sleeping", event: "SessionEnd" };
+
+      default:
+        return null;
+    }
+  }
+
+  function snapshotV2Post(body, logTag) {
+    const outbound = { ...(body || {}) };
+    // The plugin runs inside the shared background service (ppid=1 on macOS):
+    // the process tree belongs to the service, not to the user's terminal, so
+    // source_pid / pid_chain / editor / tmux / orca are omitted rather than
+    // reporting values that would focus the wrong window. agent_pid stays —
+    // it truthfully identifies the opencode service process.
+    outbound.agent_pid = process.pid;
+    return {
+      body: outbound,
+      payload: JSON.stringify(outbound),
+      logTag,
+      reqId: ++_reqCounter,
+    };
+  }
+
+  async function deliverV2StatePost(snapshot) {
+    const candidates = getPortCandidates();
+    for (const port of candidates) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${STATE_PATH}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: snapshot.payload,
+          signal: controller.signal,
+        });
+        const header = res.headers.get(CLAWD_SERVER_HEADER);
+        if (header === CLAWD_SERVER_ID) {
+          _cachedPort = port;
+          try { await res.text(); } catch {}
+          debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} OK port=${port}`);
+          return true;
+        }
+      } catch (err) {
+        debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} port=${port} ERR ${err && err.name}/${err && err.message}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    _cachedPort = null;
+    debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} EXHAUSTED all candidates failed`);
+    return false;
+  }
+
+  // Compacted v1-parity per-session FIFO: serialized delivery, latest-lifecycle
+  // coalescing, terminal beats queued work, hard pending cap.
+  function isV2MetadataSnapshot(snapshot) {
+    return !!(snapshot && snapshot.body && snapshot.body.metadata_only === true);
+  }
+
+  function settleV2Snapshot(snapshot) {
+    if (snapshot && snapshot.settle) snapshot.settle();
+  }
+
+  function makeV2Snapshot(body, logTag) {
+    const snapshot = snapshotV2Post(body, logTag);
+    snapshot.completion = new Promise((resolve) => { snapshot.settle = resolve; });
+    return snapshot;
+  }
+
+  async function drainV2StateQueue(sessionId, queue) {
+    while (queue.pending.length > 0 || queue.active) {
+      if (queue.active) {
+        await queue.active.done;
+        continue;
+      }
+      const snapshot = queue.pending.shift();
+      queue.active = snapshot;
+      try {
+        const ok = await deliverV2StatePost(snapshot);
+        snapshot.ok = ok;
+      } catch (err) {
+        snapshot.ok = false;
+        debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} UNCAUGHT ${err && err.message}`);
+      } finally {
+        queue.active = null;
+        settleV2Snapshot(snapshot);
+      }
+    }
+    if (_statePostQueueBySession.get(sessionId) === queue) {
+      _statePostQueueBySession.delete(sessionId);
+    }
+  }
+
+  function postStateToClawdV2(body) {
+    const sessionId = normalizeSessionId(body && body.session_id) || DEFAULT_SESSION_ID;
+    const terminal = !!body && body.event === "SessionEnd";
+    const metadata = isV2MetadataSnapshot({ body });
+    const replaceable = !terminal && !metadata && !!body
+      && ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"].includes(body.event);
+    const snapshot = makeV2Snapshot(body, `STATE ${body.event}→${body.state}${metadata ? " meta" : ""}`);
+    let queue = _statePostQueueBySession.get(sessionId);
+    if (!queue) {
+      queue = { pending: [], active: null, draining: false };
+      _statePostQueueBySession.set(sessionId, queue);
+    }
+
+    const activeTerminal = !!(queue.active && queue.active.body && queue.active.body.event === "SessionEnd");
+    const queuedTerminal = queue.pending.some((entry) => entry.body && entry.body.event === "SessionEnd");
+    if (!terminal && (activeTerminal || queuedTerminal)) {
+      settleV2Snapshot(snapshot);
+      debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} dropped=after-terminal`);
+      return snapshot.completion;
+    }
+
+    if (terminal) {
+      for (const pending of queue.pending.splice(0)) settleV2Snapshot(pending);
+      queue.pending.push(snapshot);
+      debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} coalesced=terminal`);
+    } else {
+      const last = queue.pending.at(-1);
+      if (metadata && last && isV2MetadataSnapshot(last)) {
+        // Merge so a title push and a context-usage push never lose fields.
+        Object.assign(last.body, snapshot.body);
+        last.payload = JSON.stringify(last.body);
+        settleV2Snapshot(snapshot);
+        debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} coalesced=metadata-fields`);
+        return snapshot.completion;
+      }
+      if (replaceable && last && ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"]
+        .includes(last.body && last.body.event) && !(last.body && last.body.metadata_only === true)) {
+        settleV2Snapshot(last);
+        queue.pending[queue.pending.length - 1] = snapshot;
+        debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} coalesced=latest-state`);
+      } else {
+        if (queue.pending.length >= V2_STATE_POST_MAX_PENDING) {
+          const [dropped] = queue.pending.splice(0, 1);
+          settleV2Snapshot(dropped);
+          debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} overflow=dropped-old req=${dropped.reqId}`);
+        }
+        queue.pending.push(snapshot);
+      }
+    }
+
+    if (!queue.draining) {
+      queue.draining = true;
+      void drainV2StateQueue(sessionId, queue).finally(() => { queue.draining = false; });
+    }
+    return snapshot.completion;
+  }
+
+  function sendStateV2(state, eventName, sessionId, cwd) {
+    if (!state || !eventName) return;
+    const clawdSessionId = normalizeSessionId(sessionId) || DEFAULT_SESSION_ID;
+    const body = {
+      state,
+      session_id: clawdSessionId,
+      event: eventName,
+      agent_id: AGENT_ID,
+      hook_source: HOOK_SOURCE,
+    };
+    const title = _sessionTitleById.get(clawdSessionId);
+    if (title) body.session_title = title;
+    if (cwd) body.cwd = cwd;
+    const lastState = _lastStatePerSession.get(clawdSessionId) || null;
+    if (body.state === lastState) return;
+    debugLog(`SEND ${lastState || "null"} → ${body.state} event=${body.event} session=${clawdSessionId}`);
+    _lastStatePerSession.set(clawdSessionId, body.state);
+    postStateToClawdV2(body);
+  }
+
+  function sendMetadataV2(sessionId, fields) {
+    const clawdSessionId = normalizeSessionId(sessionId);
+    if (!clawdSessionId) return;
+    const body = {
+      state: "idle",
+      session_id: clawdSessionId,
+      event: "SessionUpdate",
+      agent_id: AGENT_ID,
+      hook_source: HOOK_SOURCE,
+      metadata_only: true,
+      ...fields,
+    };
+    postStateToClawdV2(body);
+  }
+
+  function captureV2Title(sessionId, title) {
+    const normalized = normalizeSessionId(sessionId);
+    if (!normalized || typeof title !== "string" || !title.trim()) return null;
+    const prev = _sessionTitleById.get(normalized);
+    if (prev === title) return null;
+    _sessionTitleById.set(normalized, title);
+    debugLog(`SESSION_TITLE session=${normalized} changed=true len=${title.length}`);
+    return normalized;
+  }
+
+  function handleV2Event(envelope) {
+    if (!envelope || typeof envelope.type !== "string") return;
+    const type = envelope.type;
+    const data = envelope.data && typeof envelope.data === "object" ? envelope.data : {};
+    const rawSessionId = typeof data.sessionID === "string" && data.sessionID
+      ? data.sessionID
+      : (envelope.durable && typeof envelope.durable.aggregateID === "string"
+        ? envelope.durable.aggregateID
+        : "");
+    const sessionId = normalizeSessionId(rawSessionId) || null;
+
+    // Per-event cwd from the envelope location (authoritative for v2 —
+    // ctx.location is the service-level directory, never a session cwd).
+    const envelopeCwd = envelope.location && typeof envelope.location.directory === "string"
+      && envelope.location.directory.trim()
+      ? envelope.location.directory
+      : null;
+    if (sessionId && envelopeCwd) _sessionCwdById.set(sessionId, envelopeCwd);
+
+    if (type === "session.renamed") {
+      const titled = captureV2Title(sessionId, data.title);
+      if (titled) sendMetadataV2(titled, { session_title: data.title });
+      return;
+    }
+
+    if (type === "session.usage.updated") {
+      const used = extractContextUsageUsed(data.tokens);
+      if (used != null && sessionId) {
+        sendMetadataV2(sessionId, { context_usage: used });
+      }
+      return;
+    }
+
+    // Defensive capture: if a future minor reintroduces session-info payloads
+    // (info.directory / info.title on created/updated), honor them like v1 did.
+    const info = data.info && typeof data.info === "object" ? data.info : null;
+    if (info && sessionId) {
+      if (typeof info.title === "string" && info.title.trim()) {
+        const titled = captureV2Title(sessionId, info.title);
+        if (titled) sendMetadataV2(titled, { session_title: info.title });
+      }
+      if (typeof info.directory === "string" && info.directory.trim() && !envelopeCwd) {
+        _sessionCwdById.set(sessionId, info.directory);
+      }
+    }
+
+    const mapped = translateV2Event(type, data);
+    if (!mapped) {
+      // Log ignored session.* events only — low-frequency and diagnostic; the
+      // streaming text/reasoning delta events never reach translateV2Event's
+      // mapped path but still hit this branch, so gate the log on frequency.
+      if (type.startsWith("session.") && !type.endsWith(".delta")) {
+        debugLog(`IGNORE ${type}`);
+      }
+      return;
+    }
+    if (!sessionId) {
+      debugLog(`DROP ${type} event=${mapped.event} reason=no-session-id`);
+      return;
+    }
+    const cwd = envelopeCwd || _sessionCwdById.get(sessionId) || null;
+    sendStateV2(mapped.state, mapped.event, sessionId, cwd);
+  }
+
+  function rememberAlwaysAllow(sessionId, action) {
+    const normalized = normalizeSessionId(sessionId);
+    if (!normalized || typeof action !== "string" || !action) return;
+    const key = `${normalized}\u0000${action}`;
+    _alwaysAllowedBySessionAction.delete(key);
+    _alwaysAllowedBySessionAction.set(key, true);
+    while (_alwaysAllowedBySessionAction.size > V2_ALWAYS_ALLOW_MAX_ENTRIES) {
+      const oldest = _alwaysAllowedBySessionAction.keys().next().value;
+      if (oldest == null) break;
+      _alwaysAllowedBySessionAction.delete(oldest);
+    }
+  }
+
+  function buildV2PermissionBody(event, requestId) {
+    const sessionId = normalizeSessionId(typeof event.sessionID === "string" ? event.sessionID : "")
+      || DEFAULT_SESSION_ID;
+    const action = typeof event.action === "string" && event.action ? event.action : "unknown";
+    const resources = Array.isArray(event.resources) ? event.resources : [];
+    const boundedResources = resources
+      .map((value) => (typeof value === "string" ? value
+        : (value && typeof value === "object" ? JSON.stringify(value).slice(0, 4096) : String(value))))
+      .slice(0, 16);
+    const body = {
+      agent_id: AGENT_ID,
+      hook_source: HOOK_SOURCE,
+      tool_name: action,
+      tool_input: boundedResources.length === 1
+        ? { resource: boundedResources[0] }
+        : { resources: boundedResources },
+      // v2 has no host-side pattern persistence; the single always-candidate is
+      // the action itself and resolves to a session-scoped in-plugin rule.
+      patterns: [],
+      always: [action],
+      session_id: sessionId,
+      request_id: requestId,
+    };
+    // Best-effort cwd learned from the event envelope (location.directory) —
+    // improves the bubble's session folder; omitted when unknown.
+    const cwd = _sessionCwdById.get(sessionId);
+    if (cwd) body.cwd = cwd;
+    const metadata = event.metadata;
+    if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+      body.permission_metadata = metadata;
+    }
+    return body;
+  }
+
+  // Decision contract with Clawd's v2 blocking adapter (server-route-permission
+  // opencode-v2 branch): 200 + identity header + JSON { decision, message? }
+  // resolves the await; 204 / identity mismatch / unparseable body / timeout /
+  // transport error all mean "no decision" and leave the effect untouched.
+  async function deliverV2BlockingPermission(snapshot) {
+    const candidates = getPermissionPortCandidates();
+    for (const port of candidates) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), V2_PERMISSION_BLOCKING_TIMEOUT_MS);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/permission`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: snapshot.payload,
+          signal: controller.signal,
+        });
+        const header = res.headers.get(CLAWD_SERVER_HEADER);
+        if (header !== CLAWD_SERVER_ID) {
+          debugLog(`PERM[${snapshot.reqId}] port=${port} identity-mismatch header=${header}`);
+          continue;
+        }
+        if (res.status === 204) {
+          try { await res.text(); } catch {}
+          return { decision: null };
+        }
+        const text = await res.text();
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch {}
+        const decision = parsed && typeof parsed.decision === "string" ? parsed.decision : null;
+        if (decision !== "allow" && decision !== "always" && decision !== "deny") {
+          debugLog(`PERM[${snapshot.reqId}] port=${port} unsupported-decision`);
+          return { decision: null };
+        }
+        return {
+          decision,
+          message: parsed && typeof parsed.message === "string" ? parsed.message : "",
+        };
+      } catch (err) {
+        debugLog(`PERM[${snapshot.reqId}] port=${port} ERR ${err && err.name}/${err && err.message}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return { decision: null };
+  }
+
+  // evaluate-hook callback. Runs for host-configured allow AND ask effects;
+  // configured deny is final and never reaches the hook (upstream docs). Any
+  // failure path leaves `event.effect` untouched so the native prompt wins —
+  // this hook must never throw into the host.
+  async function handleV2PermissionEvaluate(event) {
+    if (!event || typeof event !== "object") return;
+    if (event.effect !== "ask") return;
+
+    const sessionId = normalizeSessionId(typeof event.sessionID === "string" ? event.sessionID : "");
+    const action = typeof event.action === "string" && event.action ? event.action : "unknown";
+    const alwaysKey = `${sessionId}\u0000${action}`;
+    if (_alwaysAllowedBySessionAction.has(alwaysKey)) {
+      event.effect = "allow";
+      debugLog(`PERM always-hit session=${sessionId || "(default)"} action=${action}`);
+      return;
+    }
+
+    const toolCallId = event.source && typeof event.source.id === "string" && event.source.id
+      ? event.source.id
+      : `req${++_permissionReqCounter}`;
+    const requestId = `v2:${toolCallId}`;
+    const body = buildV2PermissionBody(event, requestId);
+    const payload = JSON.stringify(body);
+    if (Buffer.byteLength(payload, "utf8") > V2_PERMISSION_MAX_BODY_BYTES) {
+      debugLog(`PERM skip action=${action} reason=body-over-budget bytes=${Buffer.byteLength(payload, "utf8")}`);
+      return;
+    }
+
+    const snapshot = {
+      body,
+      payload,
+      reqId: ++_reqCounter,
+      logTag: `PERM action=${action} req=${requestId}`,
+    };
+    debugLog(`PERM forward action=${action} session=${sessionId || "(default)"} req=${requestId}`);
+    const outcome = await deliverV2BlockingPermission(snapshot);
+    if (outcome.decision === "allow") {
+      event.effect = "allow";
+      debugLog(`PERM resolved allow req=${requestId}`);
+    } else if (outcome.decision === "always") {
+      rememberAlwaysAllow(sessionId, action);
+      event.effect = "allow";
+      debugLog(`PERM resolved always req=${requestId}`);
+    } else if (outcome.decision === "deny") {
+      event.effect = "deny";
+      if (outcome.message) event.message = outcome.message;
+      debugLog(`PERM resolved deny req=${requestId}`);
+    } else {
+      debugLog(`PERM no-decision → native prompt req=${requestId}`);
+    }
+  }
+
+  // Plugin definition (the object form v2's loader requires). setup runs when
+  // the service loads the plugin and returns its cleanup function.
+  const definition = {
+    id: pluginId,
+    async setup(ctx) {
+      // #1026 orphan inert gate — before every side effect, exactly like v1.
+      const managedGate = evaluateManagedLayoutGate(import.meta.url, {
+        agentId: AGENT_ID,
+        pluginDirName: markerPluginDirName,
+      });
+      if (managedGate.mode === "inert") {
+        return () => {};
+      }
+      resetDebugLog();
+      const app = ctx && ctx.app && typeof ctx.app === "object" ? ctx.app : {};
+      debugLog(`INIT v2 pid=${process.pid} app=${app.name || "?"}@${app.version || "?"} gate=${managedGate.mode}`);
+
+      // Reload idempotency: a host reload() re-runs setup. Abort the previous
+      // subscription so exactly one event loop and one evaluate hook stay live.
+      if (definition._dispose) {
+        try { definition._dispose(); } catch {}
+        definition._dispose = null;
+      }
+
+      const controller = new AbortController();
+
+      if (ctx && ctx.permission && typeof ctx.permission.hook === "function") {
+        try {
+          ctx.permission.hook("evaluate", (event) => {
+            // Never throw into the host: a rejected evaluate callback must not
+            // wedge the permission pipeline.
+            return handleV2PermissionEvaluate(event).catch((err) => {
+              debugLog(`PERM hook error: ${err && err.message}`);
+            });
+          });
+          debugLog("EVALUATE hook registered");
+        } catch (err) {
+          debugLog(`EVALUATE register-failed: ${err && err.message}`);
+        }
+      } else {
+        debugLog("EVALUATE unavailable: no ctx.permission.hook");
+      }
+
+      if (ctx && ctx.event && typeof ctx.event.subscribe === "function") {
+        void (async () => {
+          for await (const envelope of ctx.event.subscribe({ signal: controller.signal })) {
+            try {
+              handleV2Event(envelope);
+            } catch (err) {
+              debugLog(`ERROR in v2 event handler: ${err && err.message}`);
+            }
+          }
+          debugLog("EVENT stream ended");
+        })().catch((err) => {
+          debugLog(`EVENT stream error: ${err && err.message}`);
+        });
+        debugLog("EVENT subscription started");
+      } else {
+        debugLog("EVENT subscribe unavailable");
+      }
+
+      definition._dispose = () => controller.abort();
+      return () => {
+        if (definition._dispose) {
+          try { definition._dispose(); } catch {}
+          definition._dispose = null;
+        }
+      };
+    },
+  };
+
+  const __testInternalsV2 = {
+    buildStateBody: (state, eventName, sessionId) => {
+      const clawdSessionId = normalizeSessionId(sessionId) || DEFAULT_SESSION_ID;
+      const body = {
+        state, session_id: clawdSessionId, event: eventName,
+        agent_id: AGENT_ID, hook_source: HOOK_SOURCE,
+      };
+      const title = _sessionTitleById.get(clawdSessionId);
+      if (title) body.session_title = title;
+      return body;
+    },
+    translateV2Event,
+    handleV2Event,
+    handleV2PermissionEvaluate,
+    buildV2PermissionBody,
+    deliverV2BlockingPermission,
+    deliverV2StatePost: (snapshot) => deliverV2StatePost(snapshot),
+    postStateToClawdV2,
+    sendStateV2,
+    sendMetadataV2,
+    rememberAlwaysAllow,
+    captureV2Title,
+    getPortCandidates,
+    getPermissionPortCandidates,
+    readRuntimePort,
+    readPermissionRuntimePort,
+    flushDebugLog,
+    get _debugLogPath() { return DEBUG_LOG_PATH; },
+    get _cachedPort() { return _cachedPort; },
+    set _cachedPort(v) { _cachedPort = v; },
+    get _lastStatePerSession() { return _lastStatePerSession; },
+    get _sessionTitleById() { return _sessionTitleById; },
+    get _sessionCwdById() { return _sessionCwdById; },
+    get _alwaysAllowedBySessionAction() { return _alwaysAllowedBySessionAction; },
+    get _statePostQueueBySession() { return _statePostQueueBySession; },
+  };
+  Object.defineProperty(definition, "__test", { value: __testInternalsV2 });
+
+  return definition;
+}
+
