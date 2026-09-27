@@ -25,6 +25,8 @@ const {
 const {
   getClaudeHookScriptPath,
   getClaudeAutoStartScriptPath,
+  checkClaudeMaterializationFs,
+  resolveClaudeHookPaths,
   CLAUDE_CORE_HOOK_EVENTS,
   resolveClaudeSettingsPath,
 } = require("../hooks/install");
@@ -53,6 +55,7 @@ const {
   resolveCodexOfficialHookState,
 } = require("./server-codex-official-turns");
 const { createDshStateSequenceFence } = require("./dsh-state-sequence");
+const createGrokTurnFence = require("./grok-turn-fence");
 const {
   HOOK_EVENT_RING_SIZE_PER_AGENT,
   createSingleRequestHookEventRecorder,
@@ -154,7 +157,11 @@ let lastClaudeHookGuardNotice = null;
 let claudeStatuslineIngressSuppressed = false;
 const codexOfficialTurns = new Map();
 const dshStateSequenceFence = createDshStateSequenceFence();
+// Grok Build turn-order fence: bounded, in-memory, injected into /state.
+const grokTurnFence = createGrokTurnFence();
 const recentHookEvents = new Map();
+const localHookRejectTelemetry = new Map();
+const LOCAL_HOOK_REJECT_LOG_INTERVAL_MS = 30 * 1000;
 
 function isClaudeStatuslineMetadataAllowed() {
   return ctx.claudeQuotaCollectionEnabled === true && !claudeStatuslineIngressSuppressed;
@@ -298,28 +305,97 @@ const CLAUDE_STATUSLINE_UNREGISTER_SOURCES = new Set(["settings-agent-uninstall"
 // Without this, Doctor Fix / Settings Install could report success while
 // writing a command at a path that can never work (#657 review finding).
 const claudeFsApi = ctx.fs || fs;
-const claudeExpectedHookScriptPath = typeof ctx.expectedHookScriptPath === "string"
+const claudeExpectedHookScriptPathOverride = typeof ctx.expectedHookScriptPath === "string"
   ? ctx.expectedHookScriptPath
-  : getClaudeHookScriptPath();
-const claudeExpectedAutoStartScriptPath = typeof ctx.expectedAutoStartScriptPath === "string"
+  : null;
+const claudeExpectedAutoStartScriptPathOverride = typeof ctx.expectedAutoStartScriptPath === "string"
   ? ctx.expectedAutoStartScriptPath
-  : getClaudeAutoStartScriptPath();
+  : null;
 const claudeCoreEventsForHealth = Array.isArray(ctx.coreEvents) ? ctx.coreEvents : CLAUDE_CORE_HOOK_EVENTS;
 const claudeHookPlatformForHealth = ctx.platform || process.platform;
-const claudeSettingsVerifyPath = typeof ctx.claudeSettingsPath === "string"
-  ? ctx.claudeSettingsPath
-  : resolveClaudeSettingsPath();
 
-function claudeHookSourceMissing({ requireAutoStart = false } = {}) {
+// The same controlled context the preflight resolver used must flow into the
+// installer mutation and the post-write verify. In production these keys are
+// undefined (ambient host defaults), so this is a no-op; injected tests get a
+// consistent platform/remote/home/root/processEnv/settingsPath instead of a
+// preflight on one target and a mutation on another.
+function claudeMutationControls() {
+  const controls = {};
+  if (ctx.platform !== undefined) controls.platform = ctx.platform;
+  if (ctx.remote !== undefined) controls.remote = ctx.remote;
+  if (ctx.homeDir !== undefined) controls.homeDir = ctx.homeDir;
+  if (ctx.materializedRoot !== undefined) controls.materializedRoot = ctx.materializedRoot;
+  if (ctx.processEnv !== undefined) controls.processEnv = ctx.processEnv;
+  if (ctx.realpathSync !== undefined) controls.realpathSync = ctx.realpathSync;
+  if (typeof ctx.claudeSettingsPath === "string") controls.settingsPath = ctx.claudeSettingsPath;
+  return controls;
+}
+
+// Verify must read the exact settings file the mutation would write. Derive it
+// from the same controls (and therefore the same homeDir) rather than the
+// ambient default, so injecting only homeDir cannot write one home and verify
+// another.
+const claudeSettingsVerifyPath = (() => {
+  const controls = claudeMutationControls();
+  if (typeof controls.settingsPath === "string") return controls.settingsPath;
+  return resolveClaudeSettingsPath(
+    controls.homeDir !== undefined ? { homeDir: controls.homeDir } : {}
+  );
+})();
+
+// fs contract: `ctx.fs` (claudeFsApi) is the read-only health/resolver seam and
+// is used consistently by the preflight resolver, plan, and post-write verify.
+// The installer mutation deliberately does NOT receive ctx.fs — it always uses
+// its own filesystem, because writing through an injected read-only fake would
+// be unsafe. To keep "preflight A / materialize B" impossible, an injected
+// ctx.fs that is not the real fs module fails closed as resolver-fs-inconsistent
+// whenever a local AppImage materialization is actually required (direct mode
+// never reads files through the seam, so it is unaffected).
+const claudeResolverOptions = {
+  platform: claudeHookPlatformForHealth,
+  remote: ctx.remote,
+  homeDir: ctx.homeDir,
+  materializedRoot: ctx.materializedRoot,
+  processEnv: ctx.processEnv,
+  realpathSync: ctx.realpathSync,
+  fs: claudeFsApi,
+};
+
+// Source/target resolution shared by the source preflight and the post-write
+// verify. AppImage mode materializes to a persistent generation; direct mode
+// keeps source === target. Explicit ctx overrides preserve the historical
+// test-injected contract.
+function resolveClaudePathsForServer() {
+  if (
+    claudeExpectedHookScriptPathOverride !== null
+    || claudeExpectedAutoStartScriptPathOverride !== null
+  ) {
+    const state = claudeExpectedHookScriptPathOverride || getClaudeHookScriptPath();
+    const autoStart = claudeExpectedAutoStartScriptPathOverride || getClaudeAutoStartScriptPath();
+    return {
+      ok: true,
+      mode: "explicit",
+      source: { state, autoStart },
+      target: { state, autoStart },
+      targetGeneration: null,
+    };
+  }
+  const fsGuard = checkClaudeMaterializationFs(claudeResolverOptions);
+  if (fsGuard.ok !== true) return { ...fsGuard, ok: false };
+  return resolveClaudeHookPaths(claudeResolverOptions, { materialize: false });
+}
+
+function claudeHookSourceMissing(resolved, { requireAutoStart = false } = {}) {
   try {
-    if (!claudeFsApi.existsSync(claudeExpectedHookScriptPath)) return true;
+    if (!resolved || resolved.ok !== true) return true;
+    if (!claudeFsApi.existsSync(resolved.source.state)) return true;
     // auto-start.js is its own packaged source script — a register call that
     // writes a SessionStart auto-start command must not do so toward a path
     // that doesn't exist either, same reasoning as the core script check
     // above. Only checked when this call actually writes an auto-start
     // command, so a plain (non-auto-start) register/repair is never blocked
     // by an unrelated, unused script being missing.
-    if (requireAutoStart && !claudeFsApi.existsSync(claudeExpectedAutoStartScriptPath)) return true;
+    if (requireAutoStart && !claudeFsApi.existsSync(resolved.source.autoStart)) return true;
     return false;
   } catch {
     return true;
@@ -338,10 +414,26 @@ function buildClaudeHookReportForVerify(overrides = {}) {
   const requireAutoStart = overrides.requireAutoStart !== undefined
     ? overrides.requireAutoStart
     : !!ctx.autoStartWithClaude;
+  const resolved = resolveClaudePathsForServer();
+  if (!resolved || resolved.ok !== true) {
+    return {
+      status: "resolver-degraded",
+      repairable: false,
+      degradedReason: (resolved && resolved.reason) || "resolver-failed",
+      issues: [{ code: "resolver-failed", automaticRepairable: false }],
+      commandCount: 0,
+      managedCoreEventCount: 0,
+      snapshot: null,
+      message: (resolved && resolved.message) || "Claude hook path resolution failed",
+    };
+  }
   return inspectClaudeHookHealth(readClaudeSettingsRawForVerify(), {
     expectedPermissionUrl: buildPermissionUrl(getHookServerPort()),
-    expectedHookScriptPath: claudeExpectedHookScriptPath,
-    expectedAutoStartScriptPath: claudeExpectedAutoStartScriptPath,
+    expectedHookScriptPath: resolved.target.state,
+    expectedAutoStartScriptPath: resolved.target.autoStart,
+    sourceHookScriptPath: resolved.source.state,
+    sourceAutoStartScriptPath: resolved.source.autoStart,
+    targetGeneration: resolved.targetGeneration,
     requireAutoStart,
     coreEvents: claudeCoreEventsForHealth,
     platform: claudeHookPlatformForHealth,
@@ -355,7 +447,16 @@ function registerClaudeHooksTask(meta) {
     // it doesn't exist writing is pointless (and would just leave a command
     // pointing nowhere). Matches the periodic supervisor's own source-missing
     // short-circuit, now for every register source, not just the automatic one.
-    if (claudeHookSourceMissing({ requireAutoStart: !!meta.autoStart })) {
+    const resolvedPaths = resolveClaudePathsForServer();
+    if (!resolvedPaths || resolvedPaths.ok !== true) {
+      return {
+        status: "error",
+        reason: (resolvedPaths && resolvedPaths.reason) || "resolver-failed",
+        message: (resolvedPaths && resolvedPaths.message)
+          || "Claude hook path resolution failed",
+      };
+    }
+    if (claudeHookSourceMissing(resolvedPaths, { requireAutoStart: !!meta.autoStart })) {
       return {
         status: "error",
         reason: "source-script-missing",
@@ -367,16 +468,58 @@ function registerClaudeHooksTask(meta) {
       registerHooksAsync,
       registerClaudeStatusline,
       unregisterClaudeStatusline,
+      preflightClaudeRuntime,
     } = require("../hooks/install.js");
+
+    // Atomicity: when this register source will also take the statusline, the
+    // statusline runtime (its own closure in direct mode, the full generation
+    // in AppImage mode) must be proven BEFORE registerHooksAsync writes any
+    // settings. Otherwise a missing statusline dependency would leave the 15
+    // state events installed and then fail the whole Settings Install.
+    const willRegisterStatusline = CLAUDE_STATUSLINE_REGISTER_SOURCES.has(meta.source)
+      && ctx.claudeQuotaCollectionEnabled === true;
+    if (willRegisterStatusline) {
+      if (typeof preflightClaudeRuntime !== "function") {
+        return {
+          status: "error",
+          reason: "runtime-preflight-unavailable",
+          message: "Claude statusline runtime preflight is unavailable",
+        };
+      }
+      const preflight = preflightClaudeRuntime({
+        ...claudeMutationControls(),
+        requireStatusline: true,
+      });
+      if (!preflight || preflight.ok !== true) {
+        return {
+          status: "error",
+          reason: (preflight && preflight.reason) || "runtime-preflight-failed",
+          message: (preflight && preflight.message)
+            || "Claude statusline runtime preflight failed",
+        };
+      }
+    }
+
     const result = await registerHooksAsync({
       silent: true,
       autoStart: meta.autoStart,
       port: meta.port,
+      ...claudeMutationControls(),
     });
     if (CLAUDE_STATUSLINE_REGISTER_SOURCES.has(meta.source)) {
       try {
         if (ctx.claudeQuotaCollectionEnabled === true) {
-          const statuslineResult = registerClaudeStatusline({ silent: true });
+          const statuslineResult = registerClaudeStatusline({ silent: true, ...claudeMutationControls() });
+          if (statuslineResult.error) {
+            // Materialization/preflight failed before any sidecar or settings
+            // mutation. Surface it explicitly instead of a silent "installed".
+            return {
+              status: "error",
+              reason: statuslineResult.error.reason || "statusline-materialize-failed",
+              message: statuslineResult.error.message
+                || "Failed to prepare the Claude statusline runtime",
+            };
+          }
           if (statuslineResult.changed) {
             console.log("Clawd: registered Claude Code statusline");
           }
@@ -384,7 +527,7 @@ function registerClaudeHooksTask(meta) {
           claudeStatuslineIngressSuppressed = true;
           // Migration/startup cleanup is ownership-safe: the installer only
           // removes a statusLine command carrying Clawd's marker.
-          unregisterClaudeStatusline({ backup: true, silent: true });
+          unregisterClaudeStatusline({ backup: true, silent: true, ...claudeMutationControls() });
           clearLocalClaudeStatuslineAuthority();
           clearLocalClaudeQuota();
         }
@@ -437,10 +580,10 @@ function unregisterClaudeHooksTask(meta) {
     const previousSuppression = claudeStatuslineIngressSuppressed;
     if (removesStatusline) claudeStatuslineIngressSuppressed = true;
     try {
-      const hooksResult = await unregisterHooksAsync({ backup: true });
+      const hooksResult = await unregisterHooksAsync({ backup: true, ...claudeMutationControls() });
       let statuslineResult = null;
       if (removesStatusline) {
-        statuslineResult = unregisterClaudeStatusline({ backup: true, silent: true });
+        statuslineResult = unregisterClaudeStatusline({ backup: true, silent: true, ...claudeMutationControls() });
         clearLocalClaudeStatuslineAuthority();
         clearLocalClaudeQuota();
       }
@@ -482,7 +625,7 @@ function setClaudeQuotaCollectionEnabled(callOptions = {}) {
       const previousSuppression = claudeStatuslineIngressSuppressed;
       claudeStatuslineIngressSuppressed = true;
       try {
-        const result = unregisterClaudeStatusline({ backup: true, silent: true });
+        const result = unregisterClaudeStatusline({ backup: true, silent: true, ...claudeMutationControls() });
         clearLocalClaudeStatuslineAuthority();
         clearLocalClaudeQuota();
         return { status: "ok", enabled: false, ...result };
@@ -497,11 +640,30 @@ function setClaudeQuotaCollectionEnabled(callOptions = {}) {
         message: "Enable the Claude Code integration before collecting its usage metadata",
       };
     }
-    const result = registerClaudeStatusline({ backup: true, silent: true });
+    if (callOptions.chainExisting === true
+      && !/^[a-f0-9]{64}$/.test(callOptions.expectedStatuslineFingerprint || "")) {
+      return { status: "error", message: "Confirm the current Claude statusline before enabling coexistence" };
+    }
+    const result = registerClaudeStatusline({
+      backup: true, silent: true,
+      ...claudeMutationControls(),
+      ...(callOptions.chainExisting === true ? {
+        chainExisting: true,
+        expectedStatuslineFingerprint: callOptions.expectedStatuslineFingerprint,
+      } : {}),
+    });
+    if (result.error) {
+      return {
+        status: "error",
+        reason: result.error.reason || "statusline-materialize-failed",
+        message: result.error.message || "Failed to prepare the Claude statusline runtime",
+      };
+    }
     if (result.skippedExisting) {
       return {
         status: "error",
         reason: "statusline-occupied",
+        statuslineFingerprint: result.statuslineFingerprint,
         message: "Claude Code already has a custom statusline; Clawd left it unchanged",
       };
     }
@@ -530,11 +692,20 @@ function setClaudeAutoStart(callOptions = {}) {
       // it's serialized against other Claude mutations without being made
       // async itself.
       const { unregisterAutoStart } = require("../hooks/install.js");
-      unregisterAutoStart();
+      unregisterAutoStart({ ...claudeMutationControls() });
       return { status: "ok", enabled };
     }
 
-    if (claudeHookSourceMissing({ requireAutoStart: true })) {
+    const resolvedPaths = resolveClaudePathsForServer();
+    if (!resolvedPaths || resolvedPaths.ok !== true) {
+      return {
+        status: "error",
+        reason: (resolvedPaths && resolvedPaths.reason) || "resolver-failed",
+        message: (resolvedPaths && resolvedPaths.message)
+          || "Claude hook path resolution failed",
+      };
+    }
+    if (claudeHookSourceMissing(resolvedPaths, { requireAutoStart: true })) {
       return {
         status: "error",
         reason: "source-script-missing",
@@ -547,7 +718,7 @@ function setClaudeAutoStart(callOptions = {}) {
     // version probe registerHooks() performs — use the async installer, like
     // every other register path.
     const { registerHooksAsync } = require("../hooks/install.js");
-    await registerHooksAsync({ silent: true, autoStart: true, port: getHookServerPort() });
+    await registerHooksAsync({ silent: true, autoStart: true, port: getHookServerPort(), ...claudeMutationControls() });
 
     const verifyReport = buildClaudeHookReportForVerify({ requireAutoStart: true });
     if (!isExplicitRepairVerified(verifyReport)) {
@@ -715,6 +886,70 @@ function stopClaudeSettingsWatcher() {
   return claudeSettingsWatcher.stop();
 }
 
+function recordLocalHookTransportRejection(route, reason, status) {
+    if (typeof ctx.debugLog !== "function") return;
+    const key = `${route}:${reason}:${status}`;
+    const now = nowFn();
+    const previous = localHookRejectTelemetry.get(key);
+    if (Number.isFinite(previous) && now - previous < LOCAL_HOOK_REJECT_LOG_INTERVAL_MS) return;
+    if (!localHookRejectTelemetry.has(key) && localHookRejectTelemetry.size >= 32) {
+      localHookRejectTelemetry.delete(localHookRejectTelemetry.keys().next().value);
+    }
+    localHookRejectTelemetry.set(key, now);
+    try {
+      ctx.debugLog(`local-hook-transport-reject route=${route} reason=${reason} status=${status}`);
+    } catch {}
+}
+
+function rejectUnsafeLocalHookRequest(req, res, route) {
+    // These endpoints are for native hooks, not browser UI. Loopback binding and
+    // absent CORS headers alone do not stop simple cross-origin POSTs. These
+    // checks do not authenticate unrestricted processes under the same OS user.
+    const headers = req.headers || {};
+    const host = typeof headers.host === "string"
+      ? /^(?:127\.0\.0\.1|localhost|\[::1\])(?::([0-9]{1,5}))?$/i.exec(headers.host)
+      : null;
+    let status = 0;
+    let reason = "";
+    if (Object.prototype.hasOwnProperty.call(headers, "origin")) {
+      status = 403;
+      reason = "origin-present";
+    } else if (!host
+      || (host[1] !== undefined && (Number(host[1]) < 1 || Number(host[1]) > 65535))) {
+      status = 403;
+      reason = "invalid-host";
+    } else {
+      // Node discards duplicate Host / Content-Type fields by default. Reject
+      // ambiguous requests rather than validating only the retained first value.
+      const seen = new Set();
+      const raw = req.rawHeaders || [];
+      for (let i = 0; i < raw.length; i += 2) {
+        const name = String(raw[i] || "").toLowerCase();
+        if (name !== "host" && name !== "content-type") continue;
+        if (seen.has(name)) {
+          status = 400;
+          reason = name === "host" ? "duplicate-host" : "duplicate-content-type";
+          break;
+        }
+        seen.add(name);
+      }
+      const type = typeof headers["content-type"] === "string"
+        ? headers["content-type"].split(";", 1)[0].trim().toLowerCase()
+        : "";
+      if (!status && type !== "application/json") {
+        status = 415;
+        reason = "unsupported-media-type";
+      }
+    }
+    if (!status) return false;
+    recordLocalHookTransportRejection(route, reason, status);
+    // No agent decision or success marker on a transport rejection. Close
+    // without waiting for body bytes; native clients retain their own fallback.
+    res.writeHead(status, { "Connection": "close" });
+    res.end();
+    return true;
+}
+
 function routeHttpRequest(req, res, remoteProfile = null) {
     // Secure Remote SSH traffic must terminate at its profile-bound ingress,
     // never at the compatibility-oriented local main server. Rejecting the
@@ -731,12 +966,14 @@ function routeHttpRequest(req, res, remoteProfile = null) {
     if (req.method === "GET" && req.url === "/state") {
       sendStateHealthResponse(res, { getHookServerPort });
     } else if (req.method === "POST" && req.url === "/state") {
+      if (!remoteProfile && rejectUnsafeLocalHookRequest(req, res, "/state")) return;
       handleStatePost(req, res, {
         ctx,
         createRequestHookRecorder,
         shouldDropForDnd,
         codexOfficialTurns,
         dshStateSequenceFence,
+        grokTurnFence,
         captureForegroundWindowsTerminal: ctx.captureForegroundWindowsTerminal,
         isWinHost: isWindowsHost,
         windowsProcessChainRuntime,
@@ -746,6 +983,7 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         isClaudeStatuslineMetadataAllowed,
       });
     } else if (req.method === "POST" && req.url === "/permission") {
+      if (!remoteProfile && rejectUnsafeLocalHookRequest(req, res, "/permission")) return;
       handlePermissionPost(req, res, {
         ctx,
         createRequestHookRecorder,
@@ -897,6 +1135,7 @@ function cleanup() {
   claudeHookOperations.dispose();
   clearRuntimeConfigFn();
   clearClaudeHookGuardStatus();
+  localHookRejectTelemetry.clear();
   if (httpServer) httpServer.close();
 }
 

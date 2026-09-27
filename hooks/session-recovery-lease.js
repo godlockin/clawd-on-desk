@@ -201,11 +201,12 @@ function sleepSync(ms) {
   } catch {}
 }
 
-function acquireLeaseLock(filePath) {
+function acquireLeaseLock(filePath, options = {}) {
   const lockPath = `${filePath}.lock`;
   const ownerPath = path.join(lockPath, "owner");
   const token = `${process.pid}-${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
-  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt++) {
+  const retryCount = options.nonBlocking === true ? 1 : LOCK_RETRY_COUNT;
+  for (let attempt = 0; attempt < retryCount; attempt++) {
     const pendingPath = `${lockPath}.pending-${token}-${attempt}`;
     const pendingOwnerPath = path.join(pendingPath, "owner");
     try {
@@ -218,7 +219,7 @@ function acquireLeaseLock(filePath) {
     } catch (err) {
       try { fs.rmSync(pendingPath, { recursive: true, force: true }); } catch {}
       if (!err || !["EEXIST", "ENOTEMPTY", "EPERM"].includes(err.code)) return null;
-      sleepSync(LOCK_RETRY_MS);
+      if (attempt + 1 < retryCount) sleepSync(LOCK_RETRY_MS);
     }
   }
   return null;
@@ -385,7 +386,8 @@ function processAlive(pid, options = {}) {
 
 function cleanupOrphanedLeaseLocks(dir, options = {}) {
   let names;
-  try { names = fs.readdirSync(dir).filter((name) => name.endsWith(".json.lock")); }
+  try { names = fs.readdirSync(dir).filter((name) => name.endsWith(".json.lock")
+    && (!options.filePrefix || name.startsWith(options.filePrefix))); }
   catch { return; }
   for (const name of names) {
     const lockPath = path.join(dir, name);
@@ -394,6 +396,7 @@ function cleanupOrphanedLeaseLocks(dir, options = {}) {
     try { token = fs.readFileSync(ownerPath, "utf8"); } catch {}
     const match = /^(\d+)-(\d+)-[0-9a-f]+$/.exec(token);
     if (!match) {
+      if (options.requireDeadOwner === true) continue;
       // A writer can die after mkdir and before creating owner. Renaming is
       // atomic: a concurrently starting writer simply fails closed for this
       // event, while the next hook can acquire a clean lock.
@@ -401,6 +404,15 @@ function cleanupOrphanedLeaseLocks(dir, options = {}) {
       continue;
     }
     const ownerPid = Number(match[1]);
+    if (options.requireDeadOwner === true) {
+      if (!isPositivePid(ownerPid)) continue;
+      try {
+        (options.processKill || process.kill)(ownerPid, 0);
+        continue;
+      } catch (err) {
+        if (!err || err.code !== "ESRCH") continue;
+      }
+    }
     if (isPositivePid(ownerPid) && processAlive(ownerPid, options)) continue;
     quarantineAndRemoveLock(lockPath);
   }
@@ -429,12 +441,29 @@ function classifyBody(body, options = {}) {
       state: "working",
       validForMs: disposition.kind === "debounce" ? disposition.debounceMs : 0,
       terminal: false,
+      // A debounce Stop (background tasks plus a final reply) is a completed
+      // turn: the live state machine closes it after the quiet window and the
+      // lease stays provisional. History records it as ended.
+      provisionalCompletion: disposition.kind === "debounce",
       // A typed background-subagent snapshot is live evidence for this process,
       // but a Stop hook must not turn that one observation into an unbounded
       // startup-recovery lease. Preserve a lease written by earlier sustained
       // lifecycle traffic byte-for-byte; create or refresh nothing when the
       // typed count is the only reason this Stop became a hard hold.
       preserveExistingEvidence: disposition.kind === "hold" && baseDisposition.kind !== "hold",
+    };
+  }
+  if (body.event === "SubagentStop") {
+    // A finishing subagent is not new work. Claude often sends one a few
+    // seconds after the parent's Stop (#1060), so it may only settle a turn
+    // that is still durably active, never reopen a closed or provisional one.
+    // It keeps the activity clock and leaves a thinking/working lease untouched.
+    return {
+      active: true,
+      state: "working",
+      terminal: false,
+      requireActiveExisting: true,
+      subagentStop: true,
     };
   }
   if (SUSTAINED_STATES.has(body.state)) return { active: true, state: body.state, terminal: false };
@@ -474,6 +503,10 @@ function updateRecoveryLeaseFromStateBody(body, options = {}) {
     }
     return { written: false, reason: "preserved-existing-evidence", filePath, record: existing };
   }
+  if (classified.requireActiveExisting === true) {
+    const existingPath = getLeaseFilePath(agentId, sessionId, { recoveryDir: getRecoveryDir(options) });
+    if (!existingPath || !fs.existsSync(existingPath)) return { written: false, reason: "no-active-evidence" };
+  }
   const dir = ensureRecoveryDir(options);
   const filePath = dir ? getLeaseFilePath(agentId, sessionId, { recoveryDir: dir }) : null;
   if (!filePath) return { written: false, reason: "path" };
@@ -489,12 +522,24 @@ function updateRecoveryLeaseFromStateBody(body, options = {}) {
   if (!lock) return { written: false, reason: "locked" };
   try {
     const existing = readLeaseFile(filePath);
+    if (classified.requireActiveExisting === true
+      && (!existing || !existing.active || existing.validUntil !== null)) {
+      return { written: false, reason: "no-active-evidence" };
+    }
     const observedAt = Number.isFinite(options.eventAt) && options.eventAt > 0 ? options.eventAt : Date.now();
     // A half-millisecond terminal rank makes Stop/SessionEnd win ties between
     // async hook processes while still allowing same-tick SessionStart ->
     // UserPromptSubmit to become active.
     const eventAt = observedAt + (classified.terminal ? 0.5 : 0);
     if (existing && existing.eventAt > eventAt) return { written: false, reason: "older-event" };
+    // A SubagentStop is closing evidence, not new activity, so it may only
+    // settle a turn that was tracking concurrency. Thinking/working rows stay
+    // byte-for-byte, matching the live state machine's "subagent-stop keep".
+    if (classified.subagentStop === true && existing.state !== "juggling") {
+      return { written: false, reason: "nothing-to-settle" };
+    }
+    // Settling keeps the existing clock; only a genuinely new event may move it.
+    const recordEventAt = classified.subagentStop === true ? existing.eventAt : eventAt;
     const pid = isPositivePid(body.agent_pid)
       ? Math.floor(body.agent_pid)
       : (existing && existing.pid) || null;
@@ -535,8 +580,8 @@ function updateRecoveryLeaseFromStateBody(body, options = {}) {
       sessionId,
       active: classified.active,
       state: classified.state,
-      eventAt,
-      validUntil: classified.validForMs > 0 ? eventAt + classified.validForMs : null,
+      eventAt: recordEventAt,
+      validUntil: classified.validForMs > 0 ? recordEventAt + classified.validForMs : null,
       pid,
       sourcePid,
       processStartIdentity: processStartIdentity || null,
@@ -552,7 +597,9 @@ function updateRecoveryLeaseFromStateBody(body, options = {}) {
     // Every deletion path locks and re-reads, so pruning after release remains
     // safe if another hook updates the record concurrently.
     releaseLeaseLock(lock);
-    pruneRecoveryLeaseFiles(dir, { now: eventAt, skipFilePath: filePath });
+    // Prune on this observation's clock; a settled record may retain an older
+    // eventAt than the write itself.
+    pruneRecoveryLeaseFiles(dir, { now: observedAt, skipFilePath: filePath });
     return { written: true, filePath, record };
   } catch {
     return { written: false, reason: "write-failed" };
@@ -648,6 +695,9 @@ function loadActiveRecoveryLeases(options = {}) {
 
 module.exports = {
   LEASE_VERSION,
+  // Exported so hooks/session-history.js can reuse this arbiter instead of
+  // deciding "is this session still running" a second, divergent way.
+  classifyStateBodyForRecovery: classifyBody,
   LEASE_FILE_PREFIX,
   MAX_LEASE_AGE_MS,
   MAX_LEASE_FILES,
@@ -663,5 +713,7 @@ module.exports = {
   updateRecoveryLeaseFromStateBody,
   pruneRecoveryLeaseFiles,
   cleanupOrphanedLeaseLocks,
+  acquireLeaseLock,
+  releaseLeaseLock,
   loadActiveRecoveryLeases,
 };
