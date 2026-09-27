@@ -7,6 +7,9 @@ const {
   ADAPTER_POLICY,
   assessSessionAutomationIdentity,
 } = require("../src/session-automation-identity");
+const {
+  CODEX_PLACEHOLDER_SESSION_IDS,
+} = require("../hooks/codex-originator");
 
 function assess(agentId, rawSessionId, overrides = {}) {
   return assessSessionAutomationIdentity({
@@ -28,6 +31,10 @@ const CODEX_LOCAL_CLI = Object.freeze({
 });
 
 describe("session automation identity", () => {
+  it("shares the audited Codex placeholder identity contract", () => {
+    assert.strictEqual(ADAPTER_POLICY.codex.placeholders, CODEX_PLACEHOLDER_SESSION_IDS);
+  });
+
   it("fails closed for missing and blank raw session ids", () => {
     for (const rawSessionId of [undefined, null, "", "   "]) {
       assert.deepStrictEqual(

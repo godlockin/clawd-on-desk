@@ -17,6 +17,10 @@ const { HOOK_ENTRIES: CODEWHALE_HOOK_ENTRIES } = require("../hooks/codewhale-ins
 const { QODER_HOOK_EVENTS, buildQoderHookCommand } = require("../hooks/qoder-install");
 const { KIMI_HOOK_EVENTS } = require("../hooks/kimi-install");
 const {
+  buildCursorHookCommand,
+  resolveCursorHookScript,
+} = require("../hooks/cursor-install");
+const {
   CODEX_WINDOWS_STABLE_ARG,
   buildCodexHookCommand,
   buildStableCodexHookCommand,
@@ -26,7 +30,7 @@ const {
   computeCodexHookTrustedHash,
   findCodexHookTrustPositions,
 } = require("../src/doctor-detectors/codex-features-check");
-const { validateHookTarget } = require("../src/doctor-detectors/agent-node-bin-parser");
+const { validateHookCommand, validateHookTarget } = require("../src/doctor-detectors/agent-node-bin-parser");
 const {
   ZCODE_HOOK_EVENTS,
   buildZcodeHookCommand,
@@ -94,9 +98,12 @@ function baseDescriptor(overrides = {}) {
 }
 
 function runOne(descriptor, options = {}) {
+  const descriptorTestHome = descriptor && descriptor.__testHomeDir;
   return checkAgentIntegrations({
     fs,
     platform: options.platform,
+    env: options.env === undefined && descriptorTestHome ? {} : options.env,
+    homeDir: options.homeDir === undefined ? descriptorTestHome : options.homeDir,
     prefs: options.prefs || {},
     descriptors: [descriptor],
     server: options.server || null,
@@ -110,7 +117,9 @@ function runOne(descriptor, options = {}) {
       nodeBin: target.nodeBin,
       scriptPath: target.scriptPath,
     })),
-    dshInstallRoot: options.dshInstallRoot,
+    dshInstallRoot: options.dshInstallRoot === undefined && descriptor.agentId === "deepseek-harness"
+      ? null
+      : options.dshInstallRoot,
     dshManagedRoot: options.dshManagedRoot || descriptor.dshManagedRoot,
   }).details[0];
 }
@@ -379,6 +388,33 @@ afterEach(() => {
 });
 
 describe("checkAgentIntegrations", () => {
+  it("uses Cursor's strict ownership classifier for healthy and colliding commands", () => {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".cursor");
+    const descriptor = baseDescriptor({
+      agentId: "cursor-agent",
+      agentName: "Cursor Agent",
+      parentDir,
+      configPath: path.join(parentDir, "hooks.json"),
+      marker: "cursor-hook.js",
+      scriptPath: resolveCursorHookScript(),
+    });
+    writeJson(descriptor.configPath, {
+      version: 1,
+      hooks: { stop: [{ command: buildCursorHookCommand(process.execPath, descriptor.scriptPath, process.platform) }] },
+    });
+    assert.strictEqual(runOne(descriptor, { platform: process.platform, validateCommand: validateHookCommand }).status, "ok");
+
+    writeJson(descriptor.configPath, {
+      version: 1,
+      hooks: { stop: [{ command: '"/usr/bin/node" "/opt/vendor/cursor-hook.js" --vendor' }] },
+    });
+    const conflict = runOne(descriptor, { platform: "linux" });
+    assert.strictEqual(conflict.status, "needs-review");
+    assert.strictEqual(conflict.hookCommandIssue, "cursor-hook-conflict");
+    assert.strictEqual(conflict.conflictingHookEvent, "stop");
+  });
+
   function dshDescriptor() {
     const root = makeTempDir();
     const parentDir = path.join(root, ".dsh");
@@ -2332,6 +2368,190 @@ describe("checkAgentIntegrations", () => {
     assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "pi" });
   });
 
+  // OMP is the second agent on this shape. Sharing the checker is the point:
+  // a Pi-only marker validator reports a healthy OMP install as needs-review
+  // forever, and an unrouted config mode reports "Unsupported config mode"
+  // with no Fix button at all.
+  function ompDescriptor() {
+    const root = makeTempDir();
+    const homeDir = path.join(root, "home");
+    const parentDir = path.join(homeDir, ".omp", "agent");
+    const descriptor = baseDescriptor({
+      agentId: "omp",
+      agentName: "OMP",
+      eventSource: "extension",
+      parentDir,
+      configPath: path.join(parentDir, "extensions", "clawd-on-desk"),
+      configMode: "omp-extension",
+      marker: "index.ts",
+      coreFile: "omp-extension-core.js",
+      markerFile: ".clawd-managed.json",
+    });
+    // The OMP Doctor supplement scans other profiles independently of the
+    // descriptor's install path. Keep every helper-created descriptor pinned
+    // to the same synthetic home so tests never inspect the developer's OMP
+    // installation or process environment.
+    Object.defineProperty(descriptor, "__testHomeDir", { value: homeDir });
+    return descriptor;
+  }
+
+  it("reports missing OMP extension as repairable not-connected", () => {
+    const descriptor = ompDescriptor();
+    fs.mkdirSync(descriptor.parentDir, { recursive: true });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.notStrictEqual(detail.detail, "Unsupported config mode: omp-extension");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "omp" });
+  });
+
+  it("reports a fully managed OMP extension as ok", () => {
+    const descriptor = ompDescriptor();
+    writeJson(path.join(descriptor.configPath, ".clawd-managed.json"), {
+      app: "clawd-on-desk",
+      integration: "omp",
+      managed: true,
+    });
+    fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+    fs.writeFileSync(path.join(descriptor.configPath, "omp-extension-core.js"), "module.exports = {}\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "ok", detail.detail);
+    assert.strictEqual(detail.extensionFileExists, true);
+    assert.strictEqual(detail.coreFileExists, true);
+  });
+
+  it("reports managed OMP extension with missing copied files as repairable broken-path", () => {
+    const descriptor = ompDescriptor();
+    writeJson(path.join(descriptor.configPath, ".clawd-managed.json"), {
+      app: "clawd-on-desk",
+      integration: "omp",
+      managed: true,
+    });
+    fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "broken-path");
+    assert.strictEqual(detail.coreFileExists, false);
+    assert.match(detail.detail, /OMP extension files/);
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "omp" });
+  });
+
+  it("recognizes the OMP community bridge without offering an ineffective Fix", () => {
+    const descriptor = ompDescriptor();
+    const bridgePath = path.join(path.dirname(descriptor.configPath), "clawd-on-desk-omp.ts");
+    fs.mkdirSync(path.dirname(bridgePath), { recursive: true });
+    fs.writeFileSync(bridgePath, "// community bridge\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "manual-managed");
+    assert.strictEqual(detail.level, "info");
+    assert.strictEqual(detail.standaloneBridge, bridgePath);
+    assert.match(detail.detail, /community bridge is active/);
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
+  it("flags duplicate managed OMP and community bridge copies as repairable", () => {
+    const descriptor = ompDescriptor();
+    writeJson(path.join(descriptor.configPath, ".clawd-managed.json"), {
+      app: "clawd-on-desk",
+      integration: "omp",
+      managed: true,
+    });
+    fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+    fs.writeFileSync(path.join(descriptor.configPath, "omp-extension-core.js"), "module.exports = {}\n", "utf8");
+    const bridgePath = path.join(path.dirname(descriptor.configPath), "clawd-on-desk-omp.ts");
+    fs.writeFileSync(bridgePath, "// community bridge\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "broken-path");
+    assert.strictEqual(detail.standaloneBridge, bridgePath);
+    assert.match(detail.detail, /both active/);
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "omp" });
+  });
+
+  it("reports a Pi-owned directory as needs-review for OMP and vice versa", () => {
+    // The marker names the integration that wrote the files. A directory
+    // carrying the other agent's marker is foreign — Clawd must not report it
+    // connected, and must not claim it as its own.
+    for (const [descriptor, foreignIntegration] of [
+      [ompDescriptor(), "pi"],
+      [piDescriptor(), "omp"],
+    ]) {
+      writeJson(path.join(descriptor.configPath, ".clawd-managed.json"), {
+        app: "clawd-on-desk",
+        integration: foreignIntegration,
+        managed: true,
+      });
+      fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+
+      const detail = runOne(descriptor);
+      assert.strictEqual(detail.status, "needs-review", `${descriptor.agentId} on a ${foreignIntegration} marker`);
+      assert.strictEqual(detail.fixAction, undefined);
+    }
+  });
+
+  it("names the OMP profiles it does not manage instead of implying full coverage", () => {
+    // OMP's extension directory is per-profile and Clawd resolves exactly one,
+    // so "verified" alone would read as "every OMP session reports to Clawd".
+    const root = makeTempDir();
+    const homeDir = path.join(root, "home");
+    const agentDir = path.join(homeDir, ".omp", "agent");
+    const descriptor = baseDescriptor({
+      agentId: "omp",
+      agentName: "OMP",
+      eventSource: "extension",
+      parentDir: agentDir,
+      configPath: path.join(agentDir, "extensions", "clawd-on-desk"),
+      configMode: "omp-extension",
+      marker: "index.ts",
+      coreFile: "omp-extension-core.js",
+      markerFile: ".clawd-managed.json",
+    });
+    writeJson(path.join(descriptor.configPath, ".clawd-managed.json"), {
+      app: "clawd-on-desk",
+      integration: "omp",
+      managed: true,
+    });
+    fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+    fs.writeFileSync(path.join(descriptor.configPath, "omp-extension-core.js"), "module.exports = {}\n", "utf8");
+
+    const alone = runOne(descriptor, { homeDir, env: {} });
+    assert.strictEqual(alone.status, "ok", alone.detail);
+    assert.ok(!/profile/i.test(alone.detail), `no note expected: ${alone.detail}`);
+
+    fs.mkdirSync(path.join(homeDir, ".omp", "profiles", "work", "agent"), { recursive: true });
+    const withOther = runOne(descriptor, { homeDir, env: {} });
+    assert.strictEqual(withOther.status, "ok", "the note must not mask a healthy install");
+    assert.match(withOther.detail, /not managed here \(work\)/);
+    assert.deepStrictEqual(withOther.unmanagedOmpProfiles, ["work"]);
+
+    // Once Clawd itself is installed for that selected profile, the default
+    // agent directory becomes the unmanaged environment and must be named too.
+    const selectedAgentDir = path.join(homeDir, ".omp", "profiles", "work", "agent");
+    const selectedDescriptor = {
+      ...descriptor,
+      parentDir: selectedAgentDir,
+      configPath: path.join(selectedAgentDir, "extensions", "clawd-on-desk"),
+    };
+    writeJson(path.join(selectedDescriptor.configPath, ".clawd-managed.json"), {
+      app: "clawd-on-desk",
+      integration: "omp",
+      managed: true,
+    });
+    fs.writeFileSync(path.join(selectedDescriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+    fs.writeFileSync(path.join(selectedDescriptor.configPath, "omp-extension-core.js"), "module.exports = {}\n", "utf8");
+    const selected = runOne(selectedDescriptor, { homeDir, env: { OMP_PROFILE: "work" } });
+    assert.strictEqual(selected.status, "ok", selected.detail);
+    assert.match(selected.detail, /not managed here \(default\)/);
+    assert.deepStrictEqual(selected.unmanagedOmpProfiles, ["default"]);
+  });
+
   it("reports opencode stale absolute plugin paths", () => {
     const root = makeTempDir();
     const parentDir = path.join(root, ".config", "opencode");
@@ -3088,5 +3308,212 @@ describe("kimi legacy permission-mode supplement", () => {
     fs.writeFileSync(descriptor.configPath, 'default_model = "kimi-for-coding"\n', "utf8");
     const clean = runOne(descriptor);
     assert.strictEqual(clean.status, "ok");
+  });
+
+  describe("minimax-plugin config mode", () => {
+    const minimaxInstall = require("../hooks/minimax-install");
+    const { resolveNodeBin } = require("../hooks/server-config");
+    const PLUGIN_DIR_NAME = minimaxInstall.PLUGIN_DIR_NAME;
+
+    function minimaxDescriptor(root) {
+      const pluginRoot = path.join(root, "plugins", PLUGIN_DIR_NAME);
+      return {
+        agentId: "minimax",
+        agentName: "MiniMax Code",
+        eventSource: "hook",
+        parentDir: root,
+        configPath: pluginRoot,
+        configMode: "minimax-plugin",
+        autoInstall: true,
+        marker: minimaxInstall.MARKER,
+        managedFiles: [".claude-plugin/plugin.json", "hooks/hooks.json"],
+        hookEvents: minimaxInstall.MINIMAX_HOOK_EVENTS,
+      };
+    }
+
+    function writeOwnedPlugin(descriptor, overrides = {}) {
+      // The Doctor compares against the node path IT resolves, so the
+      // "current" fixture must be built from the same source.
+      const nodeBin = overrides.nodeBin || resolveNodeBin() || "node";
+      // null means "leave this file out" (an interrupted install).
+      const manifest = "manifest" in overrides ? overrides.manifest : minimaxInstall.desiredManifest();
+      const hooks = "hooks" in overrides
+        ? overrides.hooks
+        : minimaxInstall.buildDesiredHooksDocument(minimaxInstall.resolveHookScriptPath(), nodeBin);
+      fs.mkdirSync(path.join(descriptor.configPath, ".claude-plugin"), { recursive: true });
+      fs.mkdirSync(path.join(descriptor.configPath, "hooks"), { recursive: true });
+      if (overrides.withOwnerMarker !== false) {
+        writeJson(path.join(descriptor.configPath, minimaxInstall.OWNER_MARKER_FILE), minimaxInstall.buildOwnerMarker());
+      }
+      if (manifest !== null) writeJson(path.join(descriptor.configPath, ".claude-plugin", "plugin.json"), manifest);
+      if (hooks !== null) writeJson(path.join(descriptor.configPath, "hooks", "hooks.json"), hooks);
+    }
+
+    it("reports a fully foreign directory as broken-path without a Fix button", () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      writeOwnedPlugin(descriptor, {
+        withOwnerMarker: false,
+        manifest: { name: PLUGIN_DIR_NAME, description: "someone else's plugin" },
+        hooks: { hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "echo third-party" }] }] } },
+      });
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /not a verifiably Clawd-managed plugin/);
+      assert.strictEqual(detail.fixAction, undefined, "foreign directories must not offer a Fix");
+    });
+
+    it("reports a manifest-name-only directory (no marker) as broken-path without a Fix", () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      writeOwnedPlugin(descriptor, {
+        withOwnerMarker: false,
+        manifest: { name: PLUGIN_DIR_NAME },
+        hooks: { hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "echo hi" }] }] } },
+      });
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /missing-marker/);
+      assert.strictEqual(detail.fixAction, undefined);
+    });
+
+    it("reports an owned directory drifted from the canonical document as broken-path with a Fix", () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      // Every handler names a node binary that exists except one late event,
+      // so the check must walk every event, not just the first.
+      const staleHooks = minimaxInstall.buildDesiredHooksDocument(
+        minimaxInstall.resolveHookScriptPath(),
+        process.execPath,
+      );
+      // Drop one event and point one handler at a node path that no longer
+      // exists — the drift the canonical comparison must surface.
+      delete staleHooks.hooks.PostCompact;
+      staleHooks.hooks.PreCompact[0].hooks[0] = { ...staleHooks.hooks.PreCompact[0].hooks[0], command: "/removed/node/path/node" };
+      writeOwnedPlugin(descriptor, { hooks: staleHooks });
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /outdated or were modified/);
+      assert.match(detail.detail, /node path no longer exists/, "a vanished node binary must be named");
+      assert.ok(detail.fixAction, "outdated owned plugin must offer Repair");
+    });
+
+    it("reports an unmarked pre-release install as not provably ours, without a Fix, and says how to recover", () => {
+      // A document that looks exactly like Clawd's is still not ownership:
+      // Install fails closed there, so a Fix button would loop. The detail
+      // names the only safe recovery.
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      writeOwnedPlugin(descriptor, { withOwnerMarker: false });
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /missing-marker/);
+      assert.match(detail.detail, /delete it manually, then use Install/);
+      assert.strictEqual(detail.fixAction, undefined);
+    });
+
+    it("never offers a Fix for a directory whose ownership marker is a symlink", { skip: process.platform === "win32" }, () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      writeOwnedPlugin(descriptor, { withOwnerMarker: false });
+      const borrowed = path.join(root, "borrowed-marker.json");
+      writeJson(borrowed, minimaxInstall.buildOwnerMarker());
+      fs.symlinkSync(borrowed, path.join(descriptor.configPath, minimaxInstall.OWNER_MARKER_FILE));
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /symlinked-managed-path/);
+      assert.strictEqual(detail.fixAction, undefined);
+    });
+
+    it("offers Repair for an owned install interrupted before the hooks document was written", () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      writeOwnedPlugin(descriptor, { hooks: null });
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /hooks missing/);
+      assert.ok(detail.fixAction, "the marker proves ownership, so Repair must be offered");
+    });
+
+    it("never offers a Fix for a same-name plugin that only mentions the hook script in an unrelated field", () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      writeOwnedPlugin(descriptor, {
+        withOwnerMarker: false,
+        manifest: { name: PLUGIN_DIR_NAME, description: "unrelated plugin" },
+        hooks: {
+          note: "minimax-hook.js is an example filename",
+          hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "echo third-party" }] }] },
+        },
+      });
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /not a verifiably Clawd-managed plugin/);
+      assert.strictEqual(detail.fixAction, undefined);
+    });
+
+    it("reports an empty plugin directory like a missing one", () => {
+      // #1038 round-3 R1-05: an empty directory is unclaimed and Install
+      // publishes over it, so it must not be reported as a foreign conflict.
+      const emptyRoot = makeTempDir();
+      const emptyDescriptor = minimaxDescriptor(emptyRoot);
+      fs.mkdirSync(emptyDescriptor.configPath, { recursive: true });
+      const emptyDetail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [emptyDescriptor] }).details[0];
+
+      const missingRoot = makeTempDir();
+      const missingDescriptor = minimaxDescriptor(missingRoot);
+      const missingDetail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [missingDescriptor] }).details[0];
+
+      assert.strictEqual(emptyDetail.status, "not-connected");
+      assert.strictEqual(emptyDetail.status, missingDetail.status);
+      assert.strictEqual(Boolean(emptyDetail.fixAction), Boolean(missingDetail.fixAction));
+      assert.match(emptyDetail.detail, /is an empty directory/);
+    });
+
+    it("reports a plugin root it cannot inspect as broken-path without a Fix", (t) => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      const realLstat = fs.lstatSync.bind(fs);
+      t.mock.method(fs, "lstatSync", (target) => {
+        if (target === descriptor.configPath) {
+          throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+        }
+        return realLstat(target);
+      });
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /could not be inspected/);
+      assert.strictEqual(detail.fixAction, undefined, "an uninspectable root must not offer a Fix");
+    });
+
+    it("reports a plugin root that is a regular file without a Fix", () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      fs.mkdirSync(path.dirname(descriptor.configPath), { recursive: true });
+      fs.writeFileSync(descriptor.configPath, "not a directory", "utf8");
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "broken-path");
+      assert.match(detail.detail, /not-a-directory|not a verifiably Clawd-managed plugin/);
+      assert.strictEqual(detail.fixAction, undefined);
+    });
+
+    it("reports a current owned plugin as ok", () => {
+      const root = makeTempDir();
+      const descriptor = minimaxDescriptor(root);
+      writeOwnedPlugin(descriptor);
+
+      const detail = checkAgentIntegrations({ fs, prefs: {}, descriptors: [descriptor] }).details[0];
+      assert.strictEqual(detail.status, "ok");
+      assert.match(detail.detail, /Clawd plugin verified/);
+    });
   });
 });
