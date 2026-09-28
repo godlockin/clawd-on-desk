@@ -170,6 +170,7 @@ function initWithConfig(cfg) {
   _miniFlipAssets = !!tc.miniFlipAssets;
   _hasRoamVisual = !!tc.hasRoamVisual;
   _roamFlipAssets = !!tc.roamFlipAssets;
+  _rightSideMirrorFiles = Array.isArray(tc.rightSideMirrorFiles) ? tc.rightSideMirrorFiles : [];
 
   applyObjectScaleStyle(clawdEl, getObjectSvgName(clawdEl), null);
   applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext), null);
@@ -522,6 +523,8 @@ let _miniFlipAssets = false; // theme's mini assets drawn in reverse direction
 let _hasRoamVisual = false;  // theme binds a dedicated roam visual (≠ idle)
 let _roamFlipAssets = false; // theme's roam visual is drawn facing left, not right
 let _roamHeadingLeft = false; // current walk direction; roam visuals are drawn facing right
+let _rightSideMirrorFiles = []; // idle animations mirrored while the pet sits on the right half
+let _petOnRightSide = false;
 let _inMiniMode = false;
 let _miniPreEntryMode = false;
 let _viewportOffsetY = 0;
@@ -567,6 +570,9 @@ function miniFlipContext() {
     hasRoamVisual: _hasRoamVisual,
     roamHeadingLeft: _roamHeadingLeft,
     roamFlipAssets: _roamFlipAssets,
+    file: currentDisplayedSvg,
+    petOnRightSide: _petOnRightSide,
+    rightSideMirrorFiles: _rightSideMirrorFiles,
     miniFlipAssets: _miniFlipAssets,
     inMiniMode: _inMiniMode,
     miniPreEntryMode: _miniPreEntryMode,
@@ -1249,6 +1255,7 @@ function releaseImg(el) {
 // --- Reaction state (visual side) ---
 let isReacting = false;
 let reactTimer = null;
+let isSettingsPreviewReaction = false;
 let currentIdleSvg = null;    // tracks which SVG is currently showing
 let currentState = null;      // last state name received from main (for re-pulse)
 let lastCloudlingPointerPayload = null;
@@ -1505,11 +1512,26 @@ function getAssetUrl(file) {
 // --- IPC-triggered reactions (from hit window via main relay) ---
 window.electronAPI.onStartDragReaction((requestOrDirection, legacyDirection) => startDragReaction(requestOrDirection, legacyDirection));
 window.electronAPI.onEndDragReaction(() => endDragReaction());
-window.electronAPI.onPlayClickReaction((svg, duration) => playReaction(svg, duration));
+window.electronAPI.onPlayClickReaction((svg, duration, options) => playReaction(svg, duration, options));
+// Settings cancels its own reaction preview when it closes; without this the
+// pet would hold the reaction visual, and its paused cursor polling, until the
+// clip's own timer fired. A reaction the user started by clicking the pet runs
+// on the same channel and must survive Settings closing, so only a preview is
+// cancelled here.
+window.electronAPI.onCancelClickReaction(() => {
+  if (!isSettingsPreviewReaction) return;
+  if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
+  endReaction();
+});
 
-function playReaction(requestOrFile, durationMs) {
+function playReaction(requestOrFile, durationMs, options) {
+  // A reaction preview now runs as long as the clip, so the next one can start
+  // while this timer is still pending. Clearing it first keeps the old timer
+  // from firing mid-clip and ending the new reaction early.
+  if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
   const visualRequest = normalizeVisualRequest(requestOrFile);
   const svgFile = visualRequest ? visualRequest.file : requestOrFile;
+  isSettingsPreviewReaction = !!(options && options.settingsPreview);
   isReacting = true;
   detachEyeTracking();
   resumeCurrentSvgForLowPower();
@@ -1525,7 +1547,11 @@ function playReaction(requestOrFile, durationMs) {
 function endReaction() {
   if (!isReacting) return;
   isReacting = false;
+  isSettingsPreviewReaction = false;
   reactTimer = null;
+  // A drag reaction holds the same cursor-polling pause and is still running;
+  // endDragReaction() releases it when the drag itself ends.
+  if (isDragReacting) return;
   window.electronAPI.resumeFromReaction();
 }
 
@@ -1533,6 +1559,7 @@ function cancelReaction() {
   if (isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
+    isSettingsPreviewReaction = false;
   }
   if (isDragReacting) {
     isDragReacting = false;
@@ -1697,6 +1724,7 @@ function startDragReaction(requestOrDirection, legacyDirection) {
   if (!isDragReacting && isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
+    isSettingsPreviewReaction = false;
   }
 
   isDragReacting = true;
@@ -1712,7 +1740,9 @@ function endDragReaction() {
   isDragReacting = false;
   currentDragSvg = null;
   currentDragDirection = null;
-  if (!wasDragReacting) return;
+  // A click reaction that started during the drag holds the same cursor-polling
+  // pause and is still running; endReaction() releases it when that one ends.
+  if (!wasDragReacting || isReacting) return;
   window.electronAPI.resumeFromReaction();
 }
 
@@ -2838,6 +2868,13 @@ if (window.electronAPI && typeof window.electronAPI.onRoamHeading === "function"
     // without a swap, and if this message lands after the state-change (IPC
     // order across channels is not contractual) the flip captured at IMG
     // creation is stale — refresh both the on-screen and the pending element.
+    applyMiniFlip(clawdEl, currentState);
+  });
+}
+
+if (window.electronAPI && typeof window.electronAPI.onPetScreenSide === "function") {
+  window.electronAPI.onPetScreenSide((onRight) => {
+    _petOnRightSide = !!onRight;
     applyMiniFlip(clawdEl, currentState);
   });
 }
