@@ -230,6 +230,8 @@ test("settings window runtime creates the Settings BrowserWindow with taskbar id
   assert.strictEqual(win.options.backgroundColor, "#1c1c1f");
   assert.strictEqual(win.options.webPreferences.preload, "C:\\app\\src\\preload-settings.js");
   assert.strictEqual(win.options.webPreferences.nodeIntegration, false);
+  assert.strictEqual(win.options.acceptFirstMouse, undefined,
+    "non-macOS windows never set acceptFirstMouse");
   assert.strictEqual(win.options.webPreferences.contextIsolation, true);
   assert.deepStrictEqual(win.options.webPreferences.additionalArguments, [
     "--discord-default-app-id-present=0",
@@ -258,6 +260,17 @@ test("settings window runtime creates the Settings BrowserWindow with taskbar id
   win.emit("closed");
   assert.deepStrictEqual(events, ["before-create", "before-closed", "after-closed-null"]);
   assert.strictEqual(runtime.getWindow(), null);
+});
+
+test("macOS settings window passes acceptFirstMouse so the first click reaches the page", () => {
+  let runtime;
+  ({ runtime } = createRuntime({ runtime: { platform: "darwin", isWin: false } }));
+
+  runtime.open();
+  assert.strictEqual(FakeBrowserWindow.instances.length, 1);
+  const win = FakeBrowserWindow.instances[0];
+  assert.strictEqual(win.options.acceptFirstMouse, true,
+    "the pet app lives in the background; the first click must not be eaten by window activation");
 });
 
 test("settings window uses and refreshes the localized title", () => {
