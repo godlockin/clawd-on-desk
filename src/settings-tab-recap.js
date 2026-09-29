@@ -1085,9 +1085,11 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
+    label.id = "recap-recording-label";
     label.textContent = t("recapRecordingLabel");
     const desc = document.createElement("span");
     desc.className = "row-desc";
+    desc.id = "recap-recording-description";
     desc.textContent = t(paused ? "recapRecordingPaused" : "recapRecordingDesc");
     if (paused) desc.setAttribute("role", "status");
     text.appendChild(label);
@@ -1095,12 +1097,6 @@
     switchRow.appendChild(text);
     const control = document.createElement("div");
     control.className = "row-control";
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("data-settings-focus-key", "recap-recording-toggle");
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", view.togglePending ? "-1" : "0");
-    helpers.setSwitchVisual(sw, enabled, { pending: view.togglePending });
     const toggle = () => {
       if (view.togglePending || !window.settingsAPI || typeof window.settingsAPI.update !== "function") return;
       view.togglePending = true;
@@ -1113,13 +1109,15 @@
         if (coreState.activeTab === "recap") ops.requestRender({ content: true, preserveScroll: true });
       });
     };
-    sw.addEventListener("click", toggle);
-    sw.addEventListener("keydown", (event) => {
-      if (event.key === " " || event.key === "Enter") {
-        event.preventDefault();
-        toggle();
-      }
+    const switchControl = helpers.buildSwitch({
+      checked: enabled,
+      pending: view.togglePending,
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: desc.id,
+      onToggle: toggle,
     });
+    const sw = switchControl.element;
+    sw.setAttribute("data-settings-focus-key", "recap-recording-toggle");
     control.appendChild(sw);
     switchRow.appendChild(control);
     rows.push(switchRow);

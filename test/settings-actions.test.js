@@ -11,6 +11,7 @@ const {
   requireBoolean,
   requireFiniteNumber,
   requireEnum,
+  applyThemeSelection,
 } = require("../src/settings-actions");
 const prefs = require("../src/prefs");
 
@@ -2233,6 +2234,7 @@ describe("shortcut commands", () => {
         globalShortcut,
         shortcutHandlers: {
           togglePet: () => {},
+          quickSelectSession: () => {},
           permissionAllow: () => {},
           permissionDeny: () => {},
         },
@@ -2779,6 +2781,43 @@ describe("setThemeSelection command", () => {
   });
 });
 
+// Shared non-recursive runtime selection helper used by BOTH setThemeSelection
+// and officialTheme.uninstall (the latter while already holding the theme lock).
+describe("applyThemeSelection shared helper", () => {
+  it("activates with the given variant/overrides and returns the resolved variant", () => {
+    const calls = [];
+    const deps = {
+      activateTheme: (themeId, variantId, overrideMap) => {
+        calls.push({ themeId, variantId, overrideMap });
+        return { themeId, variantId: variantId === "dead" ? "default" : variantId };
+      },
+      getActiveTheme: () => ({ _id: "clawd", _capabilities: { petTint: true, accessories: true } }),
+    };
+    const r = applyThemeSelection("clawd", "dead", { sounds: { complete: { file: "x.mp3" } } }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.themeId, "clawd");
+    assert.strictEqual(r.variantId, "default", "dead variant resolves to default");
+    assert.deepStrictEqual(r.customizationCapabilities, {
+      petTint: true,
+      accessories: true,
+      mouthAccessories: false,
+    });
+    assert.deepStrictEqual(calls, [{
+      themeId: "clawd",
+      variantId: "dead",
+      overrideMap: { sounds: { complete: { file: "x.mp3" } } },
+    }]);
+    // The helper performs the runtime switch only; the caller owns the commit.
+    assert.strictEqual(r.commit, undefined);
+  });
+
+  it("errors when activateTheme is missing", () => {
+    const r = applyThemeSelection("clawd", "default", null, {});
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /activateTheme/);
+  });
+});
+
 // #509: default idle visual picker command.
 describe("setIdleVisual command", () => {
   const activeTheme = {
@@ -2832,6 +2871,18 @@ describe("setIdleVisual command", () => {
     );
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /not an idle visual/);
+  });
+
+  it("accepts a selectable-only idle visual through the existing setting command", () => {
+    const theme = {
+      ...activeTheme,
+      idleVisualOptions: [{ file: "pool.apng" }],
+    };
+    const result = commandRegistry.setIdleVisual(
+      { themeId: "clawd", file: "pool.apng" },
+      makeDeps({ getActiveTheme: () => theme })
+    );
+    assert.deepStrictEqual(result, { status: "ok", commit: { idleVisual: { clawd: "pool.apng" } } });
   });
 
   it("commits the merged map for a valid pool file, preserving other themes", () => {

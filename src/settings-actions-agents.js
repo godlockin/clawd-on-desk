@@ -36,6 +36,7 @@ const AUTO_REPAIRABLE_AGENT_IDS = new Set([
   "antigravity-cli",
   "codebuddy",
   "workbuddy",
+  "grok-build",
   "kiro-cli",
   "kimi-cli",
   "qwen-code",
@@ -43,12 +44,15 @@ const AUTO_REPAIRABLE_AGENT_IDS = new Set([
   "codewhale",
   "opencode",
   "mimocode",
+  "pi",
+  "omp",
   "hermes",
   "qoder",
   "reasonix",
   "qoderwork",
   "traecode",
   "qwenwork",
+  "minimax",
 ]);
 
 const INSTALLABLE_AGENT_IDS = new Set([
@@ -61,6 +65,7 @@ const INSTALLABLE_AGENT_IDS = new Set([
   "antigravity-cli",
   "codebuddy",
   "workbuddy",
+  "grok-build",
   "kiro-cli",
   "kimi-cli",
   "qwen-code",
@@ -69,6 +74,7 @@ const INSTALLABLE_AGENT_IDS = new Set([
   "opencode",
   "mimocode",
   "pi",
+  "omp",
   "openclaw",
   "hermes",
   "qoder",
@@ -76,6 +82,7 @@ const INSTALLABLE_AGENT_IDS = new Set([
   "qoderwork",
   "traecode",
   "qwenwork",
+  "minimax",
 ]);
 const SETTABLE_AGENT_FLAGS = AGENT_FLAGS.filter((flag) => flag !== "integrationInstalled");
 const CUSTOM_DISCOVERY_AGENT_IDS = new Set([...INSTALLABLE_AGENT_IDS, "custom"]);
@@ -306,6 +313,18 @@ function integrationResultMetadata(result) {
     if (typeof result[key] === "string" && result[key]) metadata[key] = result[key];
   }
   if (result.manualInspectionRequired === true) metadata.manualInspectionRequired = true;
+  // #1026 additive, type-guarded passthrough. Other agents simply omit these.
+  for (const key of ["registrationRemoved", "activeEntryRemaining", "managedFilesRemoved"]) {
+    if (typeof result[key] === "boolean" || result[key] === null) metadata[key] = result[key];
+  }
+  if (Array.isArray(result.warnings)) {
+    const warnings = result.warnings.filter((warning) => typeof warning === "string" && warning);
+    if (warnings.length) metadata.warnings = warnings;
+  }
+  if (Array.isArray(result.residualPaths)) {
+    const residualPaths = result.residualPaths.filter((p) => typeof p === "string" && p);
+    if (residualPaths.length) metadata.residualPaths = residualPaths;
+  }
   return metadata;
 }
 
@@ -388,15 +407,35 @@ function setAgentCustomPermissionUrl(payload, deps = {}) {
   const current = snapshot.agents && snapshot.agents[payload.agentId];
   const currentValue = normalizeOptionalHttpUrl(current && current.customPermissionUrl);
   if (currentValue === value) return { status: "ok", noop: true };
+  const commit = buildAgentCommit(snapshot, payload.agentId, { customPermissionUrl: value });
+  const finishSync = (result) => {
+    if (
+      result === false
+      || (result && typeof result === "object" && (result.status === "error" || result.status === "skipped"))
+    ) {
+      return {
+        status: "error",
+        message: (result && (result.message || result.reason)) || "Failed to sync custom permission URL",
+      };
+    }
+    return { status: "ok", commit };
+  };
   try {
     if (
       isAgentIntegrationInstalled(snapshot, payload.agentId)
       && typeof deps.syncIntegrationForAgent === "function"
     ) {
-      deps.syncIntegrationForAgent(
+      const syncResult = deps.syncIntegrationForAgent(
         payload.agentId,
         buildAgentIntegrationOptionsWithPatch(snapshot, payload.agentId, { customPermissionUrl: value })
       );
+      if (syncResult && typeof syncResult.then === "function") {
+        return syncResult.then(finishSync, (err) => ({
+          status: "error",
+          message: `setAgentCustomPermissionUrl side effect threw: ${err && err.message}`,
+        }));
+      }
+      return finishSync(syncResult);
     }
   } catch (err) {
     return {
@@ -404,10 +443,7 @@ function setAgentCustomPermissionUrl(payload, deps = {}) {
       message: `setAgentCustomPermissionUrl side effect threw: ${err && err.message}`,
     };
   }
-  return {
-    status: "ok",
-    commit: buildAgentCommit(snapshot, payload.agentId, { customPermissionUrl: value }),
-  };
+  return { status: "ok", commit };
 }
 
 function setAgentCustomDiscoveryPaths(payload, deps = {}) {
@@ -625,6 +661,24 @@ async function uninstallAgentIntegration(payload, deps = {}) {
         message: resultMessage(result, `Failed to uninstall ${agentId}`),
       };
     }
+    // #1026 §7.2: an uninstall only commits when the active registration is
+    // gone. `undefined` preserves the legacy status-only path for the other
+    // cleaners; `false`/`null` means an active (or unconfirmable) entry
+    // remains, so no commit and no runtime teardown.
+    if (result && typeof result === "object" && result.registrationRemoved === false) {
+      return {
+        status: "error",
+        ...integrationResultMetadata(result),
+        message: resultMessage(result, `Failed to uninstall ${agentId}: an active integration entry is still registered`),
+      };
+    }
+    if (result && typeof result === "object" && result.registrationRemoved === null) {
+      return {
+        status: "error",
+        ...integrationResultMetadata(result),
+        message: resultMessage(result, `Failed to uninstall ${agentId}: could not confirm the active registration was removed`),
+      };
+    }
     if (typeof deps.stopMonitorForAgent === "function") deps.stopMonitorForAgent(agentId);
     if (typeof deps.clearSessionAutomationByAgent === "function") {
       deps.clearSessionAutomationByAgent(agentId);
@@ -633,6 +687,7 @@ async function uninstallAgentIntegration(payload, deps = {}) {
     if (typeof deps.dismissPermissionsByAgent === "function") deps.dismissPermissionsByAgent(agentId);
     return {
       status: "ok",
+      ...integrationResultMetadata(result),
       message: resultMessage(result, `Uninstalled ${agentId}`),
       commit: {
         ...buildAgentCommit(snapshot, agentId, {
@@ -716,6 +771,19 @@ async function repairAgentIntegration(payload, deps) {
     });
     if (result === false) {
       return { status: "error", message: `No automatic integration repair is available for ${agentId}` };
+    }
+    if (
+      agentId === "omp"
+      && result
+      && typeof result === "object"
+      && result.status === "skipped"
+      && result.reason === "standalone-bridge-present"
+    ) {
+      return {
+        status: "ok",
+        ...integrationResultMetadata(result),
+        message: resultMessage(result, "OMP community bridge is active; no managed repair is needed"),
+      };
     }
     if (result && typeof result === "object" && result.status && result.status !== "ok") {
       return {

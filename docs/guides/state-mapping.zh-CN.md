@@ -81,6 +81,56 @@ Pi 使用全局 extension（`~/.pi/agent/extensions/clawd-on-desk`），会把�
 
 Pi 当前在 Clawd 中是 state-only 集成：Clawd 不接管权限、不新增确认弹窗，Pi 保持默认 YOLO 执行行为。
 
+## OMP Extension 事件
+
+OMP（oh-my-pi）使用按 agent 目录解析的 extension——默认环境下是 `~/.omp/agent/extensions/clawd-on-desk`——并把交互式会话生命周期事件映射到 Clawd 的共享状态：
+
+| OMP Extension Event | Clawd Event | 状态 |
+|---|---|---|
+| session_start | SessionStart | idle |
+| session_switch / session_branch | SessionStart | idle |
+| before_agent_start | UserPromptSubmit | thinking |
+| tool_call | PreToolUse | working |
+| tool_result（成功） | PostToolUse | working |
+| tool_result（isError） | PostToolUseFailure | error |
+| session_stop 候选 + 随后的 agent_end（`willContinue !== true`） | Stop | attention |
+| session_before_compact | PreCompact | sweeping |
+| session_compact | PostCompact | attention |
+| session_shutdown | SessionEnd | 删除会话；无其他 live 会话时回到 idle |
+
+与 Pi extension 相比有三处刻意不同：
+
+- **完成事件由 `session_stop` 与随后的 `agent_end` 共同确认。** `session_stop` 是 settle 前的聚合钩子：Clawd handler 跑完后，别的 extension 仍可请求隐藏续跑。Clawd 只在这里记录主会话候选，等 OMP 随后发出不带 `willContinue: true` 的 `agent_end` 才真正上报完成，因此调度暂停、内建重试和 extension 续跑都不会误播完成动效。
+- **会上报 `session_switch` / `session_branch`，并为被离开的会话补发合成 `SessionEnd`。** OMP 可以把交互式终端切到另一段对话而旧会话没有任何 shutdown，否则 HUD 会留下一条再也不会更新的事件行。
+- **始终发送 `session_title`。** 多个交互式 OMP 会话会合法地共用同一个工作目录，仅靠文件夹名回退会让每一行——以及每个跳转目标——显示成同一个名字。
+
+OMP 在 Clawd 中同样是 state-only 集成：Clawd 不接管权限、不新增确认弹窗，OMP 保持自身的执行行为。
+
+## Whale-chan（可选官方主题）
+
+Whale-chan（鲸鱼娘）不随 Clawd 内置，而是从 `rullerzhou-afk/clawd-themes` 按需下载（设置 → 主题 → 官方主题），需要 Clawd 1.2.0。它是外部 APNG 主题，特效已烘入动画，没有鼠标眼球跟随；逻辑状态与其他主题相同。
+
+| 状态 | Whale-chan 动画 |
+|---|---|
+| idle | 陪你发一会儿呆（站立呼吸） |
+| 鼠标静止 20 秒后的 idle 随机池 | 大家一起来合奏（指挥，光环淡入淡出后回到 idle） |
+| 默认 idle 造型选项 | 泡在泳池里偷个懒（只由设置选择，不进入随机池） |
+| thinking | 认真想一想 |
+| working（1 会话） | 今天也在努力呀 |
+| working（2 会话）/ juggling（子代理） | 发现电饭煲啦 |
+| working（3 个以上会话） | 撑着小伞去踩水 |
+| attention / notification / error | 任务完成啦！/ 有件事要你确认哦 / 报错也要被接住 |
+| sweeping / carrying | 把尾巴擦得亮晶晶 / 泡在泳池里偷个懒 |
+| yawning → dozing → collapsing → sleeping → waking | 慢慢钻进纸箱里 → 在纸箱里轻轻呼吸 → 从纸箱飘进云朵 → 睡在软绵绵的云上 → 睡饱啦，回来陪你 |
+| DND 深睡 / 漫游 / 极简移动 | 乘着云朵进入深睡 / 搭上鲸鱼巴士去兜风 |
+| 拖拽 / 点击反应 | 被拎起来也要晃一晃 / 戳我干嘛，哼！ |
+| 极简入场 / idle | 从屏幕边探出头来 / 趴在屏幕边陪着你 |
+| 极简悬停探出 | 撑起身子看看你；鼠标停留时保持姿势（`mini-peek-hold`） |
+| 极简 working / alert / task complete | 认真干饭中 / 叮！有事找你 / 砰！做完啦 |
+| 极简入睡 / DND 睡眠 / 睡眠中悬停 | 闭着眼也来陪你 / 趴在屏幕边睡着了 / 睡着也撑起身子（`mini-sleep-peek`） |
+
+重新下载已卸载的主题会清除该主题的自定义修改与 Clawd 管理的音效覆盖。
+
 ## 极简模式
 
 拖到屏幕右边缘（或右键 →"极简模式"）进入——半身露出在屏幕边缘，悬停时探出来。
