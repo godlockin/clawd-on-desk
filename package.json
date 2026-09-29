@@ -1,6 +1,6 @@
 {
   "name": "clawd-on-desk",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A desktop pet that reacts to your Claude Code sessions in real-time.",
   "main": "src/main.js",
   "scripts": {
@@ -19,9 +19,11 @@
     "postinstall": "node scripts/verify-electron-install.js --context postinstall",
     "test": "node test/run-tests.js",
     "audit:assets": "node scripts/audit-repository-assets.js",
+    "audit:pr-history-assets": "node scripts/audit-pr-history-assets.js",
     "audit:native-package": "node scripts/audit-packaged-native.js",
     "verify:updater-metadata": "node scripts/verify-updater-metadata.js",
     "verify:winget-arch": "node scripts/verify-winget-arch-contract.js",
+    "verify:winget-manifest": "node scripts/verify-winget-generated-manifest.js",
     "verify:release": "node scripts/verify-release-version.js && node scripts/verify-release-contributors.js",
     "create-theme": "node scripts/create-theme.js",
     "export-agent-icons": "node scripts/export-agent-icons.js",
@@ -39,6 +41,8 @@
     "uninstall:codewhale-hooks": "node hooks/codewhale-install.js --uninstall",
     "install:pi-extension": "node hooks/pi-install.js",
     "uninstall:pi-extension": "node hooks/pi-install.js --uninstall",
+    "install:omp-extension": "node hooks/omp-install.js",
+    "uninstall:omp-extension": "node hooks/omp-install.js --uninstall",
     "install:openclaw-plugin": "node hooks/openclaw-install.js",
     "uninstall:openclaw-plugin": "node hooks/openclaw-install.js --uninstall",
     "install:mimocode-plugin": "node hooks/mimocode-install.js",
@@ -61,6 +65,10 @@
     "uninstall:traecode-hooks": "node hooks/traecode-install.js --uninstall",
     "install:workbuddy-hooks": "node hooks/workbuddy-install.js",
     "uninstall:workbuddy-hooks": "node hooks/workbuddy-install.js --uninstall",
+    "install:grok-hooks": "node hooks/grok-install.js",
+    "uninstall:grok-hooks": "node hooks/grok-install.js --uninstall",
+    "install:minimax-hooks": "node hooks/minimax-install.js",
+    "uninstall:minimax-hooks": "node hooks/minimax-install.js --uninstall",
     "install:dsh": "node hooks/dsh-install.js",
     "uninstall:dsh": "node hooks/dsh-install.js --uninstall",
     "cleanup:integrations": "node hooks/cleanup-integrations.js --apply",
@@ -200,7 +208,8 @@
   "devDependencies": {
     "@electron/asar": "^3.4.1",
     "electron": "^41.10.4",
-    "electron-builder": "^26.15.7"
+    "electron-builder": "^26.15.7",
+    "js-yaml": "^4.1.0"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",
@@ -209,6 +218,7 @@
     "jsonc-parser": "^3.3.1",
     "koffi": "2.16.3",
     "markdown-it": "15.0.0",
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "yauzl": "^2.10.0"
   }
 }

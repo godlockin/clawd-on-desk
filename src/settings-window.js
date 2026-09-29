@@ -82,6 +82,7 @@ function createSettingsWindowRuntime(options = {}) {
   const path = options.path || defaultPath;
   const platform = options.platform || process.platform;
   const isWin = options.isWin != null ? !!options.isWin : platform === "win32";
+  const isMac = options.isMac != null ? !!options.isMac : platform === "darwin";
   const resourcesPath = options.resourcesPath || process.resourcesPath;
   const execPath = options.execPath || process.execPath;
   const appDir = options.appDir || path.join(__dirname, "..");
@@ -444,6 +445,10 @@ function createSettingsWindowRuntime(options = {}) {
       maximizable: true,
       skipTaskbar: false,
       alwaysOnTop: false,
+      // macOS: the pet app mostly lives in the background, so the first click
+      // on the inactive Settings window must reach the page instead of only
+      // activating the window — same treatment the permission prompts get.
+      ...(isMac ? { acceptFirstMouse: true } : {}),
       title: getTitle(),
       // Match settings.html's dark-mode palette to avoid a white flash before
       // CSS media query kicks in. Hex values must stay in sync with the
