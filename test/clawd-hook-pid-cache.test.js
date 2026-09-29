@@ -526,6 +526,19 @@ describe("clawd-hook end-to-end with the real resolver — non-Windows", () => {
       assert.ok(!JSON.stringify(body).includes("--print"));
     });
 
+    // A node process that never set process.title is not "node" to Linux
+    // `ps -o comm=` on Node 23.8+: it is listed under its main thread's name,
+    // MainThread (node-MainThread from 25.5).
+    for (const comm of ["MainThread", "node-MainThread"]) {
+      it(`finds a node-hosted install that Linux lists as ${comm}`, () => {
+        asHeadlessClaude();
+        env.state.psComm = comm;
+        const body = env.buildStateBody("PreToolUse", { session_id: freshSid(), cwd: CWD }, env.makeResolve());
+        assert.ok(body.agent_pid, "the command-line check must run for Node's main-thread name");
+        assert.strictEqual(body.headless, true);
+      });
+    }
+
     // The fixtures above model a node-hosted install (`comm=` → node, so the
     // walk matches via agentCmdlineCheck). A native-binary install — the macOS
     // default now — takes a DIFFERENT branch: `comm=` basename is `claude`, so
