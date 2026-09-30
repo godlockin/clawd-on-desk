@@ -352,8 +352,516 @@ function unregisterJsonc({ cfg, agentId, configPath, pluginDir, options = {} }) 
   return result;
 }
 
+// ===========================================================================
+// #1026 managed-generation path (managedMaterialization:true members only).
+//
+// The legacy registerJsonc/unregisterJsonc above keep their broad-basename
+// ownership for MiMo. The functions below are the hardened planner used by
+// OpenCode: shared entry classifier, verified tuple support, duplicate
+// convergence, fail-closed ambiguous handling, masked-lower cleanup and a
+// pre-write recheck for the single missing legacy candidate.
+// ===========================================================================
+
+const managedGeneration = require("./opencode-family-managed-generation");
+const entryOwnership = require("./opencode-family-entry-ownership");
+
+function canonicalOf(value, platform, fsImpl) {
+  return managedGeneration.canonicalizeTargetPath(value, platform || process.platform, fsImpl || fs);
+}
+
+function isClawdLikeDir(dir, fsImpl) {
+  const fsy = fsImpl || fs;
+  try {
+    const source = fsy.readFileSync(path.join(dir, "index.mjs"), "utf8");
+    if (/createOpencodeFamilyPlugin|opencode-family-plugin\/core\.mjs/.test(source)) return true;
+  } catch {
+    // fall through to the sibling-probe below
+  }
+  try {
+    const sibling = path.join(path.dirname(dir), "opencode-family-plugin", "core.mjs");
+    fsy.statSync(sibling);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The nearest existing ancestor of a path must be enumerable, and on Windows
+// the volume root too. A path we cannot even enumerate is not provably absent
+// (#1026 §6.1 step 9), so callers must fail closed rather than assume. Only
+// ENOENT may be skipped while climbing; EACCES/EPERM/any other error is
+// indeterminate (climbing past it could silently reach a readable higher
+// ancestor and produce a false "absent").
+function nearestExistingAncestor(target, fsImpl) {
+  let cursor = path.resolve(target);
+  for (;;) {
+    try {
+      fsImpl.statSync(cursor);
+      return { ancestor: cursor, indeterminate: false, reason: null };
+    } catch (err) {
+      const code = err && err.code;
+      if (code && code !== "ENOENT") {
+        return { ancestor: null, indeterminate: true, reason: `ancestor-stat-${code}` };
+      }
+      if (!code) return { ancestor: null, indeterminate: true, reason: "ancestor-stat-unknown" };
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return { ancestor: null, indeterminate: true, reason: "no-existing-ancestor" };
+      cursor = parent;
+    }
+  }
+}
+
+function missingPathStillAbsent(specifier, options = {}) {
+  const fsImpl = options.fs || fs;
+  const platform = options.platform || process.platform;
+  try {
+    fsImpl.statSync(specifier);
+    return { absent: false, reason: "path-reappeared" };
+  } catch (err) {
+    if (err && err.code !== "ENOENT") return { absent: false, reason: `indeterminate:${err.code || err.message}` };
+  }
+  const lookup = nearestExistingAncestor(specifier, fsImpl);
+  if (lookup.indeterminate) return { absent: false, reason: lookup.reason || "ancestor-indeterminate" };
+  const ancestor = lookup.ancestor;
+  try {
+    fsImpl.readdirSync(ancestor);
+  } catch (err) {
+    return { absent: false, reason: `ancestor-unreadable:${err && err.code}` };
+  }
+  if (platform === "win32") {
+    const parsed = path.win32.parse(specifier);
+    const root = parsed.root;
+    if (root) {
+      try {
+        fsImpl.readdirSync(root);
+      } catch (err) {
+        return { absent: false, reason: `volume-root-unreadable:${err && err.code}` };
+      }
+    }
+  }
+  return { absent: true };
+}
+
+function buildManagedContext({ cfg, target, expectedCanonicalDir, expectedGeneration, sourceFiles, ownerRecord, fsImpl, platform, managedBoundary }) {
+  const fsy = fsImpl || fs;
+  const plat = platform || process.platform;
+  const known = new Set();
+  if (ownerRecord && Array.isArray(ownerRecord.knownRegisteredPaths)) {
+    for (const value of ownerRecord.knownRegisteredPaths) {
+      const canonical = canonicalOf(value, plat, fsy);
+      if (canonical) known.add(canonical);
+    }
+  }
+  return {
+    fs: fsy,
+    platform: plat,
+    pluginDirName: cfg.pluginDirName,
+    expectedCanonicalDir: expectedCanonicalDir || null,
+    targetRoot: managedBoundary ? canonicalOf(target.targetRoot, plat, fsy) : null,
+    sourcePluginDir: null,
+    knownRegisteredPaths: known,
+    canonicalize: (value) => canonicalOf(value, plat, fsy),
+    canonicalizeStrict: (value) => managedGeneration.canonicalizeTargetPathStrict(value, plat, fsy),
+    exists: (value) => {
+      try { fsy.statSync(value); return true; } catch { return false; }
+    },
+    probeIndeterminate: (value) => {
+      try {
+        fsy.statSync(value);
+        return false;
+      } catch (err) {
+        if (err && err.code === "ENOENT") return false;
+        return true;
+      }
+    },
+    inspectExpectedGeneration: () => (typeof expectedGeneration === "function" ? expectedGeneration() : { ok: true }),
+    inspectManagedBoundary: (value) => {
+      const abs = path.resolve(value);
+      const base = path.posix.basename(abs.replace(/\\/g, "/"));
+      if (base !== cfg.pluginDirName) return { state: "corrupt", reason: "boundary-plugin-name" };
+      const genDir = path.dirname(abs);
+      const gensDir = path.dirname(genDir);
+      if (managedBoundary && canonicalOf(gensDir, plat, fsy) !== canonicalOf(target.generationsDir, plat, fsy)) {
+        return { state: "corrupt", reason: "boundary-outside-generations" };
+      }
+      const inspected = managedGeneration.inspectGeneration(genDir, cfg, target.agentId, { fs: fsy });
+      if (!inspected.ok) return { state: "corrupt", reason: inspected.reason };
+      if (!managedBoundary) {
+        // configPath-only / override: still require the layout's own target
+        // owner record (same identity rule the plugin inert gate uses) rather
+        // than trusting a bare manifest.
+        const agentHome = path.dirname(gensDir);
+        const ownerPath = path.join(agentHome, "owner.json");
+        let owner = null;
+        try {
+          const text = fsy.readFileSync(ownerPath, "utf8");
+          owner = JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+        } catch {
+          return { state: "corrupt", reason: "boundary-owner-record-missing" };
+        }
+        // Shared owner-shape contract (literal/agent/history/source pairing
+        // includes the expected <root>/<pluginDirName>/index.mjs marker).
+        const shape = managedGeneration.validateOwnerShape(owner, {
+          agentId: target.agentId,
+          pluginDirName: cfg.pluginDirName,
+          fs: fsy,
+          platform: plat,
+        });
+        if (!shape.ok) return { state: "corrupt", reason: `boundary-owner-${shape.reason}` };
+        const expectedHash = path.basename(agentHome).toLowerCase();
+        if (typeof owner.configDirHash !== "string" || owner.configDirHash.toLowerCase() !== expectedHash) {
+          return { state: "corrupt", reason: "boundary-owner-hash-mismatch" };
+        }
+      }
+      return { state: "owned" };
+    },
+    bundleBytesMatch: (value) => (
+      Array.isArray(sourceFiles) && sourceFiles.length
+        ? managedGeneration.bundleBytesMatch(value, cfg, sourceFiles, fsy)
+        : false
+    ),
+    isClawdLike: (value) => isClawdLikeDir(value, fsy),
+  };
+}
+
+function candidateHasPluginArray(state) {
+  return !!state && state.exists && isObjectRoot(state.tree) && Array.isArray(state.tree.plugin);
+}
+
+function selectEffective(states) {
+  return states.find(declaresPlugin) || states.find((state) => state.exists) || null;
+}
+
+// Replace ONLY the specifier. For a tuple (`[specifier, options]`) this edits
+// element 0 and leaves element 1 value-for-value intact. Passing the whole
+// `[canonical, options]` array here would nest the tuple (#1026 r1 P0).
+function applyReplace(text, index, specifier, isTuple) {
+  const editPath = isTuple ? ["plugin", index, 0] : ["plugin", index];
+  return applyEdits(text, modify(text, editPath, specifier, formattingFor(text)));
+}
+
+function applyAppend(text, value) {
+  return applyEdits(text, modify(text, ["plugin", -1], value, { ...formattingFor(text), isArrayInsertion: true }));
+}
+
+// Read-only pre-scan used by the installer before it takes the target lock.
+function inspectManagedRegister({ cfg, configPath, candidates, makeContext, canonicalEntry, legacyMissingRecheck }) {
+  const states = candidates;
+  const effective = selectEffective(states);
+  const perFile = [];
+  const warnings = [];
+  let needsReview = null;
+  let needsMutation = false;
+
+  for (const state of states) {
+    const isEffective = state === effective;
+    if (!candidateHasPluginArray(state)) {
+      if (isEffective) needsMutation = true; // effective is absent / non-array → (re)write
+      continue;
+    }
+    const ctx = makeContext(state.path);
+    const classification = entryOwnership.classifyPluginEntries(state.tree.plugin, ctx);
+    perFile.push({ path: state.path, isEffective, classification });
+
+    if (isEffective) {
+      const plan = entryOwnership.planEffectiveArray(state.tree.plugin, ctx, { canonicalEntry, configPath: state.path });
+      if (plan.action === "needs-review" || plan.action === "ownership-conflict") {
+        needsReview = plan;
+      } else if (plan.action !== "noop") {
+        needsMutation = true;
+      }
+      const pending = classification.entries.some((entry) => entry.category === "canonical-current" && entry.generationPending);
+      if (pending) needsMutation = true;
+    } else {
+      const plan = entryOwnership.planUnregisterArray(state.tree.plugin, ctx, {});
+      if (plan.remove.length) needsMutation = true;
+      for (const entry of plan.failClosed) {
+        warnings.push(`masked ${entry.category} entry at ${state.path}[${entry.index}] retained (${JSON.stringify(entry.rawEntry)})`);
+      }
+    }
+  }
+
+  if (!effective) needsMutation = true; // create the default file fresh
+  return { effective, perFile, warnings, needsReview, needsMutation };
+}
+
+// Write the config changes. MUST run inside the target lock, after the
+// generation has been materialized (unless options.pluginDir override).
+//
+// The COMPLETE plan (masked-lower cleanups + effective edit) is validated
+// BEFORE any file is written, so an ownership/conflict failure can never be
+// reported after a destructive partial write.
+function applyManagedRegister({ cfg, configPath, candidates, makeContext, canonicalEntry, options = {}, tupleContractVerified = false }) {
+  const fsImpl = options.fs || fs;
+  const states = candidates;
+  const effective = selectEffective(states);
+  const warnings = [];
+
+  // ---- Plan phase (zero mutation) ----
+  const lowerEdits = [];
+  for (const state of states) {
+    if (state === effective || !candidateHasPluginArray(state)) continue;
+    const ctx = makeContext(state.path);
+    const plan = entryOwnership.planUnregisterArray(state.tree.plugin, ctx, {});
+    if (plan.remove.length) lowerEdits.push({ state, remove: plan.remove });
+    for (const entry of plan.failClosed) {
+      warnings.push(`masked ${entry.category} entry at ${state.path}[${entry.index}] retained (${JSON.stringify(entry.rawEntry)})`);
+    }
+  }
+
+  let effectiveEdit;
+  let legacyLiterals = [];
+  if (!effective) {
+    effectiveEdit = { kind: "create" };
+  } else if (!isObjectRoot(effective.tree)) {
+    effectiveEdit = { kind: "rewrite-object" };
+  } else if (!Array.isArray(effective.tree.plugin)) {
+    effectiveEdit = { kind: "rewrite-plugin" };
+  } else {
+    const ctx = makeContext(effective.path);
+    const classification = entryOwnership.classifyPluginEntries(effective.tree.plugin, ctx);
+    legacyLiterals = classification.entries
+      .filter((entry) => entry.category === "legacy-missing-candidate")
+      .map((entry) => entry.rawEntry);
+    const plan = entryOwnership.planEffectiveArray(effective.tree.plugin, ctx, {
+      canonicalEntry,
+      configPath: effective.path,
+      tupleContractVerified,
+    });
+    if (plan.action === "needs-review" || plan.action === "ownership-conflict") {
+      return {
+        status: "error",
+        reason: plan.reason,
+        message: `refusing to edit ${effective.path}: ${plan.reason}`,
+        mutatedPaths: [],
+        pendingPaths: [],
+        warnings,
+        plan,
+      };
+    }
+    effectiveEdit = { kind: plan.action, plan };
+  }
+
+  const pendingPaths = [
+    ...lowerEdits.map((edit) => edit.state.path),
+    ...(effective ? [effective.path] : [configPath]),
+  ];
+
+  // Recheck every legacy-missing candidate across ALL files immediately before
+  // ANY write. A path that reappeared or cannot be proven absent aborts with
+  // zero config mutation.
+  for (const state of states) {
+    if (!candidateHasPluginArray(state)) continue;
+    const ctx = makeContext(state.path);
+    const classification = entryOwnership.classifyPluginEntries(state.tree.plugin, ctx);
+    for (const entry of classification.entries) {
+      if (entry.category !== "legacy-missing-candidate") continue;
+      const check = missingPathStillAbsent(entry.specifier, { fs: fsImpl, platform: options.platform });
+      if (!check.absent) {
+        return {
+          status: "error",
+          reason: "legacy-missing-candidate-unconfirmable",
+          message: `refusing to edit ${state.path}: ${entry.specifier} is no longer provably absent (${check.reason})`,
+          mutatedPaths: [],
+          pendingPaths,
+          warnings,
+        };
+      }
+    }
+  }
+
+  // ---- Execute phase: masked lower files first, effective last ----
+  const mutatedPaths = [];
+  let added = false;
+  let created = false;
+  try {
+    for (const edit of lowerEdits) {
+      const nextText = removeEntriesFromText(edit.state.text, edit.remove);
+      writeTextAtomic(edit.state.path, nextText, { mode: fileMode(edit.state.path) });
+      mutatedPaths.push(edit.state.path);
+    }
+    if (effectiveEdit.kind === "create") {
+      writeTextAtomic(configPath, freshConfigText(cfg, canonicalEntry));
+      mutatedPaths.push(configPath);
+      added = true;
+      created = true;
+    } else if (effectiveEdit.kind === "rewrite-object") {
+      writeTextAtomic(effective.path, freshConfigText(cfg, canonicalEntry), { mode: fileMode(effective.path) });
+      mutatedPaths.push(effective.path);
+      added = true;
+    } else if (effectiveEdit.kind === "rewrite-plugin") {
+      const text = applyEdits(effective.text, modify(effective.text, ["plugin"], [canonicalEntry], formattingFor(effective.text)));
+      writeTextAtomic(effective.path, text, { mode: fileMode(effective.path) });
+      mutatedPaths.push(effective.path);
+      added = true;
+    } else if (effectiveEdit.kind === "append") {
+      const text = applyAppend(effective.text, canonicalEntry);
+      writeTextAtomic(effective.path, text, { mode: fileMode(effective.path) });
+      mutatedPaths.push(effective.path);
+      added = true;
+    } else if (effectiveEdit.kind === "edit") {
+      let text = effective.text;
+      for (const replace of effectiveEdit.plan.replace) {
+        text = applyReplace(text, replace.index, replace.specifier, replace.tuple);
+      }
+      if (effectiveEdit.plan.remove.length) text = removeEntriesFromText(text, effectiveEdit.plan.remove);
+      writeTextAtomic(effective.path, text, { mode: fileMode(effective.path) });
+      mutatedPaths.push(effective.path);
+      added = true;
+    }
+  } catch (err) {
+    return {
+      status: "error",
+      reason: "config-write-failed",
+      message: err && err.message ? err.message : "failed to write opencode config",
+      mutatedPaths,
+      pendingPaths: pendingPaths.filter((p) => !mutatedPaths.includes(p)),
+      warnings,
+    };
+  }
+
+  return { status: "ok", added, created, mutatedPaths, pendingPaths: [], warnings, legacyLiterals };
+}
+
+// Read-only unregister scan. Returns the effective view plus whether any
+// proven-owned entry remains removable and whether an active fail-closed entry
+// is present. Callers MUST derive `registrationRemoved` from this, never from
+// "we attempted a sweep".
+function inspectManagedUnregister({ candidates, makeContext }) {
+  const states = candidates;
+  const effective = selectEffective(states);
+  const warnings = [];
+  const failClosedActive = [];
+  let hasRemovable = false;
+  let activeEntryRemaining = false;
+
+  for (const state of states) {
+    if (!candidateHasPluginArray(state)) continue;
+    const ctx = makeContext(state.path);
+    const plan = entryOwnership.planUnregisterArray(state.tree.plugin, ctx, {});
+    if (plan.remove.length) hasRemovable = true;
+    if (state === effective) {
+      activeEntryRemaining = plan.retained.some((entry) => entry.category !== "foreign");
+      for (const entry of plan.failClosed) failClosedActive.push({ path: state.path, entry });
+    } else {
+      for (const entry of plan.failClosed) {
+        warnings.push(`masked ${entry.category} entry at ${state.path}[${entry.index}] retained (${JSON.stringify(entry.rawEntry)})`);
+      }
+    }
+  }
+
+  return { effective, hasRemovable, activeEntryRemaining, failClosedActive, warnings };
+}
+
+function verifyManagedRegisterPostcondition({ cfg, configPath, makeContext, legacyLiterals = [] }) {
+  const states = readCandidates(cfg, configPath);
+  const effective = selectEffective(states);
+  if (!effective || !candidateHasPluginArray(effective)) {
+    return { ok: false, reason: "no-effective-plugin-array" };
+  }
+  const classification = entryOwnership.classifyPluginEntries(effective.tree.plugin, makeContext(effective.path));
+  const canonicalCount = classification.entries.filter((entry) => entry.category === "canonical-current").length;
+  if (canonicalCount !== 1) return { ok: false, reason: `canonical-entry-count-${canonicalCount}` };
+  if (classification.entries.some((entry) => entryOwnership.FAIL_CLOSED_CATEGORIES.has(entry.category))) {
+    return { ok: false, reason: "fail-closed-entry-remains" };
+  }
+  for (const literal of legacyLiterals) {
+    if (classification.entries.some((entry) => entry.rawEntry === literal)) {
+      return { ok: false, reason: "legacy-missing-literal-remains" };
+    }
+  }
+  return { ok: true };
+}
+
+// Sweep proven-owned entries from every candidate. Returns the post-sweep
+// effective view so the installer can decide about generation cleanup and
+// whether an active registration remains. Unregister also destroys entries, so
+// the legacy-missing absence recheck happens before any write here too.
+function applyManagedUnregister({ cfg, configPath, candidates, makeContext, options = {} }) {
+  const fsImpl = options.fs || fs;
+  const states = candidates;
+  const warnings = [];
+
+  for (const state of states) {
+    if (!candidateHasPluginArray(state)) continue;
+    const ctx = makeContext(state.path);
+    const classification = entryOwnership.classifyPluginEntries(state.tree.plugin, ctx);
+    for (const entry of classification.entries) {
+      if (entry.category !== "legacy-missing-candidate") continue;
+      const check = missingPathStillAbsent(entry.specifier, { fs: fsImpl, platform: options.platform });
+      if (!check.absent) {
+        return {
+          removed: 0,
+          changed: false,
+          mutatedPaths: [],
+          backupPaths: [],
+          warnings: [...warnings, `refusing to sweep ${state.path}: ${entry.specifier} is no longer provably absent (${check.reason})`],
+          activeEntryRemaining: true,
+          effectivePath: configPath,
+          error: { reason: "legacy-missing-candidate-unconfirmable", configPath: state.path, specifier: entry.specifier },
+        };
+      }
+    }
+  }
+
+  let removed = 0;
+  const mutatedPaths = [];
+  const backupPaths = [];
+  for (const state of states) {
+    if (!candidateHasPluginArray(state)) continue;
+    const ctx = makeContext(state.path);
+    const plan = entryOwnership.planUnregisterArray(state.tree.plugin, ctx, {});
+    if (!plan.remove.length) continue;
+    const text = removeEntriesFromText(state.text, plan.remove);
+    const backupPath = writeTextAtomicWithBackup(state.path, text, { ...options, mode: fileMode(state.path) });
+    if (backupPath) backupPaths.push(backupPath);
+    mutatedPaths.push(state.path);
+    removed += plan.remove.length;
+  }
+
+  const reread = readCandidates(cfg, configPath);
+  const effective = selectEffective(reread);
+  let activeEntryRemaining = null;
+  const failClosedActive = [];
+  if (effective && candidateHasPluginArray(effective)) {
+    const classification = entryOwnership.classifyPluginEntries(effective.tree.plugin, makeContext(effective.path));
+    activeEntryRemaining = classification.entries.some((entry) => entry.category !== "foreign");
+    for (const entry of classification.entries) {
+      if (entryOwnership.FAIL_CLOSED_CATEGORIES.has(entry.category)) {
+        failClosedActive.push({ path: effective.path, entry });
+        warnings.push(`active ${entry.category} entry retained at ${effective.path}[${entry.index}] (${JSON.stringify(entry.rawEntry)})`);
+      }
+    }
+  } else {
+    activeEntryRemaining = false;
+  }
+
+  return {
+    removed,
+    changed: removed > 0,
+    mutatedPaths,
+    backupPaths,
+    warnings,
+    activeEntryRemaining,
+    failClosedActive,
+    effectivePath: effective ? effective.path : configPath,
+  };
+}
+
 module.exports = {
   registerJsonc,
   unregisterJsonc,
-  __test: { parseJsoncStrict, findManagedIndex, entryIsExactManagedPlugin, isManagedEntry, freshConfigText, candidatePaths, removeEntriesFromText },
+  readCandidates,
+  inspectManagedRegister,
+  inspectManagedUnregister,
+  applyManagedRegister,
+  verifyManagedRegisterPostcondition,
+  applyManagedUnregister,
+  buildManagedContext,
+  missingPathStillAbsent,
+  isClawdLikeDir,
+  __test: {
+    parseJsoncStrict, findManagedIndex, entryIsExactManagedPlugin, isManagedEntry,
+    freshConfigText, candidatePaths, removeEntriesFromText, nearestExistingAncestor,
+  },
 };

@@ -36,6 +36,7 @@ The included package assets are:
 - `hermesagent.png`
 - `kimi-color.png` (archived source candidate)
 - `kiro-color.png`
+- `minimax-color.png`
 - `xiaomimimo.png`
 - `openclaw-color.png`
 - `opencode.png`
