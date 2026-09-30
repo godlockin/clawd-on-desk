@@ -42,6 +42,9 @@ function resolveCodexSessionDir(options = {}) {
 }
 const POLL_INTERVAL_MS = 1500;
 const STALE_MS = 300000;
+const BACKFILL_GRACE_MS = 5 * 1000;
+const REPLAY_LINE_GRACE_MS = 1500;
+const SUSTAINED_ACTIVE_STATES = new Set(["thinking", "working"]);
 const DELIVERY_FAILURE_EXIT_MS = 24 * 60 * 60 * 1000;
 const MAX_PARTIAL_BYTES = 65536;
 const MAX_POLL_READ_BYTES = 4 * 1024 * 1024;
@@ -130,11 +133,15 @@ function recoverySnapshotStatus(before, after) {
   return "stable";
 }
 
-function emitRecoveredPendingUserInputs(entry, options = {}) {
+function emitRecoveredPendingUserInputs(entry, filePath, options = {}) {
   if (!entry || entry.isSubagent) return;
+  if (hasNewerSiblingRollout(filePath, entry.sessionId.slice("codex:".length))) {
+    entry.pendingUserInputs.clear();
+    return;
+  }
   const postStateFn = typeof options.postState === "function" ? options.postState : postState;
   for (const request of entry.pendingUserInputs.values()) {
-    postStateFn(entry.sessionId, "notification", "CodexUserInputRequest", entry.cwd, false, {
+    sendTrackedState(entry, postStateFn, "notification", "CodexUserInputRequest", entry.cwd, false, {
       codexUserInput: request,
     });
   }
@@ -175,6 +182,7 @@ const replayWork = new Map();
 const deferredRecent = new Map();
 const deferredBackground = new Map();
 let pollCursor = 0;
+let monitorStartedAtMs = Date.now();
 // One-shot startup recovery can span bounded poll slices while its path cursor
 // checks files outside the 2-minute active window for a still-unresolved
 // request_user_input. Once complete, later polls use the cheap mtime-only gate.
@@ -184,6 +192,12 @@ let startupRecoveryWalker = null;
 let startupRecoveryReady = false;
 let startupRecoveryFilesScanned = 0;
 let startupRecoveryBytesScanned = 0;
+
+function setSessionStale(sessionId, stale) {
+  for (const sibling of tracked.values()) {
+    if (sibling.sessionId === sessionId) sibling.stale = stale;
+  }
+}
 
 // ── Core polling logic (mirrors agents/codex-log-monitor.js) ──
 
@@ -203,9 +217,19 @@ function getSessionDirs() {
 }
 
 function extractSessionId(fileName) {
-  // rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl
-  const base = fileName.replace(".jsonl", "");
-  const parts = base.split("-");
+  // Codex Desktop can append the turn UUID to a rollout filename:
+  // rollout-<timestamp>-<thread UUID>_<turn UUID>.jsonl. Keep the parent
+  // thread as the session identity instead of creating one remote card per
+  // turn, matching the local monitor and official hook paths.
+  const base = String(fileName || "").replace(/\.jsonl$/i, "");
+  const uuid = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})";
+  const match = base.match(new RegExp(`${uuid}(?:_${uuid})?$`, "i"));
+  if (match) return match[1];
+
+  // Preserve the historical permissive fallback for older/custom rollouts,
+  // but never let a UUID-shaped turn suffix become part of the session id.
+  const withoutTurnSuffix = base.replace(new RegExp(`_${uuid}$`, "i"), "");
+  const parts = withoutTurnSuffix.split("-");
   if (parts.length < 10) return null;
   return parts.slice(-5).join("-");
 }
@@ -242,11 +266,32 @@ function buildPostStateBody(sessionId, state, event, cwd, isSubagent, host, extr
 
 function postState(sessionId, state, event, cwd, isSubagent, extra = null) {
   const body = buildPostStateBody(sessionId, state, event, cwd, isSubagent, undefined, extra);
-  postStateToRunningServer(
-    body,
-    { timeoutMs: 100, preferredPort, remote: true },
-    (ok) => deliveryWatchdog.record(ok)
-  );
+  return new Promise((resolve) => {
+    postStateToRunningServer(
+      body,
+      { timeoutMs: 100, preferredPort, remote: true },
+      (ok) => {
+        deliveryWatchdog.record(ok);
+        resolve(ok);
+      }
+    );
+  });
+}
+
+function sendTrackedState(entry, postStateFn, state, event, cwd, isSubagent, extra = null) {
+  const delivery = postStateFn(entry.sessionId, state, event, cwd, isSubagent, extra);
+  if (delivery && typeof delivery.then === "function") {
+    entry.deliveryPending = (entry.deliveryPending || 0) + 1;
+    Promise.resolve(delivery).then((ok) => {
+      if (ok === true) entry.reported = true;
+      entry.deliveryPending -= 1;
+    }, () => {
+      entry.deliveryPending -= 1;
+    });
+  } else if (delivery !== false) {
+    // Synchronous test transports treat a non-false return as delivery.
+    entry.reported = true;
+  }
 }
 
 // Subscription quota is telemetry, not lifecycle: it goes out as a
@@ -330,9 +375,9 @@ function processLine(line, entry, options = {}) {
       // "sleeping" by the very next cleanStaleFiles() poll (#707 follow-up).
       entry.lastEventTime = Date.now();
       entry.lastState = "notification";
-      entry.stale = false;
       if (!entry.isSubagent && !entry.initializing) {
-        postStateFn(entry.sessionId, "notification", "CodexUserInputRequest", entry.cwd, false, {
+        setSessionStale(entry.sessionId, false);
+        sendTrackedState(entry, postStateFn, "notification", "CodexUserInputRequest", entry.cwd, false, {
           codexUserInput: userInputRecord,
         });
       }
@@ -342,13 +387,25 @@ function processLine(line, entry, options = {}) {
     entry.pendingUserInputs.delete(userInputRecord.callId);
     entry.lastEventTime = Date.now();
     entry.lastState = "idle";
-    entry.stale = false;
     if (!entry.isSubagent && !entry.initializing) {
-      postStateFn(entry.sessionId, "idle", "CodexUserInputResolved", entry.cwd, false, {
+      setSessionStale(entry.sessionId, false);
+      sendTrackedState(entry, postStateFn, "idle", "CodexUserInputResolved", entry.cwd, false, {
         codexUserInput: userInputRecord,
       });
     }
     return;
+  }
+
+  // Replay protection is two-layered, matching the local JSONL monitor:
+  // backfill mode silently derives a snapshot for pre-existing files, while
+  // this timestamp gate drops old records from a recently-touched file.
+  if (typeof obj.timestamp === "string") {
+    const occurredAt = Date.parse(obj.timestamp);
+    if (
+      !entry.backfilling
+      && Number.isFinite(occurredAt)
+      && occurredAt < monitorStartedAtMs - REPLAY_LINE_GRACE_MS
+    ) return;
   }
 
   const assistantText = extractAssistantTextFromRecord(obj);
@@ -383,6 +440,7 @@ function processLine(line, entry, options = {}) {
   const state = LOG_EVENT_MAP[key];
   if (state === undefined || state === null) return;
   const finalState = entry.isSubagent && state === "attention" ? "idle" : state;
+  entry.lastStateEvent = key;
   if (key === "event_msg:task_started") {
     entry.assistantLastOutput = null;
     entry.assistantLastOutputTruncated = false;
@@ -396,9 +454,6 @@ function processLine(line, entry, options = {}) {
   if (finalState === entry.lastState && finalState === "working" && !entry.stale) return;
   entry.lastState = finalState;
   entry.lastEventTime = Date.now();
-  // A real event re-activates the session, so a later idle window re-arms the
-  // one-shot "sleeping" post in cleanStaleFiles.
-  entry.stale = false;
 
   const postStateFn = typeof options.postState === "function" ? options.postState : postState;
 
@@ -414,12 +469,21 @@ function processLine(line, entry, options = {}) {
     entry.pendingUserInputs.clear();
     if (!entry.isSubagent && !entry.initializing) {
       for (const callId of abandonedCallIds) {
-        postStateFn(entry.sessionId, "idle", "CodexUserInputResolved", entry.cwd, false, {
+        sendTrackedState(entry, postStateFn, "idle", "CodexUserInputResolved", entry.cwd, false, {
           codexUserInput: { phase: "resolved", callId },
         });
       }
     }
   }
+
+  // A pre-existing file is replayed only to reconstruct its current durable
+  // state. One-shot history (especially task_complete) must never be emitted
+  // into the shared thread session during monitor restart.
+  if (entry.backfilling) return;
+
+  // A real visible event re-activates the entire shared thread, not merely
+  // the rollout file that happened to carry it.
+  setSessionStale(entry.sessionId, false);
 
   const extra = key === "event_msg:task_complete" && entry.assistantLastOutput
     ? {
@@ -427,7 +491,7 @@ function processLine(line, entry, options = {}) {
       assistantLastOutputTruncated: entry.assistantLastOutputTruncated === true,
     }
     : null;
-  postStateFn(entry.sessionId, finalState, key, entry.cwd, entry.isSubagent, extra);
+  sendTrackedState(entry, postStateFn, finalState, key, entry.cwd, entry.isSubagent, extra);
 }
 
 // Cheap, standalone pass over an otherwise-ignored file's own
@@ -660,15 +724,17 @@ function recoverStalePendingUserInputEntry(filePath, fileName, options = {}) {
     isSubagent,
     lastEventTime: Date.now(),
     lastState: "notification",
+    lastStateEvent: "CodexUserInputRequest",
     assistantLastOutput: null,
     assistantLastOutputTruncated: false,
     codexQuotaProviderHint: null,
     pendingUserInputs: pending,
     initializing: false,
+    backfilling: false,
     stale: false,
   };
 
-  if (options.deferEmit !== true) emitRecoveredPendingUserInputs(entry, options);
+  if (options.deferEmit !== true) emitRecoveredPendingUserInputs(entry, filePath, options);
   return entry;
 }
 
@@ -701,12 +767,17 @@ function pollFile(filePath, fileName, options = {}) {
       isSubagent: false,
       lastEventTime: Date.now(),
       lastState: null,
+      lastStateEvent: null,
       assistantLastOutput: null,
       assistantLastOutputTruncated: false,
       codexQuotaProviderHint: null,
       pendingUserInputs: new Map(),
       initializing: true,
+      backfilling:
+        stat.size > 0
+        && stat.mtimeMs < monitorStartedAtMs - BACKFILL_GRACE_MS,
       stale: false,
+      reported: false,
     };
     if (!admitRemoteReplay(filePath, fileName, entry, stat)) {
       return { kind: "deferred", requestedBytes: 0, bytesRead: 0 };
@@ -736,6 +807,9 @@ function pollFile(filePath, fileName, options = {}) {
     if (entry.pendingUserInputs instanceof Map) entry.pendingUserInputs.clear();
     entry.offset = 0;
     entry.initializing = true;
+    entry.backfilling =
+      stat.size > 0
+      && stat.mtimeMs < monitorStartedAtMs - BACKFILL_GRACE_MS;
     replayWork.delete(filePath);
     if (!admitRemoteReplay(filePath, fileName, entry, stat)) {
       tracked.delete(filePath);
@@ -934,6 +1008,7 @@ function markRemoteReplayNoProgress(filePath, entry, options = {}) {
   if (entry.pendingUserInputs instanceof Map) entry.pendingUserInputs.clear();
   entry.offset = item.lastValidatedSnapshotSize;
   entry.initializing = false;
+  entry.backfilling = false;
   entry.readBackoffUntil = now + backoffMs;
   entry.readBackoffLevel = retryLevel;
   replayWork.delete(filePath);
@@ -953,48 +1028,109 @@ function scheduleRemotePostBaselineReadBackoff(entry, options = {}) {
   return true;
 }
 
+// Rollout timestamps are the durable turn order. mtime is unsuitable here:
+// Desktop may touch an older rollout after a newer turn has completed. Check
+// files on disk too, since bounded polling may not have attached the newer
+// sibling yet. If discovery is uncertain, skip the speculative restore.
+function hasNewerSiblingRollout(filePath, sessionId) {
+  const name = path.basename(filePath);
+  const stamp = name.match(/^rollout-(\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d)-/);
+  if (!stamp) return true;
+  const dirs = new Set([path.dirname(filePath), ...getSessionDirs()]);
+  for (const dir of dirs) {
+    let names;
+    try { names = fs.readdirSync(dir); } catch (err) {
+      if (err && err.code === "ENOENT") continue;
+      return true;
+    }
+    for (const sibling of names) {
+      if (path.join(dir, sibling) === filePath || extractSessionId(sibling) !== sessionId) continue;
+      const siblingStamp = sibling.match(/^rollout-(\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d)-/);
+      if (!siblingStamp || siblingStamp[1] >= stamp[1]) return true;
+    }
+  }
+  return false;
+}
+
 function finalizeRemoteReplay(filePath, entry, options = {}) {
   if (!entry || !entry.initializing) {
     replayWork.delete(filePath);
     return;
   }
+  const wasBackfilling = entry.backfilling === true;
   entry.initializing = false;
+  entry.backfilling = false;
   const inWindow = options.inWindow !== false;
   if (!inWindow) {
     if (entry.pendingUserInputs instanceof Map) entry.pendingUserInputs.clear();
     replayWork.delete(filePath);
     return;
   }
+  const postStateFn = typeof options.postState === "function" ? options.postState : postState;
+  const hasRootPendingInput = !entry.isSubagent
+    && entry.pendingUserInputs instanceof Map
+    && entry.pendingUserInputs.size > 0;
+  const superseded = (hasRootPendingInput || (wasBackfilling && SUSTAINED_ACTIVE_STATES.has(entry.lastState)))
+    && hasNewerSiblingRollout(filePath, entry.sessionId.slice("codex:".length));
+  if (superseded && hasRootPendingInput) entry.pendingUserInputs.clear();
   if (!entry.isSubagent && entry.pendingUserInputs instanceof Map) {
-    const postStateFn = typeof options.postState === "function" ? options.postState : postState;
     for (const request of entry.pendingUserInputs.values()) {
-      postStateFn(entry.sessionId, "notification", "CodexUserInputRequest", entry.cwd, false, {
+      setSessionStale(entry.sessionId, false);
+      sendTrackedState(entry, postStateFn, "notification", "CodexUserInputRequest", entry.cwd, false, {
         codexUserInput: request,
       });
     }
   }
+  if (
+    wasBackfilling
+    && !hasRootPendingInput
+    && SUSTAINED_ACTIVE_STATES.has(entry.lastState)
+    && !superseded
+  ) {
+    setSessionStale(entry.sessionId, false);
+    sendTrackedState(
+      entry,
+      postStateFn,
+      entry.lastState,
+      entry.lastStateEvent || "session_meta",
+      entry.cwd,
+      entry.isSubagent
+    );
+  }
   replayWork.delete(filePath);
 }
 
-// Post a one-shot "sleeping" after a session goes idle, but KEEP the tracked
-// entry (and its byte offset). Deleting it used to drop the offset, so a later
-// resume of the same rollout file re-attached at offset 0 and re-read the whole
-// JSONL — re-emitting historical terminal events (task_complete) as fresh ones,
-// which double-fired completion notifications and dashboard state. Retaining the
-// offset means a resume only ever processes newly appended lines.
+// Post a one-shot "sleeping" per shared session, while KEEPING every tracked
+// file entry (and its byte offset). A Desktop thread can have several sibling
+// turn rollouts; an old sibling must not put a newer active sibling to sleep.
+// The session-wide stale latch also ensures the next working event bypasses
+// same-state dedup and wakes the shared card.
 function cleanStaleFiles(options = {}) {
   const now = typeof options.now === "function" ? options.now() : Date.now();
   const postStateFn = typeof options.postState === "function" ? options.postState : postState;
-  for (const [, entry] of tracked) {
-    // Initial replay can legitimately span minutes under the bounded 4 MiB /
-    // file and 16 MiB / poll budgets. Its lastEventTime describes attach or a
-    // staged historical record, not a committed live-idle interval. Publishing
-    // sleeping before replay reaches its snapshot EOF creates a false state
-    // transition that the initialization gate is meant to suppress.
-    if (entry.initializing) continue;
-    if (!entry.stale && now - entry.lastEventTime > STALE_MS) {
-      postStateFn(entry.sessionId, "sleeping", "stale-cleanup", entry.cwd, entry.isSubagent);
-      entry.stale = true;
+  const sessions = new Map();
+  for (const entry of tracked.values()) {
+    const group = sessions.get(entry.sessionId) || [];
+    group.push(entry);
+    sessions.set(entry.sessionId, group);
+  }
+  for (const [sessionId, entries] of sessions) {
+    // A bounded initial replay can span minutes. Until every sibling reaches
+    // its snapshot EOF, the session's real current state is unknown.
+    if (entries.some((entry) => entry.initializing)) continue;
+    if (entries.some((entry) => entry.deliveryPending > 0)) continue;
+    if (entries.some((entry) => entry.stale)) continue;
+    if (!entries.some((entry) => entry.reported)) {
+      setSessionStale(sessionId, true);
+      continue;
+    }
+    let latest = entries[0];
+    for (const entry of entries.slice(1)) {
+      if (entry.lastEventTime > latest.lastEventTime) latest = entry;
+    }
+    if (now - latest.lastEventTime > STALE_MS) {
+      setSessionStale(sessionId, true);
+      postStateFn(sessionId, "sleeping", "stale-cleanup", latest.cwd, latest.isSubagent);
     }
   }
 }
@@ -1044,7 +1180,7 @@ function runRecoverySweep(candidates, options = {}) {
     if (snapshotStatus === "missing" || snapshotStatus === "changed") continue;
     if (recovered) {
       tracked.set(candidate.filePath, recovered);
-      emitRecoveredPendingUserInputs(recovered, options);
+      emitRecoveredPendingUserInputs(recovered, candidate.filePath, options);
     }
   }
 }
@@ -1210,7 +1346,7 @@ function runReadyRemoteRecovery(context) {
     }
     if (recovered) {
       tracked.set(candidate.filePath, recovered);
-      emitRecoveredPendingUserInputs(recovered, recoveryOptions);
+      emitRecoveredPendingUserInputs(recovered, candidate.filePath, recoveryOptions);
     } else if (snapshotStatus === "grew") {
       pausedForAttempts = true;
       continue;
@@ -1353,7 +1489,7 @@ function main() {
   }
 }
 
-function resetMonitorStateForTests() {
+function resetMonitorStateForTests(options = {}) {
   tracked.clear();
   replayWork.clear();
   deferredRecent.clear();
@@ -1365,6 +1501,9 @@ function resetMonitorStateForTests() {
   pollCursor = 0;
   startupRecoveryFilesScanned = 0;
   startupRecoveryBytesScanned = 0;
+  monitorStartedAtMs = Number.isFinite(options.startedAtMs)
+    ? options.startedAtMs
+    : Date.now();
 }
 
 if (require.main === module) main();
@@ -1400,6 +1539,7 @@ module.exports.__test = {
   MAX_REPLAY_WORK_ITEMS,
   MAX_BACKGROUND_REPLAY_WORK_ITEMS,
   STALE_MS,
+  BACKFILL_GRACE_MS,
   DELIVERY_FAILURE_EXIT_MS,
   createDeliveryWatchdog,
 };
