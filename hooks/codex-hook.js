@@ -36,7 +36,9 @@ const {
   extractLastAssistantTextFromTranscript,
 } = require("./codex-assistant-output");
 const { readCodexThreadName } = require("./codex-session-index");
+const { isCodexMemoryWorkerPayload } = require("./codex-internal-worker");
 const {
+  CODEX_DEFAULT_SESSION_ID,
   isCodexCliOriginator,
   isCodexDesktopOriginator,
 } = require("./codex-originator");
@@ -148,8 +150,9 @@ function getCodexPermissionTimeoutMs() {
 function extractCodexSessionIdFromTranscriptPath(transcriptPath) {
   if (typeof transcriptPath !== "string" || !transcriptPath.trim()) return null;
   const fileName = path.basename(transcriptPath.replace(/\\/g, "/"));
+  const uuid = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})";
   const match = fileName.match(
-    /^rollout-.+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
+    new RegExp(`^rollout-.+-${uuid}(?:_${uuid})?\\.jsonl$`, "i")
   );
   return match ? match[1] : null;
 }
@@ -157,7 +160,7 @@ function extractCodexSessionIdFromTranscriptPath(transcriptPath) {
 function normalizeCodexSessionId(value, transcriptPath = "") {
   const transcriptSessionId = extractCodexSessionIdFromTranscriptPath(transcriptPath);
   const raw = transcriptSessionId
-    || (typeof value === "string" && value.trim() ? value.trim() : "default");
+    || (typeof value === "string" && value.trim() ? value.trim() : CODEX_DEFAULT_SESSION_ID);
   return raw.startsWith("codex:") ? raw : `codex:${raw}`;
 }
 
@@ -723,6 +726,19 @@ async function runCodexHook(payload, options = {}) {
         windowsProcessChain,
       });
     });
+  }
+
+  // Codex memory consolidation runs as an internal, ephemeral thread whose
+  // cwd is <CODEX_HOME>/memories(_v2). It has no transcript and upstream
+  // (openai/codex#40587) stops forwarding its Stop to user hooks, so a state
+  // event from it would open a "memories" ghost session that never ends. The
+  // payload carries no thread/session source, so cwd plus an empty transcript
+  // is the only identity available. Drop these state events entirely — no
+  // POST, no auto-start gate, no cold start. PermissionRequest is handled
+  // above and is deliberately not filtered: the worker's approval policy is
+  // Never, and a permission request must never be silently swallowed here.
+  if (isCodexMemoryWorkerPayload(payload, { env, platform })) {
+    return { body: null, posted: false, stdout: "" };
   }
 
   const postState = options.postState || postStateToRunningServer;
