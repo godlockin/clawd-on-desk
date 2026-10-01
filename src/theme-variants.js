@@ -16,7 +16,7 @@ const VARIANT_ALLOWED_KEYS = new Set([
   // Metadata (not merged into runtime theme)
   "name", "description", "preview",
   // Runtime fields
-  "workingTiers", "jugglingTiers", "idleAnimations",
+  "workingTiers", "jugglingTiers", "idleAnimations", "idleVisualOptions",
   "wideHitboxFiles", "sleepingHitboxFiles",
   "hitBoxes", "fileHitBoxes", "timings", "transitions",
   "objectScale", "displayHintMap",
@@ -25,7 +25,7 @@ const VARIANT_ALLOWED_KEYS = new Set([
 // Fields that replace wholesale instead of deep-merge. Arrays always replace;
 // displayHintMap explicitly replaces because deep-merge cannot express removals.
 const VARIANT_REPLACE_FIELDS = new Set([
-  "workingTiers", "jugglingTiers", "idleAnimations",
+  "workingTiers", "jugglingTiers", "idleAnimations", "idleVisualOptions",
   "wideHitboxFiles", "sleepingHitboxFiles",
   "displayHintMap",
 ]);
