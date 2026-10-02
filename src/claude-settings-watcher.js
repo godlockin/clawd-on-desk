@@ -4,10 +4,12 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { buildPermissionUrl } = require("../hooks/server-config");
-const { classifyManagedClaudeStateHookCommand } = require("../hooks/json-utils");
+const { classifyManagedClaudeStateHookCommand, stripUtf8Bom } = require("../hooks/json-utils");
 const {
   getClaudeHookScriptPath,
   getClaudeAutoStartScriptPath,
+  checkClaudeMaterializationFs,
+  resolveClaudeHookPaths,
   CLAUDE_CORE_HOOK_EVENTS,
 } = require("../hooks/install");
 const {
@@ -64,7 +66,7 @@ function settingsNeedClaudeHookResync(rawSettings, expectedPermissionUrl) {
 
   let parsed;
   try {
-    parsed = JSON.parse(rawSettings);
+    parsed = JSON.parse(stripUtf8Bom(rawSettings));
   } catch {
     return false;
   }
@@ -150,7 +152,7 @@ function takeSnapshot(raw) {
   if (typeof raw !== "string" || !raw.trim()) return null;
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripUtf8Bom(raw));
   } catch {
     return null;
   }
@@ -230,12 +232,29 @@ function createClaudeSettingsWatcher(ctx = {}) {
   const maxRepairAttempts = Number.isInteger(ctx.maxRepairAttempts) && ctx.maxRepairAttempts > 0
     ? ctx.maxRepairAttempts
     : DEFAULT_MAX_REPAIR_ATTEMPTS;
-  const expectedHookScriptPath = typeof ctx.expectedHookScriptPath === "string"
+  // Explicit paths keep the historical/test-injected direct contract. In
+  // production neither is supplied and every check resolves source/target
+  // through the shared Claude resolver instead of a frozen zero-arg getter,
+  // so a lazy AppImage generation (or its deletion) is tracked live.
+  const explicitHookScriptPath = typeof ctx.expectedHookScriptPath === "string"
     ? ctx.expectedHookScriptPath
-    : getClaudeHookScriptPath();
-  const expectedAutoStartScriptPath = typeof ctx.expectedAutoStartScriptPath === "string"
+    : null;
+  const explicitAutoStartScriptPath = typeof ctx.expectedAutoStartScriptPath === "string"
     ? ctx.expectedAutoStartScriptPath
-    : getClaudeAutoStartScriptPath();
+    : null;
+  const hasExplicitPaths = explicitHookScriptPath !== null || explicitAutoStartScriptPath !== null;
+  const resolverOptions = {
+    platform: ctx.platform || process.platform,
+    remote: ctx.remote,
+    homeDir: ctx.homeDir,
+    materializedRoot: ctx.materializedRoot,
+    processEnv: ctx.processEnv,
+    realpathSync: ctx.realpathSync,
+    fs: fsApi,
+  };
+  const resolvePaths = typeof ctx.resolveClaudeHookPaths === "function"
+    ? ctx.resolveClaudeHookPaths
+    : (options) => resolveClaudeHookPaths(options, { materialize: false });
   const coreEvents = Array.isArray(ctx.coreEvents) ? ctx.coreEvents : CLAUDE_CORE_HOOK_EVENTS;
   const platform = ctx.platform || process.platform;
 
@@ -313,14 +332,72 @@ function createClaudeSettingsWatcher(ctx = {}) {
 
   function buildReport(raw) {
     const port = typeof ctx.getHookServerPort === "function" ? ctx.getHookServerPort() : null;
-    return inspectClaudeHookHealth(raw, {
+    const common = {
       expectedPermissionUrl: buildPermissionUrl(port),
-      expectedHookScriptPath,
-      expectedAutoStartScriptPath,
       requireAutoStart: !!ctx.autoStartWithClaude,
       coreEvents,
       platform,
       fs: fsApi,
+    };
+    if (hasExplicitPaths) {
+      // A one-sided injection must fall back to the real getter for the other
+      // entry. Leaving it null would make scriptPathMatchesExpected() treat the
+      // event as "nothing to compare" and report a false healthy.
+      const state = explicitHookScriptPath !== null ? explicitHookScriptPath : getClaudeHookScriptPath();
+      const autoStart = explicitAutoStartScriptPath !== null
+        ? explicitAutoStartScriptPath
+        : getClaudeAutoStartScriptPath();
+      return inspectClaudeHookHealth(raw, {
+        ...common,
+        expectedHookScriptPath: state,
+        expectedAutoStartScriptPath: autoStart,
+        sourceHookScriptPath: state,
+        sourceAutoStartScriptPath: autoStart,
+      });
+    }
+    // Same fail-closed contract as src/server.js when an injected read-only fs
+    // cannot be shared with the real installer materialization.
+    const fsGuard = checkClaudeMaterializationFs(resolverOptions);
+    if (fsGuard.ok !== true) {
+      return {
+        status: "resolver-degraded",
+        repairable: false,
+        degradedReason: fsGuard.reason,
+        issues: [],
+        commandCount: 0,
+        managedCoreEventCount: 0,
+        snapshot: null,
+        message: fsGuard.message,
+      };
+    }
+    // Total, read-only resolution. Any I/O or plan error becomes an explicit
+    // degraded signal instead of an exception or a phantom "expected path",
+    // and the caller reschedules the next patrol (handleReport).
+    let resolved;
+    try {
+      resolved = resolvePaths(resolverOptions);
+    } catch (err) {
+      resolved = { ok: false, reason: "resolver-threw", message: err && err.message };
+    }
+    if (!resolved || resolved.ok !== true) {
+      return {
+        status: "resolver-degraded",
+        repairable: false,
+        degradedReason: (resolved && resolved.reason) || "resolver-failed",
+        issues: [],
+        commandCount: 0,
+        managedCoreEventCount: 0,
+        snapshot: null,
+        message: (resolved && resolved.message) || "Claude hook path resolution failed",
+      };
+    }
+    return inspectClaudeHookHealth(raw, {
+      ...common,
+      expectedHookScriptPath: resolved.target.state,
+      expectedAutoStartScriptPath: resolved.target.autoStart,
+      sourceHookScriptPath: resolved.source.state,
+      sourceAutoStartScriptPath: resolved.source.autoStart,
+      targetGeneration: resolved.targetGeneration,
     });
   }
 
@@ -382,6 +459,34 @@ function createClaudeSettingsWatcher(ctx = {}) {
       return;
     }
     unreadableStreak = 0;
+
+    if (report.status === "resolver-degraded") {
+      // A transient resolver I/O/plan failure must not permanently stop the
+      // patrol, fake a healthy report, or drive a blind repair. Degrade and
+      // schedule the next read-only check. A source-script-missing reason is
+      // the one durable case: no repair can succeed until Clawd is reinstalled.
+      const reasonCode = report.degradedReason || "resolver-failed";
+      const sourceMissing = reasonCode === "source-script-missing";
+      if (sourceMissing && !sourceMissingLogged) {
+        console.warn("Clawd: the current Claude hook source script is missing — reinstall or re-extract Clawd to restore automatic hook repair");
+        sourceMissingLogged = true;
+      } else if (!sourceMissing) {
+        sourceMissingLogged = false;
+      }
+      updateHealthStatus({
+        status: "degraded",
+        degradedReason: reasonCode,
+        lastCheckAt: nowFn(),
+        source: reason,
+        issueSignature: null,
+        issues: [],
+        message: sourceMissing
+          ? "Claude hook source script is missing; reinstall or re-extract Clawd"
+          : (report.message || "Claude hook path resolution failed; will retry"),
+      });
+      scheduleHealthCheck(healthCheckIntervalMs, "periodic-health");
+      return;
+    }
 
     if (report.status === "source-script-missing") {
       // Rewriting settings.json here would only point it at a path that

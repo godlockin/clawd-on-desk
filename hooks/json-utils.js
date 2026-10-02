@@ -4,6 +4,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const CURSOR_HOOK_SENTINEL = "--clawd-cursor-hook=v1";
 
 function stripUtf8Bom(text) {
   const value = String(text || "");
@@ -859,6 +860,7 @@ function findHookCommands(settings, marker, options) {
 }
 
 module.exports = {
+  CURSOR_HOOK_SENTINEL,
   stripUtf8Bom,
   readTextFileStripBom,
   readTextFileStripBomAsync,
