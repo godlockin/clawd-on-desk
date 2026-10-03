@@ -47,10 +47,12 @@ const remoteSshStatusListeners = new Set();
 const remoteSshProgressListeners = new Set();
 const remoteApprovalStatusListeners = new Set();
 const textScaleContextListeners = new Set();
+const sizeContextListeners = new Set();
 const agentActivityListeners = new Set();
 const recapChangedListeners = new Set();
 const updateCheckStatusListeners = new Set();
 const requestedTabListeners = new Set();
+const officialThemeProgressListeners = new Set();
 let pendingRequestedTab = null;
 ipcRenderer.on("settings-changed", (_event, payload) => {
   for (const cb of listeners) {
@@ -90,6 +92,11 @@ ipcRenderer.on("settings:text-scale-context-changed", () => {
     try { cb(); } catch (err) { console.warn("text scale context listener threw:", err); }
   }
 });
+ipcRenderer.on("settings:size-context-changed", () => {
+  for (const cb of sizeContextListeners) {
+    try { cb(); } catch (err) { console.warn("size context listener threw:", err); }
+  }
+});
 ipcRenderer.on("settings:agent-activity", (_event, payload) => {
   for (const cb of agentActivityListeners) {
     try { cb(payload); } catch (err) { console.warn("agent activity listener threw:", err); }
@@ -110,6 +117,11 @@ ipcRenderer.on("settings:select-tab", (_event, tab) => {
   pendingRequestedTab = tab;
   for (const cb of requestedTabListeners) {
     try { cb(tab); } catch (err) { console.warn("settings requested-tab listener threw:", err); }
+  }
+});
+ipcRenderer.on("officialTheme:progress", (_event, payload) => {
+  for (const cb of officialThemeProgressListeners) {
+    try { cb(payload); } catch (err) { console.warn("official theme progress listener threw:", err); }
   }
 });
 
@@ -158,6 +170,12 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   previewTextScale: (value) => ipcRenderer.invoke("settings:preview-text-scale", value),
   endTextScalePreview: () => ipcRenderer.invoke("settings:end-text-scale-preview"),
   getTextScaleContext: () => ipcRenderer.invoke("settings:get-text-scale-context"),
+  getSizeContext: () => ipcRenderer.invoke("settings:get-size-context"),
+  onSizeContextChanged: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    sizeContextListeners.add(cb);
+    return () => sizeContextListeners.delete(cb);
+  },
   onTextScaleContextChanged: (cb) => {
     if (typeof cb !== "function") return () => {};
     textScaleContextListeners.add(cb);
@@ -181,6 +199,17 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   showTutorial: () => ipcRenderer.invoke("settings:show-tutorial"),
   openExternal: (url) => ipcRenderer.invoke("settings:open-external", url),
   listThemes: () => ipcRenderer.invoke("settings:list-themes"),
+  listOfficialThemes: () => ipcRenderer.invoke("settings:list-official-themes"),
+  installOfficialTheme: (themeId) => ipcRenderer.invoke("settings:install-official-theme", themeId),
+  cancelOfficialThemeInstall: () => ipcRenderer.invoke("settings:cancel-official-theme-install"),
+  uninstallOfficialTheme: (themeId) => ipcRenderer.invoke("settings:uninstall-official-theme", themeId),
+  confirmUninstallOfficialTheme: (themeId) =>
+    ipcRenderer.invoke("settings:confirm-uninstall-official-theme", themeId),
+  onOfficialThemeProgress: (cb) => {
+    if (typeof cb !== "function") return () => {};
+    officialThemeProgressListeners.add(cb);
+    return () => officialThemeProgressListeners.delete(cb);
+  },
   openUserThemesDir: () => ipcRenderer.invoke("settings:open-user-themes-dir"),
   importUserThemeZip: () => ipcRenderer.invoke("settings:import-user-theme-zip"),
   refreshCodexPets: () => ipcRenderer.invoke("settings:refresh-codex-pets"),
@@ -241,6 +270,7 @@ contextBridge.exposeInMainWorld("doctor", {
   testConnection: (durationMs) => ipcRenderer.invoke("doctor:test-connection", { durationMs }),
   openClawdLog: () => ipcRenderer.invoke("doctor:open-clawd-log"),
   codexHookHealth: () => ipcRenderer.invoke("doctor:codex-hook-health"),
+  claudeHookHealth: () => ipcRenderer.invoke("doctor:claude-hook-health"),
 });
 
 // ── Remote SSH (Phase 2) ──

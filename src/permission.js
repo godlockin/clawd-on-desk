@@ -6,7 +6,7 @@ const { getDefaultShortcuts } = require("./shortcut-actions");
 const { keepOutOfTaskbar } = require("./taskbar");
 const { clampTextScale, scaleWidth, scaleHeight, applyZoomToWindow } = require("./text-scale");
 const { createTranslator } = require("./i18n");
-const { firstStringValue, formatDetail, truncate, parseMcpToolName } = require("./bubble-format");
+const { firstStringValue, formatDetail, formatReminderReason, truncate, parseMcpToolName } = require("./bubble-format");
 const {
   getPermissionSessionKey,
   groupPermissionEntries,
@@ -23,6 +23,7 @@ const {
 } = require("../hooks/server-config");
 const { isOpencodeFamilyEntry, getFamilyConfig } = require("../agents/opencode-family");
 const { isPassiveNotifyEntry } = require("./passive-notify-entry");
+const { reminderHolds } = require("./permission-reminder");
 const {
   normalizeOpencodeFamilyBridgeUrl,
   isValidOpencodeFamilyBridgeToken,
@@ -2162,6 +2163,125 @@ function isPermissionEntryHeadless(permEntry) {
     && !isInteractiveCodexSubagentEntry(permEntry));
 }
 
+// Destructive-action reminder (opt-in, off by default).
+//
+// Reads the stamp the route put on the entry instead of re-deriving anything
+// from entry.toolInput: that field is the display copy and has already been
+// through truncateDeep(), so a command whose destructive part sits past
+// PREVIEW_MAX would not be in it.
+//
+// If the setting cannot be read at all, an unmatched request keeps today's
+// behavior and a matched one ends at the human. A settings read that throws is
+// already a broken state, and the direction that costs an extra card is
+// preferable to the one that silently disarms a guard the user switched on.
+//
+// #1021 review (5), TOCTOU: the match stamp (hold/tag) is computed once, at
+// accept time, by permission-reminder.js -- a module with no ctx, so it
+// cannot read this setting at all. Whether that stamp actually holds used to
+// re-read the LIVE setting on every call, including from
+// canAutoResolvePendingPermission()/sweep(), which can run much later than
+// accept time (a session grant can arrive after the request has already been
+// sitting, displayed, for a while). That let a request already shown to a
+// human as held become sweep-resolvable the moment the setting was turned
+// off, with no human action and no re-render of the already-shown card --
+// and the reverse (turning it on) could newly hold a request that automation
+// had already committed to resolving through a path that does not re-check
+// this predicate. Freezing the decision the first time it is asked answers
+// both directions the same way a snapshot answers a race: whichever value
+// was true when this request first became eligible for automation is the
+// value it keeps for its whole pending lifetime, so the display (whenever it
+// last rendered) and the decision can never silently diverge on a request
+// that neither the human nor policy has touched.
+function permissionReminderHolds(permEntry) {
+  // Scoped to the same branch the policy scopes it to. Elicitation and plan
+  // entries are answered or reviewed on their own paths, and a question card
+  // must never show a reminder reason just because the safety net in the route
+  // stamped one.
+  if (!isValidInteraction(permEntry && permEntry.interaction)) return false;
+  const intent = permEntry.interaction.intent;
+  if (intent !== INTERACTION_INTENT.TOOL_APPROVAL && intent !== INTERACTION_INTENT.UNKNOWN) {
+    return false;
+  }
+  if (typeof permEntry._reminderHoldAtAccept === "boolean") {
+    return permEntry._reminderHoldAtAccept;
+  }
+  const stampHolds = reminderHolds(permEntry.permissionReminder);
+  let result;
+  if (typeof ctx.isDestructiveReminderEnabled !== "function") {
+    result = false;
+  } else {
+    try {
+      result = ctx.isDestructiveReminderEnabled() === true ? stampHolds : false;
+    } catch (err) {
+      permLog(`destructive reminder: setting read failed (${err && err.message ? err.message : err}); falling back to the match`);
+      result = stampHolds;
+    }
+  }
+  permEntry._reminderHoldAtAccept = result;
+  return result;
+}
+
+// Whether the reminder is the reason this request is in front of a human.
+//
+// permissionReminderHolds() answers "should automation stop here"; this answers
+// "did stopping here change anything". They differ whenever the request was going
+// to reach a human regardless -- automation off, an ineligible agent, a session
+// with no grant -- and in that case the card must not claim Clawd intervened.
+// The card still shows the ordinary destructive-action hint there, as before.
+//
+// #1021 review (3): this used to re-evaluate automation policy with its own
+// partial copy of canAutoResolvePendingPermission()'s gates, which skipped the
+// entry-level ones entirely (agent/subagent enabled, headless, Codex permission
+// intercept, session-automation eligibility, live-response, DND). Reachable
+// miss: a remote-only entry with an existing session grant, where Codex
+// permission intercept or the subagent automation gate is off -- sweep()
+// would never have resolved that entry (canAutoResolvePendingPermission
+// returns false), yet this function said the reminder was why it was
+// pending, so the card rendered Tier 1 ("Automatic approval paused") when the
+// request needed a human regardless (Tier 2 is correct).
+//
+// Fix: derive from canAutoResolvePendingPermission() itself -- the same
+// predicate sweep()/session-grant flows use -- instead of keeping a second
+// copy of its gates, but ONLY in the exact circumstance where that predicate
+// is actually consulted for real auto-resolution: a session-automation
+// override exists, or this is an interactive Codex subagent entry
+// (maybeAutoApprovePermission's own `needsLiveGate` condition, unchanged
+// here). An ordinary global-automation request is never routed through
+// canAutoResolvePendingPermission()'s entry-level gates either -- see
+// maybeAutoApprovePermission(), which auto-allows it directly once
+// evaluatePermissionAutomation() says AUTO_ALLOW -- so asking this predicate
+// to apply those gates there would claim a stronger check happened than the
+// one that actually resolves the request, which would then wrongly downgrade
+// an otherwise-correct Tier 1 card (e.g. an opencode-family session under
+// plain global automation) to Tier 2.
+function reminderIsWhyThisIsPending(permEntry) {
+  if (!permissionReminderHolds(permEntry)) return false;
+  let mode;
+  if (typeof ctx.getEffectivePermissionAutomationMode === "function") {
+    mode = ctx.getEffectivePermissionAutomationMode(permEntry, {
+      sessionOnly: permEntry.remoteOnly === true,
+    });
+  } else if (typeof ctx.getPermissionAutomationMode === "function") {
+    mode = ctx.getPermissionAutomationMode();
+  } else {
+    mode = PERMISSION_AUTOMATION_MODE.OFF;
+  }
+  const wouldAutoAllow = evaluatePermissionAutomation({
+    mode,
+    interaction: permEntry.interaction,
+    entry: permEntry,
+    reminderHold: false,
+  }) === AUTOMATION_ACTION.AUTO_ALLOW;
+  if (!wouldAutoAllow) return false;
+
+  const hasSessionOverride = typeof ctx.hasSessionAutomationOverride === "function"
+    && ctx.hasSessionAutomationOverride(permEntry);
+  const needsLiveGate = hasSessionOverride || isInteractiveCodexSubagentEntry(permEntry);
+  if (!needsLiveGate) return true;
+
+  return canAutoResolvePendingPermission(permEntry, { mode, ignoreReminderHold: true }) === true;
+}
+
 function canAutoResolvePendingPermission(permEntry, options = {}) {
   if (!isPermissionEntryLive(permEntry)) return false;
   if (ctx.doNotDisturb) return false;
@@ -2215,10 +2335,18 @@ function canAutoResolvePendingPermission(permEntry, options = {}) {
         );
   }
 
+  // ignoreReminderHold lets reminderIsWhyThisIsPending() ask "would every
+  // OTHER gate have let this through" without re-implementing them: it is
+  // the neutralize-only-the-reminder-hold view onto this exact predicate.
+  const reminderHold = options.ignoreReminderHold === true
+    ? false
+    : permissionReminderHolds(permEntry);
+
   return evaluatePermissionAutomation({
     mode,
     interaction: permEntry.interaction,
     entry: permEntry,
+    reminderHold,
   }) === AUTOMATION_ACTION.AUTO_ALLOW;
 }
 
@@ -2252,13 +2380,17 @@ function maybeAutoApprovePermission(permEntry) {
           ? ctx.getPermissionAutomationMode()
           : PERMISSION_AUTOMATION_MODE.OFF
       );
+  const reminderHold = permissionReminderHolds(permEntry);
   const action = evaluatePermissionAutomation({
     mode,
     interaction: permEntry.interaction,
     entry: permEntry,
+    reminderHold,
   });
   if (action === AUTOMATION_ACTION.DEFER) {
-    if (!isValidInteraction(permEntry.interaction)) {
+    if (reminderHold) {
+      permLog(`destructive reminder: holding for a human mode=${mode} reason=${permEntry.permissionReminder.tag} tool=${permEntry.toolName || "(missing)"} session=${permEntry.sessionId} agent=${permEntry.agentId || "unknown"}`);
+    } else if (!isValidInteraction(permEntry.interaction)) {
       permLog(`automation defer: invalid interaction tool=${permEntry.toolName} session=${permEntry.sessionId} agent=${permEntry.agentId || "unknown"}`);
     } else if (
       mode !== PERMISSION_AUTOMATION_MODE.OFF
@@ -2402,17 +2534,23 @@ function showPermissionBubble(permEntry) {
       permissionBubbleWindows.delete(bub);
       const idx = pendingPermissions.indexOf(permEntry);
       if (idx !== -1) {
-        // Qwen + Copilot + ZCode + DSH can hand no-decision back to their native
-        // flow. Hermes has no native permission UI, so its opt-in plugin gate
-        // treats this as a retryable block. In every case we avoid fabricating a
-        // user denial. CC/CodeBuddy still get an explicit deny for this
-        // user-close action.
+        // Codex + Qwen + Copilot + ZCode + DSH can hand no-decision back to
+        // their native flow. opencode-family entries do the same: OpenCode v2
+        // answers 204 on its blocking evaluate hook so the native ask UI takes
+        // over, while OpenCode v1 / MiMo silently drop the request so their
+        // built-in terminal or Desktop prompt wins. Hermes has no native
+        // permission UI, so its opt-in plugin gate treats this as a retryable
+        // block. In every case we avoid fabricating a user denial.
+        // Claude Code / CodeBuddy still get an explicit deny for this user-close
+        // action.
         const behavior = (
-          permEntry.isQwenCode
+          permEntry.isCodex
+          || permEntry.isQwenCode
           || permEntry.isCopilotCli
           || permEntry.isHermes
           || permEntry.isZcode
           || permEntry.isDsh
+          || isOpencodeFamilyEntry(permEntry)
         ) ? "no-decision" : "deny";
         resolvePermissionEntry(permEntry, behavior, "Bubble window closed by user");
       }
@@ -2643,6 +2781,13 @@ function buildPermissionBubblePayload(permEntry) {
   return {
     toolName: permEntry.toolName,
     toolInput: permEntry.toolInput,
+    // Why this card exists, when it exists because the reminder held it. Null
+    // for every other card -- including one whose command the display hint
+    // badges anyway. The badge says "this looks destructive"; this says
+    // "automation would have allowed this and Clawd stopped for you".
+    reminderTag: reminderIsWhyThisIsPending(permEntry)
+      ? permEntry.permissionReminder.tag
+      : null,
     detailText: typeof permEntry.detailText === "string"
       ? permEntry.detailText
       : null,
@@ -2668,6 +2813,10 @@ function buildPermissionBubblePayload(permEntry) {
     familyDisplayName: isOpencodeFamilyEntry(permEntry)
       ? ((getFamilyConfig(permEntry.agentId) || {}).displayName || permEntry.agentId)
       : null,
+    // v2 family entries keep their "always" rule inside the host's background
+    // service (plugin memory), not the CLI process, so the blanket-always
+    // tooltip must not tell the user a terminal restart revokes it.
+    familyV2: permEntry.isOpencodeV2 === true,
     isAntigravity: permEntry.isAntigravity || false,
     // Provenance for the renderer: lets the bubble relabel Codex MCP tool calls
     // (issue #445) without touching approval semantics. Mirrors the flags above.
@@ -2983,17 +3132,48 @@ function buildRemoteApprovalPayload(permEntry) {
   );
   // Label this value "Folder" (not "Session"): it is only the cwd basename,
   // never a session id or full local path.
+  // The same reason the local card shows, so a remote-only operator is not told
+  // less about why the request stopped than someone sitting at the desk.
+  //
+  // Two tiers, mirroring bubble-renderer.js's badge exactly, because the local
+  // card degrades to a weaker line where this used to degrade to silence:
+  //   held BY the reminder        -> "Automatic approval paused: X"
+  //   destructive but pending anyway -> "Potentially destructive action: X"
+  // The second tier is the case the old single-tier code dropped. It is the
+  // ONLY tier a remote-only operator can ever see: bubbles are off, so the
+  // local irreversible badge that carries this hint is not on their screen at
+  // all. Dropping it left exactly one configuration -- the one named in the
+  // comment above -- told nothing, which is the opposite of what it promises.
+  // Tier 2 must NOT reuse the tier-1 wording: the request was reaching a human
+  // regardless, so claiming Clawd stopped it would be false.
+  // One extraction, not three: reminderHolds() already rejects a null stamp, a
+  // malformed one, and an empty tag (test/permission-reminder lanes pin all
+  // four shapes), so a true from either predicate GUARANTEES an object with a
+  // truthy tag. Two cross-family reviewers independently read the old shape as
+  // a null-dereference plus an empty-tag asymmetry; both were refuted at the
+  // source, and the per-branch guards that invited the reading are gone with
+  // them rather than being left as dead code that documents a fear.
+  const reminderTag = permissionReminderHolds(permEntry)
+    ? permEntry.permissionReminder.tag
+    : null;
+  const reminderLine = !reminderTag
+    ? null
+    : (reminderIsWhyThisIsPending(permEntry)
+      ? interpolate(t("approvalDetailReminderValue"), "{reason}", formatReminderReason(reminderTag, ctx.lang))
+      : interpolate(t("approvalDetailIrreversibleValue"), "{reason}", formatReminderReason(reminderTag, ctx.lang)));
   const detail = [
     `${t("approvalDetailAgent")}: ${agentId}`,
     `${t("approvalDetailTool")}: ${toolName}`,
     sessionFolder ? `${t("approvalDetailFolder")}: ${sessionFolder}` : null,
     `${t("approvalDetailSummary")}: ${summary}`,
+    reminderLine ? `${t("approvalDetailReminder")}: ${reminderLine}` : null,
   ].filter(Boolean).join("\n");
   const fields = [
     { label: t("approvalDetailAgent"), value: agentId },
     { label: t("approvalDetailTool"), value: toolName },
     sessionFolder ? { label: t("approvalDetailFolder"), value: sessionFolder } : null,
     { label: t("approvalDetailSummary"), value: summary },
+    reminderLine ? { label: t("approvalDetailReminder"), value: reminderLine } : null,
   ].filter(Boolean);
   const suggestionButtons = buildRemoteSuggestionButtons(permEntry);
   const payload = {
@@ -3706,6 +3886,20 @@ function applyPermissionSuggestion(perm, index, options = {}) {
   // (Bun.serve or node:http on a random localhost port). The plugin then calls
   // the host's in-process Hono route. Plugin sent us a fire-and-forget POST — no HTTP
   // response to complete on this connection.
+  if (permEntry.isOpencodeV2) {
+    // opencode v2 (issue #1039): the plugin's evaluate hook is BLOCKING on
+    // this very HTTP response — the decision is the response body. 204 keeps
+    // the effect untouched so the native ask UI takes over.
+    if (behavior === "no-decision") {
+      sendOpencodeV2NoDecisionResponse(res, message || "no-decision");
+      return;
+    }
+    const decision = behavior === "deny"
+      ? "deny"
+      : (permEntry.familyAlwaysPicked ? "always" : "allow");
+    sendOpencodeV2Response(res, decision, message);
+    return;
+  }
   if (isOpencodeFamilyEntry(permEntry)) {
     // Autoclose: silent drop — same DND semantics. The host falls back to its
     // built-in terminal or Desktop prompt so the user can answer natively.
@@ -3869,12 +4063,16 @@ function permLog(msg) {
   rotatedAppend(ctx.permDebugLog, `[${new Date().toISOString()}] ${msg}\n`);
 }
 
-// Fire-and-forget POST to the family plugin's reverse bridge. The plugin runs
-// inside the host and does NOT expose the host's own permission route
-// externally — TUI mode has no TCP listener at all (see Phase 2 Spike in
-// docs/plans/plan-opencode-integration.md). Instead the plugin starts a tiny
+// Fire-and-forget POST to the family plugin's reverse bridge. The default TUI
+// has no TCP listener at all (see Phase 2 Spike in
+// docs/plans/plan-opencode-integration.md), so the plugin starts a tiny
 // Bun.serve (CLI/TUI) or node:http (Desktop) listener on a random port and
-// forwards our decision to the host's in-process Hono router via ctx.client._client.post().
+// forwards our decision to the host's router. Under `opencode serve` / `web`
+// the host does listen, but ctx.client targets that listening address; a
+// wildcard address (0.0.0.0 / [::]) is a listen address rather than a
+// destination, and the host process's Bun fetch would hand it to HTTP_PROXY, so
+// the plugin rewrites those hosts to loopback per call (#1065). This side always
+// talks to the plugin's own 127.0.0.1 bridge.
 //
 // Shape: POST http://127.0.0.1:<plugin-port>/reply
 //   Authorization: Bearer <hex token>
@@ -3986,6 +4184,27 @@ function sendCodexPermissionResponse(res, decisionOrBehavior, message) {
 
 function sendQwenCodeNoDecisionResponse(res, reason = "") {
   return sendNoDecisionResponse(res, reason, "qwen-code");
+}
+
+// opencode v2 (issue #1039): the plugin's evaluate hook awaits this response.
+// 200 + JSON { decision: "allow" | "always" | "deny", message? } resolves the
+// await; 204 means "no decision" and leaves the hook's effect untouched so the
+// native prompt wins. Any non-2xx/identity-less answer is treated the same by
+// the plugin.
+function sendOpencodeV2Response(res, decision, message) {
+  if (!res || res.writableEnded || res.destroyed || res.headersSent) return false;
+  const responseBody = JSON.stringify(message ? { decision, message } : { decision });
+  permLog(`opencode-v2 response: ${responseBody}`);
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID,
+  });
+  res.end(responseBody);
+  return true;
+}
+
+function sendOpencodeV2NoDecisionResponse(res, reason = "") {
+  return sendNoDecisionResponse(res, reason, "opencode-v2");
 }
 
 function sendQwenCodePermissionResponse(res, decisionOrBehavior, message) {
@@ -4940,6 +5159,10 @@ function dismissInteractivePermissionWithoutDecision(perm, reason) {
     sendCodexNoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isQwenCode) {
     sendQwenCodeNoDecisionResponse(perm.res, reason || "permission-dismissed");
+  } else if (perm.isOpencodeV2) {
+    // v2 blocks on this connection: release the await explicitly instead of
+    // relying on socket close (same contract as codex/qwen above).
+    sendOpencodeV2NoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isZcode) {
     sendZcodeNoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isCopilotCli) {
@@ -5075,6 +5298,29 @@ function dismissPermissionsByAgent(agentId, options = {}) {
   return toDismiss.length;
 }
 
+// Session-scoped retirement used by Codex archive lifecycle (#655). Drops only
+// the surfaces owned by this session: passive notify/user-input cards are
+// cleared, and any interactive prompt is handed back with the normal
+// no-decision semantics — never an allow/deny on the user's behalf.
+function dismissPermissionsForSession(sessionId, reason = "session-dismissed") {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return 0;
+  const toDismiss = pendingPermissions.filter((p) => p && p.sessionId === id);
+  if (toDismiss.length === 0) return 0;
+  for (const perm of toDismiss) {
+    if (isPassiveNotifyEntry(perm)) {
+      dismissPassiveNotify(perm, reason);
+      continue;
+    }
+    dismissInteractivePermissionWithoutDecision(perm, reason);
+  }
+  repositionBubbles();
+  repositionDependentBubbles();
+  syncPermissionShortcuts();
+  permLog(`dismissPermissionsForSession(${id}): cleared ${toDismiss.length}`);
+  return toDismiss.length;
+}
+
 function dismissInteractivePermissionBubbles() {
   const toDismiss = pendingPermissions.filter((p) => p && !isPassiveNotifyEntry(p));
   if (toDismiss.length === 0) return 0;
@@ -5190,10 +5436,13 @@ return {
   refreshPassiveNotifyAutoClose,
   refreshPermissionAutoCloseForPolicy,
   dismissPermissionsByAgent, dismissInteractivePermissionBubbles,
+  dismissPermissionsForSession,
   dismissPermissionsForDnd,
   dismissOpencodeFamilyPermissionResolvedExternally,
   syncPermissionShortcuts,
   replyOpencodeFamilyPermission,
+  sendOpencodeV2Response,
+  sendOpencodeV2NoDecisionResponse,
   // Exposed for the payload↔renderer contract test (plan §3.5/§9): the
   // builder closes over ctx, so it can only be reached through an instance.
   buildPermissionBubblePayload,
