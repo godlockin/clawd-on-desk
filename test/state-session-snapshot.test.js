@@ -2,6 +2,9 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const {
   INTERNAL_WORKSPACE_AGENTS,
@@ -14,6 +17,7 @@ const {
   buildSessionSnapshot,
   getActiveSessionAliasKeys,
   sessionSnapshotSignature,
+  shouldAutoClearDetachedSession,
   sessionDisplayFolder,
   sessionDisplayTitle,
   normalizeTitle,
@@ -731,6 +735,16 @@ describe("state-session-snapshot builder", () => {
     });
   });
 
+  it("gives prompt expansion the translated user-prompt label", () => {
+    const entry = buildSessionSnapshotEntry("design", session("thinking", {
+      agentId: "claude-code",
+      recentEvents: [{ event: "UserPromptExpansion", state: "thinking", at: 1234 }],
+    }), { statePriority: STATE_PRIORITY, getAgentIconUrl: () => null });
+    assert.deepStrictEqual(entry.lastEvent, {
+      labelKey: "eventLabelUserPromptSubmit", rawEvent: "UserPromptExpansion", at: 1234,
+    });
+  });
+
   it("exposes focus target metadata for terminal and Codex Desktop sessions", () => {
     const rawCodexSessionId = "codex:019e115a-4df2-7ed0-b90e-8e6345aca777";
     const scopedCodexSessionId = makeSessionKey({
@@ -767,7 +781,7 @@ describe("state-session-snapshot builder", () => {
     assert.strictEqual(byId.get(scopedCodexSessionId).codexSource, "vscode");
   });
 
-  it("downgrades Codex Desktop focus targets on Windows snapshots", () => {
+  it("exposes Codex Desktop thread focus targets on Windows snapshots", () => {
     const snapshot = buildSessionSnapshot(new Map([
       ["codex:019e115a-4df2-7ed0-b90e-8e6345aca777", session("working", {
         agentId: "codex",
@@ -783,11 +797,14 @@ describe("state-session-snapshot builder", () => {
     const byId = new Map(snapshot.sessions.map((entry) => [entry.id, entry]));
     assert.strictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").canFocus, true);
     assert.deepStrictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").focusTarget, {
-      type: "terminal",
-      url: null,
+      type: "codex-thread",
+      url: "codex://threads/019e115a-4df2-7ed0-b90e-8e6345aca777",
     });
-    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").canFocus, false);
-    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").focusTarget, null);
+    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").canFocus, true);
+    assert.deepStrictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").focusTarget, {
+      type: "codex-thread",
+      url: "codex://threads/019e115b-4df2-7ed0-b90e-8e6345aca777",
+    });
 
     const nonWindowsSnapshot = buildSessionSnapshot(new Map([
       ["codex:019e115b-4df2-7ed0-b90e-8e6345aca777", session("working", {
@@ -841,6 +858,59 @@ describe("state-session-snapshot builder", () => {
       assert.strictEqual(entry.focusTarget, null, entry.id);
     }
     assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "hidden").hiddenFromHud, true);
+  });
+
+  it("issue #1103: batches local Codex titles per snapshot", () => {
+    const codexDir = fs.mkdtempSync(path.join(os.tmpdir(), "snapshot-index-"));
+    const indexFile = path.join(codexDir, "session_index.jsonl");
+    const previousCodexHome = process.env.CODEX_HOME;
+    const originalOpenSync = fs.openSync;
+    let indexOpens = 0;
+    const localSessions = ["one", "two", "three"].map((name, i) => [
+      i === 2 ? `codex:${name}` : makeSessionKey({ profileId: "local", rawSessionId: `codex:${name}` }),
+      session("working", {
+        agentId: "codex",
+        ...(i === 2 ? {} : { rawSessionId: `codex:${name}` }),
+        sessionTitle: `Stored ${name}`,
+      }),
+    ]);
+    const otherSessions = [
+      ["remote", session("working", {
+        agentId: "codex", rawSessionId: "codex:remote", host: "devbox", sessionTitle: "Remote title",
+      })],
+      ["claude", session("working", { rawSessionId: "codex:one", sessionTitle: "Claude title" })],
+    ];
+    try {
+      process.env.CODEX_HOME = codexDir;
+      fs.writeFileSync(indexFile, ["one", "two", "three", "remote"].map((name) =>
+        JSON.stringify({ id: name, thread_name: `Index ${name}` })
+      ).join("\n") + "\n");
+      fs.openSync = function(file, ...args) {
+        if (file === indexFile) indexOpens++;
+        return originalOpenSync.call(this, file, ...args);
+      };
+      const snapshot = buildSessionSnapshot(new Map([...localSessions, ...otherSessions]));
+      assert.strictEqual(indexOpens, 1);
+      for (const [i, [id]] of localSessions.entries()) {
+        const entry = snapshot.sessions.find((entry) => entry.id === id);
+        const title = `Index ${["one", "two", "three"][i]}`;
+        assert.strictEqual(entry.sessionTitle, title);
+        assert.strictEqual(entry.displayTitle, title);
+      }
+      for (const [id, stored] of otherSessions) {
+        const entry = snapshot.sessions.find((entry) => entry.id === id);
+        assert.strictEqual(entry.sessionTitle, stored.sessionTitle);
+        assert.strictEqual(entry.displayTitle, stored.sessionTitle);
+      }
+      indexOpens = 0;
+      buildSessionSnapshot(new Map(otherSessions));
+      assert.strictEqual(indexOpens, 0);
+    } finally {
+      fs.openSync = originalOpenSync;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(codexDir, { recursive: true, force: true });
+    }
   });
 
   it("applies aliases, Codex thread names, and Kiro cwd-scoped alias keys", () => {
@@ -1270,5 +1340,48 @@ describe("state-session-snapshot builder", () => {
 
     assert.strictEqual(nova.sessions[0].agentName, "Nova AI");
     assert.notStrictEqual(sessionSnapshotSignature(nova), sessionSnapshotSignature(renamed));
+  });
+});
+
+describe("shouldAutoClearDetachedSession WSL guard", () => {
+  it("never probes a WSL session and keeps it visible even with an ended badge", () => {
+    for (const marker of [{ wslDistro: "Ubuntu" }, { host: "wsl:Ubuntu" }]) {
+      let probes = 0;
+      const hidden = shouldAutoClearDetachedSession(
+        {
+          state: "idle",
+          headless: false,
+          pidReachable: true,
+          sourcePid: 20,
+          ...marker,
+        },
+        "done",
+        {
+          sessionHudCleanupDetached: true,
+          isProcessAlive: () => { probes += 1; return false; },
+        }
+      );
+      assert.strictEqual(hidden, false);
+      assert.strictEqual(probes, 0);
+    }
+  });
+
+  it("still clears a local detached-ended session whose source is gone", () => {
+    let probes = 0;
+    const hidden = shouldAutoClearDetachedSession(
+      {
+        state: "idle",
+        headless: false,
+        pidReachable: true,
+        sourcePid: 20,
+      },
+      "done",
+      {
+        sessionHudCleanupDetached: true,
+        isProcessAlive: () => { probes += 1; return false; },
+      }
+    );
+    assert.strictEqual(hidden, true);
+    assert.strictEqual(probes, 1);
   });
 });
