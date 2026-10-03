@@ -63,11 +63,14 @@ function createSpawnedHookHarness(options = {}) {
       if (key.startsWith("CLAWD_")) delete env[key];
     }
     for (const key of [
+      "CLAUDE_CONFIG_DIR",
       "CODEX_HOME",
       "COPILOT_HOME",
+      "GROK_HOOK_EVENT",
       "HERMES_HOME",
       "KIMI_CODE_HOME",
       "NODE_OPTIONS",
+      "ORCA_PANE_KEY",
       "REASONIX_HOME",
       "TMUX",
       "TMUX_PANE",
