@@ -3,11 +3,14 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const {
-  APPIMAGE_HOOK_MARKER_FILE,
   CODEX_WINDOWS_STABLE_ARG,
   CODEX_WSL_INTEROP_ARG,
   resolveNodeBin,
 } = require("./server-config");
+const {
+  collectRelativeHookClosure,
+  materializeAppImageHookScript,
+} = require("./appimage-hook-materializer");
 const {
   readJsonFile,
   writeJsonAtomic,
@@ -741,117 +744,6 @@ function buildCodexHookPosixInteropCommand(nodeBin, hookScript) {
   return `${formatNodeHookCommand(posixNodeBin, hookScript, { platform: "linux" })} ${CODEX_WSL_INTEROP_ARG}`;
 }
 
-function collectRelativeHookClosure(entryPath, options = {}) {
-  const fsApi = options.fs || fs;
-  const resolvedEntry = path.resolve(entryPath);
-  const rootDir = path.dirname(resolvedEntry);
-  const extraEntryPaths = Array.isArray(options.extraEntryPaths)
-    ? options.extraEntryPaths.map((value) => path.resolve(value))
-    : [];
-  const pending = [resolvedEntry, ...extraEntryPaths];
-  const files = new Map();
-
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (files.has(current)) continue;
-    const relative = path.relative(rootDir, current);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error(`AppImage hook dependency escaped hooks directory: ${current}`);
-    }
-    const content = fsApi.readFileSync(current);
-    files.set(current, content);
-    const source = content.toString("utf8");
-    for (const match of source.matchAll(/require\(["'](\.\/[^"']+)["']\)/g)) {
-      const resolved = path.resolve(path.dirname(current), match[1]);
-      const candidate = path.extname(resolved) ? resolved : `${resolved}.js`;
-      const dependencyRelative = path.relative(rootDir, candidate);
-      if (dependencyRelative.startsWith("..") || path.isAbsolute(dependencyRelative)) {
-        throw new Error(`AppImage hook dependency escaped hooks directory: ${match[1]}`);
-      }
-      pending.push(candidate);
-    }
-  }
-  return { rootDir, files };
-}
-
-function materializeAppImageHookScript(entryPath, options = {}) {
-  const fsApi = options.fs || fs;
-  const appImagePath = String(options.appImagePath || "").trim();
-  if (!path.posix.isAbsolute(appImagePath)) {
-    throw new Error("AppImage hook installation requires an absolute APPIMAGE path");
-  }
-
-  const resolvedEntry = path.resolve(entryPath);
-  const { rootDir, files } = collectRelativeHookClosure(resolvedEntry, {
-    fs: fsApi,
-    extraEntryPaths: options.extraEntryPaths,
-  });
-  const ordered = [...files.entries()].sort(([a], [b]) => a.localeCompare(b));
-  const hasher = crypto.createHash("sha256");
-  hasher.update(`${appImagePath}\0`);
-  for (const [filePath, content] of ordered) {
-    hasher.update(`${path.relative(rootDir, filePath)}\0`);
-    hasher.update(content);
-    hasher.update("\0");
-  }
-
-  const materializedRoot = options.materializedRoot
-    || path.join(options.homeDir || os.homedir(), ".clawd", "appimage-hooks");
-  const versionDir = path.join(materializedRoot, hasher.digest("hex").slice(0, 20));
-  const targetEntry = path.join(versionDir, path.relative(rootDir, resolvedEntry));
-  const markerPath = path.join(versionDir, APPIMAGE_HOOK_MARKER_FILE);
-  const isComplete = () => {
-    try {
-      if (String(fsApi.readFileSync(markerPath, "utf8")).trim() !== appImagePath) return false;
-      return ordered.every(([filePath]) =>
-        fsApi.existsSync(path.join(versionDir, path.relative(rootDir, filePath))));
-    } catch {
-      return false;
-    }
-  };
-  if (isComplete()) return targetEntry;
-
-  fsApi.mkdirSync(materializedRoot, { recursive: true, mode: 0o700 });
-  const stagingDir = `${versionDir}.tmp-${process.pid}-${Date.now()}`;
-  let replacedDir = null;
-  try {
-    fsApi.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
-    for (const [filePath, content] of ordered) {
-      const target = path.join(stagingDir, path.relative(rootDir, filePath));
-      fsApi.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-      fsApi.writeFileSync(target, content);
-    }
-    fsApi.writeFileSync(
-      path.join(stagingDir, APPIMAGE_HOOK_MARKER_FILE),
-      `${appImagePath}\n`,
-      { mode: 0o600 }
-    );
-    if (fsApi.existsSync(versionDir) && !isComplete()) {
-      replacedDir = `${versionDir}.replaced-${process.pid}-${Date.now()}`;
-      fsApi.renameSync(versionDir, replacedDir);
-    }
-    try {
-      fsApi.renameSync(stagingDir, versionDir);
-    } catch (err) {
-      // Another process may have won the same content-addressed install.
-      if (!isComplete()) {
-        if (replacedDir && !fsApi.existsSync(versionDir)) {
-          try { fsApi.renameSync(replacedDir, versionDir); } catch {}
-        }
-        throw err;
-      }
-      fsApi.rmSync(stagingDir, { recursive: true, force: true });
-    }
-    if (replacedDir) fsApi.rmSync(replacedDir, { recursive: true, force: true });
-  } catch (err) {
-    try {
-      fsApi.rmSync(stagingDir, { recursive: true, force: true });
-    } catch {}
-    throw err;
-  }
-  return targetEntry;
-}
-
 function quotePosixEnvValue(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
@@ -1249,6 +1141,7 @@ function registerCodexCommandHooks(options = {}) {
       appImagePath: processEnv.APPIMAGE,
       homeDir: options.homeDir,
       materializedRoot: options.materializedRoot,
+      platform: hostPlatform,
       extraEntryPaths,
     }).replace(/\\/g, "/");
   }
