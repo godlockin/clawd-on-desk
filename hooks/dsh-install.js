@@ -17,36 +17,71 @@ const MANAGED_OWNER = "clawd-on-desk";
 const MANIFEST_FILE = "clawd-manifest.json";
 const MANIFEST_SCHEMA_VERSION = 1;
 const BRIDGE_PROTOCOL_VERSION = 1;
-// Verified DSH versions, newest first. Each entry is an exact-version
-// contract: the version, its exact supported range, and the npm artifact
-// bound to it. New installs prefer the first entry; Repair, Uninstall, and
-// manual commands select the contract whose version matches the detected
-// host or the owned marker. Pre-release DSH versions are intentionally
-// exact-pinned — a broad range (>=0.1.x) would admit artifacts this bridge
-// has not verified.
-const DSH_VERSION_CONTRACTS = Object.freeze([
+// The one place that names concrete DSH releases. Each entry is the npm
+// artifact this bridge was verified against by hand; newest first. New
+// generations, markers, and manual npx fallbacks pick an artifact from here.
+// The family table below is only the admission rule.
+const VERIFIED_DSH_ARTIFACTS = Object.freeze([
+  Object.freeze({
+    version: "0.2.0-rc.2",
+    artifact: "@deepseek-ai/dsh@0.2.0-rc.2",
+    integrity: "sha512-EAJ3gPNcVt/uv8X19PMm9NkVhWgT7xXNMk0UKCVm+IQ5rpSQOcsMUa0HWlnYYVybKMsccjcRB21vVVsaXQ6IdA==",
+  }),
+  Object.freeze({
+    version: "0.1.5-rc.3",
+    artifact: "@deepseek-ai/dsh@0.1.5-rc.3",
+    integrity: "sha512-c0W6Xqc4ChjFcCJkbzPeIxZQdnbKqe+QAcJzWGtogg0ZzsnZRcw3vopMyZ5oZU6E2fmyqGcyDR1sBeiCH4yHcg==",
+  }),
+  Object.freeze({
+    version: "0.1.5-rc.1",
+    artifact: "@deepseek-ai/dsh@0.1.5-rc.1",
+    integrity: "sha512-rmNmzQCg3oIc1z8xH7izRSOuy1TNzq+/NILyfM+7e8DKOyV+yBtg47WEsqR2SiIe1ATec3L/rUa1YhIcfQ2XEg==",
+  }),
   Object.freeze({
     version: "0.1.1-rc.2",
-    supportedDshRange: "=0.1.1-rc.2",
-    verifiedDshArtifact: "@deepseek-ai/dsh@0.1.1-rc.2",
-    verifiedDshArtifactIntegrity: "sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg==",
+    artifact: "@deepseek-ai/dsh@0.1.1-rc.2",
+    integrity: "sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg==",
   }),
   Object.freeze({
     version: "0.1.0-rc.6",
-    supportedDshRange: "=0.1.0-rc.6",
-    verifiedDshArtifact: "@deepseek-ai/dsh@0.1.0-rc.6",
-    verifiedDshArtifactIntegrity: "sha512-brpZfED7ieRa2PQ5tUxMhHrM1pb2CmKFVM/f6yMULBDMicahk+Z2OsHgTwTDnoiZm23Ftu9rQz0NN4pflaoJcg==",
+    artifact: "@deepseek-ai/dsh@0.1.0-rc.6",
+    integrity: "sha512-brpZfED7ieRa2PQ5tUxMhHrM1pb2CmKFVM/f6yMULBDMicahk+Z2OsHgTwTDnoiZm23Ftu9rQz0NN4pflaoJcg==",
   }),
 ]);
-const PREFERRED_DSH_CONTRACT = DSH_VERSION_CONTRACTS[0];
 
-// Backwards-compatible aliases for the preferred contract. Code that acts on a
-// specific detected host or an owned marker should use dshContractForVersion /
-// dshContractForMarker instead of these singletons.
-const SUPPORTED_DSH_VERSION = PREFERRED_DSH_CONTRACT.version;
-const SUPPORTED_DSH_RANGE = PREFERRED_DSH_CONTRACT.supportedDshRange;
-const VERIFIED_DSH_ARTIFACT = PREFERRED_DSH_CONTRACT.verifiedDshArtifact;
-const VERIFIED_DSH_ARTIFACT_INTEGRITY = PREFERRED_DSH_CONTRACT.verifiedDshArtifactIntegrity;
+// Admission rule: a host version is supported when it parses strictly, its
+// major.minor matches a family, and it is at or above the family's first
+// verified version. Adding a new minor means verifying and listing at least
+// one artifact for it, then adding a family. Preferred family first, so a
+// fresh host-less install stages the first family's newest verified artifact.
+const DSH_VERSION_FAMILIES = Object.freeze([
+  Object.freeze({ family: "0.2", minVersion: "0.2.0-rc.2", range: ">=0.2.0-rc.2 <0.3.0-0" }),
+  Object.freeze({ family: "0.1", minVersion: "0.1.0-rc.6", range: ">=0.1.0-rc.6 <0.2.0-0" }),
+]);
+
+// Exact-version contracts derived from the artifact list. They are the old
+// "=<version>" shape, kept only to recognize markers written before families
+// and to hash-verify those generations in place.
+const HISTORICAL_DSH_CONTRACTS = Object.freeze(
+  VERIFIED_DSH_ARTIFACTS.map((entry) => Object.freeze({
+    version: entry.version,
+    supportedDshRange: `=${entry.version}`,
+    verifiedDshArtifact: entry.artifact,
+    verifiedDshArtifactIntegrity: entry.integrity,
+  }))
+);
+
+const PREFERRED_DSH_FAMILY = DSH_VERSION_FAMILIES[0];
+const PREFERRED_DSH_CONTRACT = dshTargetContract(PREFERRED_DSH_FAMILY, null);
+
+// Backwards-compatible aliases. SUPPORTED_DSH_VERSION is the newest verified
+// artifact, not the only supported version, and SUPPORTED_DSH_RANGE is the
+// preferred family's range — a label, never a per-host decision. Use
+// dshFamilyForVersion / dshContractForMarker for a specific host or marker.
+const SUPPORTED_DSH_VERSION = VERIFIED_DSH_ARTIFACTS[0].version;
+const SUPPORTED_DSH_RANGE = PREFERRED_DSH_FAMILY.range;
+const VERIFIED_DSH_ARTIFACT = VERIFIED_DSH_ARTIFACTS[0].artifact;
+const VERIFIED_DSH_ARTIFACT_INTEGRITY = VERIFIED_DSH_ARTIFACTS[0].integrity;
 const SOURCE_AUDIT_BASELINE_COMMIT = "47f943859bef60e4160492346772ded9b24f765a";
 const DEFAULT_OPERATION_TIMEOUT_MS = 120000;
 const MUTATION_LOCK_SCHEMA_VERSION = 2;
@@ -83,23 +118,24 @@ function realpathSyncCanonical(fsImpl, value) {
 function resolveCanonicalDshHome(options = {}) {
   const platform = options.platform || process.platform;
   const pathApi = platform === "win32" ? path.win32 : path.posix;
-  const configured = options.canonicalDshHome
-    || options.dshHome
-    || resolveDshHome(options.env);
-  let canonical = pathApi.resolve(configured);
-  if (platform === process.platform) {
-    try {
-      canonical = realpathSyncCanonical(fs, canonical);
-    } catch {}
-  }
-  return canonical;
+  // A running mutation already chose this identity; never resolve it again if
+  // an ancestor is replaced while the operation is in progress.
+  if (options.canonicalDshHome) return pathApi.resolve(options.canonicalDshHome);
+  const configured = options.dshHome || resolveDshHome(options.env);
+  const resolved = pathApi.resolve(configured);
+  // DSH may create its home during plugin add. Resolve an existing ancestor
+  // now so its managed namespace stays the same before and after that step.
+  return platform === process.platform
+    ? resolveCanonicalLocalPath(resolved, options)
+    : resolved;
 }
 
 // Resolve symlinks in the deepest existing ancestor while preserving any
-// not-yet-created suffix. Managed roots are often created below a temporary or
-// relocated home whose lexical path differs from its real path (for example
-// macOS /var -> /private/var). Keeping the future suffix lets first install and
-// later ownership inspection agree without weakening marker/hash checks.
+// not-yet-created suffix. DSH homes and managed roots may be created below a
+// temporary or relocated parent whose lexical path differs from its real path
+// (for example macOS /tmp -> /private/tmp). Keeping the future suffix lets
+// first install and later ownership inspection agree without weakening
+// marker/hash checks.
 function resolveCanonicalLocalPath(value, options = {}) {
   const platform = options.platform || process.platform;
   const resolved = path.resolve(value);
@@ -459,31 +495,181 @@ async function resolveDshCommand(options = {}) {
   return null;
 }
 
-function parseDshVersion(value) {
-  const match = String(value || "").match(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\b/);
-  return match ? match[1] : null;
+// Pick the whole version token out of raw command output. Only a line that is
+// exactly "<token>" or "dsh <token>", with a token that starts with a digit,
+// counts. Several candidates (or none) mean the version is unknown, and an
+// invalid token is never trimmed down to a valid prefix.
+function extractDshVersionToken(rawOutput) {
+  const candidates = [];
+  for (const rawLine of String(rawOutput || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = line.match(/^(?:dsh\s+)?(\S+)$/);
+    if (!match || !/^\d/.test(match[1])) continue;
+    candidates.push(match[1]);
+  }
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
-function dshContractForVersion(version) {
-  return DSH_VERSION_CONTRACTS.find((contract) => contract.version === version) || null;
+// Strict SemVer core parser. Build metadata is rejected on purpose: the
+// verified artifacts never carried it, and accepting it would widen the input
+// space without evidence. Numeric segments stay strings so large integers
+// keep their full precision during comparison.
+function parseStrictDshVersion(token) {
+  const match = String(token || "").match(
+    /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
+  );
+  if (!match) return null;
+  const [, major, minor, patch] = match;
+  for (const segment of [major, minor, patch]) {
+    if (segment.length > 1 && segment[0] === "0") return null;
+  }
+  const prerelease = match[4] ? match[4].split(".") : [];
+  for (const identifier of prerelease) {
+    if (/^\d+$/.test(identifier) && identifier.length > 1 && identifier[0] === "0") return null;
+  }
+  return { major, minor, patch, prerelease };
+}
+
+function parseDshVersion(value) {
+  const token = extractDshVersionToken(value);
+  return token && parseStrictDshVersion(token) ? token : null;
+}
+
+function compareDshNumericIdentifiers(left, right) {
+  if (left.length !== right.length) return left.length > right.length ? 1 : -1;
+  if (left === right) return 0;
+  return left > right ? 1 : -1;
+}
+
+// SemVer precedence. Numeric identifiers are compared as digit strings (length
+// first, then lexicographically) so values above Number.MAX_SAFE_INTEGER do
+// not collapse to the same Number.
+function compareDshVersions(left, right) {
+  const a = parseStrictDshVersion(left);
+  const b = parseStrictDshVersion(right);
+  if (!a || !b) return null;
+  for (const key of ["major", "minor", "patch"]) {
+    const order = compareDshNumericIdentifiers(a[key], b[key]);
+    if (order !== 0) return order;
+  }
+  if (a.prerelease.length === 0 && b.prerelease.length === 0) return 0;
+  if (a.prerelease.length === 0) return 1;
+  if (b.prerelease.length === 0) return -1;
+  const shared = Math.min(a.prerelease.length, b.prerelease.length);
+  for (let index = 0; index < shared; index += 1) {
+    const leftIdentifier = a.prerelease[index];
+    const rightIdentifier = b.prerelease[index];
+    const leftNumeric = /^\d+$/.test(leftIdentifier);
+    const rightNumeric = /^\d+$/.test(rightIdentifier);
+    if (leftNumeric && rightNumeric) {
+      const order = compareDshNumericIdentifiers(leftIdentifier, rightIdentifier);
+      if (order !== 0) return order;
+    } else if (leftNumeric) {
+      return -1;
+    } else if (rightNumeric) {
+      return 1;
+    } else if (leftIdentifier !== rightIdentifier) {
+      return leftIdentifier > rightIdentifier ? 1 : -1;
+    }
+  }
+  if (a.prerelease.length === b.prerelease.length) return 0;
+  return a.prerelease.length > b.prerelease.length ? 1 : -1;
+}
+
+function dshFamilyForRange(range) {
+  return DSH_VERSION_FAMILIES.find((family) => family.range === range) || null;
+}
+
+function dshFamilyForVersion(version) {
+  const parsed = parseStrictDshVersion(version);
+  if (!parsed) return null;
+  const family = DSH_VERSION_FAMILIES.find(
+    (candidate) => candidate.family === `${parsed.major}.${parsed.minor}`
+  );
+  if (!family) return null;
+  return compareDshVersions(version, family.minVersion) >= 0 ? family : null;
 }
 
 function isSupportedDshVersion(version) {
-  return dshContractForVersion(version) !== null;
+  return dshFamilyForVersion(version) !== null;
+}
+
+// Only the pre-family exact contracts are listed here. This is not the
+// admission rule; use dshFamilyForVersion to decide whether a host is admitted.
+function dshContractForVersion(version) {
+  return HISTORICAL_DSH_CONTRACTS.find((contract) => contract.version === version) || null;
 }
 
 function supportedDshRangeLabel() {
-  return DSH_VERSION_CONTRACTS.map((contract) => contract.supportedDshRange).join(" or ");
+  return DSH_VERSION_FAMILIES.map((family) => family.range).join(" or ");
 }
 
-// Resolve the exact contract an installed generation was staged for. A marker
-// whose installedDshVersion is not in the table, or whose supportedDshRange
-// disagrees with its version's contract, is unlisted and returns null.
+// The hash contract answers "which range should verify this installed
+// generation". A family marker uses its family range; a pre-family marker uses
+// its old exact range. Anything else is unlisted and returns null.
 function dshContractForMarker(marker) {
-  if (!marker || typeof marker.installedDshVersion !== "string") return null;
-  const contract = dshContractForVersion(marker.installedDshVersion);
-  if (!contract || marker.supportedDshRange !== contract.supportedDshRange) return null;
-  return contract;
+  if (
+    !marker
+    || typeof marker.installedDshVersion !== "string"
+    || typeof marker.supportedDshRange !== "string"
+  ) return null;
+  const family = dshFamilyForRange(marker.supportedDshRange);
+  if (family) {
+    const markerFamily = dshFamilyForVersion(marker.installedDshVersion);
+    if (!markerFamily || markerFamily.family !== family.family) return null;
+    return { family: family.family, supportedDshRange: family.range };
+  }
+  const historical = HISTORICAL_DSH_CONTRACTS.find(
+    (contract) => contract.supportedDshRange === marker.supportedDshRange
+  );
+  if (historical && historical.version === marker.installedDshVersion) return historical;
+  return null;
+}
+
+// A stable identity for a marker during lock re-verification: its hash
+// contract plus the exact version it was staged for.
+function dshMarkerIdentity(marker) {
+  const contract = dshContractForMarker(marker);
+  if (!contract || !marker) return null;
+  return `${contract.supportedDshRange}\0${marker.installedDshVersion}`;
+}
+
+function verifiedArtifactsForFamily(family) {
+  return VERIFIED_DSH_ARTIFACTS.filter((entry) => dshFamilyForVersion(entry.version) === family);
+}
+
+// Manual npx commands and staged generations pin an artifact. A marker's own
+// version wins when it was verified; otherwise the family's newest verified
+// artifact is the closest available stand-in.
+function selectDshArtifact(family, markerVersion) {
+  const artifacts = verifiedArtifactsForFamily(family);
+  if (markerVersion) {
+    const exact = artifacts.find((entry) => entry.version === markerVersion);
+    if (exact) return exact;
+  }
+  return artifacts[0] || null;
+}
+
+// The target contract describes the generation Clawd is about to write. Its
+// identity is the family range, so hosts in the same family share one
+// generation regardless of the exact host version.
+function dshTargetContract(family, installedVersion) {
+  if (!family) return null;
+  const artifact = selectDshArtifact(
+    family,
+    typeof installedVersion === "string" ? installedVersion : null
+  );
+  if (!artifact) return null;
+  return {
+    family: family.family,
+    // The selected artifact's version, not the detected host version. Markers
+    // written from this contract stay inside the family its range describes.
+    artifactVersion: artifact.version,
+    supportedDshRange: family.range,
+    verifiedDshArtifact: artifact.artifact,
+    verifiedDshArtifactIntegrity: artifact.integrity,
+  };
 }
 
 async function readDshVersion(commandInfo, options = {}) {
@@ -688,9 +874,9 @@ function hashBridgeDirectorySync(fsImpl, packageDir, contract = PREFERRED_DSH_CO
   }
 }
 
-// Hash the current bridge source once per verified contract so health checks
-// can compare an installed marker against the source hash for the exact
-// contract it was staged for (never against another contract's hash).
+// Hash the current bridge source once per contract identity so health checks
+// can compare an installed marker against the source hash for the range it was
+// staged for (never against another range's hash).
 function computeExpectedSourceHashesSync(fsImpl, sourceDir) {
   try {
     const files = [];
@@ -703,8 +889,11 @@ function computeExpectedSourceHashesSync(fsImpl, sourceDir) {
       files.push({ relativePath, content: fsImpl.readFileSync(filePath) });
     }
     const hashes = {};
-    for (const contract of DSH_VERSION_CONTRACTS) {
-      hashes[contract.version] = digestBridgeFiles(files, contract);
+    for (const family of DSH_VERSION_FAMILIES) {
+      hashes[family.range] = digestBridgeFiles(files, { supportedDshRange: family.range });
+    }
+    for (const contract of HISTORICAL_DSH_CONTRACTS) {
+      hashes[contract.supportedDshRange] = digestBridgeFiles(files, contract);
     }
     return hashes;
   } catch {
@@ -914,6 +1103,7 @@ function classifyDeepSeekHarnessProfile({
   const marker = (resolved && resolved.clawdManifest)
     || (ownershipRecord && ownershipRecord.clawdManifest)
     || null;
+  const markerContract = marker ? dshContractForMarker(marker) : null;
   let status = "absent";
 
   if (dependencyPresent || bundlePresent) {
@@ -941,9 +1131,9 @@ function classifyDeepSeekHarnessProfile({
       status = owned ? "managed-bundle-missing" : "profile-entry-foreign-or-conflicting";
     } else if (!profileOwned && !fallbackOwned) {
       status = "profile-entry-foreign-or-conflicting";
-    } else if (!dshContractForMarker(marker)) {
+    } else if (!markerContract) {
       status = "version-unsupported";
-    } else if (expectedHashes && marker.bundleHash !== expectedHashes[marker.installedDshVersion]) {
+    } else if (expectedHashes && marker.bundleHash !== expectedHashes[markerContract.supportedDshRange]) {
       status = "generation-mismatch";
     } else {
       status = "healthy";
@@ -1081,7 +1271,7 @@ function inspectDeepSeekHarnessDiskSync(options = {}) {
     : sourceAwareHealth;
   compatibilityAwareHealth.detectedDshVersion = detectedDshVersion;
   compatibilityAwareHealth.supportedDshRange = supportedDshRangeLabel();
-  compatibilityAwareHealth.supportedDshVersions = DSH_VERSION_CONTRACTS.map((contract) => contract.version);
+  compatibilityAwareHealth.supportedDshVersions = VERIFIED_DSH_ARTIFACTS.map((entry) => entry.version);
   const latch = readInspectionLatchSync(fsImpl, options);
   if (!latch) return compatibilityAwareHealth;
   const latchBlockedByHigherPriority = immutableConflict
@@ -1165,7 +1355,9 @@ async function inspectDeepSeekHarnessIntegration(options = {}) {
 }
 
 async function readSourceBundle(options = {}) {
-  const contract = options.contract || dshContractForVersion(options.dshVersion) || PREFERRED_DSH_CONTRACT;
+  const contract = options.contract
+    || dshTargetContract(dshFamilyForVersion(options.dshVersion), options.dshVersion)
+    || PREFERRED_DSH_CONTRACT;
   const sourceDir = options.sourceDir || resolveBridgeSourceDir(options.baseDir);
   const files = [];
   for (const relativePath of BRIDGE_SOURCE_FILES) {
@@ -1190,7 +1382,7 @@ async function sourceClawdVersion(options = {}) {
 }
 
 async function promoteGeneration(bundle, options = {}) {
-  const contract = options.contract || dshContractForVersion(options.dshVersion) || bundle.contract || PREFERRED_DSH_CONTRACT;
+  const contract = options.contract || bundle.contract || PREFERRED_DSH_CONTRACT;
   const managedRoot = resolveManagedRoot(options);
   const generationsDir = path.join(managedRoot, "generations");
   const generationDir = path.join(generationsDir, bundle.bundleHash);
@@ -1206,7 +1398,7 @@ async function promoteGeneration(bundle, options = {}) {
     && existing.protocolVersion === BRIDGE_PROTOCOL_VERSION
     && existing.bundleHash === bundle.bundleHash
     && existingContract
-    && existingContract.version === contract.version
+    && existingContract.supportedDshRange === contract.supportedDshRange
     && existingHash === bundle.bundleHash
   ) {
     return { managedRoot, generationDir, bundleHash: bundle.bundleHash, created: false, manifest: existing };
@@ -1230,7 +1422,7 @@ async function promoteGeneration(bundle, options = {}) {
       bundleHash: bundle.bundleHash,
       sourceClawdVersion: version,
       supportedDshRange: contract.supportedDshRange,
-      installedDshVersion: options.dshVersion || contract.version,
+      installedDshVersion: options.dshVersion || contract.artifactVersion || contract.version,
       installedDshVersionAssumedAtStaging: options.dshVersionAssumed === true,
       verifiedDshArtifact: contract.verifiedDshArtifact,
       verifiedDshArtifactIntegrity: contract.verifiedDshArtifactIntegrity,
@@ -2186,7 +2378,24 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
           manualInspectionRequired: true,
         };
       }
-      const noCliContract = markerContract || PREFERRED_DSH_CONTRACT;
+      const targetFamily = before.marker
+        ? dshFamilyForVersion(before.marker.installedDshVersion)
+        : PREFERRED_DSH_FAMILY;
+      const noCliContract = dshTargetContract(
+        targetFamily,
+        before.marker ? before.marker.installedDshVersion : null
+      );
+      if (!noCliContract) {
+        return {
+          status: "error",
+          reason: "version-unsupported",
+          message: `DeepSeek Harness ${before.marker ? before.marker.installedDshVersion : "unknown"} is unsupported; this bridge supports ${supportedDshRangeLabel()}`,
+          detectedVersion: before.marker ? before.marker.installedDshVersion : null,
+          supportedRange: supportedDshRangeLabel(),
+          manualInspectionRequired: true,
+        };
+      }
+      const assumedVersion = before.marker ? before.marker.installedDshVersion : noCliContract.artifactVersion;
       const bundle = await readSourceBundle({ ...options, contract: noCliContract });
       if (before.status === "healthy" && before.marker.bundleHash === bundle.bundleHash) {
         if (latch) return inspectionLatchResult(latch);
@@ -2231,11 +2440,7 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
               manualInspectionRequired: true,
             };
           }
-          const lockedContract = locked.marker ? dshContractForMarker(locked.marker) : null;
-          if (
-            (before.marker && (!lockedContract || lockedContract.version !== noCliContract.version))
-            || (!before.marker && locked.marker)
-          ) {
+          if (dshMarkerIdentity(before.marker) !== dshMarkerIdentity(locked.marker)) {
             return {
               status: "error",
               reason: "ownership-changed",
@@ -2246,7 +2451,7 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
           const generation = await promoteGeneration(bundle, {
             ...options,
             contract: noCliContract,
-            dshVersion: noCliContract.version,
+            dshVersion: assumedVersion,
             dshVersionAssumed: true,
           });
           await writeManualGenerationReference(generation, options);
@@ -2257,7 +2462,7 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
             message: "DeepSeek Harness was detected, but a global dsh CLI is not available",
             manualCommand: buildManualDshCommand([
               "npx",
-              `@deepseek-ai/dsh@${noCliContract.version}`,
+              noCliContract.verifiedDshArtifact,
               "plugin",
               "--profile",
               WEB_PROFILE_NAME,
@@ -2273,9 +2478,8 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
       return { status: "error", reason: "cli-unavailable", message: "DeepSeek Harness CLI is not available" };
     }
     const dshVersion = await readDshVersion(commandInfo, options);
-    const contract = dshContractForVersion(dshVersion);
-    const bundle = await readSourceBundle({ ...options, contract });
-    if (!contract) {
+    const family = dshFamilyForVersion(dshVersion);
+    if (!family) {
       return {
         status: "error",
         reason: "version-unsupported",
@@ -2284,6 +2488,8 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
         supportedRange: supportedDshRangeLabel(),
       };
     }
+    const contract = dshTargetContract(family, dshVersion);
+    const bundle = await readSourceBundle({ ...options, contract });
     if (
       !latch
       && !manualReference
@@ -2315,13 +2521,13 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
           supportedRange: supportedDshRangeLabel(),
         };
       }
-      if (lockedVersion !== contract.version) {
+      if (lockedVersion !== dshVersion) {
         return {
           status: "error",
           reason: "version-changed",
-          message: `DeepSeek Harness changed from ${contract.version} to ${lockedVersion} before mutation; retry after the host version is stable`,
+          message: `DeepSeek Harness changed from ${dshVersion} to ${lockedVersion} before mutation; retry after the host version is stable`,
           detectedVersion: lockedVersion,
-          expectedVersion: contract.version,
+          expectedVersion: dshVersion,
           supportedRange: supportedDshRangeLabel(),
         };
       }
@@ -2392,7 +2598,7 @@ async function syncDeepSeekHarnessIntegration(options = {}) {
       const after = await inspectDeepSeekHarnessIntegration({
         ...options,
         commandInfo,
-        expectedHashes: { [contract.version]: generation.bundleHash },
+        expectedHashes: { [contract.supportedDshRange]: generation.bundleHash },
       });
       if (after.status !== "healthy") {
         await writeInspectionLatch("plugin-add-verification-failed", after.status, options);
@@ -2525,6 +2731,20 @@ async function uninstallDeepSeekHarnessBridge(options = {}) {
           manualInspectionRequired: true,
         };
       }
+      const removalTarget = dshTargetContract(
+        dshFamilyForVersion(before.marker.installedDshVersion),
+        before.marker.installedDshVersion
+      );
+      if (!removalTarget) {
+        return {
+          status: "error",
+          reason: "version-unsupported",
+          message: `DeepSeek Harness ${before.marker.installedDshVersion || "unknown"} is unsupported; refusing to build a manual uninstall command for an unlisted contract`,
+          detectedVersion: before.marker.installedDshVersion || null,
+          supportedRange: supportedDshRangeLabel(),
+          manualInspectionRequired: true,
+        };
+      }
       if (before.status === "managed-residue") {
         const lock = await acquireMutationLock(options);
         try {
@@ -2553,7 +2773,7 @@ async function uninstallDeepSeekHarnessBridge(options = {}) {
               manualInspectionRequired: true,
             };
           }
-          if (lockedContract.version !== removalContract.version) {
+          if (dshMarkerIdentity(locked.marker) !== dshMarkerIdentity(before.marker)) {
             return {
               status: "error",
               reason: "ownership-changed",
@@ -2572,7 +2792,7 @@ async function uninstallDeepSeekHarnessBridge(options = {}) {
         message: "DeepSeek Harness CLI is unavailable; the managed plugin was left installed",
         manualCommand: buildManualDshCommand([
           "npx",
-          `@deepseek-ai/dsh@${removalContract.version}`,
+          removalTarget.verifiedDshArtifact,
           "plugin",
           "--profile",
           WEB_PROFILE_NAME,
@@ -2715,16 +2935,19 @@ module.exports = {
   BRIDGE_PROTOCOL_VERSION,
   BRIDGE_SOURCE_FILES,
   DSH_RESTART_HINT,
-  DSH_VERSION_CONTRACTS,
+  DSH_VERSION_FAMILIES,
   MANAGED_OWNER,
   PREFERRED_DSH_CONTRACT,
   SUPPORTED_DSH_RANGE,
   SUPPORTED_DSH_VERSION,
   VERIFIED_DSH_ARTIFACT,
   VERIFIED_DSH_ARTIFACT_INTEGRITY,
+  VERIFIED_DSH_ARTIFACTS,
   WEB_PROFILE_NAME,
   dshContractForMarker,
   dshContractForVersion,
+  dshFamilyForVersion,
+  dshTargetContract,
   isSupportedDshVersion,
   supportedDshRangeLabel,
   dshCommandPathsSync,
@@ -2763,7 +2986,13 @@ module.exports = {
     digestBridgeFiles,
     dshContractForMarker,
     dshContractForVersion,
+    dshFamilyForVersion,
+    dshMarkerIdentity,
+    dshTargetContract,
+    compareDshVersions,
+    extractDshVersionToken,
     isSupportedDshVersion,
+    parseStrictDshVersion,
     resolveCanonicalDshHome,
     packagePath,
     parseDshVersion,
