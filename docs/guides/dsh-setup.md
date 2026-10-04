@@ -13,16 +13,42 @@ own npm artifact and integrity:
 
 | DSH version | npm artifact | npm integrity (sha512) |
 | --- | --- | --- |
-| `0.1.1-rc.2` (preferred for new installs) | `@deepseek-ai/dsh@0.1.1-rc.2` | `sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg==` |
+| `0.2.0-rc.2` (preferred for new installs) | `@deepseek-ai/dsh@0.2.0-rc.2` | `sha512-EAJ3gPNcVt/uv8X19PMm9NkVhWgT7xXNMk0UKCVm+IQ5rpSQOcsMUa0HWlnYYVybKMsccjcRB21vVVsaXQ6IdA==` |
+| `0.1.5-rc.3` | `@deepseek-ai/dsh@0.1.5-rc.3` | `sha512-c0W6Xqc4ChjFcCJkbzPeIxZQdnbKqe+QAcJzWGtogg0ZzsnZRcw3vopMyZ5oZU6E2fmyqGcyDR1sBeiCH4yHcg==` |
+| `0.1.5-rc.1` | `@deepseek-ai/dsh@0.1.5-rc.1` | `sha512-rmNmzQCg3oIc1z8xH7izRSOuy1TNzq+/NILyfM+7e8DKOyV+yBtg47WEsqR2SiIe1ATec3L/rUa1YhIcfQ2XEg==` |
+| `0.1.1-rc.2` | `@deepseek-ai/dsh@0.1.1-rc.2` | `sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg==` |
 | `0.1.0-rc.6` | `@deepseek-ai/dsh@0.1.0-rc.6` | `sha512-brpZfED7ieRa2PQ5tUxMhHrM1pb2CmKFVM/f6yMULBDMicahk+Z2OsHgTwTDnoiZm23Ftu9rQz0NN4pflaoJcg==` |
 
 Install and Repair select the contract matching the detected host (or the owned
-marker when no CLI probe is available); new installs prefer `0.1.1-rc.2`.
+marker when no CLI probe is available); new installs prefer `0.2.0-rc.2`.
 Uninstall and manual `npx` commands select the contract of the installed
 marker. Pre-release versions are exact-pinned — a broad `>=0.1.x` range would
 admit artifacts this bridge has not verified. The public seams were first
 audited against upstream commit `47f9438`, then rechecked in the compiled
 rc.6 artifact; that commit is a source baseline, not a claimed tag mapping.
+The `0.1.5-rc.1` row was added after re-checking the same four public seams
+(`session/created`, `session/event`, `session/disposed`, and the
+`approval/request` waterfall) in the published `0.1.5-rc.1` artifact. The
+optional title and context-pressure projections were also checked against
+the published rc.1 packages. A
+controlled macOS session and approval smoke against a localhost mock Clawd
+endpoint followed; its scope is
+described below. The `0.1.5-rc.3` row was added after re-checking the same four
+public seams (`session/created`, `session/event`, `session/disposed`, and the
+`approval/request` waterfall) plus the optional title and context-pressure
+projections in the published rc.3 artifact; a macOS real-machine run using the
+real Clawd UI followed (see below).
+The `0.2.0-rc.2` row was added after a read-only static audit of the published
+`0.2.0-rc.2` artifact confirmed the same four public seams plus the optional
+title and context-pressure projections, followed by the 2026-10-04 macOS
+real-machine check described below. That check reused the rc.3 bridge generation
+Clawd had already installed: its four bridge files were byte-identical to
+`hooks/dsh-clawd-bridge` at main `fe3e1b01`, but the installer at the time did not
+yet admit `0.2.0-rc.2`, so it was not an install performed by Clawd's installer.
+A later 2026-10-04 run used the `0.2.0-rc.2` generation that Clawd's installer
+produced and passed (see below). In `0.2.0-rc.2` a failed `tool/result` marks
+`isError` on the message rather than on its content items; the bridge accepts
+both shapes.
 Unlisted versions fail before Clawd changes the DSH profile.
 
 ## Behavior
@@ -44,6 +70,24 @@ session.
 | turn ended | `Stop` / `attention` (or `StopFailure` / `error`) |
 | session disposed | `SessionEnd` / `sleeping` |
 
+DSH's `session/title` event supplies the Session HUD and Dashboard title. When
+the public session projection service is present, the plugin also follows
+`contextPressure` changes and reads its current value when a session is
+created. Clawd displays the same reference occupancy as DSH's ContextMeter:
+`(projectedTokens ?? pressureTokens) / contextWindow`, rounded and capped at
+100%. It appears only after DSH has reported both usage and model capacity.
+The projection is a reference estimate, especially after content changes or a
+model switch. Projection updates annotate an existing Clawd session without
+creating a card or changing its activity time. If DSH no longer reports both
+operands, Clawd clears the old percentage instead of displaying a stale one.
+The standard completion bell appears when a finished DSH session is unread.
+
+The quota coin is separate account telemetry. DSH does not currently expose
+a five-hour usage bucket through this plugin's public session APIs, so Clawd
+does not invent a DSH `5h` percentage. DeepSeek's
+[API balance](https://api-docs.deepseek.com/api/get-user-balance/) is an amount
+of money and cannot be represented as that rolling-window percentage.
+
 For ordinary `approval/request`, the plugin prepends a blocking listener:
 
 - Clawd **Allow** returns DSH `allowed-once`.
@@ -61,7 +105,7 @@ mode is enabled; per-session grants are not offered in this experimental release
 
 ## Requirements
 
-- DSH `0.1.1-rc.2` (preferred) or `0.1.0-rc.6` on the same machine.
+- DSH `0.2.0-rc.2` (preferred), `0.1.5-rc.3`, `0.1.5-rc.1`, `0.1.1-rc.2`, or `0.1.0-rc.6` on the same machine.
 - The `web` profile.
 - `pnpm`, because the official DSH plugin command delegates profile mutation to
   pnpm.
@@ -94,9 +138,10 @@ Separate DSH homes therefore never share a generation that one home's uninstall
 or cleanup could delete.
 
 If DSH is only used through `npx`, Clawd does not download it automatically.
-Settings returns an exact manual `npx @deepseek-ai/dsh@0.1.1-rc.2 plugin ... add`
-command (the contract matching the staged generation, or `0.1.0-rc.6` when the
-installed marker is rc.6) pointing at the staged managed generation and explicitly setting the
+Settings returns an exact manual `npx @deepseek-ai/dsh@<contract> plugin ... add`
+command (the contract matching the staged generation — `0.2.0-rc.2` for a
+preferred-contract install, or the marker's own version
+`0.1.5-rc.3`, `0.1.5-rc.1`, `0.1.1-rc.2`, or `0.1.0-rc.6` otherwise) pointing at the staged managed generation and explicitly setting the
 canonical target `DSH_HOME` (PowerShell on Windows, POSIX environment-prefix
 syntax elsewhere). This keeps an alternate home from accidentally mutating the
 default `~/.dsh` when the command is pasted into a fresh terminal. After that command succeeds,
@@ -111,6 +156,17 @@ Startup sync repairs only an already opted-in, installed-and-enabled integration
 It never initializes a missing DSH profile. Settings Install or explicit Doctor
 Repair may allow the official CLI to initialize that profile. A running `dsh web`
 process may need a restart after install or repair.
+
+Upgrading the DSH host and Clawd separately has two paths. When only DSH is
+upgraded and Clawd stays on the same version, startup sync keeps the existing
+generation instead of staging a new one (it reports `generation-conflict`
+internally). The kept generation already contains the bridge files from the
+current Clawd version, but its marker still records the older DSH version. To
+switch to the new contract right away, open **Settings → Agents**, click
+**Uninstall** and then **Install** for DeepSeek Harness, and restart any running
+`dsh web`. When Clawd itself is upgraded first and the installed generation was
+staged by an older Clawd version, startup sync replaces that generation
+automatically.
 
 ### Mutation lock recovery
 
@@ -175,8 +231,101 @@ warnings, and rely on DSH's native web flow whenever Clawd yields no decision.
   install/uninstall lifecycle through isolated pnpm and the real rc.6 macOS
   lifecycle, including no-CLI commands
   ([#938](https://github.com/rullerzhou-afk/clawd-on-desk/pull/938)).
-  Automated installer coverage includes rc.6 retention, rc.2 installation,
-  cross-contract generation migration, and unlisted-version rejection.
+  Automated installer coverage includes rc.1 installation, rc.3 installation,
+  first install below
+  a symlinked parent, rc.6 retention, rc.2 installation, cross-contract
+  generation migration, and unlisted-version rejection.
+- On 2026-09-23, a **macOS rc.1 source-run** used isolated `HOME` and `DSH_HOME`,
+  real `dsh web` sessions created and prompted through DSH's public API, and a
+  localhost mock Clawd endpoint. Without the bridge, the baseline session
+  emitted no `/state` request. With the bridge, the endpoint received
+  `SessionStart`, `UserPromptSubmit`, and `Stop`; a controlled ordinary approval
+  request sent to `/permission` resolved to `allowed-once` for Allow and
+  `rejected` for Deny. An HTTP 204 left the request pending until DSH session
+  cancellation produced `cancelled`. The probe ended before any model step.
+  This verifies the bridge and DSH API behavior, not the real Clawd UI or a
+  packaged app.
+- On 2026-09-24, a second isolated rc.1 Web API run verified `session/title`
+  forwarding and live `contextPressure` updates. A local fake SSE endpoint
+  supplied controlled model usage, so no real model call or user DSH profile
+  was involved. A synthetic 500013-token prompt against DSH's 1000000-token
+  context window produced `context_usage: { used: 500013, limit: 1000000,
+  percent: 50 }` at a mock Clawd `/state` endpoint, alongside SessionStart,
+  UserPromptSubmit, and Stop. This verifies the DSH-to-bridge calculation and
+  delivery, not a real user's usage, the Clawd UI, or a packaged app.
+- On 2026-09-27, a **macOS rc.3 source-run** used macOS 26.6.2 on Apple silicon
+  with the globally npm-installed `@deepseek-ai/dsh@0.1.5-rc.3`
+  (`dsh --version` printed `0.1.5-rc.3`) running `dsh web`. It used the
+  maintainer's everyday DSH profile rather than an isolated `DSH_HOME`, and Clawd
+  ran from this branch's source at commit `691e2ee3`, not a packaged app. Clawd's
+  startup sync replaced the managed bridge generation left by an older Clawd
+  build with the rc.3 generation (manifest `installedDshVersion: 0.1.5-rc.3`,
+  range `=0.1.5-rc.3`), and DSH web listed `clawd-bridge` as an enabled global
+  plugin. The real conversation used DSH's official DeepSeek provider with
+  `deepseek-flash`, the default `workspace-write` permission preset, and the
+  `ask` approval policy. Clawd received `SessionStart`, `UserPromptSubmit`,
+  `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `Stop` from the bridge.
+  Clawd's Session HUD showed the DSH-generated session title and the context
+  occupancy percentage (confirmed visually). For an approval, asking DSH to
+  create a file outside the workspace made the model request sandbox escalation
+  to `danger-full-access` for bash, which raised `approval/request` and showed a
+  Clawd approval bubble. Choosing **Allow** recorded `allowed-once` in DSH, the
+  command ran, and the file was created. Choosing **Deny** recorded `rejected`,
+  the tool call failed (Clawd showed `PostToolUseFailure`), and the command did
+  not run (the Deny prompt targeted the file created in the Allow step, and its
+  modification time did not change). This verifies install via startup sync,
+  session state, HUD metadata, and Allow/Deny with the real Clawd UI on a source
+  run. It did not cover a packaged app, a first install through Settings,
+  Uninstall, DND, or the HTTP 204 hand-back and cancellation paths; the last two
+  were exercised against a mock endpoint in the 2026-09-23 rc.1 run and were not
+  retested on rc.3.
+- On 2026-10-04, a **macOS 0.2.0-rc.2 source-run** used macOS 26.6.2 on Apple
+  silicon with the globally npm-installed `@deepseek-ai/dsh@0.2.0-rc.2`
+  (`dsh --version` printed `0.2.0-rc.2`) running `dsh web`, and Clawd from source
+  at main `fe3e1b01`. The installed bridge generation was still the rc.3
+  generation Clawd had staged earlier: its four bridge files were byte-identical
+  to `hooks/dsh-clawd-bridge` at main `fe3e1b01`, but the installer at the time
+  did not yet admit `0.2.0-rc.2`, so this was not an install owned by Clawd's
+  `0.2.0-rc.2` contract.
+  DSH's plugin list and assembled config included the bridge with no compatibility
+  warning. A real conversation used DSH's official DeepSeek provider with
+  `DeepSeek-V41-Flash`, the default `workspace-write` permission preset, and the
+  `ask` approval policy. Clawd received `SessionStart`, `UserPromptSubmit`,
+  `PreToolUse`, `PostToolUse`, and `Stop`. Asking DSH to create a file outside the
+  workspace was first refused by the sandbox, then raised `approval/request` on a
+  sandbox-escalation retry. Choosing **Allow** recorded `allowed-once`, the file
+  was created, and Clawd received `PostToolUse` and `Stop`. Choosing **Deny**
+  recorded `rejected` and left the file unchanged; the rejected result carried
+  `message.isError: true` (the `0.2.0-rc.2` location) with no content-item
+  `isError`, and the rc.3 bridge, which only checked `data.error` and content-item
+  `isError`, reported it as `PostToolUse` instead of `PostToolUseFailure`. This
+  run is the evidence for the `0.2.0-rc.2` message-level failure shape; it did not
+  itself produce a correct `PostToolUseFailure`. It did not cover an install
+  performed by Clawd's installer for `0.2.0-rc.2`, a first install through
+  Settings, Uninstall, DND, the HTTP 204 hand-back, Windows, a packaged app, or
+  the desktop profile.
+- On 2026-10-04, a second **macOS 0.2.0-rc.2 source-run** used the `0.2.0-rc.2`
+  generation produced by Clawd's own installer. Clawd ran from source at main
+  `fe3e1b01` plus this change's three runtime files, and startup sync replaced
+  the rc.3 generation left by Clawd 1.1.0 (the new manifest recorded
+  `sourceClawdVersion: 1.2.0`, `installedDshVersion: 0.2.0-rc.2`, range
+  `=0.2.0-rc.2`); the profile dependency moved to the new generation and the old
+  generation was removed. Restarting `dsh web` and opening a real conversation
+  with DSH's official DeepSeek provider, `DeepSeek-V41-Flash`, the default
+  `workspace-write` permission preset, and the `ask` approval policy delivered
+  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop` to
+  Clawd. For a sandbox-escalation approval to write outside the workspace,
+  **Allow** recorded `allowed-once` and created the file; **Deny** recorded
+  `rejected`, left the file unchanged (its modification time and size did not
+  change), and — because the failed
+  result carried `message.isError: true` with no `data.error` — Clawd showed
+  `PostToolUseFailure` / `error` before `Stop`. Clawd's Session HUD showed the
+  DSH-generated session title and the context occupancy percentage (1%),
+  confirmed visually. This verifies install via startup sync with a generation
+  Clawd itself staged, state mapping, HUD metadata, Allow/Deny, and the
+  message-level failure flag with the real Clawd UI on a source run. It did not
+  cover a packaged app, a first install through Settings, Uninstall, DND, the
+  HTTP 204 hand-back and cancellation, Windows, or the desktop profile.
 - Linux, WSL, remote SSH, non-web profiles, macOS packaging, and ARM64 packaging
   remain unverified.
 - There is no terminal-focus action because DSH web is a browser surface.
