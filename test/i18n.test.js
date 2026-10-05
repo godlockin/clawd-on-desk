@@ -88,6 +88,21 @@ describe("i18n locales", () => {
     assertLocaleObjectParity(i18n, "runtime");
   });
 
+  it("localizes the DSH desktop open action in every supported language", () => {
+    assert.deepStrictEqual(
+      Object.fromEntries(SUPPORTED_LANGS.map((lang) => [lang, i18n[lang].dashboardOpenDshDesktop])),
+      {
+        en: "Open DeepSeek Harness",
+        zh: "打开 DeepSeek Harness",
+        "zh-TW": "開啟 DeepSeek Harness",
+        ko: "DeepSeek Harness 열기",
+        ja: "DeepSeek Harness を開く",
+        "pt-BR": "Abrir o DeepSeek Harness",
+        es: "Abrir DeepSeek Harness",
+      }
+    );
+  });
+
   it("keeps native startup health notices in the runtime dictionary", () => {
     const keys = [
       "feishuApprovalMigrationNudgeTitle",
@@ -111,6 +126,17 @@ describe("i18n locales", () => {
 
   it("keeps Settings locale keysets aligned with English", () => {
     assertLocaleObjectParity(loadSettingsI18nStrings(), "settings");
+  });
+
+  it("describes Codex CLI queue delivery in every Settings locale", () => {
+    const strings = loadSettingsI18nStrings();
+    for (const lang of SUPPORTED_LANGS) {
+      assert.match(
+        strings[lang].telegramApprovalDirectSendDesc,
+        /Codex Desktop.*Codex CLI/,
+        `settings.${lang}.telegramApprovalDirectSendDesc should name both queue routes`,
+      );
+    }
   });
 
   it("localizes every Feishu provenance, lookup lifecycle, and persistence outcome", () => {

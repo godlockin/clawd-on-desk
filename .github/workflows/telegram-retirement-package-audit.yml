@@ -24,17 +24,23 @@ on:
       - "src/settings-actions.js"
       - "src/settings-i18n.js"
       - "src/settings-ui-core.js"
+      - "src/language-picker.js"
+      - "src/language-picker.css"
+      - "src/settings-tab-theme.js"
       - "src/settings-tab-recap.js"
       - "src/telegram-*"
       - "src/settings-tab-telegram-approval.js"
       - "src/settings.css"
       - "agents/traecode.js"
       - "hooks/traecode-*"
+      - "agents/minimax.js"
+      - "hooks/minimax-*"
       - "src/state-stale-cleanup.js"
       - "src/state.js"
       - "src/integration-sync.js"
       - "src/doctor-detectors/agent-descriptors.js"
       - "test/traecode-*.test.js"
+      - "test/minimax-*.test.js"
       - "test/recap*.test.js"
       - "test/fixtures/recap-private-permissions-*.js"
       - "test/state-stale-cleanup.test.js"
@@ -68,6 +74,8 @@ on:
       - "test/win-foreground-terminal.test.js"
       - "test/win-fullscreen-detect.test.js"
       - "test/settings-renderer-browser-env.test.js"
+      - "test/settings-picker-layout-electron.test.js"
+      - "test/fixtures/settings-picker-layout-electron.js"
       - "test/settings-recap.test.js"
       - "test/telegram-legacy-retirement.test.js"
       - "test/telegram-migration-*.test.js"
@@ -123,11 +131,25 @@ jobs:
             test/server-hook-management.test.js \
             test/settings-renderer-browser-env.test.js \
             test/hook-adapter-offline-contract.test.js
+      - name: Run MiniMax Code integration tests
+        run: |
+          node --test \
+            test/minimax-hook.test.js \
+            test/minimax-install.test.js \
+            test/registry.test.js \
+            test/integration-sync.test.js \
+            test/doctor-agent-descriptors.test.js \
+            test/doctor-agent-integrations.test.js \
+            test/server-hook-management.test.js \
+            test/settings-renderer-browser-env.test.js \
+            test/hook-adapter-offline-contract.test.js
       - name: Run recap unit tests
         run: >-
           node --test
           test/recap*.test.js
           test/settings-recap.test.js
+      - name: Run Settings picker layout under Electron
+        run: xvfb-run -a node --test test/settings-picker-layout-electron.test.js
       - name: Run native SVG motion audit
         run: xvfb-run -a node --test test/accessory-motion-electron.test.js
 

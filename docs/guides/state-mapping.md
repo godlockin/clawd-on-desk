@@ -29,6 +29,8 @@ Clawd also has a conditional Outlaw idle easter egg: while both the Western cowb
 | 60s mouse idle | sleeping | Sleep | <img src="../../assets/gif/clawd-sleeping.gif" width="160"> | <img src="../../assets/gif/calico-sleeping.gif" width="130"> | <img src="../../assets/gif/cloudling-sleeping.gif" width="140"> |
 | SessionEnd | remove session; idle if no live sessions | No sleep transition | | | |
 
+In the Clawd theme, a direct Claude Code `/design` command selects the painting visual through `UserPromptExpansion`. The accepted main-session `Stop` selects heart eyes; this marks a completed turn, not successful publication. Temporary tool failures, notifications and automatic compaction keep the design hint for resumed work, while terminal failures, session end and the next ordinary prompt clear it. Both poses retain the selected head accessory and temporarily hide the mouth accessory, which returns on supported ordinary poses. Other themes use their normal state visuals.
+
 ## Kimi Code CLI (Kimi-CLI) Hook Events
 
 Kimi Code CLI (Kimi-CLI) now uses hook-only integration (`~/.kimi/config.toml`), and maps these 13 hook events to shared Clawd states:
@@ -74,6 +76,30 @@ ZCode uses config-file hooks under `~/.zcode/cli/config.json`:
 
 `PermissionRequest` is a blocking permission approval since Phase 2: the hook waits on Clawd's local bubble or remote approval and answers a manual allow/deny via `hookSpecificOutput` on stdout. Permission automation deliberately defers for ZCode until its tool surface and session identity are audited. The `notification` mapping above only fires on the fail-closed path (missing/unknown tool name) or when Clawd is not running; a real decision never posts `/state`. ZCode does not provide a `SessionEnd` hook in this integration, so completion relies on `Stop` plus Clawd's normal process-liveness and stale-session cleanup. When Clawd yields no decision (timeout, disconnect, DND, bubbles off), the hook prints `{}` and ZCode's own permission flow takes over.
 
+## Grok Build Hook Events
+
+Grok Build uses config-file hooks under `<GROK_HOME or ~/.grok>/hooks/clawd-on-desk.json`:
+
+| Grok Hook Event | State | Notes |
+|---|---|---|
+| SessionStart | idle | |
+| UserPromptSubmit | thinking | records the newest turn in the turn fence |
+| PreToolUse / PostToolUse | working | |
+| PostToolUseFailure / StopFailure | error | |
+| Stop (`reason="end_turn"`, no live background tasks/crons, inactive stop hook) | attention | only a genuine unblocked end of turn |
+| Stop (continuation signal) | working with `event=null` | adapter-local; never latches a terminal |
+| Stop (`channel_closed` / `shutdown` / missing / unknown reason) | dropped | never synthesizes Done; the real `SessionEnd` or `idle_prompt` settles |
+| StopCancelled | idle | settles without Done; corrects a same-turn Stop tail |
+| Notification (`notificationType="idle_prompt"`) | notification | plays the one-shot, then stores the session idle; fence settles the turn |
+| Other Notification | notification | presentation only; does not settle the active turn |
+| PreCompact | sweeping | |
+| PostCompact (manual) | idle | never a completion |
+| PostCompact (auto) | thinking | never a completion |
+| PermissionDenied | notification (passive) | no decision; Grok owns permissions |
+| SessionEnd | remove session; idle if no live sessions | clears the turn fence record |
+
+Grok never registers `/permission`; the adapter always emits `{}`. Subagent events (`subagentType`) and `SubagentStart` / `SubagentStop` are out of scope in Phase 1.
+
 ## Pi Extension Events
 
 Pi uses a global extension (`~/.pi/agent/extensions/clawd-on-desk`) and maps interactive-session lifecycle events to shared Clawd states:
@@ -92,6 +118,31 @@ Pi uses a global extension (`~/.pi/agent/extensions/clawd-on-desk`) and maps int
 
 Pi is state-only in Clawd: Clawd does not intercept permissions or add confirmation prompts, so Pi keeps its default YOLO execution behavior.
 
+## OMP Extension Events
+
+OMP (oh-my-pi) uses a per-agent extension directory — `~/.omp/agent/extensions/clawd-on-desk` for the default environment — and maps interactive-session lifecycle events to shared Clawd states:
+
+| OMP Extension Event | Clawd Event | State |
+|---|---|---|
+| session_start | SessionStart | idle |
+| session_switch / session_branch | SessionStart | idle |
+| before_agent_start | UserPromptSubmit | thinking |
+| tool_call | PreToolUse | working |
+| tool_result (ok) | PostToolUse | working |
+| tool_result (isError) | PostToolUseFailure | error |
+| session_stop candidate + following agent_end (`willContinue !== true`) | Stop | attention |
+| session_before_compact | PreCompact | sweeping |
+| session_compact | PostCompact | attention |
+| session_shutdown | SessionEnd | remove session; idle if no live sessions |
+
+Three behaviours differ from the Pi extension deliberately:
+
+- **Completion is committed across `session_stop` and the following `agent_end`.** `session_stop` is a pre-settle aggregation hook: another extension can still request a hidden continuation after Clawd's handler runs. Clawd records a main-session candidate there, then commits it only when OMP's following `agent_end` does not carry `willContinue: true`. Scheduling pauses, built-in retries and extension continuations therefore do not play the finish chime.
+- **`session_switch` / `session_branch` are reported, and the session being left is retired** with a synthetic `SessionEnd`. OMP can move an interactive terminal to another conversation with no shutdown for the old one, which would otherwise leave a live HUD row for a session nothing reports on again.
+- **A `session_title` is always sent.** Several interactive OMP sessions legitimately share one working directory, and the folder-name fallback would render every row — and every jump target — identically.
+
+OMP is state-only in Clawd: Clawd does not intercept permissions or add confirmation prompts, so OMP keeps its own execution behavior.
+
 ## Mini Mode
 
 Drag to the right screen edge (or right-click → "Mini Mode") to enter mini mode — half-body visible at screen edge, peeking out on hover.
@@ -106,3 +157,55 @@ Drag to the right screen edge (or right-click → "Mini Mode") to enter mini mod
 ## Click Reactions
 
 Easter eggs — try double-clicking, rapid 4-clicks, or poking Clawd repeatedly to discover hidden reactions.
+
+## Hash Sage (optional official theme)
+
+Hash Sage (哈希仙人) is **not** bundled with Clawd. It is an optional official theme downloaded on demand from the independent `rullerzhou-afk/clawd-themes` repository (Settings → Theme → Official themes). Once installed it runs as an external APNG theme with the same logical states, the approved SVG effects baked into each APNG, and no cursor eye tracking:
+
+| State | Hash Sage animation |
+|---|---|
+| idle | 空手待机 — standing breath (approved sample; the full idle set is not final yet) |
+| idle random pool (after 20 s without mouse movement) | 小云捉迷藏 — a little cloud flies in, circles her with a gold trail, plays on her fingertip and flies off; starts and ends on the idle pose |
+| thinking | 掐诀推演 — palm compass turns, code glyphs rise |
+| working (1 session) | 执笔制符 — writes the verification talisman |
+| working (2 sessions) / juggling (1 subagent) | 御剑 · 哈希符文 — twin swords with hash runes |
+| working (3+ sessions) / juggling (2+ subagents) | 忙碌协作 — two paper spirits help out |
+| attention | 完成收功 — unrolls the seal scroll |
+| notification | 小铃轻唤 — rings the small bell |
+| error | 怎么又炸了 — the talisman backfires |
+| sweeping / carrying | 拂尘引纸 / 牵云运匣 |
+| yawning → dozing → collapsing → sleeping → waking | 哈欠入盹 → 托腮轻盹 → 云来安睡 → 云上代码梦 → 伸懒腰醒来 |
+| DND sleep transition | 直接安睡 |
+| roam, mini crab-walk | 乘云而行 (drawn heading right, mirrored when heading left) |
+| drag / double-click / annoyed, 4-click | 张手轻摆 / 小小吃惊 / 有点嫌弃 |
+| mini idle / enter / hover peek | 贴边探头 / 从右侧走入 / 探出与呼吸 |
+| mini alert / task complete / working | 摇铃 / 竖卷收功 / 挥符 |
+| mini enter-sleep / sleep (DND) | 闭眼入场 / 贴墙睡眠呼吸 |
+
+Re-downloading after an uninstall is a lossy upgrade: it clears this theme's customizations and Clawd-managed sound overrides.
+
+## Whale-chan (optional official theme)
+
+Whale-chan (鲸鱼娘) is **not** bundled with Clawd either. It is an optional official theme downloaded on demand from the same `rullerzhou-afk/clawd-themes` repository (Settings → Theme → Official themes) and requires Clawd 1.2.0. Once installed it runs as an external animated-image theme (animated WebP since theme 1.0.1) with the same logical states, effects baked into each animation, and no cursor eye tracking:
+
+| State | Whale-chan animation |
+|---|---|
+| idle | 陪你发一会儿呆 — standing breath |
+| idle random pool (after 20 s without mouse movement) | 大家一起来合奏 — conducts, the music ring fades in and out, then crossfades back to idle |
+| Default idle visual choice (Settings → Default idle visual) | 泡在泳池里偷个懒 — offered through `idleVisualOptions`, never picked at random |
+| thinking | 认真想一想 |
+| working (1 session) | 今天也在努力呀 |
+| working (2 sessions) / juggling (subagents) | 发现电饭煲啦 — the magic rice cooker |
+| working (3+ sessions) | 撑着小伞去踩水 — umbrella in the rain |
+| attention | 任务完成啦！ |
+| notification | 有件事要你确认哦 |
+| error | 报错也要被接住 |
+| sweeping / carrying | 把尾巴擦得亮晶晶 / 泡在泳池里偷个懒 |
+| yawning → dozing → collapsing → sleeping → waking | 慢慢钻进纸箱里 → 在纸箱里轻轻呼吸 → 从纸箱飘进云朵 → 睡在软绵绵的云上 → 睡饱啦，回来陪你 |
+| DND sleep transition | 乘着云朵进入深睡 |
+| roam, mini crab-walk | 搭上鲸鱼巴士去兜风 (drawn heading right, mirrored when heading left) |
+| drag / click reactions | 被拎起来也要晃一晃 / 戳我干嘛，哼！ |
+| mini enter / idle | 从屏幕边探出头来 / 趴在屏幕边陪着你 |
+| mini hover peek | 撑起身子看看你, then holds the pose while the pointer stays (`mini-peek-hold`) |
+| mini working / alert / task complete | 认真干饭中 / 叮！有事找你 / 砰！做完啦 |
+| mini enter-sleep / sleep (DND) / hover while asleep | 闭着眼也来陪你 / 趴在屏幕边睡着了 / 睡着也撑起身子 (`mini-sleep-peek`) |

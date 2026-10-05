@@ -8,7 +8,8 @@ const {
   buildLatestLocalCodexProcessIds,
   isSupersededLocalCodexProcessSession,
 } = require("./state-session-dedupe");
-const { readCodexThreadName } = require("../hooks/codex-session-index");
+const { bareCodexSessionId, readCodexThreadName, readCodexThreadNames } = require("../hooks/codex-session-index");
+const { isWslSourced } = require("./remote-process-metadata");
 
 // ── Session source derivation ────────────────────────────────────────
 
@@ -41,6 +42,7 @@ const EVENT_LABEL_KEYS = {
   SessionStart: "eventLabelSessionStart",
   SessionEnd: "eventLabelSessionEnd",
   UserPromptSubmit: "eventLabelUserPromptSubmit",
+  UserPromptExpansion: "eventLabelUserPromptSubmit",
   PreToolUse: "eventLabelPreToolUse",
   PostToolUse: "eventLabelPostToolUse",
   PostToolUseFailure: "eventLabelPostToolUseFailure",
@@ -154,6 +156,9 @@ function isEndedSessionBadge(badge) {
 function shouldAutoClearDetachedSession(session, badge, options = {}) {
   if (options.sessionHudCleanupDetached !== true) return false;
   if (!session || session.headless || session.state !== "idle" || session.agentPid) return false;
+  // A WSL session's sourcePid is a Linux PID that can alias a live process on
+  // the Windows host. Never probe it (or hide the session) on that basis.
+  if (isWslSourced({ wslDistro: session.wslDistro, host: session.host })) return false;
   if (!session.pidReachable || !session.sourcePid) return false;
   if (!isEndedSessionBadge(badge)) return false;
   const isProcessAlive = typeof options.isProcessAlive === "function"
@@ -396,6 +401,7 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     provider: (session && session.provider) || null,
     codexOriginator: (session && session.codexOriginator) || null,
     codexSource: (session && session.codexSource) || null,
+    dshCarrier: (session && session.dshCarrier) || null,
     contextUsage: snapshotContextUsage(session),
     assistantLastOutput: (session && typeof session.assistantLastOutput === "string")
       ? session.assistantLastOutput
@@ -447,6 +453,17 @@ function normalizeSessionsIterable(sessions) {
 }
 
 function buildSessionSnapshot(sessions, options = {}) {
+  let readThreadName = options.readCodexThreadName;
+  if (typeof readThreadName !== "function") {
+    const localCodexSessionIds = [];
+    for (const [id, session] of normalizeSessionsIterable(sessions)) {
+      if (session && session.agentId === "codex" && !session.host) {
+        localCodexSessionIds.push(session.rawSessionId || id);
+      }
+    }
+    const threadNames = readCodexThreadNames(localCodexSessionIds);
+    readThreadName = (id) => threadNames.get(bareCodexSessionId(id)) || null;
+  }
   const entries = [];
   const sessionAliases = options.sessionAliases && typeof options.sessionAliases === "object"
     ? options.sessionAliases
@@ -467,6 +484,7 @@ function buildSessionSnapshot(sessions, options = {}) {
     if (automationRecord) matchedAutomationGrantIds.add(automationRecord.grantId);
     entries.push(buildSessionSnapshotEntry(id, session, sessionAliases, {
       ...options,
+      readCodexThreadName: readThreadName,
       latestLocalCodexProcessIds,
       sessionAutomationRecord: automationRecord,
     }));
@@ -623,6 +641,7 @@ function sessionSnapshotSignature(snapshot) {
       provider: entry.provider,
       codexOriginator: entry.codexOriginator,
       codexSource: entry.codexSource,
+      dshCarrier: entry.dshCarrier,
       contextUsage: entry.contextUsage,
       assistantLastOutput: entry.assistantLastOutput,
       assistantLastOutputTruncated: !!entry.assistantLastOutputTruncated,
