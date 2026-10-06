@@ -3,12 +3,20 @@ const { describe, it } = require("node:test");
 const fs = require("node:fs");
 const path = require("node:path");
 const { minimatch } = require("minimatch");
+const yaml = require("js-yaml");
 
 const pkg = require("../package.json");
 const ROOT = path.join(__dirname, "..");
 
 function matchedByAnyGlob(globs, target) {
   return globs.some((g) => minimatch(target, g));
+}
+
+function loadWorkflow(name) {
+  return yaml.load(fs.readFileSync(
+    path.join(ROOT, ".github", "workflows", name),
+    "utf8",
+  ));
 }
 
 function sliceWorkflowBlock(workflow, startMarker, endMarker) {
@@ -33,6 +41,61 @@ function sliceWorkflowJob(workflow, jobName) {
 }
 
 describe("package build config", () => {
+  describe("full-suite CI", () => {
+    it("runs npm test on pull requests and main pushes across all three platforms", () => {
+      const workflow = loadWorkflow("test.yml");
+      assert.strictEqual(workflow.name, "Test");
+      assert.deepStrictEqual(Object.keys(workflow.on).sort(), [
+        "pull_request",
+        "push",
+        "workflow_dispatch",
+      ]);
+      assert.deepStrictEqual(workflow.on.push.branches, ["main"]);
+      assert.deepStrictEqual(workflow.permissions, { contents: "read" });
+      assert.strictEqual(workflow.concurrency["cancel-in-progress"], true);
+      assert.match(workflow.concurrency.group, /github\.ref/);
+
+      const job = workflow.jobs.test;
+      assert.ok(job, "Test workflow should contain the test job");
+      assert.strictEqual(job["runs-on"], "${{ matrix.os }}");
+      assert.strictEqual(job.strategy["fail-fast"], false);
+      assert.deepStrictEqual(job.strategy.matrix.os, [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+      ]);
+      const setupNode = job.steps.find((step) => step.uses === "actions/setup-node@v4");
+      assert.deepStrictEqual(setupNode.with, { "node-version-file": ".nvmrc" });
+      assert.deepStrictEqual(
+        job.steps.filter((step) => step.run).map((step) => step.run),
+        ["npm ci", "npm test", "xvfb-run -a npm test"],
+      );
+      const nonLinuxTest = job.steps.find((step) => step.run === "npm test");
+      assert.ok(nonLinuxTest, "non-Linux full-suite step should exist");
+      assert.strictEqual(nonLinuxTest.if, "runner.os != 'Linux'");
+      const linuxTest = job.steps.find((step) => step.run === "xvfb-run -a npm test");
+      assert.ok(linuxTest, "Linux xvfb full-suite step should exist");
+      assert.strictEqual(linuxTest.if, "runner.os == 'Linux'");
+    });
+
+    it("keeps tag release jobs on full tests and limits focused mode to manual dispatch", () => {
+      const workflow = loadWorkflow("build.yml");
+      assert.deepStrictEqual(workflow.on.push.tags, ["v*"]);
+      assert.ok(workflow.on.workflow_dispatch.inputs.artifact_validation_only);
+      for (const [jobName, fullCommand] of [
+        ["build-windows", "npm test"],
+        ["build-mac", "npm test"],
+        ["build-linux", "xvfb-run -a npm test"],
+      ]) {
+        const job = workflow.jobs[jobName];
+        const fullStep = job.steps.find((step) => step.run === fullCommand);
+        assert.ok(fullStep, `${jobName} should retain its full-suite step`);
+        assert.match(fullStep.if, /github\.event_name != 'workflow_dispatch'/);
+        assert.match(fullStep.if, /!inputs\.artifact_validation_only/);
+      }
+    });
+  });
+
   describe("repository asset audit", () => {
     it("exposes a Windows-compatible npm audit command", () => {
       assert.strictEqual(
@@ -55,6 +118,9 @@ describe("package build config", () => {
       const workflow = fs.readFileSync(workflowPath, "utf8");
       assert.match(workflow, /pull_request:/);
       assert.match(workflow, /npm run audit:assets/);
+      assert.match(workflow, /npm run audit:pr-history-assets/);
+      assert.match(workflow, /PR_BASE_SHA:\s*\$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+      assert.match(workflow, /PR_HEAD_SHA:\s*\$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
       assert.match(workflow, /test\/preload-settings\.test\.js/);
       assert.match(workflow, /test\/state-agent-icons\.test\.js/);
       for (const testFile of [

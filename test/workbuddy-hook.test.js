@@ -2,6 +2,7 @@ const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert");
 const path = require("node:path");
 const { createSpawnedHookHarness } = require("./helpers/spawned-hook");
+const { loadSharedProcessWithMock } = require("./helpers/load-shared-process-with-mock");
 const {
   HOOK_MAP,
   stdoutForEvent,
@@ -9,6 +10,9 @@ const {
   SESSION_TITLE_MAX,
   WORKBUDDY_AGENT_NAMES,
   isWorkBuddyCliCommand,
+  isWorkBuddyMainProcessCommand,
+  getWorkBuddyPlatformConfig,
+  getWorkBuddyPidResolverOptions,
 } = require("../hooks/workbuddy-hook");
 const { normalizePosixProcessName } = require("../hooks/shared-process");
 
@@ -100,6 +104,202 @@ describe("WorkBuddy macOS process-name contract", () => {
   });
 });
 
+// issue #655: Windows WorkBuddy 5.6.2 runs each turn in a prewarmed CLI host
+// that exits seconds after Stop. Every role shares the same WorkBuddy.exe, so
+// agent_pid must be resolved from the command line (the long-lived GUI main
+// process), not from the process name (the per-turn host).
+describe("issue #655: WorkBuddy Windows agent_pid", () => {
+  const WB = "C:\\Program Files\\WorkBuddy\\WorkBuddy.exe";
+  const MAIN = `"${WB}"`;
+  const DAEMON = `"${WB}" "C:\\Program Files\\WorkBuddy\\resources\\app.asar\\main\\daemon-app-server-entry.js" --stdio`;
+  const TURN_HOST = `"${WB}" "C:\\Program Files\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy" --prewarm --prewarm-id wb-pool-1791205819681-fed118`;
+  const SIDECAR = `"${WB}" "C:\\Program Files\\WorkBuddy\\resources\\app.asar\\main\\sidecar-entry.js" --token redacted --control-pipe-uuid redacted`;
+  const EDGE_SYNC = `"${WB}" "C:\\Program Files\\WorkBuddy\\resources\\app.asar.unpacked\\resources\\extensions\\edge-sync\\server\\index.cjs"`;
+  const RENDERER = `"${WB}" --type=renderer --user-data-dir="C:\\Users\\t\\AppData\\Roaming\\WorkBuddy"`;
+  const RENDERER_QUOTED = `"${WB}" "--type=renderer"`;
+  // 5.2.6 shape (the exact arguments were not captured; this is the inferred
+  // form): a per-conversation process under the unpacked CLI with --session-id.
+  const CONVERSATION = `"${WB}" "C:\\Program Files\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy" --session-id 1234-5678`;
+
+  function snapshotJson(procs) {
+    return JSON.stringify(procs.map((p) => ({
+      ProcessId: p.pid,
+      Name: p.name,
+      ParentProcessId: p.ppid,
+      CommandLine: typeof p.cmd === "string" ? p.cmd : null,
+    })));
+  }
+
+  // Runs the REAL shared-process resolver over a mock Windows process snapshot,
+  // built from the SAME options the hook ships (getWorkBuddyPidResolverOptions).
+  function resolveWindowsChain(procs, startPid) {
+    const { mod, cleanup } = loadSharedProcessWithMock({
+      execFileSyncMock: () => snapshotJson(procs),
+      platform: "win32",
+    });
+    const cfg = getWorkBuddyPlatformConfig(mod.getPlatformConfig);
+    const resolve = mod.createPidResolver({
+      ...getWorkBuddyPidResolverOptions(cfg, "win32"),
+      startPid,
+      readRuntimeIdentity: () => ({ ok: true, reason: null, port: 23333, ownerPid: process.pid }),
+      env: {},
+    });
+    return { resolve, cleanup };
+  }
+
+  it("issue #655: classifies command lines by their app.asar script and --type= role markers", () => {
+    assert.strictEqual(isWorkBuddyMainProcessCommand(MAIN), true);
+    for (const cmd of [DAEMON, SIDECAR, EDGE_SYNC, TURN_HOST, RENDERER, RENDERER_QUOTED, CONVERSATION]) {
+      assert.strictEqual(isWorkBuddyMainProcessCommand(cmd), false, `must not be the main process: ${cmd}`);
+    }
+    assert.strictEqual(isWorkBuddyMainProcessCommand(""), false);
+    assert.strictEqual(isWorkBuddyMainProcessCommand(null), false);
+  });
+
+  it("issue #655: credits the GUI main process, not the per-turn host or daemon, on the 5.6.2 chain", () => {
+    const { resolve, cleanup } = resolveWindowsChain([
+      { pid: 10, name: "sometemp.exe", ppid: 20, cmd: null },
+      { pid: 20, name: "WorkBuddy.exe", ppid: 30, cmd: TURN_HOST },
+      { pid: 30, name: "WorkBuddy.exe", ppid: 40, cmd: DAEMON },
+      { pid: 40, name: "WorkBuddy.exe", ppid: 50, cmd: MAIN },
+      { pid: 50, name: "explorer.exe", ppid: 0, cmd: null },
+    ], 10);
+    try {
+      const r = resolve();
+      assert.strictEqual(r.agentPid, 40, "agent_pid is the long-lived main process");
+      assert.notStrictEqual(r.agentPid, 20, "never the per-turn host");
+      assert.notStrictEqual(r.agentPid, 30, "never the daemon");
+      assert.strictEqual(r.stablePid, 40, "source_pid lands on the topmost WorkBuddy.exe");
+    } finally { cleanup(); }
+  });
+
+  it("issue #655: credits the main process on the 5.2.6 conversation chain", () => {
+    const { resolve, cleanup } = resolveWindowsChain([
+      { pid: 10, name: "WorkBuddy.exe", ppid: 40, cmd: CONVERSATION },
+      { pid: 40, name: "WorkBuddy.exe", ppid: 50, cmd: MAIN },
+      { pid: 50, name: "explorer.exe", ppid: 0, cmd: null },
+    ], 10);
+    try {
+      assert.strictEqual(resolve().agentPid, 40);
+    } finally { cleanup(); }
+  });
+
+  it("issue #655: skips a quoted --type= renderer ancestor and still credits the main process", () => {
+    const { resolve, cleanup } = resolveWindowsChain([
+      { pid: 10, name: "WorkBuddy.exe", ppid: 40, cmd: RENDERER_QUOTED },
+      { pid: 40, name: "WorkBuddy.exe", ppid: 50, cmd: MAIN },
+      { pid: 50, name: "explorer.exe", ppid: 0, cmd: null },
+    ], 10);
+    try {
+      assert.strictEqual(resolve().agentPid, 40, "the quoted helper must not become agent_pid");
+    } finally { cleanup(); }
+  });
+
+  it("issue #655: never credits daemon, sidecar, edge-sync, per-turn host, renderer, or an unreadable line", () => {
+    for (const cmd of [DAEMON, SIDECAR, EDGE_SYNC, TURN_HOST, RENDERER, null]) {
+      const { resolve, cleanup } = resolveWindowsChain([
+        { pid: 10, name: "WorkBuddy.exe", ppid: 50, cmd },
+        { pid: 50, name: "explorer.exe", ppid: 0, cmd: null },
+      ], 10);
+      try {
+        assert.strictEqual(resolve().agentPid, null, `must not credit: ${cmd}`);
+      } finally { cleanup(); }
+    }
+  });
+
+  it("issue #655: leaves agent_pid empty when the chain never reaches the main process", () => {
+    const { resolve, cleanup } = resolveWindowsChain([
+      { pid: 10, name: "sometemp.exe", ppid: 20, cmd: null },
+      { pid: 20, name: "WorkBuddy.exe", ppid: 30, cmd: TURN_HOST },
+      { pid: 30, name: "WorkBuddy.exe", ppid: 50, cmd: DAEMON },
+      { pid: 50, name: "explorer.exe", ppid: 0, cmd: null },
+    ], 10);
+    try {
+      assert.strictEqual(resolve().agentPid, null, "no main process means no agent_pid, not a fallback");
+    } finally { cleanup(); }
+  });
+
+  it("issue #655: selects the main-process predicate on win32 and the CLI predicate elsewhere", () => {
+    const cfg = {};
+    assert.strictEqual(
+      getWorkBuddyPidResolverOptions(cfg, "win32").agentCmdlineCheck,
+      isWorkBuddyMainProcessCommand,
+    );
+    assert.strictEqual(
+      getWorkBuddyPidResolverOptions(cfg, "darwin").agentCmdlineCheck,
+      isWorkBuddyCliCommand,
+    );
+    assert.strictEqual(
+      getWorkBuddyPidResolverOptions(cfg, "linux").agentCmdlineCheck,
+      isWorkBuddyCliCommand,
+    );
+  });
+
+  it("issue #655: no longer matches WorkBuddy.exe by name on Windows; it probes the command line instead", () => {
+    assert.strictEqual(WORKBUDDY_AGENT_NAMES.win.has("workbuddy.exe"), false);
+    const opts = getWorkBuddyPidResolverOptions({}, "win32");
+    assert.ok(opts.agentCmdlineNames.has("workbuddy.exe"));
+    assert.ok(opts.agentCmdlineNames.has("electron"));
+  });
+});
+
+// issue #655: 5.6.x delivers UserPromptSubmit ~0.1s before SessionStart on
+// every turn; without preserve_state that late idle SessionStart would flip a
+// running turn back to idle.
+describe("issue #655: WorkBuddy SessionStart preserve_state", () => {
+  const HOOK = path.resolve(__dirname, "..", "hooks", "workbuddy-hook.js");
+  let hookHarness;
+
+  before(() => {
+    hookHarness = createSpawnedHookHarness({ prefix: "wb-preserve-state-" });
+  });
+
+  after(() => hookHarness.cleanup());
+
+  function runHook(payload) {
+    return hookHarness.run({
+      script: HOOK,
+      payload,
+      httpContract: "expect-attempt",
+      // Block real process queries (e.g. `ps`): this contract is about the POST
+      // body, not about the machine's live process tree.
+      probeProcessSpawns: true,
+      // The recorder only captures the POST body when it plays a success
+      // response; without this the body would be undefined.
+      env: { CLAWD_POST_RECORDER_SUCCEED: "1" },
+    });
+  }
+
+  function postedStateBody(result) {
+    const request = (result.attempts || []).find((a) => a.kind === "request" && a.body);
+    assert.ok(request, `expected a state POST; attempts=${JSON.stringify(result.attempts)}`);
+    return JSON.parse(request.body);
+  }
+
+  it("issue #655: sets preserve_state on every turn's SessionStart so a late start cannot flip a running turn to idle", () => {
+    const r = runHook({ hook_event_name: "SessionStart", session_id: "wb-655", cwd: "/tmp/repo" });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const body = postedStateBody(r);
+    assert.strictEqual(body.event, "SessionStart");
+    assert.strictEqual(body.state, "idle");
+    assert.strictEqual(body.preserve_state, true);
+  });
+
+  it("issue #655: does not send preserve_state on UserPromptSubmit or Stop", () => {
+    for (const event of ["UserPromptSubmit", "Stop"]) {
+      const r = runHook({ hook_event_name: event, session_id: "wb-655", cwd: "/tmp/repo" });
+      assert.strictEqual(r.status, 0, r.stderr);
+      const body = postedStateBody(r);
+      assert.strictEqual(body.event, event);
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(body, "preserve_state"),
+        false,
+        `${event} must not carry preserve_state`,
+      );
+    }
+  });
+});
+
 describe("WorkBuddy hook session title (#648)", () => {
   it("prefers an explicit payload.session_title over the prompt", () => {
     const title = deriveSessionTitle("UserPromptSubmit", {
@@ -118,10 +318,17 @@ describe("WorkBuddy hook session title (#648)", () => {
 
   it("truncates long titles to SESSION_TITLE_MAX with an ellipsis", () => {
     const long = "x".repeat(200);
-    const title = deriveSessionTitle("UserPromptSubmit", { prompt: long });
+    const title = deriveSessionTitle("UserPromptSubmit", { session_title: long });
     assert.strictEqual(title.length, SESSION_TITLE_MAX);
     assert.ok(title.endsWith("\u2026"));
     assert.strictEqual(title, `${"x".repeat(SESSION_TITLE_MAX - 1)}\u2026`);
+    const prompt = "A longer readable prompt ".repeat(10);
+    assert.strictEqual(deriveSessionTitle("UserPromptSubmit", { prompt }), `${prompt.slice(0, SESSION_TITLE_MAX - 1)}\u2026`);
+  });
+
+  it("does not expose secret-looking fallback lines, including after the truncation boundary", () => {
+    assert.strictEqual(deriveSessionTitle("UserPromptSubmit", { prompt: "Check my token ghp_abcdefghijklmnopqrstuvwx" }), null);
+    assert.strictEqual(deriveSessionTitle("UserPromptSubmit", { prompt: `${"Readable text ".repeat(10)}password=hidden` }), null);
   });
 
   it("does not derive a prompt title on non-UserPromptSubmit events", () => {
@@ -164,6 +371,24 @@ describe("WorkBuddy hook session_id filter (#618 / #648) — real subprocess", (
       httpContract,
     });
   }
+
+  it("marks fallback provenance and forwards the transcript for native names", () => {
+    for (const explicit of [false, true]) {
+      const r = hookHarness.run({ script: HOOK, httpContract: "expect-attempt",
+        env: { CLAWD_POST_RECORDER_SUCCEED: "1", CLAWD_REMOTE: "1" },
+        payload: { hook_event_name: "UserPromptSubmit", session_id: "s-title", prompt: "Prompt text",
+          transcript_path: "/workbuddy/projects/project/s-title.jsonl", ...(explicit ? { session_title: "Actual chat name" } : {}) } });
+      assert.strictEqual(r.status, 0, r.stderr);
+      assert.strictEqual(r.stdout, "{}\n");
+      const post = r.attempts.find((attempt) => attempt.path === "/state" && attempt.method === "POST");
+      assert.ok(post, "the shipped adapter must send a real state payload");
+      const body = JSON.parse(post.body);
+      assert.strictEqual(body.session_title, explicit ? "Actual chat name" : "Prompt text");
+      assert.strictEqual(body.session_title_from_prompt, !explicit);
+      assert.strictEqual(body.transcript_path, "/workbuddy/projects/project/s-title.jsonl");
+      assert.strictEqual(body.agent_id, "workbuddy");
+    }
+  });
 
   it("forwards nothing and produces no placeholder session when session_id is absent", () => {
     const r = runHook(
