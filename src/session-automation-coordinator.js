@@ -7,12 +7,33 @@ const { sanitizeDisplayLabel } = require("./session-automation-store");
 const MODE_OFF = "off";
 const MODE_AUTO_TOOLS = "auto-tools";
 
+// Lower rank is stricter: a session that asks every time must never be widened
+// by a broader global mode just because one request failed verification.
+const MODE_STRICTNESS = Object.freeze({ off: 0, "auto-tools": 1, unattended: 2 });
+
+function stricterMode(left, right) {
+  const safeLeft = Object.prototype.hasOwnProperty.call(MODE_STRICTNESS, left) ? left : MODE_OFF;
+  const safeRight = Object.prototype.hasOwnProperty.call(MODE_STRICTNESS, right) ? right : MODE_OFF;
+  return MODE_STRICTNESS[safeLeft] <= MODE_STRICTNESS[safeRight] ? safeLeft : safeRight;
+}
+
 function trustedIdentityFromEntry(entry) {
   if (!entry || typeof entry !== "object") return null;
   const assessment = entry.sessionAutomationIdentity;
   const agentId = typeof entry.agentId === "string" ? entry.agentId.trim() : "";
   const sessionId = typeof entry.sessionId === "string" ? entry.sessionId.trim() : "";
   if (!agentId || !sessionId || !assessment || assessment.eligible !== true) return null;
+  return { agentId, sessionId };
+}
+
+// The identity a request claims about itself, whether or not verification
+// succeeded. Only used to stop an unverified request from falling back past a
+// stricter per-session setting it claims to own.
+function claimedIdentityFromEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const agentId = typeof entry.agentId === "string" ? entry.agentId.trim() : "";
+  const sessionId = typeof entry.sessionId === "string" ? entry.sessionId.trim() : "";
+  if (!agentId || !sessionId) return null;
   return { agentId, sessionId };
 }
 
@@ -80,11 +101,18 @@ function createSessionAutomationCoordinator(options = {}) {
   function getEffectiveMode(entry, config = {}) {
     const record = getRecordForEntry(entry);
     if (record) return record.mode;
-    if (config.sessionOnly === true) return MODE_OFF;
-    const globalMode = getGlobalMode();
-    return globalMode === MODE_AUTO_TOOLS || globalMode === "unattended"
-      ? globalMode
-      : MODE_OFF;
+    let fallback = MODE_OFF;
+    if (config.sessionOnly !== true) {
+      const globalMode = getGlobalMode();
+      if (globalMode === MODE_AUTO_TOOLS || globalMode === "unattended") fallback = globalMode;
+    }
+    // A request whose identity verification failed must not fall back to a
+    // broader global mode and bypass the session's own stricter setting. When
+    // the claimed session has a record, only ever tighten: return the stricter
+    // of the record and the fallback.
+    const claimed = claimedIdentityFromEntry(entry);
+    const claimedRecord = claimed ? store.get(claimed) : null;
+    return claimedRecord ? stricterMode(claimedRecord.mode, fallback) : fallback;
   }
 
   function canResolve(entry, config = {}) {

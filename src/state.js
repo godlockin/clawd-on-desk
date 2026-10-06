@@ -105,6 +105,11 @@ const {
 
 // Session display hints — validated against theme.displayHintMap keys
 let DISPLAY_HINT_MAP = {};
+let COMPLETION_VISUAL_MAP = {};
+
+function completionVisualForHint(hint) {
+  return typeof hint === "string" ? (COMPLETION_VISUAL_MAP[hint] || null) : null;
+}
 
 // ── Session tracking ──
 const sessions = new Map();
@@ -135,9 +140,13 @@ const COMPLETION_HOUSEKEEPING_EVENTS = new Set([
 ]);
 // #406: forward progress for a session cancels its pending (debounced)
 // completion — these events all mean the agent loop is still running.
+// SubagentStop is deliberately absent: a finishing subagent is closing
+// evidence, not parent progress, and Claude sends one 1.5-15s after the Stop
+// from a background helper (#1060), so it must not veto a completion that has
+// already reached its quiet window.
 const COMPLETION_CANCEL_EVENTS = new Set([
-  "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
-  "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
+  "UserPromptSubmit", "UserPromptExpansion", "PreToolUse", "PostToolUse", "PostToolUseFailure",
+  "SubagentStart", "PreCompact", "PostCompact",
   "PermissionRequest", "CodexUserInputRequest", "Elicitation", "StopFailure", "ApiError", "SessionEnd",
 ]);
 const CLAUDE_ELICITATION_COMPLETION_PROBE_DELAY_MS = 2000;
@@ -182,8 +191,20 @@ let currentHitBox = HIT_BOXES.default;
 
 // ── State machine internal ──
 let currentState = "idle";
+// Bumped by every applyState that actually lands, so an owner can tell "the
+// visual I put up is still the current one" from "something applied a state
+// since" — including a real event that re-applies the same state name.
+let displayRevision = 0;
 let previousState = "idle";
 let currentSvg = null;
+// Where the currently displayed visual came from. A Settings animation preview
+// temporarily owns the pet's visual even though it reuses a logical state name.
+// A real event landing on that same name must still be able to take the visual
+// back, so setState has to know the difference between "the pet is really in
+// this state" and "a preview is holding this visual". Any applyState that is
+// not itself a preview clears it — the last landed applyState is the owner.
+const VISUAL_SOURCE_SETTINGS_PREVIEW = "settings-preview";
+let currentVisualSource = null;
 let stateChangedAt = Date.now();
 let pendingTimer = null;
 let autoReturnTimer = null;
@@ -518,6 +539,7 @@ function refreshTheme() {
   COLLAPSE_DURATION = theme.timings.collapseDuration || 0;
   SLEEP_MODE = theme.sleepSequence && theme.sleepSequence.mode === "direct" ? "direct" : "full";
   DISPLAY_HINT_MAP = theme.displayHintMap || {};
+  COMPLETION_VISUAL_MAP = theme.completionVisualMap || {};
   hitboxRuntime = createHitboxRuntime(theme);
   HIT_BOXES = hitboxRuntime.hitBoxes;
   FILE_HIT_BOXES = hitboxRuntime.fileHitBoxes;
@@ -548,7 +570,7 @@ function scheduleAutoReturn(state) {
         if (state === "mini-peek") {
           // Peek animation done — stay peeked but show idle (don't re-trigger peek)
           ctx.miniPeeked = true;
-          applyState("mini-idle");
+          applyState(hasOwnVisualFiles("mini-peek-hold") ? "mini-peek-hold" : "mini-idle");
         } else {
           ctx.miniPeekIn();
           applyState("mini-peek");
@@ -576,7 +598,16 @@ function setState(newState, svgOverride, options = {}) {
 
   const sameState = newState === currentState;
   const sameSvg = !svgOverride || svgOverride === currentSvg;
-  if (sameState && sameSvg) {
+  // A Settings animation preview can hold the current visual under the same
+  // state name a real event wants. The name+svg dedupe below would swallow the
+  // real event, leaving the preview asset up, the display revision frozen, and
+  // the preview's own auto-return timer in charge — so the completion cue/flash
+  // never play and the one-shot never restarts from the real event. Let the
+  // real event through once so it takes the visual back and re-establishes
+  // everything from now. Repeated real events still dedupe below.
+  const realEventTakingOverPreview = currentVisualSource === VISUAL_SOURCE_SETTINGS_PREVIEW
+    && options.settingsPreview !== true;
+  if (sameState && sameSvg && !realEventTakingOverPreview) {
     // Kimi CLI permission hold: re-arm the auto-return timer so the
     // notification animation keeps cycling while the user is reviewing
     // the permission prompt.
@@ -588,6 +619,12 @@ function setState(newState, svgOverride, options = {}) {
       scheduleAutoReturn(newState);
     }
     return;
+  }
+
+  // A preview is not a real display of this state, so its min-display hold must
+  // not delay (or let the preview timer beat) the real event taking over.
+  if (realEventTakingOverPreview) {
+    options = { ...options, bypassMinDisplay: true };
   }
 
   if (pendingTimer) {
@@ -724,29 +761,42 @@ function applyState(state, svgOverride, options = {}) {
   }
 
   if (ctx.miniMode && !state.startsWith("mini-")) {
+    // Every mini remap that actually lands must forward applyOptions so a
+    // Settings preview keeps ownership of the visual it just put up — in
+    // particular mini-working, where the preview asset is replaced by the
+    // theme's mini binding but the Settings runtime still needs to schedule
+    // and later perform the hand-back.
     if (state === "notification") return applyState("mini-alert", undefined, applyOptions);
     if (state === "attention") return applyState("mini-happy", undefined, applyOptions);
     if (state === "working" || state === "thinking" || state === "juggling") {
-      if (hasOwnVisualFiles("mini-working")) return applyState("mini-working");
+      if (hasOwnVisualFiles("mini-working")) return applyState("mini-working", undefined, applyOptions);
       return;
     }
     if ((AUTO_RETURN_MS[currentState] || currentState === "mini-working") && !autoReturnTimer) {
-      return applyState(ctx.mouseOverPet ? "mini-peek" : "mini-idle");
+      return applyState(ctx.mouseOverPet ? "mini-peek" : "mini-idle", undefined, applyOptions);
     }
     return;
   }
 
   previousState = currentState;
   currentState = state;
+  displayRevision += 1;
+  currentVisualSource = applyOptions.settingsPreview === true
+    ? VISUAL_SOURCE_SETTINGS_PREVIEW
+    : null;
   stateChangedAt = Date.now();
   ctx.idlePaused = false;
 
-  // Sound triggers
-  if (state === "attention" || state === "mini-happy") {
-    ctx.playSound("complete");
-    if (ctx.flashTaskbar) ctx.flashTaskbar();
-  } else if (state === "notification" || state === "mini-alert") {
-    if (!applyOptions.muteNotificationSound) ctx.playSound("confirm");
+  // Sound triggers. muteStateSounds is for re-applying a state the pet is
+  // already in — handing an animation preview back — where the cue already
+  // played when that state first arrived.
+  if (!applyOptions.muteStateSounds) {
+    if (state === "attention" || state === "mini-happy") {
+      ctx.playSound("complete");
+      if (ctx.flashTaskbar) ctx.flashTaskbar();
+    } else if (state === "notification" || state === "mini-alert") {
+      if (!applyOptions.muteNotificationSound) ctx.playSound("confirm");
+    }
   }
 
   // #509: no-override idle entries (e.g. roam ending) also rest on the
@@ -811,7 +861,7 @@ function applyState(state, svgOverride, options = {}) {
       autoReturnTimer = null;
       applyResolvedDisplayState();
     }, WAKE_DURATION);
-  } else if (AUTO_RETURN_MS[state]) {
+  } else if (state !== "mini-peek-hold" && state !== "mini-sleep-peek" && AUTO_RETURN_MS[state]) {
     scheduleAutoReturn(state);
   }
 }
@@ -1501,13 +1551,32 @@ function updateSessionMetadata(sessionId, opts = {}) {
     debugSession(`metadata-only drop sid=${id} reason=no-session`);
     return false;
   }
+  // Some metadata channels bypass the lifecycle sequence fence, so they must
+  // prove they only annotate their own agent's session. Without this, a
+  // metadata-only POST could rewrite the title/usage of a session that another
+  // agent happened to create with a colliding raw id. Absent means the legacy
+  // "annotate whatever exists" behavior (opencode-family, statusline, ...).
+  const expectedAgentId = typeof opts.expectedAgentId === "string" ? opts.expectedAgentId : null;
+  if (expectedAgentId && session.agentId !== expectedAgentId) {
+    debugSession(`metadata-only drop sid=${id} reason=agent-mismatch expected=${expectedAgentId} actual=${session.agentId}`);
+    return false;
+  }
   const incomingContextUsage = normalizeContextUsage(opts.contextUsage);
   const incomingTitle = typeof opts.sessionTitle === "string"
     ? normalizeTitle(opts.sessionTitle)
     : null;
-  if (!incomingContextUsage && !incomingTitle) return false;
+  const incomingModel = typeof opts.model === "string" ? opts.model.trim() : "";
+  const clearContextUsage = opts.clearContextUsage === true;
+  if (!incomingContextUsage && !clearContextUsage && !incomingTitle && !incomingModel) return false;
   let applied = false;
-  if (incomingContextUsage) {
+  if (clearContextUsage) {
+    if (session.contextUsage || session.contextUsageOrigin) {
+      session.contextUsage = null;
+      session.contextUsageOrigin = null;
+      session.metadataUpdatedAt = Date.now();
+      applied = true;
+    }
+  } else if (incomingContextUsage) {
     const resolved = resolveContextUsageUpdate(
       session,
       incomingContextUsage,
@@ -1535,8 +1604,20 @@ function updateSessionMetadata(sessionId, opts = {}) {
   // freshness, and a rename must not make stale telemetry look fresh. The
   // title broadcasts anyway - sessionTitle/displayTitle are in the snapshot
   // signature, so emitSessionSnapshot below fans it out.
-  if (incomingTitle && incomingTitle !== session.sessionTitle) {
-    session.sessionTitle = incomingTitle;
+  if (incomingTitle) {
+    if (incomingTitle !== session.sessionTitle) {
+      session.sessionTitle = incomingTitle;
+      applied = true;
+    }
+    // Metadata titles are formal: a later prompt fallback must not displace
+    // them, even when the text happens to match the current prompt fallback.
+    session.sessionTitleFromPrompt = false;
+  }
+  // Deliberately NOT stamping metadataUpdatedAt: that field is context/quota
+  // telemetry freshness, and a model switch must not make stale telemetry
+  // look fresh.
+  if (incomingModel && incomingModel !== session.model) {
+    session.model = incomingModel;
     applied = true;
   }
   if (applied) emitSessionSnapshot();
@@ -1719,9 +1800,20 @@ function scheduleClaudeTranscriptCompletionProbe(sessionId, transcriptPath) {
       return;
     }
 
+    // Claude transcript entries carry the raw `session_id` (UUID) that Claude
+    // emitted, not Clawd's canonical session key (#908). The probe map is keyed
+    // by the canonical id, so filter the transcript by the session's raw id.
+    // Stored sessions always carry a rawSessionId (it falls back to the session
+    // key at construction, and a missing wire identity is represented as
+    // "default"), so this is the real underlying id, not a canonical key.
+    // rejectToolUse makes the extractor a completion predicate: a text-plus-
+    // tool-use preamble must not synthesize a completion while the turn's
+    // PreToolUse may still be in flight. Entries with no `sessionId` are still
+    // accepted, keeping the #904 deletion-cleanup mechanism fallback intact.
     const assistantOutput = extractLastClaudeAssistantTextFromEntries(
       readClaudeTranscriptTailEntries(safePath),
-      sessionId
+      session.rawSessionId || sessionId,
+      { rejectToolUse: true }
     );
     if (assistantOutput && assistantOutput.text) {
       claudeTranscriptCompletionProbes.delete(sessionId);
@@ -1772,6 +1864,9 @@ function promoteCompletion(sessionId, completionPayload = undefined) {
       && completionPayload.truncated === true
     );
   }
+  const completionVisual = session.agentId === "claude-code"
+    ? completionVisualForHint(session.displayHint)
+    : null;
   session.subagentTracker = clearSubagentTracker(cloneSubagentTracker(session));
   // The stored session settles idle, but this Stop consumed the completion
   // attention cue. Record that distinction so a later duplicate Stop is
@@ -1808,7 +1903,7 @@ function promoteCompletion(sessionId, completionPayload = undefined) {
   // from ANOTHER session (e.g. an error) — it must win. We must NOT clear the
   // global pending queue here; pendingTimer/pendingState are process-wide, not
   // per-session, so clearing them would swallow another session's visual.
-  setState("attention");
+  setState("attention", completionVisual);
   return true;
 }
 
@@ -1879,14 +1974,29 @@ function mergeSessionProcessMetadata(existing, incoming = {}, options = {}) {
 // first prompt line. The first title that reaches the server wins — a title
 // whose POST fails is not permanently claimed, and follow-up prompts never
 // overwrite the first one (matching Trae's constant session title).
-const FIRST_WINS_TITLE_AGENT_IDS = new Set(["traecode"]);
+// MiniMax Code carries no session title in its hook payload either, so its
+// prompt-derived titles follow the same first-wins rule.
+const FIRST_WINS_TITLE_AGENT_IDS = new Set(["traecode", "minimax"]);
 
-function resolveIncomingSessionTitle(existing, agentId, incomingTitle) {
+function resolveIncomingSessionTitle(existing, agentId, incomingTitle, incomingFromPrompt = false) {
   const normalized = normalizeTitle(incomingTitle);
-  if (FIRST_WINS_TITLE_AGENT_IDS.has(agentId)) {
-    return (existing && existing.sessionTitle) || normalized || null;
+  const existingTitle = (existing && existing.sessionTitle) || null;
+  const existingFromPrompt = existingTitle
+    ? !!(existing && existing.sessionTitleFromPrompt)
+    : false;
+  const fromPrompt = incomingFromPrompt === true;
+  // A prompt-derived fallback (Claude Code's UserPromptSubmit first line) must
+  // not displace a formal title. Prompt still wins over an earlier prompt.
+  if (fromPrompt && existingTitle && !existingFromPrompt) {
+    return { title: existingTitle, fromPrompt: existingFromPrompt };
   }
-  return normalized || (existing && existing.sessionTitle) || null;
+  if (FIRST_WINS_TITLE_AGENT_IDS.has(agentId)) {
+    return existingTitle
+      ? { title: existingTitle, fromPrompt: existingFromPrompt }
+      : { title: normalized, fromPrompt: fromPrompt && !!normalized };
+  }
+  if (normalized) return { title: normalized, fromPrompt };
+  return { title: existingTitle, fromPrompt: existingFromPrompt };
 }
 
 function updateSession(sessionId, state, event, opts = {}) {
@@ -1918,9 +2028,11 @@ function updateSession(sessionId, state, event, opts = {}) {
     provider = null,
     codexOriginator = null,
     codexSource = null,
+    dshCarrier = null,
     ghosttyTerminalId = null,
     displayHint = undefined,
     sessionTitle = null,
+    sessionTitleFromPrompt = false,
     contextUsage = null,
     contextUsageOrigin = null,
     assistantLastOutput = null,
@@ -1993,6 +2105,18 @@ function updateSession(sessionId, state, event, opts = {}) {
     );
     if (shouldStorePermissionAutomationIdentity) {
       sessionForPerm.sessionAutomationIdentity = normalizedSessionAutomationIdentity;
+    }
+    // An approval is an action. Clear the reopened-conversation marker so the
+    // HUD reveals it. Only mutate an existing same-agent session: this transient
+    // branch never creates one, and a raw-id collision must not relabel a row.
+    const clearedDshAwaitingActivity = !!(
+      permAgentId === "deepseek-harness"
+      && sessionForPerm
+      && sessionForPerm.agentId === permAgentId
+      && sessionForPerm.dshAwaitingActivity === true
+    );
+    if (clearedDshAwaitingActivity) {
+      sessionForPerm.dshAwaitingActivity = false;
     }
     // Observation is independent from the permission-bubble preference. A
     // legacy Kimi PreToolUse may arrive here as PermissionRequest with a
@@ -2070,7 +2194,10 @@ function updateSession(sessionId, state, event, opts = {}) {
       const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
       const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
       const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
-      const srcSessionTitle = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
+      const {
+        title: srcSessionTitle,
+        fromPrompt: srcSessionTitleFromPrompt,
+      } = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle, sessionTitleFromPrompt);
       const permissionContext = resolveContextUsageUpdate(existing, contextUsage, contextUsageOrigin);
       const srcContextUsage = permissionContext.contextUsage;
       const srcContextUsageOrigin = permissionContext.contextUsageOrigin;
@@ -2116,6 +2243,7 @@ function updateSession(sessionId, state, event, opts = {}) {
         codexSource: srcCodexSource,
         ghosttyTerminalId: srcGhosttyTerminalId,
         sessionTitle: srcSessionTitle,
+        sessionTitleFromPrompt: srcSessionTitleFromPrompt,
         contextUsage: srcContextUsage,
         contextUsageOrigin: srcContextUsageOrigin,
         recentEvents,
@@ -2166,6 +2294,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     if (
       shouldStorePermissionAutomationIdentity
       || (shouldPersistCodexPermissionFocus && normalizedSessionAutomationIdentity)
+      || clearedDshAwaitingActivity
     ) {
       emitSessionSnapshot();
     }
@@ -2206,10 +2335,19 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcProvider = provider || (existing && existing.provider) || null;
   const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
   const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
+  // Deliberately NOT sticky like codexOriginator: each lifecycle event states
+  // its own carrier, so a missing value clears it. A DSH session can be
+  // reopened in the other carrier (or a stale field can appear without one),
+  // and an app-focus target must never survive on a comparison the last event
+  // no longer supports.
+  const srcDshCarrier = dshCarrier || null;
   const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
   // Sticky: empty input does not clear an existing title. A session that has
   // ever been named keeps that name until the user explicitly renames it.
-  const srcSessionTitle = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
+  const {
+    title: srcSessionTitle,
+    fromPrompt: srcSessionTitleFromPrompt,
+  } = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle, sessionTitleFromPrompt);
   const normalizedIncomingContextUsage = normalizeContextUsage(contextUsage);
   const effectiveContextUsageOrigin = normalizeContextUsageOrigin(contextUsageOrigin)
     || (srcAgentId === "claude-code" && normalizedIncomingContextUsage && normalizedIncomingContextUsage.source === "claude"
@@ -2249,6 +2387,9 @@ function updateSession(sessionId, state, event, opts = {}) {
     && state === "attention"
     && srcAgentId === "claude-code"
     && !normalizedSubagentId;
+  const completionVisual = isClaudeMainStop
+    ? completionVisualForHint(existing && existing.displayHint)
+    : null;
   const typedSubagentSnapshotKnown = Object.prototype.hasOwnProperty.call(
     opts,
     "backgroundSubagentsCount",
@@ -2513,7 +2654,13 @@ function updateSession(sessionId, state, event, opts = {}) {
     clearSubagentTracker(subagentTracker);
   }
 
-  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, orcaPaneKey: srcOrcaPaneKey, agentPid: srcAgentPid, agentId: srcAgentId, profileId: (existing && existing.profileId) || profileId || "local", rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId, sessionAutomationIdentity: srcSessionAutomationIdentity, host: srcHost, wslDistro: srcWslDistro, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, contextUsage: srcContextUsage, contextUsageOrigin: srcContextUsageOrigin, metadataUpdatedAt: srcMetadataUpdatedAt, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true, claudeBackgroundSubagentHoldAt };
+  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, orcaPaneKey: srcOrcaPaneKey, agentPid: srcAgentPid, agentId: srcAgentId, profileId: (existing && existing.profileId) || profileId || "local", rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId, sessionAutomationIdentity: srcSessionAutomationIdentity, host: srcHost, wslDistro: srcWslDistro, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, dshCarrier: srcDshCarrier, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, sessionTitleFromPrompt: srcSessionTitleFromPrompt, contextUsage: srcContextUsage, contextUsageOrigin: srcContextUsageOrigin, metadataUpdatedAt: srcMetadataUpdatedAt, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true, claudeBackgroundSubagentHoldAt };
+  // DSH desktop reopens the last conversation on launch, so SessionStart only
+  // means "opened" — not "used". Any other lifecycle event is a real action and
+  // clears the marker. Only DSH carries the field; other agents are untouched.
+  if (srcAgentId === "deepseek-harness") {
+    base.dshAwaitingActivity = event === "SessionStart";
+  }
   if (preserveCompletionAck) base.requiresCompletionAck = true;
   // #862: every branch below rebuilds the session object from `base`; carry the
   // private identity tracker through without exposing it on snapshot surfaces.
@@ -2585,6 +2732,17 @@ function updateSession(sessionId, state, event, opts = {}) {
     return;
   }
 
+  // A completion-mapped hint (such as /design) belongs to the parent
+  // turn. Temporary cues may settle the session idle without ending that turn.
+  // Keep explicit null, terminal events and ordinary per-tool hints clearing.
+  const continuationDisplayHint = srcAgentId === "claude-code"
+    && !normalizedSubagentId
+    && completionVisualForHint(existing && existing.displayHint)
+    && (["PostToolUseFailure", "Notification", "Elicitation", "PreCompact", "WorktreeCreate"].includes(event)
+      || (event === "SessionStart" && sessionStartSource === "compact"))
+    ? pickDisplayHint("working", existing, displayHint)
+    : null;
+
   if (event === "SessionEnd") {
     const endingSession = sessions.get(sessionId);
     cancelCodexExitProbe(sessionId, "SessionEnd");
@@ -2641,7 +2799,7 @@ function updateSession(sessionId, state, event, opts = {}) {
         resumeState: (existing && existing.resumeState) || null,
       });
     } else {
-      sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base, resumeState: null });
+      sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: continuationDisplayHint, ...base, resumeState: null });
     }
   } else if (ONESHOT_STATES.has(state)) {
     if (hasSubagentHoldEvidence(subagentTracker)) {
@@ -2664,7 +2822,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       Object.assign(existing, base);
       existing.state = "idle";
       existing.updatedAt = Date.now();
-      existing.displayHint = null;
+      existing.displayHint = continuationDisplayHint;
       existing.resumeState = null;
     } else {
       sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base, resumeState: null });
@@ -2698,7 +2856,9 @@ function updateSession(sessionId, state, event, opts = {}) {
         resumeState: (existing && existing.resumeState) || null,
       });
     } else {
-      const dh = pickDisplayHint(state, existing, displayHint);
+      const dh = state === "idle"
+        ? continuationDisplayHint
+        : pickDisplayHint(state, existing, displayHint);
       sessions.set(sessionId, { state, updatedAt: Date.now(), displayHint: dh, ...base, resumeState: null });
     }
   }
@@ -2846,7 +3006,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       setState(displayState, getSvgOverride(displayState));
       return;
     }
-    setState(state);
+    setState(state, state === "attention" && event === "Stop" ? completionVisual : null);
     return;
   }
 
@@ -2917,6 +3077,7 @@ function restoreSessionFromLease(lease) {
     codexSource: null,
     ghosttyTerminalId: null,
     sessionTitle: typeof lease.title === "string" ? lease.title : null,
+    sessionTitleFromPrompt: false,
     contextUsage: null,
     contextUsageOrigin: null,
     antigravityQuota: null,
@@ -2964,6 +3125,9 @@ function cleanStaleSessions() {
       deriveSessionBadge,
       shouldAutoClearDetachedSession,
       staleConfig,
+      hasReplyableCompletionMapping: typeof ctx.hasReplyableCompletionMapping === "function"
+        ? (session) => ctx.hasReplyableCompletionMapping(id, session)
+        : null,
     });
 
     if (decision.snapshotRefreshNeeded) snapshotRefreshNeeded = true;
@@ -3176,13 +3340,21 @@ function detectRunningAgentProcesses(callback) {
     // cmdline token disambiguates the working process from the GUI shell.
     { agentId: "zcode", needle: "zcode.cjs", processName: "zcode.exe" },
   ].filter((entry) => isEnabled(entry.agentId));
-  const platformCommandLineNeedles = process.platform === "win32" || !isEnabled("pi")
+  // POSIX-only cmdline markers. A bare `omp`/`pi` process name is ambiguous on
+  // POSIX — the GUI shell and unrelated binaries share it — so the package path
+  // is what identifies a running CLI. OMP's marker is deliberately the scoped
+  // package path: the unscoped `pi-coding-agent/dist/cli.js` needle above also
+  // matches an OMP process, and OMP keeps helper processes on that path, so
+  // this stays a bounded launch-time keep-awake (STARTUP_RECOVERY_MAX_MS) and
+  // never a session or a task-level state.
+  const posixCommandLineNeedles = [
+    { agentId: "pi", needle: "@earendil-works/pi-coding-agent" },
+    { agentId: "pi", needle: "pi-coding-agent/dist/cli.js" },
+    { agentId: "omp", needle: "@oh-my-pi/pi-coding-agent" },
+  ].filter((entry) => isEnabled(entry.agentId));
+  const platformCommandLineNeedles = process.platform === "win32"
     ? commandLineNeedles
-    : [
-        ...commandLineNeedles,
-        { agentId: "pi", needle: "@earendil-works/pi-coding-agent" },
-        { agentId: "pi", needle: "pi-coding-agent/dist/cli.js" },
-      ];
+    : [...commandLineNeedles, ...posixCommandLineNeedles];
   if (processEntries.length === 0 && platformCommandLineNeedles.length === 0) {
     done(false);
     return;
@@ -3466,6 +3638,7 @@ function enableDoNotDisturb() {
   // consumers still receive the accepted turn boundary.
   stopWakePoll();
   if (ctx.miniMode) {
+    if (typeof ctx.cancelPendingMiniPeek === "function") ctx.cancelPendingMiniPeek(true);
     applyState("mini-sleep");
   } else {
     applyDndSleepState();
@@ -3503,7 +3676,13 @@ function startStartupRecovery() {
 }
 
 function getCurrentState() { return currentState; }
+function getDisplayRevision() { return displayRevision; }
 function getCurrentSvg() { return currentSvg; }
+// True while the last landed applyState was a Settings animation preview. The
+// Settings runtime uses this to confirm its preview actually took the visual
+// (an early return — mini transition, disabled one-shot — leaves it false) and
+// so never records an owner it would later fail to release.
+function isSettingsPreviewVisual() { return currentVisualSource === VISUAL_SOURCE_SETTINGS_PREVIEW; }
 function getCurrentHitBox() { return currentHitBox; }
 function getStartupRecoveryActive() { return startupRecoveryActive; }
 
@@ -3558,7 +3737,7 @@ return {
   clearSessionsByAgent,
   disposeAllKimiPermissionState,
   deriveSessionBadge,
-  getCurrentState, getCurrentSvg, getCurrentHitBox, resolveHitBoxForSvg, getStartupRecoveryActive,
+  getCurrentState, getDisplayRevision, getCurrentSvg, getCurrentHitBox, resolveHitBoxForSvg, getStartupRecoveryActive, isSettingsPreviewVisual,
   sessions, STATE_PRIORITY, ONESHOT_STATES, SLEEP_SEQUENCE,
   get STATE_SVGS() { return STATE_SVGS; },
   get HIT_BOXES() { return HIT_BOXES; },
