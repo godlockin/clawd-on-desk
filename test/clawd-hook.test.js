@@ -147,6 +147,36 @@ describe("buildStateBody", () => {
     assert.strictEqual(body.state, "working");
   });
 
+  it("reports the SessionStart model so the session card can label it", () => {
+    const body = buildStateBody(
+      "SessionStart",
+      { session_id: "sid-model", model: "claude-opus-5" },
+      mockResolve
+    );
+    assert.strictEqual(body.model, "claude-opus-5");
+  });
+
+  it("omits model when SessionStart carries none (clear / some resume paths)", () => {
+    const body = buildStateBody("SessionStart", { session_id: "sid-no-model" }, mockResolve);
+    assert.strictEqual(body.model, undefined);
+  });
+
+  for (const [label, model] of [
+    ["blank", "  \t "],
+    ["overlong", "m".repeat(129)],
+    ["line break", "claude-opus-5\nspoofed"],
+    ["non-string", 5],
+  ]) {
+    it(`drops ${label} model ids rather than rendering them on the card`, () => {
+      const body = buildStateBody(
+        "SessionStart",
+        { session_id: `bad-model-${label.replace(/\s+/g, "-")}`, model },
+        mockResolve
+      );
+      assert.strictEqual(body.model, undefined);
+    });
+  }
+
   it("maps current Agent and legacy Task tool starts to synthetic SubagentStart", () => {
     for (const toolName of ["Agent", "Task"]) {
       const body = buildStateBody(
@@ -889,6 +919,101 @@ describe("buildStateBody", () => {
       );
       assert.strictEqual(body.session_title, "Transcript Title");
     });
+
+    it("uses the AI transcript title when no manual or payload title exists (#1125)", () => {
+      const file = writeTmpJsonl([
+        { type: "ai-title", aiTitle: "Generated Title", sessionId: "s" },
+      ]);
+      const body = buildStateBody(
+        "SessionStart",
+        { session_id: "s", transcript_path: file },
+        mockResolve
+      );
+      assert.strictEqual(body.session_title, "Generated Title");
+      assert.ok(!("session_title_from_prompt" in body));
+    });
+
+    it("prefers a manual rename over an AI title regardless of order (#1125)", () => {
+      for (const entries of [
+        [
+          { type: "custom-title", customTitle: "Manual Name" },
+          { type: "ai-title", aiTitle: "Generated Title" },
+        ],
+        [
+          { type: "ai-title", aiTitle: "Generated Title" },
+          { type: "custom-title", customTitle: "Manual Name" },
+        ],
+      ]) {
+        const body = buildStateBody(
+          "SessionStart",
+          { session_id: "s", transcript_path: writeTmpJsonl(entries) },
+          mockResolve
+        );
+        assert.strictEqual(body.session_title, "Manual Name");
+      }
+    });
+
+    it("prefers an agent name over an AI title (#1125)", () => {
+      const file = writeTmpJsonl([
+        { type: "ai-title", aiTitle: "Generated Title" },
+        { type: "agent-name", agentName: "Agent Name" },
+      ]);
+      const body = buildStateBody(
+        "SessionStart",
+        { session_id: "s", transcript_path: file },
+        mockResolve
+      );
+      assert.strictEqual(body.session_title, "Agent Name");
+    });
+
+    it("keeps an AI title over the prompt fallback on UserPromptSubmit (#1125)", () => {
+      const file = writeTmpJsonl([
+        { type: "ai-title", aiTitle: "Generated Title", sessionId: "s" },
+      ]);
+      const body = buildStateBody(
+        "UserPromptSubmit",
+        { session_id: "s", prompt: "Prompt first line", transcript_path: file },
+        mockResolve
+      );
+      assert.strictEqual(body.session_title, "Generated Title");
+      assert.ok(!("session_title_from_prompt" in body));
+    });
+
+    it("marks a prompt fallback title for the server (#1125)", () => {
+      const body = buildStateBody(
+        "UserPromptSubmit",
+        { session_id: "s", prompt: "Prompt first line" },
+        mockResolve
+      );
+      assert.strictEqual(body.session_title, "Prompt first line");
+      assert.strictEqual(body.session_title_from_prompt, true);
+      assert.ok(JSON.stringify(body).includes('"session_title_from_prompt":true'));
+    });
+
+    it("prefers payload.session_title over an AI transcript title (#1125)", () => {
+      const file = writeTmpJsonl([
+        { type: "ai-title", aiTitle: "Generated Title", sessionId: "s" },
+      ]);
+      const body = buildStateBody(
+        "SessionStart",
+        { session_id: "s", session_title: "Payload Title", transcript_path: file },
+        mockResolve
+      );
+      assert.strictEqual(body.session_title, "Payload Title");
+      assert.ok(!("session_title_from_prompt" in body));
+    });
+
+    it("ignores an AI title recorded for another session (#1125)", () => {
+      const file = writeTmpJsonl([
+        { type: "ai-title", aiTitle: "Other Session Title", sessionId: "other" },
+      ]);
+      const body = buildStateBody(
+        "SessionStart",
+        { session_id: "s", transcript_path: file },
+        mockResolve
+      );
+      assert.ok(!("session_title" in body));
+    });
   });
 
   describe("remote mode (CLAWD_REMOTE=1)", () => {
@@ -995,6 +1120,75 @@ describe("extractSessionTitleFromTranscript", () => {
     assert.strictEqual(extractSessionTitleFromTranscript(undefined), null);
     assert.strictEqual(extractSessionTitleFromTranscript(42), null);
     assert.strictEqual(extractSessionTitleFromTranscript(""), null);
+  });
+
+  it("returns an ai-title entry (#1125)", () => {
+    const file = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "Generated Title", sessionId: "s" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(file, "s"), "Generated Title");
+  });
+
+  it("prefers a manual title over ai-title in any record order (#1125)", () => {
+    const manualThenAi = writeTmpJsonl([
+      { type: "custom-title", customTitle: "Manual Name" },
+      { type: "ai-title", aiTitle: "Generated Title" },
+    ]);
+    const aiThenManual = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "Generated Title" },
+      { type: "agent-name", agentName: "Manual Name" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(manualThenAi), "Manual Name");
+    assert.strictEqual(extractSessionTitleFromTranscript(aiThenManual), "Manual Name");
+  });
+
+  it("returns the latest valid ai-title entry (#1125)", () => {
+    const file = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "First Generated" },
+      { type: "ai-title", aiTitle: "" },
+      { type: "ai-title", aiTitle: "Second Generated" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(file), "Second Generated");
+  });
+
+  it("filters ai-title entries by session id (#1125)", () => {
+    const file = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "Other Session", sessionId: "other" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(file, "s"), null);
+  });
+
+  it("accepts ai-title entries without a sessionId or without a requested session id (#1125)", () => {
+    const withoutEntryId = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "No Entry Id" },
+    ]);
+    const withoutRequestedId = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "No Requested Id", sessionId: "s" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(withoutEntryId, "s"), "No Entry Id");
+    assert.strictEqual(extractSessionTitleFromTranscript(withoutRequestedId), "No Requested Id");
+  });
+
+  it("does not filter manual titles by session (#1125)", () => {
+    const file = writeTmpJsonl([
+      { type: "custom-title", customTitle: "Other Session Manual", sessionId: "other" },
+      { type: "ai-title", aiTitle: "This Session AI", sessionId: "s" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(file, "s"), "Other Session Manual");
+  });
+
+  it("does not clear a valid AI title with a later empty or other-session ai-title (#1125)", () => {
+    const emptyLater = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "Kept Title", sessionId: "s" },
+      { type: "ai-title", aiTitle: "", sessionId: "s" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(emptyLater, "s"), "Kept Title");
+
+    const otherSessionLater = writeTmpJsonl([
+      { type: "ai-title", aiTitle: "Kept Title", sessionId: "s" },
+      { type: "ai-title", aiTitle: "Other Title", sessionId: "other" },
+    ]);
+    assert.strictEqual(extractSessionTitleFromTranscript(otherSessionLater, "s"), "Kept Title");
   });
 
   it("skips the truncated first line when reading a file larger than the tail window", () => {

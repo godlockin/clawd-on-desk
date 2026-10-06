@@ -40,12 +40,23 @@ async function assertProductionStack(win) {
     const outer = cigarette.getBoundingClientRect();
     const inner = cigaretteRoot.getBoundingClientRect();
     return {
+      devicePixelRatio: window.devicePixelRatio,
       outer: { width: outer.width, height: outer.height },
       inner: { width: inner.width, height: inner.height },
     };
   })()`);
-  assert(Math.abs(layout.outer.width - layout.inner.width) < 0.1, "cigarette SVG root did not fill object width");
-  assert(Math.abs(layout.outer.height - layout.inner.height) < 0.1, "cigarette SVG root did not fill object height");
+  const expectedScale = Number(process.env.CLAWD_ELECTRON_AUDIT_SCALE);
+  assert(Number.isFinite(expectedScale) && expectedScale > 0, "missing expected display scale");
+  assert(Math.abs(layout.devicePixelRatio - expectedScale) < 0.05,
+    `Electron used devicePixelRatio ${layout.devicePixelRatio}, expected ${expectedScale}`);
+  // The object viewport and embedded SVG root may be rounded on opposite sides
+  // of a physical pixel. Compare in CSS pixels using one device pixel of
+  // tolerance instead of forcing every audit to 1x.
+  const roundingTolerance = (1 / layout.devicePixelRatio) + 0.01;
+  assert(Math.abs(layout.outer.width - layout.inner.width) <= roundingTolerance,
+    "cigarette SVG root did not fill object width within one device pixel");
+  assert(Math.abs(layout.outer.height - layout.inner.height) <= roundingTolerance,
+    "cigarette SVG root did not fill object height within one device pixel");
 
   await win.webContents.executeJavaScript(`document.getElementById("cigarette").style.visibility = "hidden"`);
   const baseline = await win.webContents.capturePage({ x: 60, y: 45, width: 1, height: 1 });

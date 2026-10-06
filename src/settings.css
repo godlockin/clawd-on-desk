@@ -1362,6 +1362,15 @@ html, body {
 .bubble-policy-warning {
   color: var(--accent);
 }
+.size-readout.over-max {
+  color: var(--accent);
+}
+.size-over-max-hint {
+  color: var(--accent);
+}
+.size-over-max-hint[hidden] {
+  display: none;
+}
 .bubble-policy-controls {
   display: inline-flex;
   align-items: center;
@@ -1403,9 +1412,14 @@ html, body {
 /* ── Switch (iOS-style) ── */
 .switch {
   --switch-knob-x: 0;
+  appearance: none;
+  box-sizing: border-box;
   position: relative;
+  display: inline-block;
   width: 40px;
   height: 24px;
+  padding: 0;
+  border: 0;
   border-radius: 999px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0)), var(--switch-off);
   cursor: pointer;
@@ -1858,6 +1872,51 @@ html, body {
 .custom-agent-copy {
   flex: 0 0 auto;
   white-space: nowrap;
+}
+.agent-dsh-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.agent-dsh-notices:empty {
+  display: none;
+}
+.agent-dsh-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+.agent-dsh-notice[data-kind="restart-required"],
+.agent-dsh-notice[data-kind="failed-target"] {
+  color: #9a6700;
+}
+@media (prefers-color-scheme: dark) {
+  .agent-dsh-notice[data-kind="restart-required"],
+  .agent-dsh-notice[data-kind="failed-target"] {
+    color: #f6c343;
+  }
+}
+.agent-dsh-notice-line {
+  overflow-wrap: anywhere;
+}
+.agent-dsh-notice-commands {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 92%, var(--text-secondary) 8%);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.agent-dsh-notice-actions {
+  display: flex;
+  gap: 8px;
 }
 .custom-tool-result-found .custom-tool-result-status {
   border-color: color-mix(in srgb, var(--accent) 45%, transparent);
@@ -2504,6 +2563,15 @@ html, body {
   white-space: nowrap;
   min-width: 0;
 }
+.theme-card-description {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
 .theme-card-badge {
   font-size: 10px;
   font-weight: 600;
@@ -2535,6 +2603,13 @@ html, body {
   gap: 8px;
   min-height: 26px;
   margin-top: auto;
+}
+.theme-card-footer-official {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+.theme-card-footer-official .theme-card-check:empty {
+  display: none;
 }
 .theme-card-check {
   font-size: 11px;
@@ -2713,8 +2788,26 @@ html, body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 6px;
   min-height: 34px;
   line-height: 1.25;
+}
+.settings-button-icon,
+.settings-button-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.settings-button-icon {
+  flex: 0 0 auto;
+}
+.settings-button-icon > svg,
+.settings-button-icon > img {
+  width: 1em;
+  height: 1em;
+}
+.settings-button-label {
+  min-width: 0;
 }
 .settings-button-compact {
   min-height: 28px;
@@ -5255,4 +5348,99 @@ html, body {
   .mobile-action-btn {
     transition: none;
   }
+}
+
+/* Official theme cards */
+.theme-official-offline-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  color: var(--text-secondary, #8a8a8a);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.theme-official-offline-retry {
+  flex: none;
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.theme-official-offline-retry:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+/* One wrapper per official card row so progress patches can rebuild just that
+   row. contents keeps the children participating in the footer's flex layout
+   exactly as if they had been appended directly. */
+.theme-official-controls {
+  display: contents;
+}
+.theme-official-note {
+  flex: 0 0 100%;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary, #8a8a8a);
+}
+.theme-official-progress {
+  flex: 0 0 100%;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+.theme-official-progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 160ms ease;
+}
+.theme-official-download-btn,
+.theme-official-showcase-btn,
+.theme-official-cancel-btn,
+.theme-official-retry-btn {
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.theme-official-showcase-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+}
+.theme-official-showcase-btn:hover:not(:disabled) {
+  border-color: var(--text-secondary);
+}
+.theme-card-footer-official .theme-uninstall-btn {
+  white-space: nowrap;
+}
+.theme-official-download-btn,
+.theme-official-retry-btn {
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: inherit;
+}
+.theme-official-cancel-btn {
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+}
+.theme-official-download-btn:disabled,
+.theme-official-cancel-btn:disabled,
+.theme-official-retry-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }

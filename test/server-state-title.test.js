@@ -32,6 +32,14 @@ function makeReq(method, url, body) {
   const req = new EventEmitter();
   req.method = method;
   req.url = url;
+  req.headers = {
+    host: "127.0.0.1:23333",
+    "content-type": "application/json",
+  };
+  req.rawHeaders = [
+    "Host", "127.0.0.1:23333",
+    "Content-Type", "application/json",
+  ];
   // Emit data/end asynchronously — mirrors real http.IncomingMessage behavior
   setImmediate(() => {
     if (body != null) req.emit("data", Buffer.from(body));
@@ -194,6 +202,60 @@ describe("/state session_title handling", () => {
     const res = await callHandler(handler, req);
     assert.strictEqual(res.statusCode, 200);
     assert.strictEqual(updateSessionCalls[0][3].sessionTitle, null);
+  });
+
+  it("passes sessionTitleFromPrompt for a marked non-empty title (#1125)", async () => {
+    const { handler, updateSessionCalls } = startServer();
+    const req = makeReq("POST", "/state", JSON.stringify({
+      state: "thinking",
+      session_id: "sid-1",
+      event: "UserPromptSubmit",
+      session_title: "Prompt first line",
+      session_title_from_prompt: true,
+    }));
+    const res = await callHandler(handler, req);
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(updateSessionCalls[0][3].sessionTitle, "Prompt first line");
+    assert.strictEqual(updateSessionCalls[0][3].sessionTitleFromPrompt, true);
+  });
+
+  it("does not treat a string marker as prompt-derived (#1125)", async () => {
+    const { handler, updateSessionCalls } = startServer();
+    const req = makeReq("POST", "/state", JSON.stringify({
+      state: "thinking",
+      session_id: "sid-1",
+      event: "UserPromptSubmit",
+      session_title: "Prompt first line",
+      session_title_from_prompt: "true",
+    }));
+    await callHandler(handler, req);
+    assert.strictEqual(updateSessionCalls[0][3].sessionTitleFromPrompt, false);
+  });
+
+  it("does not treat a numeric marker as prompt-derived (#1125)", async () => {
+    const { handler, updateSessionCalls } = startServer();
+    const req = makeReq("POST", "/state", JSON.stringify({
+      state: "thinking",
+      session_id: "sid-1",
+      event: "UserPromptSubmit",
+      session_title: "Prompt first line",
+      session_title_from_prompt: 1,
+    }));
+    await callHandler(handler, req);
+    assert.strictEqual(updateSessionCalls[0][3].sessionTitleFromPrompt, false);
+  });
+
+  it("does not mark a request with no title as prompt-derived (#1125)", async () => {
+    const { handler, updateSessionCalls } = startServer();
+    const req = makeReq("POST", "/state", JSON.stringify({
+      state: "thinking",
+      session_id: "sid-1",
+      event: "UserPromptSubmit",
+      session_title_from_prompt: true,
+    }));
+    await callHandler(handler, req);
+    assert.strictEqual(updateSessionCalls[0][3].sessionTitle, null);
+    assert.strictEqual(updateSessionCalls[0][3].sessionTitleFromPrompt, false);
   });
 });
 
