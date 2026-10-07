@@ -62,7 +62,7 @@ function acceptedMetadataSpy(calls) {
   };
 }
 
-function makeMetadataStateRuntime() {
+function makeMetadataStateRuntime(overrides = {}) {
   const ctx = {
     lang: "en",
     theme: metadataContractTheme,
@@ -83,6 +83,7 @@ function makeMetadataStateRuntime() {
     pendingPermissions: [],
     processKill: () => { const err = new Error("dead"); err.code = "ESRCH"; throw err; },
     getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+    ...overrides,
   };
   return initState(ctx);
 }
@@ -93,6 +94,14 @@ function seedMetadataSession(api, sessionId) {
     agentId: "opencode",
     profileId: "local",
     rawSessionId: sessionId,
+  });
+}
+
+function makeClaudePhaseStateRuntime(overrides = {}) {
+  return makeMetadataStateRuntime({
+    theme: { ...metadataContractTheme,
+      timings: { ...metadataContractTheme.timings, minDisplay: {} } },
+    ...overrides,
   });
 }
 
@@ -190,6 +199,356 @@ describe("server-route-state health", () => {
 });
 
 describe("server-route-state POST", () => {
+  it("does not consume Claude phase evidence for disabled, metadata-only or invalid-state requests", async () => {
+    const base = { agent_id: "claude-code", session_id: "batch-session", state: "thinking",
+      event: "UserPromptSubmit", prompt_id: "prompt-1" };
+    for (const [body, disabled] of [[base, true], [{ ...base, metadata_only: true }, false],
+      [{ ...base, state: "unknown-state" }, false]]) {
+      let observed = 0;
+      await callStatePost(JSON.stringify(body), { ctx: {
+        isAgentEnabled: () => !disabled,
+        observeClaudeToolPhase: () => { observed++; return { accept: true }; },
+      } });
+      assert.equal(observed, 0);
+    }
+  });
+  it("passes only validated Claude prompt and batch identities to the state arbiter", async () => {
+    const res = await callStatePost(JSON.stringify({ agent_id: "claude-code", session_id: "batch-session",
+      state: "thinking", event: "PostToolBatch", prompt_id: "prompt-1", tool_use_ids: ["tool-1"] }));
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.calls.updateSession.length, 1);
+    assert.equal(res.calls.updateSession[0][3].claudePromptId, "prompt-1");
+    assert.deepStrictEqual(res.calls.updateSession[0][3].batchToolUseIds, ["tool-1"]);
+    assert.equal(res.calls.resolved.length, 0);
+  });
+
+  it("drops malformed, foreign, child, and decorative batch events before state mutation", async () => {
+    const base = { agent_id: "claude-code", session_id: "batch-session", state: "thinking",
+      event: "PostToolBatch", prompt_id: "prompt-1", tool_use_ids: ["tool-1"] };
+    for (const extra of [{ prompt_id: null }, { tool_use_ids: [] }, { tool_use_ids: ["tool-1", "tool-1"] },
+      { agent_id: "codex" }, { subagent_id: "child-1" }, { svg: "x.svg" }, { state: "working" }]) {
+      const res = await callStatePost(JSON.stringify({ ...base, ...extra }));
+      assert.equal(res.statusCode, 204, JSON.stringify(extra));
+      assert.equal(res.calls.updateSession.length, 0);
+      assert.equal(res.calls.setState.length, 0);
+      assert.equal(res.calls.resolved.length, 0);
+    }
+  });
+
+  it("keeps an outstanding Claude permission when the batch phase arrives", async () => {
+    const pending = makePlanPermission("batch-session");
+    const res = await callStatePost(JSON.stringify({ agent_id: "claude-code", session_id: "batch-session",
+      state: "thinking", event: "PostToolBatch", prompt_id: "prompt-1", tool_use_ids: ["tool-1"] }),
+    { ctx: { pendingPermissions: [pending] } });
+    assert.equal(res.statusCode, 204);
+    assert.equal(res.calls.updateSession.length, 0);
+    assert.equal(res.calls.resolved.length, 0);
+  });
+
+  it("preserves a newer Claude phase and permission when a retired Stop arrives", async () => {
+    const api = makeMetadataStateRuntime();
+    const sid = localSessionKey("batch-session");
+    try {
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "old-prompt" });
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "new-prompt" });
+      const pending = makePlanPermission("batch-session");
+      const res = await callStatePost(JSON.stringify({ agent_id: "claude-code", session_id: "batch-session",
+        state: "attention", event: "Stop", prompt_id: "old-prompt" }), { ctx: {
+          pendingPermissions: [pending], observeClaudeToolPhase: api.observeClaudeToolPhase,
+          updateSession: api.updateSession,
+        } });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.calls.resolved.length, 0);
+      assert.equal(api.sessions.get(sid).state, "thinking");
+    } finally { api.cleanup(); }
+  });
+  it("cleans only the exact retired Claude tool request while preserving a newer plan", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const sid = localSessionKey("retired-tool-cleanup");
+    try {
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "old" });
+      api.updateSession(sid, "working", "PreToolUse", { agentId: "claude-code", claudePromptId: "old", toolUseId: "old-tool" });
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "new" });
+      const oldRequest = { res: {}, sessionId: sid, agentId: "claude-code", toolUseId: "old-tool", toolName: "Read" };
+      const newPlan = makePlanPermission("retired-tool-cleanup");
+      const res = await callStatePost(JSON.stringify({ agent_id: "claude-code", session_id: "retired-tool-cleanup",
+        state: "working", event: "PostToolUse", prompt_id: "old", tool_use_id: "old-tool", tool_name: "Read" }), {
+        ctx: { sessions: api.sessions, pendingPermissions: [oldRequest, newPlan],
+          observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession },
+      });
+      assert.equal(res.calls.resolved.length, 1);
+      assert.strictEqual(res.calls.resolved[0].perm, oldRequest);
+      assert.equal(api.sessions.get(sid).state, "thinking");
+    } finally { api.cleanup(); }
+  });
+
+  it("cannot bypass retired Claude phase protection with a decorative SVG", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const sid = localSessionKey("retired-decorative");
+    try {
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "old" });
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "new" });
+      const res = await callStatePost(JSON.stringify({ agent_id: "claude-code", session_id: "retired-decorative",
+        state: "working", event: "PreToolUse", prompt_id: "old", svg: "x.svg", model: "metadata-model" }), {
+        ctx: { sessions: api.sessions, observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession },
+      });
+      assert.equal(res.calls.setState.length, 0);
+      assert.equal(api.sessions.get(sid).state, "thinking");
+      assert.equal(api.sessions.get(sid).model, "metadata-model");
+    } finally { api.cleanup(); }
+  });
+
+  it("does not match a retired Claude result to a newer request by repeated input fingerprint", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const sid = localSessionKey("retired-fingerprint");
+    try {
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "old" });
+      api.updateSession(sid, "working", "PreToolUse", { agentId: "claude-code", claudePromptId: "old", toolUseId: "old-tool" });
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "new" });
+      const newerRequest = { res: {}, sessionId: sid, agentId: "claude-code", toolName: "Bash",
+        toolInputFingerprint: "repeated-input" };
+      const res = await callStatePost(JSON.stringify({ agent_id: "claude-code", session_id: "retired-fingerprint",
+        state: "working", event: "PostToolUse", prompt_id: "old", tool_use_id: "old-tool",
+        tool_name: "Bash", tool_input_fingerprint: "repeated-input" }), { ctx: {
+        sessions: api.sessions, pendingPermissions: [newerRequest],
+        observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      assert.equal(res.calls.resolved.length, 0);
+      assert.equal(api.sessions.get(sid).state, "thinking");
+    } finally { api.cleanup(); }
+  });
+
+  it("does not promote a retired Claude prompt fallback into a formal metadata title", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const sid = localSessionKey("retired-prompt-title");
+    try {
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "old" });
+      api.updateSession(sid, "thinking", "UserPromptSubmit", {
+        agentId: "claude-code", claudePromptId: "new", sessionTitle: "formal chat name",
+      });
+      const res = await callStatePost(JSON.stringify(buildStateBody("UserPromptSubmit",
+        { session_id: "retired-prompt-title", prompt_id: "old", prompt: "late fallback text" },
+        () => ({ pid: null }))), { ctx: {
+        sessions: api.sessions, observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      assert.equal(res.statusCode, 200);
+      assert.equal(api.sessions.get(sid).sessionTitle, "formal chat name");
+      assert.equal(api.sessions.get(sid).sessionTitleFromPrompt, false);
+      assert.equal(api.sessions.get(sid).state, "thinking");
+    } finally { api.cleanup(); }
+  });
+
+  for (const foreignEvent of ["PreToolUse", "PostToolUse", "Stop"]) {
+    it(`still completes the open Claude prompt after unseen ${foreignEvent} through /state`, async () => {
+      const sounds = [];
+      const api = makeClaudePhaseStateRuntime({ playSound: name => sounds.push(name) });
+      const rawId = "unseen-prompt-arrival", sid = localSessionKey(rawId);
+      const post = (name, extra = {}) => callStatePost(JSON.stringify(buildStateBody(name,
+        { session_id: rawId, prompt_id: "open", ...extra }, () => ({ pid: null }))), { ctx: {
+        sessions: api.sessions, observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      try {
+        await post("UserPromptSubmit");
+        await post("PreToolUse", { tool_name: "Read", tool_use_id: "open-tool" });
+        await post(foreignEvent, { prompt_id: "unseen", tool_name: "Read", tool_use_id: "unseen-tool" });
+        await post("PostToolUse", { tool_name: "Read", tool_use_id: "open-tool" });
+        sounds.length = 0;
+        await post("Stop");
+        assert.equal(api.sessions.get(sid).state, "idle");
+        assert.equal(api.deriveSessionBadge(api.sessions.get(sid)), "done");
+        assert.deepEqual(sounds, ["complete"]);
+      } finally { api.cleanup(); }
+    });
+  }
+
+  for (const multi of [false, true]) {
+    for (const tail of ["PreToolUse", "PostToolUseFailure"]) {
+      it(`recovers a reordered Claude ${multi ? "parallel" : "single-tool"} batch via ${tail} through /state`, async () => {
+        const pendingPermissions = [];
+        const api = makeClaudePhaseStateRuntime({ pendingPermissions });
+        const rawId = "reordered-claude-batch", sid = localSessionKey(rawId);
+        const post = (name, extra = {}) => callStatePost(JSON.stringify(buildStateBody(name,
+          { session_id: rawId, prompt_id: "open", ...extra }, () => ({ pid: null }))), { ctx: {
+          sessions: api.sessions, pendingPermissions,
+          observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+        } });
+        try {
+          await post("UserPromptSubmit");
+          if (multi) await post("PreToolUse", { tool_use_id: "slow-tool", tool_name: "Read" });
+          const toolIds = multi ? ["slow-tool", "fast-tool"] : ["fast-tool"];
+          await post("PostToolBatch", { tool_calls: toolIds.map(tool_use_id => ({ tool_use_id })) });
+          if (tail === "PostToolUseFailure") pendingPermissions.push({ res: {}, sessionId: sid,
+            agentId: "claude-code", toolUseId: "fast-tool", toolName: "Bash" });
+          const response = await post(tail, { tool_use_id: "fast-tool", tool_name: "Bash", error: "fixture failure" });
+          assert.equal(api.sessions.get(sid).state, "thinking");
+          if (tail === "PostToolUseFailure") {
+            assert.equal(api.getCurrentState(), "error");
+            assert.equal(response.calls.resolved.length, 1);
+            pendingPermissions.length = 0;
+          }
+          await post("PreToolUse", { tool_use_id: "fast-tool", tool_name: "Bash" });
+          await post("PostToolUse", { tool_use_id: "fast-tool", tool_name: "Bash" });
+          assert.equal(api.sessions.get(sid).state, "thinking");
+          await post("PreToolUse", { tool_use_id: "next-tool", tool_name: "Read" });
+          await post("PostToolBatch", { tool_calls: [{ tool_use_id: "next-tool" }] });
+          assert.equal(api.sessions.get(sid).state, "thinking");
+        } finally { api.cleanup(); }
+      });
+    }
+  }
+
+  it("accepts a queued Claude turn with a new prompt id and no second UserPromptSubmit", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const rawId = "queued-claude-turn";
+    const sid = localSessionKey(rawId);
+    const post = (name, extra = {}) => {
+      const body = buildStateBody(name, { session_id: rawId, prompt_id: "original", ...extra },
+        () => ({ pid: null }));
+      assert.ok(body);
+      return callStatePost(JSON.stringify(body), { ctx: {
+        sessions: api.sessions, observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+    };
+    try {
+      await post("UserPromptSubmit");
+      await post("UserPromptSubmit");
+      await post("Stop");
+      const start = await post("PreToolUse", { prompt_id: "queued", tool_name: "Read", tool_use_id: "queued-tool" });
+      assert.equal(start.statusCode, 200);
+      assert.equal(api.sessions.get(sid).state, "working");
+      await post("PostToolUse", { prompt_id: "queued", tool_name: "Read", tool_use_id: "queued-tool" });
+      await post("PostToolBatch", { prompt_id: "queued", tool_calls: [{ tool_use_id: "queued-tool" }] });
+      assert.equal(api.sessions.get(sid).state, "thinking");
+      await post("Stop", { prompt_id: "queued" });
+      await post("SessionEnd", { prompt_id: "queued" });
+      assert.equal(api.sessions.has(sid), false);
+    } finally { api.cleanup(); }
+  });
+
+  it("handles an additional same-prompt Claude message and resets its display hint and plan dialog", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const rawId = "same-prompt-message";
+    const sid = localSessionKey(rawId);
+    try {
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "same" });
+      api.updateSession(sid, "working", "PreToolUse", { agentId: "claude-code", claudePromptId: "same", toolUseId: "ongoing-tool" });
+      api.sessions.get(sid).displayHint = "code";
+      const pending = makePlanPermission(rawId);
+      const res = await callStatePost(JSON.stringify(buildStateBody("UserPromptSubmit",
+        { session_id: rawId, prompt_id: "same", prompt: "continue the fixture" }, () => ({ pid: null }))), { ctx: {
+        pendingPermissions: [pending], sessions: api.sessions,
+        observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.calls.resolved.length, 1);
+      assert.strictEqual(res.calls.resolved[0].perm, pending);
+      assert.equal(api.sessions.get(sid).displayHint, null);
+      assert.notEqual(api.updateSession(sid, "thinking", "PostToolBatch", {
+        agentId: "claude-code", claudePromptId: "same", batchToolUseIds: ["ongoing-tool"],
+      }), false);
+      assert.equal(api.sessions.get(sid).state, "thinking");
+    } finally { api.cleanup(); }
+  });
+
+  for (const batchFirst of [true, false]) {
+    it(`retains Claude tool failures and matching permission cleanup when batchFirst=${batchFirst}`, async () => {
+      const pendingPermissions = [];
+      const api = makeClaudePhaseStateRuntime({ pendingPermissions });
+      const rawId = "failed-batch";
+      const sid = localSessionKey(rawId);
+      const post = (name, extra = {}) => callStatePost(JSON.stringify(buildStateBody(name,
+        { session_id: rawId, prompt_id: "failure-prompt", tool_use_id: "failed-tool", tool_name: "Read", ...extra },
+        () => ({ pid: null }))), { ctx: {
+        sessions: api.sessions, pendingPermissions,
+        observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      try {
+        await post("UserPromptSubmit");
+        await post("PreToolUse");
+        if (batchFirst) await post("PostToolBatch", { tool_calls: [{ tool_use_id: "failed-tool" }] });
+        const permission = { res: {}, sessionId: sid, agentId: "claude-code", toolUseId: "failed-tool", toolName: "Read" };
+        pendingPermissions.push(permission);
+        const failure = await post("PostToolUseFailure", { error: "fixture failure" });
+        assert.equal(failure.statusCode, 200);
+        assert.equal(api.getCurrentState(), "error");
+        if (batchFirst) assert.equal(api.sessions.get(sid).state, "thinking");
+        assert.equal(failure.calls.resolved.length, 1);
+        assert.strictEqual(failure.calls.resolved[0].perm, permission);
+        pendingPermissions.length = 0;
+        if (!batchFirst) {
+          await post("PostToolBatch", { tool_calls: [{ tool_use_id: "failed-tool" }] });
+          assert.equal(api.sessions.get(sid).state, "thinking");
+        }
+      } finally { api.cleanup(); }
+    });
+  }
+
+  for (const resultEvent of ["PostToolUse", "PostToolUseFailure"]) {
+    it(`registers fresh same-prompt Claude tools after a vetoed Stop, including ${resultEvent}`, async () => {
+      const api = makeClaudePhaseStateRuntime();
+      const rawId = "vetoed-stop-continuation";
+      const sid = localSessionKey(rawId);
+      const post = (name, extra = {}) => callStatePost(JSON.stringify(buildStateBody(name,
+        { session_id: rawId, prompt_id: "continued", ...extra }, () => ({ pid: null }))), { ctx: {
+        sessions: api.sessions, observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      try {
+        await post("UserPromptSubmit");
+        await post("Stop", { stop_hook_active: true });
+        await post("PreToolUse", { tool_name: "Read", tool_use_id: "continued-tool" });
+        const result = await post(resultEvent, { tool_name: "Read", tool_use_id: "continued-tool", error: "fixture" });
+        assert.equal(result.statusCode, 200);
+        assert.equal(api.getCurrentState(), resultEvent === "PostToolUseFailure" ? "error" : "working");
+        await post("PostToolBatch", { tool_calls: [{ tool_use_id: "continued-tool" }] });
+        assert.equal(api.sessions.get(sid).state, "thinking");
+      } finally { api.cleanup(); }
+    });
+  }
+
+  it("treats Claude SessionEnd as authoritative even with a retired prompt id", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const sid = localSessionKey("end-with-retired-prompt");
+    try {
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "old" });
+      api.updateSession(sid, "thinking", "UserPromptSubmit", { agentId: "claude-code", claudePromptId: "new" });
+      const pending = makePlanPermission("end-with-retired-prompt");
+      const res = await callStatePost(JSON.stringify({
+        agent_id: "claude-code", session_id: "end-with-retired-prompt", event: "SessionEnd", state: "idle", prompt_id: "old",
+      }), { ctx: {
+        pendingPermissions: [pending], sessions: api.sessions,
+        observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.calls.resolved.length, 1);
+      assert.equal(res.calls.resolved[0].behavior, "no-decision");
+      assert.equal(api.sessions.has(sid), false);
+    } finally { api.cleanup(); }
+  });
+
+  it("keeps settled Claude success tails metadata and exact permission cleanup without replacing thinking", async () => {
+    const api = makeClaudePhaseStateRuntime();
+    const sid = localSessionKey("settled-success-tail");
+    try {
+      const opts = { agentId: "claude-code", claudePromptId: "same", toolUseId: "settled-tool" };
+      api.updateSession(sid, "thinking", "UserPromptSubmit", opts);
+      api.updateSession(sid, "working", "PreToolUse", opts);
+      api.updateSession(sid, "thinking", "PostToolBatch", { ...opts, batchToolUseIds: ["settled-tool"] });
+      const before = api.sessions.get(sid).updatedAt;
+      const permission = { res: {}, sessionId: sid, agentId: "claude-code", toolUseId: "settled-tool", toolName: "Read" };
+      const res = await callStatePost(JSON.stringify({ agent_id: "claude-code", session_id: "settled-success-tail",
+        state: "working", event: "PostToolUse", prompt_id: "same", tool_use_id: "settled-tool",
+        tool_name: "Read", session_title: "native title", model: "fixture-model" }), { ctx: {
+        pendingPermissions: [permission], sessions: api.sessions,
+        observeClaudeToolPhase: api.observeClaudeToolPhase, updateSession: api.updateSession,
+      } });
+      assert.equal(res.calls.resolved.length, 1);
+      assert.equal(api.sessions.get(sid).state, "thinking");
+      assert.equal(api.sessions.get(sid).updatedAt, before);
+      assert.equal(api.sessions.get(sid).sessionTitle, "native title");
+      assert.equal(api.sessions.get(sid).model, "fixture-model");
+    } finally { api.cleanup(); }
+  });
+
   it("enforces DSH upstream sequence order across created, event, and disposed callbacks", async () => {
     const fence = createDshStateSequenceFence();
     const post = (event, state, sequence = {}) => callStatePost(JSON.stringify({
@@ -215,6 +574,168 @@ describe("server-route-state POST", () => {
     assert.strictEqual(ended.statusCode, 200);
     assert.strictEqual(late.statusCode, 204);
     assert.deepStrictEqual(late.calls.updateSession, []);
+  });
+
+  it("accepts DSH projection metadata without consuming a lifecycle event sequence", async () => {
+    const fence = createDshStateSequenceFence();
+    const metadataCalls = [];
+    const common = {
+      agent_id: "deepseek-harness",
+      hook_source: "dsh-plugin",
+      session_id: "deepseek-harness:projected",
+    };
+    const post = (body) => callStatePost(JSON.stringify({ ...common, ...body }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+      options: { dshStateSequenceFence: fence },
+    });
+    const started = await post({ event: "SessionStart", state: "idle", session_seq: 0 });
+    const metadata = await post({
+      metadata_only: true,
+      session_title: "Fix DSH integration",
+      context_usage: { used: 78, limit: 100, percent: 78 },
+    });
+    const event = await post({ event: "UserPromptSubmit", state: "thinking", event_seq: 0 });
+    assert.strictEqual(started.statusCode, 200);
+    assert.strictEqual(metadata.statusCode, 204);
+    assert.strictEqual(metadata.headers[CLAWD_METADATA_ACCEPTED_HEADER], "1");
+    assert.strictEqual(metadata.calls.updateSession.length, 0);
+    assert.deepStrictEqual(metadataCalls[0][1], {
+      sessionTitle: "Fix DSH integration",
+      contextUsage: { used: 78, limit: 100, percent: 78 },
+      contextUsageOrigin: null,
+      expectedAgentId: "deepseek-harness",
+    });
+    assert.strictEqual(event.statusCode, 200);
+    assert.strictEqual(fence.snapshot(common.session_id).lastEventSeq, 0);
+  });
+
+  it("rejects DSH projection metadata outside the plugin's canonical session namespace", async () => {
+    const metadataCalls = [];
+    const post = (body) => callStatePost(JSON.stringify({
+      agent_id: "deepseek-harness",
+      metadata_only: true,
+      session_title: "Invalid",
+      ...body,
+    }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+      options: { dshStateSequenceFence: createDshStateSequenceFence() },
+    });
+    const foreignSource = await post({ hook_source: "external", session_id: "deepseek-harness:s1" });
+    const wrongNamespace = await post({ hook_source: "dsh-plugin", session_id: "codex:s1" });
+    assert.strictEqual(foreignSource.statusCode, 204);
+    assert.strictEqual(wrongNamespace.statusCode, 204);
+    assert.deepStrictEqual(metadataCalls, []);
+  });
+
+  it("DSH projection metadata annotates an existing session without creating a ghost or extending activity", async () => {
+    const api = makeMetadataStateRuntime();
+    const rawId = "deepseek-harness:observed";
+    const sessionId = localSessionKey(rawId);
+    const post = (fields = {}) => callStatePost(JSON.stringify({
+      agent_id: "deepseek-harness",
+      hook_source: "dsh-plugin",
+      session_id: rawId,
+      metadata_only: true,
+      session_title: "DSH task",
+      context_usage: { used: 78, limit: 100, percent: 78 },
+      ...fields,
+    }), {
+      ctx: { updateSessionMetadata: api.updateSessionMetadata },
+      options: { dshStateSequenceFence: createDshStateSequenceFence() },
+    });
+    try {
+      const unknown = await post();
+      assert.strictEqual(unknown.headers[CLAWD_METADATA_ACCEPTED_HEADER], undefined);
+      assert.strictEqual(api.sessions.size, 0);
+
+      api.updateSession(sessionId, "idle", "SessionStart", {
+        agentId: "deepseek-harness", profileId: "local", rawSessionId: rawId,
+      });
+      const before = api.sessions.get(sessionId).updatedAt;
+      const accepted = await post();
+      const session = api.sessions.get(sessionId);
+      assert.strictEqual(accepted.headers[CLAWD_METADATA_ACCEPTED_HEADER], "1");
+      assert.strictEqual(session.sessionTitle, "DSH task");
+      assert.deepStrictEqual(session.contextUsage, { used: 78, limit: 100, percent: 78 });
+      assert.strictEqual(session.updatedAt, before);
+      assert.strictEqual(session.state, "idle");
+
+      const unavailable = await post({ session_title: undefined, context_usage: null });
+      assert.strictEqual(unavailable.headers[CLAWD_METADATA_ACCEPTED_HEADER], "1");
+      assert.strictEqual(session.contextUsage, null);
+      assert.strictEqual(session.updatedAt, before);
+    } finally {
+      api.cleanup();
+    }
+  });
+
+  it("drops DSH projection metadata when the raw id belongs to another agent's session", async () => {
+    const api = makeMetadataStateRuntime();
+    const rawId = "deepseek-harness:collision";
+    const sessionId = localSessionKey(rawId);
+    const post = (body, ctx = { updateSessionMetadata: api.updateSessionMetadata }) => callStatePost(
+      JSON.stringify({
+        agent_id: "deepseek-harness",
+        hook_source: "dsh-plugin",
+        session_id: rawId,
+        metadata_only: true,
+        ...body,
+      }),
+      {
+        ctx,
+        options: { dshStateSequenceFence: createDshStateSequenceFence() },
+      },
+    );
+    try {
+      // A different agent owns a session whose raw id happens to start with
+      // DSH's namespace. DSH metadata must not be able to annotate it.
+      api.updateSession(sessionId, "working", "PreToolUse", {
+        agentId: "codex",
+        profileId: "local",
+        rawSessionId: rawId,
+      });
+      api.updateSessionMetadata(sessionId, {
+        sessionTitle: "codex owns this",
+        contextUsage: { used: 1, limit: 10, percent: 10 },
+      });
+      const collision = api.sessions.get(sessionId);
+      const beforeTitle = collision.sessionTitle;
+      const beforeUsage = collision.contextUsage;
+      const rejected = await post({
+        session_title: "DSH takeover",
+        context_usage: { used: 78, limit: 100, percent: 78 },
+      });
+      assert.strictEqual(rejected.statusCode, 204);
+      assert.strictEqual(rejected.headers[CLAWD_METADATA_ACCEPTED_HEADER], undefined);
+      assert.strictEqual(collision.sessionTitle, beforeTitle);
+      assert.deepStrictEqual(collision.contextUsage, beforeUsage);
+
+      // DSH's own session on the same namespace is still annotated.
+      const dshRaw = "deepseek-harness:own";
+      const dshKey = localSessionKey(dshRaw);
+      api.updateSession(dshKey, "idle", "SessionStart", {
+        agentId: "deepseek-harness",
+        profileId: "local",
+        rawSessionId: dshRaw,
+      });
+      const accepted = await callStatePost(JSON.stringify({
+        agent_id: "deepseek-harness",
+        hook_source: "dsh-plugin",
+        session_id: dshRaw,
+        metadata_only: true,
+        session_title: "DSH own",
+        context_usage: { used: 78, limit: 100, percent: 78 },
+      }), {
+        ctx: { updateSessionMetadata: api.updateSessionMetadata },
+        options: { dshStateSequenceFence: createDshStateSequenceFence() },
+      });
+      assert.strictEqual(accepted.headers[CLAWD_METADATA_ACCEPTED_HEADER], "1");
+      const dshSession = api.sessions.get(dshKey);
+      assert.strictEqual(dshSession.sessionTitle, "DSH own");
+      assert.deepStrictEqual(dshSession.contextUsage, { used: 78, limit: 100, percent: 78 });
+    } finally {
+      api.cleanup();
+    }
   });
 
   it("fails DSH state closed when its sequence fence or required watermark is unavailable", async () => {
@@ -255,6 +776,116 @@ describe("server-route-state POST", () => {
     });
     assert.strictEqual(disabled.statusCode, 204);
     assert.strictEqual(enabled.statusCode, 200);
+  });
+
+  it("accepts the desktop carrier only from a local DSH bridge lifecycle event and never sticks", async () => {
+    const api = makeMetadataStateRuntime();
+    const rawId = "deepseek-harness:carrier";
+    const sessionId = localSessionKey(rawId);
+    const ctx = { updateSession: api.updateSession, updateSessionMetadata: api.updateSessionMetadata };
+    const options = { dshStateSequenceFence: createDshStateSequenceFence() };
+    const post = (body) => callStatePost(JSON.stringify(body), { ctx, options });
+    try {
+      const started = await post({
+        agent_id: "deepseek-harness",
+        hook_source: "dsh-plugin",
+        session_id: rawId,
+        event: "SessionStart",
+        state: "idle",
+        session_seq: 0,
+        dsh_carrier: "desktop",
+      });
+      assert.strictEqual(started.statusCode, 200);
+      assert.strictEqual(api.sessions.get(sessionId).dshCarrier, "desktop");
+
+      // Metadata-only traffic annotates the session but cannot change its source.
+      const annotated = await post({
+        agent_id: "deepseek-harness",
+        hook_source: "dsh-plugin",
+        session_id: rawId,
+        metadata_only: true,
+        session_title: "still desktop",
+      });
+      assert.strictEqual(annotated.headers[CLAWD_METADATA_ACCEPTED_HEADER], "1");
+      assert.strictEqual(api.sessions.get(sessionId).dshCarrier, "desktop");
+
+      // The next lifecycle event states its own carrier; a missing value clears it.
+      const cleared = await post({
+        agent_id: "deepseek-harness",
+        hook_source: "dsh-plugin",
+        session_id: rawId,
+        event: "UserPromptSubmit",
+        state: "thinking",
+        event_seq: 0,
+      });
+      assert.strictEqual(cleared.statusCode, 200);
+      assert.strictEqual(api.sessions.get(sessionId).dshCarrier, null);
+
+      // A metadata-only request can never upgrade a session to the desktop carrier.
+      const metadataCarrier = await post({
+        agent_id: "deepseek-harness",
+        hook_source: "dsh-plugin",
+        session_id: rawId,
+        metadata_only: true,
+        dsh_carrier: "desktop",
+        session_title: "metadata cannot upgrade",
+      });
+      assert.strictEqual(metadataCarrier.headers[CLAWD_METADATA_ACCEPTED_HEADER], "1");
+      assert.strictEqual(api.sessions.get(sessionId).dshCarrier, null);
+    } finally {
+      api.cleanup();
+    }
+  });
+
+  it("rejects the desktop carrier from non-DSH, non-bridge, Remote SSH, and WSL state requests", async () => {
+    const body = {
+      session_id: "deepseek-harness:src",
+      event: "SessionStart",
+      state: "idle",
+      session_seq: 0,
+      dsh_carrier: "desktop",
+    };
+    const foreignAgent = await callStatePost(JSON.stringify({
+      ...body,
+      agent_id: "claude-code",
+      hook_source: "clawd-hook",
+    }));
+    assert.strictEqual(foreignAgent.calls.updateSession[0][3].dshCarrier, null);
+
+    // The bridge hook source alone must not be enough: the agent has to be DSH.
+    const foreignAgentWithBridgeSource = await callStatePost(JSON.stringify({
+      ...body,
+      agent_id: "claude-code",
+      hook_source: "dsh-plugin",
+    }));
+    assert.strictEqual(foreignAgentWithBridgeSource.calls.updateSession[0][3].dshCarrier, null);
+
+    const foreignSource = await callStatePost(JSON.stringify({
+      ...body,
+      agent_id: "deepseek-harness",
+      hook_source: "external",
+    }), { options: { dshStateSequenceFence: createDshStateSequenceFence() } });
+    assert.strictEqual(foreignSource.calls.updateSession[0][3].dshCarrier, null);
+
+    const remote = await callStatePost(JSON.stringify({
+      ...body,
+      agent_id: "deepseek-harness",
+      hook_source: "dsh-plugin",
+    }), {
+      options: {
+        dshStateSequenceFence: createDshStateSequenceFence(),
+        remoteProfile: { profileId: "remote-1", displayHost: "remote-host" },
+      },
+    });
+    assert.strictEqual(remote.calls.updateSession[0][3].dshCarrier, null);
+
+    const wsl = await callStatePost(JSON.stringify({
+      ...body,
+      agent_id: "deepseek-harness",
+      hook_source: "dsh-plugin",
+      wsl_distro: "Ubuntu",
+    }), { options: { dshStateSequenceFence: createDshStateSequenceFence() } });
+    assert.strictEqual(wsl.calls.updateSession[0][3].dshCarrier, null);
   });
 
   it("relays a normalized test result after the lifecycle update", async () => {
@@ -695,9 +1326,11 @@ describe("server-route-state POST", () => {
         provider: "openai",
         codexOriginator: "codex_work_desktop",
         codexSource: "vscode",
+        dshCarrier: null,
         ghosttyTerminalId: "ghostty-term-7",
         displayHint: "display.svg",
         sessionTitle: "Work title",
+        sessionTitleFromPrompt: false,
         contextUsage: null,
         contextUsageOrigin: null,
         assistantLastOutput: null,
@@ -723,6 +1356,312 @@ describe("server-route-state POST", () => {
         },
       },
     ]]);
+  });
+
+  it("forwards Qoder title inputs for runtime enrichment after accepting the lifecycle", async () => {
+    for (const sessionTitle of [null, "Explicit Qoder title"]) {
+      const res = await callStatePost(JSON.stringify({
+        state: "thinking", event: "UserPromptSubmit", session_id: "qoder:s1",
+        agent_id: "qoder", transcript_path: "/tmp/qoder-session.jsonl",
+        ...(sessionTitle ? { session_title: sessionTitle } : {}),
+      }));
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.calls.updateSession[0][3].sessionTitle, sessionTitle);
+      assert.strictEqual(res.calls.updateSession[0][3].transcriptPath, "/tmp/qoder-session.jsonl");
+    }
+  });
+
+  it("does not forward disabled Qoder events for title enrichment", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "attention", event: "Stop", session_id: "qoder:s1",
+      agent_id: "qoder", transcript_path: "/tmp/qoder-session.jsonl",
+    }), { ctx: { isAgentEnabled: () => false } });
+    assert.strictEqual(res.statusCode, 204);
+    assert.deepStrictEqual(res.calls.updateSession, []);
+  });
+
+  it("strips remote process metadata from state updates on the profile-bound ingress", async () => {
+    const body = JSON.stringify({
+      state: "working",
+      session_id: "sid",
+      event: "PreToolUse",
+      agent_id: "codex",
+      hook_source: "codex-official",
+      source_pid: 4242,
+      agent_pid: 4243,
+      pid_chain: [1, 4242, 4243],
+      editor: "cursor",
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
+      orca_pane_key: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wt_hwnd: "123456",
+      host: "spoofed-by-hook",
+    });
+    const processFields = (res) => {
+      const opts = res.calls.updateSession[0][3];
+      return {
+        sourcePid: opts.sourcePid,
+        agentPid: opts.agentPid,
+        pidChain: opts.pidChain,
+        editor: opts.editor,
+        tmuxSocket: opts.tmuxSocket,
+        tmuxClient: opts.tmuxClient,
+        orcaPaneKey: opts.orcaPaneKey,
+        cwd: opts.cwd,
+        wtHwnd: opts.wtHwnd,
+        host: opts.host,
+      };
+    };
+
+    const remote = await callStatePost(body, {
+      options: { remoteProfile: { profileId: "ssh-work", displayHost: "workbox" } },
+    });
+    assert.strictEqual(remote.statusCode, 200);
+    assert.deepStrictEqual(processFields(remote), {
+      sourcePid: null,
+      agentPid: null,
+      pidChain: null,
+      editor: null,
+      tmuxSocket: null,
+      tmuxClient: null,
+      // Untouched by the gate: opaque labels, not handles on a local process.
+      orcaPaneKey: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wtHwnd: null,
+      host: "workbox",
+    });
+
+    // Regression: the local path must stay exactly what it was before the gate.
+    const local = await callStatePost(body);
+    assert.strictEqual(local.statusCode, 200);
+    assert.deepStrictEqual(processFields(local), {
+      sourcePid: 4242,
+      agentPid: 4243,
+      pidChain: [1, 4242, 4243],
+      editor: "cursor",
+      tmuxSocket: "/tmp/tmux-1000/work",
+      tmuxClient: "/dev/pts/7",
+      orcaPaneKey: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wtHwnd: "123456",
+      host: "spoofed-by-hook",
+    });
+  });
+
+  it("keeps remote PIDs out of the Codex user-input bubble too", async () => {
+    const body = JSON.stringify({
+      state: "notification",
+      session_id: "codex:remote-pid",
+      event: "CodexUserInputRequest",
+      agent_id: "codex",
+      source_pid: 4242,
+      agent_pid: 4243,
+      cwd: "/home/user/repo",
+      codex_user_input: {
+        phase: "request",
+        call_id: "call_remote_pid",
+        questions: [{
+          id: "scope",
+          header: "Scope",
+          question: "Which scope?",
+          options: [{ label: "Focused", description: "One module" }],
+        }],
+      },
+    });
+
+    const remote = await callStatePost(body, {
+      options: { remoteProfile: { profileId: "ssh-work", displayHost: "workbox" } },
+    });
+    assert.strictEqual(remote.calls.userInputShown[0].sourcePid, null);
+    assert.strictEqual(remote.calls.userInputShown[0].agentPid, null);
+    assert.strictEqual(remote.calls.userInputShown[0].cwd, "/home/user/repo");
+
+    const local = await callStatePost(body);
+    assert.strictEqual(local.calls.userInputShown[0].sourcePid, 4242);
+    assert.strictEqual(local.calls.userInputShown[0].agentPid, 4243);
+  });
+
+  it("strips WSL process metadata from state updates in both marker forms", async () => {
+    const base = {
+      state: "working",
+      session_id: "sid-wsl",
+      event: "PreToolUse",
+      agent_id: "codex",
+      hook_source: "codex-official",
+      source_pid: 4242,
+      agent_pid: 4243,
+      pid_chain: [1, 4242, 4243],
+      editor: "cursor",
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
+      orca_pane_key: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wt_hwnd: "123456",
+    };
+    const processFields = (res) => {
+      const opts = res.calls.updateSession[0][3];
+      return {
+        sourcePid: opts.sourcePid,
+        agentPid: opts.agentPid,
+        pidChain: opts.pidChain,
+        editor: opts.editor,
+        tmuxSocket: opts.tmuxSocket,
+        tmuxClient: opts.tmuxClient,
+        orcaPaneKey: opts.orcaPaneKey,
+        cwd: opts.cwd,
+        wtHwnd: opts.wtHwnd,
+      };
+    };
+    const strippedFields = {
+      sourcePid: null,
+      agentPid: null,
+      pidChain: null,
+      editor: null,
+      tmuxSocket: null,
+      tmuxClient: null,
+      // Untouched by the gate: opaque labels, not handles on a local process.
+      orcaPaneKey: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wtHwnd: null,
+    };
+
+    const byDistro = await callStatePost(JSON.stringify({ ...base, wsl_distro: "Ubuntu" }));
+    assert.strictEqual(byDistro.statusCode, 200);
+    assert.deepStrictEqual(processFields(byDistro), strippedFields);
+    assert.strictEqual(byDistro.calls.updateSession[0][3].wslDistro, "Ubuntu");
+    assert.strictEqual(byDistro.calls.updateSession[0][3].host, null);
+
+    const byHost = await callStatePost(JSON.stringify({ ...base, host: "wsl:Ubuntu" }));
+    assert.strictEqual(byHost.statusCode, 200);
+    assert.deepStrictEqual(processFields(byHost), strippedFields);
+    assert.strictEqual(byHost.calls.updateSession[0][3].host, "wsl:Ubuntu");
+    assert.strictEqual(byHost.calls.updateSession[0][3].wslDistro, null);
+
+    // Regression: a local request without a WSL marker stays bit-for-bit unchanged.
+    const local = await callStatePost(JSON.stringify(base));
+    assert.strictEqual(local.statusCode, 200);
+    assert.deepStrictEqual(processFields(local), {
+      sourcePid: 4242,
+      agentPid: 4243,
+      pidChain: [1, 4242, 4243],
+      editor: "cursor",
+      tmuxSocket: "/tmp/tmux-1000/work",
+      tmuxClient: "/dev/pts/7",
+      orcaPaneKey: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wtHwnd: "123456",
+    });
+  });
+
+  it("keeps WSL PIDs out of the Codex user-input bubble too", async () => {
+    const body = JSON.stringify({
+      state: "notification",
+      session_id: "codex:wsl-pid",
+      event: "CodexUserInputRequest",
+      agent_id: "codex",
+      source_pid: 4242,
+      agent_pid: 4243,
+      cwd: "/home/user/repo",
+      wsl_distro: "Ubuntu",
+      codex_user_input: {
+        phase: "request",
+        call_id: "call_wsl_pid",
+        questions: [{
+          id: "scope",
+          header: "Scope",
+          question: "Which scope?",
+          options: [{ label: "Focused", description: "One module" }],
+        }],
+      },
+    });
+
+    const res = await callStatePost(body);
+    assert.strictEqual(res.calls.userInputShown[0].sourcePid, null);
+    assert.strictEqual(res.calls.userInputShown[0].agentPid, null);
+    assert.strictEqual(res.calls.userInputShown[0].cwd, "/home/user/repo");
+  });
+
+  it("keeps WSL markers from changing Codex per-session automation eligibility", async () => {
+    const sessionId = "codex:019f9c87-23a9-7d03-a7ac-c11e3270c3b8";
+    const body = {
+      state: "working",
+      session_id: sessionId,
+      event: "PreToolUse",
+      agent_id: "codex",
+      hook_source: "codex-official",
+      agent_pid: 777,
+      codex_originator: "codex-tui",
+      codex_source: "cli",
+      wsl_distro: "Ubuntu",
+      host: "wsl:Ubuntu",
+    };
+
+    const wsl = await callStatePost(JSON.stringify(body));
+    const opts = wsl.calls.updateSession[0][3];
+    assert.deepStrictEqual(
+      opts.sessionAutomationIdentity,
+      { eligible: true, reason: "eligible" }
+    );
+    // The automation identity path and the session process metadata path are
+    // deliberately separate: the WSL PID is stripped from the session but not
+    // from the automation eligibility input.
+    assert.strictEqual(opts.agentPid, null);
+  });
+
+  it("drops archived local Codex lifecycle and passive user-input while keeping quota (#655)", async () => {
+    const suppressedRaw = "codex:archived-1";
+    const isArchived = (raw) => raw === suppressedRaw;
+    const base = {
+      state: "working",
+      session_id: suppressedRaw,
+      event: "PreToolUse",
+      agent_id: "codex",
+      codex_quota: { codexFiveHour: { usedPercent: 5 } },
+    };
+
+    const dropped = await callStatePost(JSON.stringify(base), {
+      ctx: { shouldSuppressCodexArchive: isArchived },
+    });
+    assert.strictEqual(dropped.statusCode, 204);
+    assert.deepStrictEqual(dropped.calls.updateSession, []);
+    assert.strictEqual(dropped.calls.updateAccountQuota.length, 1);
+    assert.deepStrictEqual(
+      dropped.calls.recorder.map((entry) => entry.outcome).filter(Boolean),
+      ["unsupported"]
+    );
+
+    const userInput = await callStatePost(JSON.stringify({
+      state: "notification",
+      session_id: suppressedRaw,
+      event: "CodexUserInputRequest",
+      agent_id: "codex",
+      codex_user_input: {
+        phase: "request",
+        call_id: "call_archived",
+        questions: [{ id: "q", header: "H", question: "Q?", options: [] }],
+      },
+    }), { ctx: { shouldSuppressCodexArchive: isArchived } });
+    assert.strictEqual(userInput.statusCode, 204);
+    assert.deepStrictEqual(userInput.calls.userInputShown, []);
+    assert.deepStrictEqual(userInput.calls.updateSession, []);
+
+    const remote = await callStatePost(JSON.stringify(base), {
+      ctx: { shouldSuppressCodexArchive: isArchived },
+      options: { remoteProfile: { profileId: "ssh-work", displayHost: "workbox" } },
+    });
+    assert.strictEqual(remote.statusCode, 200);
+    assert.strictEqual(remote.calls.updateSession.length, 1);
+
+    const metadata = await callStatePost(JSON.stringify({
+      agent_id: "codex",
+      session_id: suppressedRaw,
+      event: "SessionStart",
+      state: "idle",
+      metadata_only: true,
+    }), { ctx: { shouldSuppressCodexArchive: isArchived } });
+    assert.strictEqual(metadata.statusCode, 204);
+    assert.strictEqual(metadata.calls.updateSession.length, 0);
   });
 
   it("preserves absent versus authoritative zero for typed Claude background subagents (#952)", async () => {
@@ -1268,6 +2207,42 @@ describe("server-route-state POST", () => {
     assert.strictEqual(metadataCalls[0][1].contextUsageOrigin, "claude-statusline");
   });
 
+  it("forwards the statusline model so a /model switch relabels the card", async () => {
+    const metadataCalls = [];
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      preserve_state: true,
+      metadata_only: true,
+      session_id: "sid",
+      agent_id: "claude-code",
+      model: "claude-opus-5",
+    }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(res.calls.updateSession.length, 0);
+    assert.strictEqual(metadataCalls.length, 1);
+    assert.deepStrictEqual(metadataCalls[0][1], { model: "claude-opus-5" });
+  });
+
+  it("drops the statusline model while the telemetry gate is closed", async () => {
+    const metadataCalls = [];
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      metadata_only: true,
+      session_id: "sid",
+      agent_id: "claude-code",
+      model: "claude-opus-5",
+    }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+      options: { isClaudeStatuslineMetadataAllowed: () => false },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.deepStrictEqual(metadataCalls, []);
+  });
+
   it("keeps ordinary Claude lifecycle context when only statusline telemetry is gated", async () => {
     const res = await callStatePost(JSON.stringify({
       state: "working",
@@ -1711,11 +2686,25 @@ describe("server-route-state POST", () => {
     }));
 
     assert.strictEqual(res.statusCode, 200);
-    assert.strictEqual(res.calls.updateSession[0][0], localSessionKey("default"));
+    assert.strictEqual(res.calls.updateSession[0][0], localSessionKey("claude-code:default"));
+    assert.strictEqual(res.calls.updateSession[0][3].rawSessionId, "default");
     assert.deepStrictEqual(
       res.calls.updateSession[0][3].sessionAutomationIdentity,
       { eligible: false, reason: "placeholder-session-id" }
     );
+  });
+
+  it("keeps an explicit state's canonical and public raw session ids normalized together", async () => {
+    const res = await callStatePost(JSON.stringify({
+      state: "working",
+      session_id: "  abc-123  ",
+      event: "PreToolUse",
+      agent_id: "claude-code",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.calls.updateSession[0][0], localSessionKey("abc-123"));
+    assert.strictEqual(res.calls.updateSession[0][3].rawSessionId, "abc-123");
   });
 
   it("marks only local process-bound Codex TUI state identities eligible", async () => {
@@ -2573,5 +3562,107 @@ describe("server-route-state ExitPlanMode stale sweep", () => {
     assert.strictEqual(res.statusCode, 200);
     assert.deepStrictEqual(res.calls.resolved, []);
     assert.match(res.calls.logs.join("\n"), /decision sweep ambiguous:.*candidates=2/);
+  });
+});
+
+describe("issue #1125 AI session title end to end", () => {
+  it("keeps the AI transcript title after it scrolls out of the tail window", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-1125-"));
+    const file = path.join(dir, "transcript.jsonl");
+    const sessionId = "1125-session";
+    const resolve = () => ({ stablePid: null, agentPid: null, detectedEditor: null, pidChain: [] });
+
+    fs.writeFileSync(file, `${JSON.stringify({
+      type: "ai-title",
+      aiTitle: "Generated Title",
+      sessionId,
+    })}\n`);
+
+    const api = makeMetadataStateRuntime();
+    const post = (body) => callStatePost(JSON.stringify(body), {
+      ctx: {
+        sessions: api.sessions,
+        updateSession: (...args) => api.updateSession(...args),
+      },
+    });
+    const canonical = localSessionKey(sessionId);
+
+    try {
+      const startRes = await post(buildStateBody(
+        "SessionStart",
+        { session_id: sessionId, transcript_path: file },
+        resolve
+      ));
+      assert.strictEqual(startRes.statusCode, 200);
+      assert.strictEqual(api.sessions.get(canonical).sessionTitle, "Generated Title");
+
+      // Push the ai-title record out of the 256 KB tail window.
+      const pad = `${JSON.stringify({ type: "user", message: { content: "x".repeat(400) } })}\n`;
+      fs.appendFileSync(file, pad.repeat(700));
+      assert.ok(fs.statSync(file).size > 262144);
+
+      const promptBody = buildStateBody("UserPromptSubmit", {
+        session_id: sessionId,
+        prompt: "Prompt first line",
+        transcript_path: file,
+      }, resolve);
+      assert.strictEqual(promptBody.session_title, "Prompt first line");
+      assert.strictEqual(promptBody.session_title_from_prompt, true);
+
+      const promptRes = await post(promptBody);
+      assert.strictEqual(promptRes.statusCode, 200);
+      assert.strictEqual(api.sessions.get(canonical).sessionTitle, "Generated Title");
+    } finally {
+      api.cleanup();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a metadata-only title as formal even when marked prompt-derived", async () => {
+    const api = makeMetadataStateRuntime();
+    const rawId = "1125-metadata-session";
+    const canonical = localSessionKey(rawId);
+    const post = (body) => callStatePost(JSON.stringify(body), {
+      ctx: {
+        sessions: api.sessions,
+        updateSession: (...args) => api.updateSession(...args),
+        updateSessionMetadata: (...args) => api.updateSessionMetadata(...args),
+      },
+    });
+
+    try {
+      const seed = await post({
+        state: "working",
+        session_id: rawId,
+        event: "PreToolUse",
+        session_title: "Formal Title",
+      });
+      assert.strictEqual(seed.statusCode, 200);
+
+      const metadata = await post({
+        session_id: rawId,
+        metadata_only: true,
+        session_title: "Metadata Title",
+        session_title_from_prompt: true,
+      });
+      assert.strictEqual(metadata.statusCode, 204);
+      assert.strictEqual(api.sessions.get(canonical).sessionTitle, "Metadata Title");
+      assert.strictEqual(api.sessions.get(canonical).sessionTitleFromPrompt, false);
+
+      const prompt = await post({
+        state: "thinking",
+        session_id: rawId,
+        event: "UserPromptSubmit",
+        session_title: "Prompt line",
+        session_title_from_prompt: true,
+      });
+      assert.strictEqual(prompt.statusCode, 200);
+      assert.strictEqual(api.sessions.get(canonical).sessionTitle, "Metadata Title");
+    } finally {
+      api.cleanup();
+    }
   });
 });
