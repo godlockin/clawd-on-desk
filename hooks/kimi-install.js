@@ -18,6 +18,10 @@ const {
   resolveWslDistroEnv,
   writeTextAtomicWithBackup,
 } = require("./json-utils");
+const {
+  findMissingHookDependencies,
+  formatMissingHookDependencies,
+} = require("./hook-dependency-preflight");
 const MARKER = "kimi-hook.js";
 const MODE_EXPLICIT = "explicit";
 const MODE_SUSPECT = "suspect";
@@ -441,6 +445,14 @@ function registerKimiHooksAtTarget(target, options = {}) {
  * @returns {{ added: number, skipped: number, updated: number, targets: object[] }}
  */
 function registerKimiHooks(options = {}) {
+  const missingDeps = findMissingHookDependencies(["kimi-hook.js"]);
+  if (missingDeps.length) {
+    const error = new Error(formatMissingHookDependencies(missingDeps));
+    error.code = "KIMI_HOOK_DEPENDENCY_MISSING";
+    error.missingDependencies = missingDeps;
+    throw error;
+  }
+
   if (options.settingsPath) {
     const target = targetDefinition(options.flavor || FLAVOR_LEGACY, options.settingsPath);
     const result = registerKimiHooksAtTarget(target, options);
@@ -560,6 +572,7 @@ module.exports = {
   stripClawdKimiHookBlocks,
   validateKimiCodeHookBlocks,
   aggregateRegisterResults,
+  findMissingHookDependencies,
   MODE_EXPLICIT,
   MODE_SUSPECT,
   FLAVOR_LEGACY,
