@@ -174,6 +174,110 @@ test("settings agent actions sync an installed custom permission URL change imme
   );
 });
 
+test("settings agent actions do not commit a custom permission URL when sync fails", () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.codebuddy.integrationInstalled = true;
+  snapshot.agents.codebuddy.customPermissionUrl = "https://old.example.test/permission";
+  const result = agentCommands.setAgentCustomPermissionUrl({
+    agentId: "codebuddy",
+    value: "https://new.example.test/permission",
+  }, {
+    snapshot,
+    syncIntegrationForAgent: () => ({ status: "error", message: "disk denied" }),
+  });
+  assert.strictEqual(result.status, "error");
+  assert.match(result.message, /disk denied/);
+  assert.strictEqual(result.commit, undefined);
+});
+
+test("settings agent actions do not commit a custom permission URL when sync is unavailable", () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.codebuddy.integrationInstalled = true;
+  snapshot.agents.codebuddy.customPermissionUrl = "https://old.example.test/permission";
+  const result = agentCommands.setAgentCustomPermissionUrl({
+    agentId: "codebuddy",
+    value: "https://new.example.test/permission",
+  }, {
+    snapshot,
+    syncIntegrationForAgent: () => false,
+  });
+  assert.strictEqual(result.status, "error");
+  assert.match(result.message, /Failed to sync custom permission URL/);
+  assert.strictEqual(result.commit, undefined);
+});
+
+test("settings agent actions do not commit a custom permission URL when sync is skipped", () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.codebuddy.integrationInstalled = true;
+  snapshot.agents.codebuddy.customPermissionUrl = "https://old.example.test/permission";
+  const result = agentCommands.setAgentCustomPermissionUrl({
+    agentId: "codebuddy",
+    value: "https://new.example.test/permission",
+  }, {
+    snapshot,
+    syncIntegrationForAgent: () => ({
+      status: "skipped",
+      reason: "codebuddy-not-installed",
+    }),
+  });
+  assert.strictEqual(result.status, "error");
+  assert.match(result.message, /codebuddy-not-installed/);
+  assert.strictEqual(result.commit, undefined);
+});
+
+test("settings agent actions handle an async custom permission URL sync failure", async () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.codebuddy.integrationInstalled = true;
+  snapshot.agents.codebuddy.customPermissionUrl = "https://old.example.test/permission";
+  const result = await agentCommands.setAgentCustomPermissionUrl({
+    agentId: "codebuddy",
+    value: "https://new.example.test/permission",
+  }, {
+    snapshot,
+    syncIntegrationForAgent: async () => ({ status: "error", message: "async disk denied" }),
+  });
+  assert.strictEqual(result.status, "error");
+  assert.match(result.message, /async disk denied/);
+  assert.strictEqual(result.commit, undefined);
+});
+
+test("settings agent actions wait for an async custom permission URL sync before committing", async () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.codebuddy.integrationInstalled = true;
+  let settled = false;
+  const resultPromise = agentCommands.setAgentCustomPermissionUrl({
+    agentId: "codebuddy",
+    value: "https://new.example.test/permission",
+  }, {
+    snapshot,
+    syncIntegrationForAgent: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      settled = true;
+      return { status: "ok" };
+    },
+  });
+  assert.strictEqual(typeof resultPromise.then, "function");
+  const result = await resultPromise;
+  assert.strictEqual(settled, true);
+  assert.strictEqual(result.status, "ok");
+  assert.strictEqual(result.commit.agents.codebuddy.customPermissionUrl, "https://new.example.test/permission");
+});
+
+test("settings agent actions reject a rejected custom permission URL sync", async () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.codebuddy.integrationInstalled = true;
+  const result = await agentCommands.setAgentCustomPermissionUrl({
+    agentId: "codebuddy",
+    value: "https://new.example.test/permission",
+  }, {
+    snapshot,
+    syncIntegrationForAgent: () => Promise.reject(new Error("network unavailable")),
+  });
+  assert.strictEqual(result.status, "error");
+  assert.match(result.message, /network unavailable/);
+  assert.strictEqual(result.commit, undefined);
+});
+
 test("settings agent actions sync clearing an installed custom permission URL immediately", () => {
   const snapshot = prefs.getDefaults();
   snapshot.agents.codebuddy.integrationInstalled = true;
@@ -555,6 +659,53 @@ test("settings agent actions repair Codex with the forced hooks feature option",
   assert.deepStrictEqual(calls, [
     { agentId: "codex", options: { forceCodexHooksFeature: true } },
   ]);
+});
+
+test("settings agent actions execute Pi and OMP Doctor repairs", async () => {
+  for (const agentId of ["pi", "omp"]) {
+    const snapshot = prefs.getDefaults();
+    snapshot.agents[agentId] = {
+      ...snapshot.agents[agentId],
+      integrationInstalled: true,
+      enabled: true,
+    };
+    const calls = [];
+    const result = await agentCommands.repairAgentIntegration({ agentId }, {
+      snapshot,
+      repairIntegrationForAgent: async (id, options) => {
+        calls.push({ id, options });
+        return { status: "ok", message: `${id} repaired` };
+      },
+    });
+
+    assert.strictEqual(result.status, "ok", agentId);
+    assert.deepStrictEqual(calls, [{
+      id: agentId,
+      options: { forceCodexHooksFeature: false },
+    }]);
+  }
+});
+
+test("settings agent actions accept an OMP community bridge as a healthy repair result", async () => {
+  const snapshot = prefs.getDefaults();
+  snapshot.agents.omp = {
+    ...snapshot.agents.omp,
+    integrationInstalled: true,
+    enabled: true,
+  };
+
+  const result = await agentCommands.repairAgentIntegration({ agentId: "omp" }, {
+    snapshot,
+    repairIntegrationForAgent: async () => ({
+      status: "skipped",
+      reason: "standalone-bridge-present",
+      message: "clawd-on-desk-omp.ts already bridges OMP; skipped extension sync",
+    }),
+  });
+
+  assert.strictEqual(result.status, "ok");
+  assert.strictEqual(result.reason, "standalone-bridge-present");
+  assert.match(result.message, /already bridges OMP/);
 });
 
 test("settings agent actions repair CodeBuddy with an explicit permission target", async () => {
@@ -1014,6 +1165,13 @@ test("every opencode-family member is installable AND auto-repairable (R10 P3)",
       agentCommands.AUTO_REPAIRABLE_AGENT_IDS.has(agentId),
       `${agentId} missing from AUTO_REPAIRABLE_AGENT_IDS`
     );
+  }
+});
+
+test("every extension-mode agent with a Doctor Fix is auto-repairable", () => {
+  for (const agentId of ["pi", "omp"]) {
+    assert.ok(agentCommands.INSTALLABLE_AGENT_IDS.has(agentId), `${agentId} must be installable`);
+    assert.ok(agentCommands.AUTO_REPAIRABLE_AGENT_IDS.has(agentId), `${agentId} must be auto-repairable`);
   }
 });
 

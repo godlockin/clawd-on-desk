@@ -8,7 +8,8 @@ const {
   buildLatestLocalCodexProcessIds,
   isSupersededLocalCodexProcessSession,
 } = require("./state-session-dedupe");
-const { readCodexThreadName } = require("../hooks/codex-session-index");
+const { bareCodexSessionId, readCodexThreadName, readCodexThreadNames } = require("../hooks/codex-session-index");
+const { isWslSourced } = require("./remote-process-metadata");
 
 // ── Session source derivation ────────────────────────────────────────
 
@@ -38,9 +39,11 @@ function deriveSourceInfo(host) {
 }
 
 const EVENT_LABEL_KEYS = {
+  PostToolBatch: "eventLabelPostToolBatch",
   SessionStart: "eventLabelSessionStart",
   SessionEnd: "eventLabelSessionEnd",
   UserPromptSubmit: "eventLabelUserPromptSubmit",
+  UserPromptExpansion: "eventLabelUserPromptSubmit",
   PreToolUse: "eventLabelPreToolUse",
   PostToolUse: "eventLabelPostToolUse",
   PostToolUseFailure: "eventLabelPostToolUseFailure",
@@ -154,6 +157,9 @@ function isEndedSessionBadge(badge) {
 function shouldAutoClearDetachedSession(session, badge, options = {}) {
   if (options.sessionHudCleanupDetached !== true) return false;
   if (!session || session.headless || session.state !== "idle" || session.agentPid) return false;
+  // A WSL session's sourcePid is a Linux PID that can alias a live process on
+  // the Windows host. Never probe it (or hide the session) on that basis.
+  if (isWslSourced({ wslDistro: session.wslDistro, host: session.host })) return false;
   if (!session.pidReachable || !session.sourcePid) return false;
   if (!isEndedSessionBadge(badge)) return false;
   const isProcessAlive = typeof options.isProcessAlive === "function"
@@ -318,6 +324,22 @@ function sessionUpdatedAtComparator(a, b) {
   return String(a.id).localeCompare(String(b.id));
 }
 
+// Desktop apps can reopen a previous conversation on launch and report only a
+// SessionStart before the user touches it. That row is real — the Dashboard
+// still lists and opens it — but it must not reach the HUD until the first
+// action clears the marker.
+//   - DSH desktop reopens the last conversation on launch.
+//   - Kimi Code desktop restores the last viewed conversation on launch, and
+//     opening an old conversation from the sidebar does the same; both only
+//     send a SessionStart.
+const AWAITING_ACTIVITY_AGENTS = new Set(["deepseek-harness", "kimi-cli"]);
+
+function isSessionAwaitingActivity(session) {
+  return !!session
+    && AWAITING_ACTIVITY_AGENTS.has(session.agentId)
+    && session.awaitingActivity === true;
+}
+
 function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {}) {
   const alias = getSessionAliasEntry(id, session, sessionAliases);
   const recentEvents = Array.isArray(session && session.recentEvents)
@@ -335,10 +357,14 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     : () => "";
   const agentId = (session && session.agentId) || null;
   const state = (session && session.state) || "idle";
-  const hiddenFromHud = shouldAutoClearDetachedSession(session, badge, options)
+  // Existing hidden reasons also disable focus (there is nothing to jump to).
+  // The awaiting-activity marker is different: it only hides the HUD row, so the
+  // Dashboard can still list the conversation and open it on demand.
+  const hiddenByExistingReason = shouldAutoClearDetachedSession(session, badge, options)
     || isSupersededLocalCodexProcessSession(id, session, options.latestLocalCodexProcessIds);
+  const hiddenFromHud = hiddenByExistingReason || isSessionAwaitingActivity(session);
   const startupRecovered = !!(session && session.startupRecovered === true);
-  const focusTarget = session && !session.headless && !startupRecovered && state !== "sleeping" && !hiddenFromHud
+  const focusTarget = session && !session.headless && !startupRecovered && state !== "sleeping" && !hiddenByExistingReason
     ? getSessionFocusTarget({ ...(session || {}), id }, {
       osPlatform: options.focusHostPlatform || options.osPlatform,
     })
@@ -396,6 +422,7 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     provider: (session && session.provider) || null,
     codexOriginator: (session && session.codexOriginator) || null,
     codexSource: (session && session.codexSource) || null,
+    dshCarrier: (session && session.dshCarrier) || null,
     contextUsage: snapshotContextUsage(session),
     assistantLastOutput: (session && typeof session.assistantLastOutput === "string")
       ? session.assistantLastOutput
@@ -447,6 +474,17 @@ function normalizeSessionsIterable(sessions) {
 }
 
 function buildSessionSnapshot(sessions, options = {}) {
+  let readThreadName = options.readCodexThreadName;
+  if (typeof readThreadName !== "function") {
+    const localCodexSessionIds = [];
+    for (const [id, session] of normalizeSessionsIterable(sessions)) {
+      if (session && session.agentId === "codex" && !session.host) {
+        localCodexSessionIds.push(session.rawSessionId || id);
+      }
+    }
+    const threadNames = readCodexThreadNames(localCodexSessionIds);
+    readThreadName = (id) => threadNames.get(bareCodexSessionId(id)) || null;
+  }
   const entries = [];
   const sessionAliases = options.sessionAliases && typeof options.sessionAliases === "object"
     ? options.sessionAliases
@@ -467,6 +505,7 @@ function buildSessionSnapshot(sessions, options = {}) {
     if (automationRecord) matchedAutomationGrantIds.add(automationRecord.grantId);
     entries.push(buildSessionSnapshotEntry(id, session, sessionAliases, {
       ...options,
+      readCodexThreadName: readThreadName,
       latestLocalCodexProcessIds,
       sessionAutomationRecord: automationRecord,
     }));
@@ -623,6 +662,7 @@ function sessionSnapshotSignature(snapshot) {
       provider: entry.provider,
       codexOriginator: entry.codexOriginator,
       codexSource: entry.codexSource,
+      dshCarrier: entry.dshCarrier,
       contextUsage: entry.contextUsage,
       assistantLastOutput: entry.assistantLastOutput,
       assistantLastOutputTruncated: !!entry.assistantLastOutputTruncated,
@@ -651,6 +691,8 @@ module.exports = {
   isSessionInProgress,
   deriveSessionBadge,
   shouldAutoClearDetachedSession,
+  AWAITING_ACTIVITY_AGENTS,
+  isSessionAwaitingActivity,
   getSessionAliasEntry,
   getEffectiveSessionTitle,
   sessionDisplayFolder,

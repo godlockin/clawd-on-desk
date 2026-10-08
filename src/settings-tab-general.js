@@ -2,6 +2,7 @@
 
 (function initSettingsTabGeneral(root) {
   const GENERAL_IN_PLACE_KEYS = new Set([
+    "destructiveActionReminder",
     "size",
     "textScale",
     "textScaleByDisplay",
@@ -21,6 +22,9 @@
     "sessionHudShowContextUsage",
     "sessionHudShowQuota",
     "quotaRingDisplayMode",
+    "quotaAlertsEnabled",
+    "quotaAlertThresholds",
+    "quotaRecoveryAlertsEnabled",
     "permissionAutomationMode",
     "permissionAutomationAutoToolsWarningDismissed",
     "permissionAutomationUnattendedWarningDismissed",
@@ -127,12 +131,7 @@
         disabled: showDock && !showTray,
       },
     ];
-    return definitions.map((definition) => {
-      const row = helpers.buildSwitchRow(definition);
-      const sw = row.querySelector(".switch");
-      if (sw) sw.setAttribute("aria-label", t(definition.labelKey));
-      return row;
-    });
+    return definitions.map((definition) => helpers.buildSwitchRow(definition));
   }
 
   function readRoamMovementStyle() {
@@ -338,15 +337,18 @@
 
     const controls = document.createElement("div");
     controls.className = "row-control roam-area-controls";
-    const resetButton = document.createElement("button");
-    resetButton.type = "button";
-    resetButton.className = "soft-btn roam-area-reset";
-    resetButton.textContent = t("roamAreaReset");
+    const resetButton = helpers.buildButton({
+      labelKey: "roamAreaReset",
+      size: "compact",
+      className: "roam-area-reset",
+    });
     resetButton.style.display = "none";
-    const chooseButton = document.createElement("button");
-    chooseButton.type = "button";
-    chooseButton.className = "soft-btn accent roam-area-choose";
-    chooseButton.textContent = t("roamAreaChoose");
+    const chooseButton = helpers.buildButton({
+      labelKey: "roamAreaChoose",
+      tone: "accent",
+      size: "compact",
+      className: "roam-area-choose",
+    });
     controls.appendChild(resetButton);
     controls.appendChild(chooseButton);
     row.appendChild(text);
@@ -358,9 +360,8 @@
     }
     function setBusy(next) {
       busy = !!next;
-      chooseButton.disabled = busy;
-      resetButton.disabled = busy;
-      chooseButton.classList.toggle("pending", busy);
+      helpers.setButtonState(chooseButton, { pending: busy });
+      helpers.setButtonState(resetButton, { pending: busy });
     }
     function applyStatus(result) {
       if (!isMounted()) return;
@@ -576,6 +577,18 @@
     // trust boundary and require an explicit confirmation.
     parent.appendChild(helpers.buildSection(t("sectionPermissions"), [
       buildPermissionAutomationRow(),
+      // Reads as a modifier of the row above, and it is one: it only narrows
+      // what the automatic modes allow on their own, so unlike them it needs no
+      // confirmation to switch on.
+      helpers.buildSwitchRow({
+        key: "destructiveActionReminder",
+        labelKey: "rowDestructiveActionReminder",
+        descKey: "rowDestructiveActionReminderDesc",
+        // Second line for the limits, the way the agent rows carry their caveats.
+        // Keeping it in one description would have made this the longest blurb on
+        // the tab by a factor of three.
+        descExtraKey: "rowDestructiveActionReminderNote",
+      }),
     ]));
   }
 
@@ -744,23 +757,28 @@
   function buildDashboardRow() {
     const row = document.createElement("div");
     row.className = "row";
-    row.innerHTML =
-      `<div class="row-text">` +
-        `<span class="row-label"></span>` +
-        `<span class="row-desc"></span>` +
-      `</div>` +
-      `<div class="row-control">` +
-        `<button type="button" class="soft-btn accent"></button>` +
-      `</div>`;
-    row.querySelector(".row-label").textContent = t("rowSessionDashboard");
-    row.querySelector(".row-desc").textContent = t("rowSessionDashboardDesc");
-    const btn = row.querySelector("button");
-    btn.textContent = t("actionOpenDashboard");
+    const text = document.createElement("div");
+    text.className = "row-text";
+    const label = document.createElement("span");
+    label.className = "row-label";
+    label.textContent = t("rowSessionDashboard");
+    const desc = document.createElement("span");
+    desc.className = "row-desc";
+    desc.textContent = t("rowSessionDashboardDesc");
+    text.append(label, desc);
+    const control = document.createElement("div");
+    control.className = "row-control";
+    const btn = helpers.buildButton({
+      labelKey: "actionOpenDashboard",
+      tone: "accent",
+    });
     btn.addEventListener("click", () => {
       if (window.settingsAPI && typeof window.settingsAPI.openDashboard === "function") {
         window.settingsAPI.openDashboard();
       }
     });
+    control.appendChild(btn);
+    row.append(text, control);
     return row;
   }
 
@@ -840,13 +858,13 @@
   // not a child of it: its switches are never gated by the HUD master, so the
   // ring can be used with the Session HUD turned off (and vice versa).
   //
-  // This group answers ONE question: what does the ring look like. It used to
-  // also carry "collect local Claude usage", which is a different question —
-  // whether to read a provider at all — and having the two side by side is why
-  // per-provider collection ended up split across two tabs, Claude here and
-  // Kimi on its agent card. Collection now lives on each provider's own card
-  // under Agents, so "which providers am I reading" has one place to look.
-  // Keep it that way: a new provider's collection switch goes on its card.
+  // This group covers what the ring shows and the reminders built on the same
+  // quota reports. Reminders live here because they read that ring data and
+  // need no extra collection. "Collect local Claude usage" used to sit here too,
+  // which is a different question — whether to read a provider at all — and
+  // that split per-provider collection across two tabs; it now lives on each
+  // provider's own Agents card. Keep it that way: a new provider's collection
+  // switch goes on its card, never in this group.
   function buildQuotaRingGroup() {
     const enabledRow = helpers.buildSwitchRow({
       key: "sessionHudShowQuota",
@@ -866,11 +884,29 @@
     mergeRow.style.display = state.snapshot && state.snapshot.quotaMergeSources === true
       ? ""
       : "none";
+    const alertsEnabledRow = helpers.buildSwitchRow({
+      key: "quotaAlertsEnabled",
+      labelKey: "quotaEnabled",
+      descKey: "quotaDescription",
+    });
+    const thresholdsRow = buildQuotaAlertThresholdsRow();
+    const recoveryRow = helpers.buildSwitchRow({
+      key: "quotaRecoveryAlertsEnabled",
+      labelKey: "quotaRecovery",
+      descKey: "quotaRecoveryDesc",
+    });
+    const testRow = buildQuotaNotificationTestRow();
+    // Visibility of these rows follows the master switch; see syncReminderRowsVisibility.
+    const reminderRows = [thresholdsRow, recoveryRow, testRow];
     const optionList = buildOptionList("quota-ring-option-list", [
       enabledRow,
       displayModeRow,
       providersBlock.element,
       mergeRow,
+      alertsEnabledRow,
+      thresholdsRow,
+      recoveryRow,
+      testRow,
     ]);
     const group = helpers.buildCollapsibleGroup({
       id: "general:quota-ring",
@@ -880,6 +916,34 @@
       className: "quota-ring-collapsible",
       children: [optionList],
     });
+    // The three reminder rows only make sense while the master switch is on.
+    // Hide them rather than gray them out, so a disabled group stays compact and
+    // never shows a hidden control in its disabled style.
+    function syncReminderRowsVisibility() {
+      const visible = !!(state.snapshot && state.snapshot.quotaAlertsEnabled === true);
+      const apply = () => {
+        const revealed = [];
+        for (const row of reminderRows) {
+          const wasHidden = row.hidden === true;
+          row.hidden = !visible;
+          row.setAttribute("aria-hidden", visible ? "false" : "true");
+          if (visible && wasHidden) revealed.push(row);
+        }
+        return revealed;
+      };
+      // Reuse the group's entrance animation, but only for rows that actually
+      // change from hidden to shown so a plain value sync stays static.
+      const willReveal = visible && reminderRows.some((row) => row.hidden === true);
+      if (willReveal && typeof group.mutateCollapsibleBody === "function") {
+        group.mutateCollapsibleBody(apply);
+      } else {
+        apply();
+      }
+    }
+    if (state.mountedControls.quotaAlertThresholds) {
+      state.mountedControls.quotaAlertThresholds.syncVisibility = syncReminderRowsVisibility;
+    }
+    syncReminderRowsVisibility();
     if (window.settingsAPI && typeof window.settingsAPI.getQuotaSourceCount === "function") {
       Promise.resolve(window.settingsAPI.getQuotaSourceCount())
         .then((count) => {
@@ -947,32 +1011,38 @@
       text.appendChild(label);
       const control = document.createElement("div");
       control.className = "row-control";
-      const sw = document.createElement("div");
-      sw.className = "switch";
-      sw.setAttribute("role", "switch");
-      sw.tabIndex = 0;
       // ON means "shown", so the switch reads the way the label does. The pref
       // stores the inverse (what is HIDDEN) — see prefs.js for why.
-      let shown = !hiddenList().includes(provider.key);
-      helpers.setSwitchVisual(sw, shown);
-      sw.setAttribute("aria-label", provider.label || provider.key);
-      control.appendChild(sw);
+      const switchControl = helpers.buildSwitch({
+        checked: !hiddenList().includes(provider.key),
+        ariaLabel: provider.label || provider.key,
+      });
+      control.appendChild(switchControl.element);
       row.append(text, control);
 
-      helpers.attachActivation(sw, () => {
-        const next = !shown;
+      switchControl.setOnToggle(({ nextChecked: next }) => {
         // Optimistic: the broadcast that confirms this rebuilds the tab, and
         // leaving the switch stale until then reads as an ignored click.
-        shown = next;
-        helpers.setSwitchVisual(sw, shown, { pending: true });
+        switchControl.setState({ checked: next, pending: true });
         const hidden = hiddenList().filter((key) => key !== provider.key);
         if (!next) hidden.push(provider.key);
-        return Promise.resolve(
-          window.settingsAPI.update("quotaRingHiddenProviders", hidden)
-        ).catch(() => {
-          shown = !next;
-          helpers.setSwitchVisual(sw, shown);
-        });
+        return Promise.resolve()
+          .then(() => window.settingsAPI.update("quotaRingHiddenProviders", hidden))
+          .then((result) => {
+            if (!result || result.status !== "ok" || result.noop) {
+              switchControl.setState({ checked: !hiddenList().includes(provider.key) });
+              if (result && result.noop) return;
+              ops.showToast(t("toastSaveFailed") + ((result && result.message) || "unknown error"), { error: true });
+            }
+          })
+          .catch((err) => {
+            switchControl.setState({ checked: !hiddenList().includes(provider.key) });
+            ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+          })
+          .finally(() => {
+            // A rejected/no-op save has no snapshot broadcast to rebuild this row.
+            switchControl.setState({ pending: false });
+          });
       });
       return row;
     }
@@ -1051,6 +1121,163 @@
     controlWrap.appendChild(control.element);
     row.append(text, controlWrap);
     state.mountedControls.quotaRingDisplayMode = control;
+    return row;
+  }
+
+  function buildQuotaAlertThresholdsRow() {
+    const row = document.createElement("div");
+    row.className = "row quota-alert-thresholds-row";
+    const text = document.createElement("div");
+    text.className = "row-text";
+    const label = document.createElement("span");
+    label.className = "row-label";
+    label.textContent = t("quotaThresholds");
+    const desc = document.createElement("span");
+    desc.className = "row-desc";
+    desc.textContent = t("quotaThresholdHelp");
+    text.append(label, desc);
+    const host = document.createElement("div");
+    host.className = "row-control";
+    row.append(text, host);
+
+    // The select's option value is the canonical, descending threshold list, so
+    // a preset is both the write payload and the selected value.
+    const presets = [
+      { value: "10", thresholds: [10], labelKey: "quotaPreset10" },
+      { value: "20,10", thresholds: [20, 10], labelKey: "quotaPreset20_10" },
+      { value: "30,20,10", thresholds: [30, 20, 10], labelKey: "quotaPreset30_20_10" },
+      { value: "50,20,10", thresholds: [50, 20, 10], labelKey: "quotaPreset50_20_10" },
+    ];
+
+    let pending = false;
+    let control = null;
+    // Canonical form of the custom option currently built into `control`, or null
+    // when that control has no custom option. The select cannot add or remove
+    // options in place, so a change forces a rebuild and not just a setValue.
+    let customSignature = undefined;
+
+    function readValues() {
+      const values = state.snapshot && state.snapshot.quotaAlertThresholds;
+      return Array.isArray(values) && values.length ? values : [20, 10];
+    }
+
+    function canonical(values) {
+      return [...values].sort((a, b) => b - a).join(",");
+    }
+
+    function matchPreset(values) {
+      const target = canonical(values);
+      return presets.find((preset) => preset.value === target) || null;
+    }
+
+    function customLabel(values) {
+      const list = [...values].sort((a, b) => b - a)
+        .map((value) => `${value}%`)
+        .join(t("quotaListSeparator"));
+      return t("quotaPresetCustom").replace("{list}", list);
+    }
+
+    function buildControl(values) {
+      if (control) {
+        // The old control may be replaced while its own onChange is still in
+        // flight. Disposing it makes that pending settle a no-op, and the new
+        // control reads the committed snapshot instead of the stale click.
+        control.dispose();
+        state.mountedControls.settingsSelects.delete(control);
+        control.element.remove();
+      }
+      const preset = matchPreset(values);
+      const options = presets.map((presetOption) => ({
+        value: presetOption.value,
+        label: t(presetOption.labelKey),
+      }));
+      if (!preset) options.push({ value: "custom", label: customLabel(values) });
+      customSignature = preset ? null : canonical(values);
+      control = helpers.buildSettingsSelect({
+        value: preset ? preset.value : "custom",
+        options,
+        ariaLabel: t("quotaThresholds"),
+        onChange: (next) => save(next),
+      });
+      host.appendChild(control.element);
+      control.setDisabled(pending);
+    }
+
+    function syncFromSnapshot() {
+      const values = readValues();
+      const preset = matchPreset(values);
+      const signature = preset ? null : canonical(values);
+      if (!control || signature !== customSignature) buildControl(values);
+      else control.setValue(preset ? preset.value : "custom");
+      if (control) control.setDisabled(pending);
+    }
+
+    async function save(next) {
+      if (pending) return false;
+      // The custom option is only ever the already-committed value, so choosing
+      // it changes nothing and writes nothing.
+      if (next === "custom") return true;
+      const preset = presets.find((entry) => entry.value === next);
+      if (!preset) return false;
+      pending = true;
+      if (control) control.setDisabled(true);
+      try {
+        const result = await window.settingsAPI.update("quotaAlertThresholds", preset.thresholds);
+        if (!result || result.status !== "ok") throw new Error((result && result.message) || "unknown error");
+        const values = result.snapshot ? result.snapshot.quotaAlertThresholds : preset.thresholds;
+        const changes = { quotaAlertThresholds: values };
+        ops.applyChanges({ changes, ...(result.snapshot ? { snapshot: result.snapshot } : {}) });
+        return true;
+      } catch (err) {
+        ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+        return false;
+      } finally {
+        pending = false;
+        // On success applyChanges has already synced the value through
+        // syncFromSnapshot. On failure we deliberately leave the value alone so
+        // the picker's own onChange(false) revert is what restores it.
+        if (control) control.setDisabled(false);
+      }
+    }
+
+    state.mountedControls.quotaAlertThresholds = { row, syncFromSnapshot };
+    syncFromSnapshot();
+    return row;
+  }
+
+  function buildQuotaNotificationTestRow() {
+    const row = document.createElement("div");
+    row.className = "row quota-notification-test-row";
+    const text = document.createElement("div");
+    text.className = "row-text";
+    const label = document.createElement("span");
+    label.className = "row-label";
+    label.textContent = t("notificationTest");
+    const desc = document.createElement("span");
+    desc.className = "row-desc";
+    const descKey = i18n && i18n.IS_MAC
+      ? "notificationTestDescMac"
+      : (i18n && i18n.IS_WIN ? "notificationTestDescWin" : "notificationTestDescLinux");
+    desc.textContent = t(descKey);
+    text.append(label, desc);
+    const control = document.createElement("div");
+    control.className = "row-control";
+    const button = helpers.buildButton({ labelKey: "notificationTestSend", size: "compact" });
+    button.addEventListener("click", async () => {
+      if (button.disabled) return;
+      helpers.setButtonState(button, { pending: true });
+      try {
+        const result = await window.settingsAPI.testQuotaNotification();
+        ops.showToast(t(result && result.ok === true ? "notificationTestSent" : "notificationTestFailed"),
+          { error: !(result && result.ok === true) });
+      } catch {
+        ops.showToast(t("notificationTestFailed"), { error: true });
+      } finally {
+        helpers.setButtonState(button, { pending: false });
+      }
+    });
+    control.appendChild(button);
+    row.append(text, control);
     return row;
   }
 
@@ -1212,12 +1439,12 @@
     // as a card; mirrors how Sound group puts the volume slider on its own row.
     const resetRow = document.createElement("div");
     resetRow.className = "row session-cleanup-reset-row";
-    const resetButton = document.createElement("button");
-    resetButton.type = "button";
-    resetButton.className = "soft-btn";
-    resetButton.textContent = t("actionResetSessionCleanup");
+    const resetButton = helpers.buildButton({
+      labelKey: "actionResetSessionCleanup",
+      size: "compact",
+    });
     resetButton.addEventListener("click", async () => {
-      resetButton.disabled = true;
+      helpers.setButtonState(resetButton, { pending: true });
       try {
         const result = await window.settingsAPI.command(
           "sessionCleanup.setTriple",
@@ -1230,7 +1457,7 @@
       } catch (err) {
         ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
       } finally {
-        resetButton.disabled = false;
+        helpers.setButtonState(resetButton, { pending: false });
       }
     });
     resetRow.appendChild(resetButton);
@@ -1310,30 +1537,31 @@
       `<div class="row-text">` +
         `<span class="row-label"></span>` +
       `</div>` +
-      `<div class="row-control"><div class="switch" role="switch" tabindex="0"></div></div>`;
-    row.querySelector(".row-label").textContent = t("rowSoundEnabled");
-    const sw = row.querySelector(".switch");
+      `<div class="row-control"></div>`;
+    const label = row.querySelector(".row-label");
+    label.id = "settings-sound-enabled-label";
+    label.textContent = t("rowSoundEnabled");
     const text = row.querySelector(".row-text");
     const override = state.transientUiState.generalSwitches.get("soundMuted");
     const visualOn = override ? override.visualOn : readers.readGeneralSwitchVisual("soundMuted", true);
-    helpers.setSwitchVisual(sw, visualOn, { pending: override ? override.pending : false });
+    const switchControl = helpers.buildSwitch({
+      checked: visualOn,
+      pending: override ? override.pending : false,
+      ariaLabelledBy: label.id,
+    });
+    row.querySelector(".row-control").appendChild(switchControl.element);
     state.mountedControls.generalSwitches.set("soundMuted", {
-      element: sw,
+      control: switchControl,
+      element: switchControl.element,
       invert: true,
       row,
       text,
       extraElement: null,
     });
 
-    const run = (ev) => {
-      if (sw.classList.contains("disabled") || sw.getAttribute("aria-disabled") === "true") return;
+    switchControl.setOnToggle(({ event }) => {
       if (!summaryControl || typeof summaryControl.toggleSound !== "function") return;
-      summaryControl.toggleSound(ev);
-    };
-    sw.addEventListener("click", run);
-    sw.addEventListener("keydown", (ev) => {
-      if (ev.key !== " " && ev.key !== "Enter") return;
-      run(ev);
+      summaryControl.toggleSound(event);
     });
     return row;
   }
@@ -1342,13 +1570,14 @@
     const wrap = document.createElement("div");
     wrap.className = "sound-summary-control";
     const chip = document.createElement("span");
-    const sw = document.createElement("div");
-    sw.className = "switch sound-header-switch";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("aria-label", t("rowSoundEnabled"));
-    sw.setAttribute("tabindex", "0");
+    const switchControl = helpers.buildSwitch({
+      checked: readers.readGeneralSwitchVisual("soundMuted", true),
+      ariaLabel: t("rowSoundEnabled"),
+      className: "sound-header-switch",
+      stopPropagation: true,
+    });
     wrap.appendChild(chip);
-    wrap.appendChild(sw);
+    wrap.appendChild(switchControl.element);
 
     function getSnapshotVolumePct() {
       const v = state.snapshot && typeof state.snapshot.soundVolume === "number"
@@ -1377,7 +1606,7 @@
     function setSoundChildSwitchVisual(visualOn, pendingVisual) {
       const meta = getMountedGeneralSwitch("soundMuted");
       if (!meta) return;
-      helpers.setSwitchVisual(meta.element, visualOn, { pending: pendingVisual });
+      meta.control.setState({ checked: visualOn, pending: pendingVisual });
     }
 
     function normalizeVolumePct(pct) {
@@ -1390,7 +1619,7 @@
       const stateLabel = enabled ? t("bubblePolicySummaryOn") : t("bubblePolicySummaryOff");
       chip.className = "collapsible-summary-chip" + (enabled ? " accent" : "");
       chip.textContent = `${stateLabel} · ${normalizeVolumePct(volumePct)}%`;
-      helpers.setSwitchVisual(sw, enabled, { pending: pendingVisual });
+      switchControl.setState({ checked: enabled, pending: pendingVisual });
     }
 
     function syncFromSnapshot() {
@@ -1442,16 +1671,13 @@
       });
     }
 
-    sw.addEventListener("click", toggleSound);
-    sw.addEventListener("keydown", (ev) => {
-      if (ev.key !== " " && ev.key !== "Enter") return;
-      toggleSound(ev);
-    });
+    switchControl.setOnToggle(({ event }) => toggleSound(event));
 
     syncFromSnapshot();
     return {
       element: wrap,
-      headerSwitch: sw,
+      headerSwitch: switchControl.element,
+      switchControl,
       syncFromSnapshot,
       syncVolumePreview,
       toggleSound,
@@ -1555,11 +1781,13 @@
         `<span class="row-label"></span>` +
         `<span class="row-desc"></span>` +
       `</div>` +
-      `<div class="bubble-policy-controls">` +
-        `<div class="switch" role="switch" tabindex="0"></div>` +
-      `</div>`;
-    item.querySelector(".row-label").textContent = t(labelKey);
-    item.querySelector(".row-desc").textContent = t(descKey);
+      `<div class="bubble-policy-controls"></div>`;
+    const label = item.querySelector(".row-label");
+    const description = item.querySelector(".row-desc");
+    label.id = `settings-bubble-${category}-label`;
+    description.id = `settings-bubble-${category}-description`;
+    label.textContent = t(labelKey);
+    description.textContent = t(descKey);
     if (warningKey) {
       const warning = document.createElement("span");
       warning.className = "row-desc bubble-policy-warning";
@@ -1567,8 +1795,13 @@
       item.querySelector(".bubble-policy-copy").appendChild(warning);
     }
 
-    const sw = item.querySelector(".switch");
     const controls = item.querySelector(".bubble-policy-controls");
+    const switchControl = helpers.buildSwitch({
+      checked: currentEnabled(),
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: description.id,
+    });
+    controls.appendChild(switchControl.element);
     let secondsInput = null;
     let secondsCommitTimer = null;
     let secondsDraftValue = null;
@@ -1589,7 +1822,7 @@
     }
 
     function setVisual(enabled, pending = false) {
-      helpers.setSwitchVisual(sw, enabled, { pending });
+      switchControl.setState({ checked: enabled, pending });
       if (secondsInput) secondsInput.disabled = !enabled || pending;
     }
 
@@ -1652,7 +1885,6 @@
     }
 
     function runToggle() {
-      if (sw.classList.contains("pending")) return;
       const nextEnabled = !currentEnabled();
       if (category === "update" && !nextEnabled) {
         setVisual(nextEnabled, true);
@@ -1680,13 +1912,7 @@
     }
 
     setVisual(currentEnabled(), false);
-    sw.addEventListener("click", runToggle);
-    sw.addEventListener("keydown", (ev) => {
-      if (ev.key === " " || ev.key === "Enter") {
-        ev.preventDefault();
-        runToggle();
-      }
-    });
+    switchControl.setOnToggle(runToggle);
 
     if (secondsKey) {
       const input = document.createElement("input");
@@ -1702,9 +1928,9 @@
       const suffix = document.createElement("span");
       suffix.className = "bubble-policy-unit";
       suffix.textContent = t("bubbleSecondsUnit");
-      controls.insertBefore(prefix, sw);
-      controls.insertBefore(input, sw);
-      controls.insertBefore(suffix, sw);
+      controls.insertBefore(prefix, switchControl.element);
+      controls.insertBefore(input, switchControl.element);
+      controls.insertBefore(suffix, switchControl.element);
       secondsInput = input;
       input.disabled = !currentEnabled();
       input.addEventListener("input", () => {
@@ -2193,17 +2419,72 @@
       `</div>`;
     row.querySelector(".row-label").textContent = t("rowSize");
     row.querySelector(".row-desc").textContent = t("rowSizeDesc");
+    const warning = document.createElement("span");
+    warning.className = "row-desc size-over-max-hint";
+    warning.textContent = t("rowSizeOverMaxHint");
+    warning.hidden = true;
+    row.querySelector(".row-text").appendChild(warning);
 
     const control = row.querySelector(".size-control");
     const slider = row.querySelector(".size-slider");
     const readout = row.querySelector(".size-readout");
     readout.title = t("rowSizeResetTitle");
 
+    let context = null;
+    let requestId = 0;
+    let disposed = false;
+    let interactionBusy = false;
+    let refreshAfterInteraction = false;
+
+    function readDisplayedUi() {
+      return context && !context.synced ? context.ui : readers.readSizeUiFromSnapshot();
+    }
+
+    function requestContext() {
+      if (disposed || !window.settingsAPI || typeof window.settingsAPI.getSizeContext !== "function") return;
+      if (interactionBusy) {
+        ++requestId;
+        refreshAfterInteraction = true;
+        return;
+      }
+      const id = ++requestId;
+      Promise.resolve().then(() => window.settingsAPI.getSizeContext()).then((result) => {
+        if (disposed || id !== requestId) return;
+        if (interactionBusy) {
+          refreshAfterInteraction = true;
+          return;
+        }
+        if (!result || !Number.isInteger(result.ui)
+          || result.ui < helpers.SIZE_UI_MIN || result.ui > helpers.SIZE_UI_MAX
+          || typeof result.synced !== "boolean" || typeof result.overMax !== "boolean"
+          || (result.overMax && (result.synced || result.ui !== helpers.SIZE_UI_MAX))) {
+          context = null;
+          controller.syncFromSnapshot();
+          return;
+        }
+        context = result;
+        controller.syncFromSnapshot();
+      }).catch(() => {
+        if (disposed || id !== requestId || interactionBusy) return;
+        context = null;
+        controller.syncFromSnapshot();
+      });
+    }
+
+    function invalidateContext() {
+      ++requestId;
+      context = null;
+    }
+
     function applyLocalValue(ui) {
       const pct = helpers.sizeUiToPct(ui);
       slider.value = String(ui);
       slider.style.setProperty("--volume-fill", `${pct}%`);
-      readout.textContent = `${ui}%`;
+      const overMax = !interactionBusy && context && !context.synced
+        && context.overMax && ui === context.ui;
+      readout.textContent = overMax ? "100%+" : `${ui}%`;
+      readout.classList.toggle("over-max", !!overMax);
+      warning.hidden = !overMax;
     }
 
     function setDragging(nextDragging, pending = state.transientUiState.size.pending) {
@@ -2211,13 +2492,14 @@
       control.classList.toggle("pending", !!pending);
     }
 
-    const initial =
-      state.transientUiState.size.draftUi === null ? readers.readSizeUiFromSnapshot() : state.transientUiState.size.draftUi;
+    const initial = (state.transientUiState.size.dragging || state.transientUiState.size.pending)
+      && state.transientUiState.size.draftUi !== null
+      ? state.transientUiState.size.draftUi : readers.readSizeUiFromSnapshot();
     applyLocalValue(initial);
     setDragging(state.transientUiState.size.dragging, state.transientUiState.size.pending);
 
     const controller = helpers.createSizeSliderController({
-      readSnapshotUi: readers.readSizeUiFromSnapshot,
+      readSnapshotUi: readDisplayedUi,
       settingsAPI: window.settingsAPI,
       onLocalValue: (ui) => {
         state.transientUiState.size.draftUi = ui;
@@ -2226,33 +2508,64 @@
       onDraggingChange: (dragging, pending) => {
         state.transientUiState.size.dragging = dragging;
         state.transientUiState.size.pending = pending;
+        const wasInteractionBusy = interactionBusy;
+        interactionBusy = !!(dragging || pending);
         setDragging(dragging, pending);
+        if (!interactionBusy && (wasInteractionBusy || refreshAfterInteraction)) {
+          refreshAfterInteraction = false;
+          requestContext();
+        }
       },
       onError: (message) => {
         state.transientUiState.size.draftUi = null;
         applyLocalValue(readers.readSizeUiFromSnapshot());
+        requestContext();
         if (message) ops.showToast(t("toastSaveFailed") + message, { error: true });
       },
     });
 
     state.mountedControls.size = {
       row,
-      syncFromSnapshot: (options) => controller.syncFromSnapshot(options),
-      dispose: () => controller.dispose(),
+      syncFromSnapshot: (options) => {
+        invalidateContext();
+        controller.syncFromSnapshot(options);
+        requestContext();
+      },
+      dispose: () => {
+        disposed = true;
+        ++requestId;
+        if (typeof unsubscribeContextChanged === "function") unsubscribeContextChanged();
+        window.removeEventListener("focus", onFocus);
+        return controller.dispose();
+      },
     };
     controller.syncFromSnapshot();
 
-    slider.addEventListener("pointerdown", () => { void controller.pointerDown(); });
+    const onFocus = () => requestContext();
+    window.addEventListener("focus", onFocus);
+    const unsubscribeContextChanged = window.settingsAPI
+      && typeof window.settingsAPI.onSizeContextChanged === "function"
+      ? window.settingsAPI.onSizeContextChanged(requestContext) : null;
+    requestContext();
+
+    slider.addEventListener("pointerdown", () => {
+      invalidateContext();
+      applyLocalValue(Number(slider.value));
+      void controller.pointerDown();
+    });
     slider.addEventListener("pointerup", () => { void controller.pointerUp(); });
     slider.addEventListener("pointercancel", () => { void controller.pointerCancel(); });
     slider.addEventListener("blur", () => { void controller.blur(); });
     slider.addEventListener("input", () => {
+      invalidateContext();
       void controller.input(Number(slider.value));
     });
     slider.addEventListener("change", () => {
+      invalidateContext();
       void controller.change(Number(slider.value));
     });
     readout.addEventListener("click", () => {
+      invalidateContext();
       void controller.change(SIZE_UI_DEFAULT);
     });
 
@@ -2268,14 +2581,7 @@
   function setGeneralSwitchDisabled(key, disabled) {
     const meta = getMountedGeneralSwitch(key);
     if (!meta) return false;
-    meta.element.classList.toggle("disabled", !!disabled);
-    if (disabled) {
-      meta.element.setAttribute("aria-disabled", "true");
-      meta.element.tabIndex = -1;
-    } else {
-      meta.element.removeAttribute("aria-disabled");
-      meta.element.tabIndex = 0;
-    }
+    meta.control.setState({ disabled: !!disabled });
     return true;
   }
 
@@ -2348,7 +2654,8 @@
     const keys = changes ? Object.keys(changes) : [];
     if (keys.length === 0) return false;
     if (!keys.every((key) => GENERAL_IN_PLACE_KEYS.has(key))) return false;
-    if (keys.includes("size") && !ops.syncMountedSizeControl({ fromBroadcast: true })) return false;
+    if ((keys.includes("size") || keys.includes("keepSizeAcrossDisplays"))
+      && !ops.syncMountedSizeControl({ fromBroadcast: true })) return false;
     if (keys.includes("textScale") || keys.includes("textScaleByDisplay")) {
       const tc = state.mountedControls.textScale;
       if (!tc || !document.body.contains(tc.row)) return false;
@@ -2376,6 +2683,10 @@
     if (keys.includes("quotaRingDisplayMode")) {
       const control = state.mountedControls.quotaRingDisplayMode;
       if (!control || !document.body.contains(control.element)) return false;
+    }
+    if (keys.includes("quotaAlertThresholds") || keys.includes("quotaAlertsEnabled")) {
+      const control = state.mountedControls.quotaAlertThresholds;
+      if (!control || !document.body.contains(control.row)) return false;
     }
     if (keys.includes("permissionAutomationMode")) {
       const control = state.mountedControls.permissionAutomationMode;
@@ -2406,6 +2717,7 @@
     for (const key of keys) {
       if (key === "size" || key === "soundVolume" || key === "textScale" || key === "textScaleByDisplay") continue;
       if (key === "quotaRingDisplayMode") continue;
+      if (key === "quotaAlertThresholds") continue;
       if (key === "permissionAutomationMode"
         || key === "permissionAutomationAutoToolsWarningDismissed"
         || key === "permissionAutomationUnattendedWarningDismissed") continue;
@@ -2423,6 +2735,7 @@
     }
     for (const key of keys) {
       if (key === "size") continue;
+      if (key === "quotaAlertThresholds") continue;
       if (key === "quotaRingDisplayMode") {
         state.mountedControls.quotaRingDisplayMode.setValue(
           state.snapshot && state.snapshot.quotaRingDisplayMode
@@ -2459,7 +2772,10 @@
       if (key === "roamConstrainAxis") continue;
       const meta = state.mountedControls.generalSwitches.get(key);
       state.transientUiState.generalSwitches.delete(key);
-      helpers.setSwitchVisual(meta.element, readers.readGeneralSwitchVisual(key, meta.invert), { pending: false });
+      meta.control.setState({
+        checked: readers.readGeneralSwitchVisual(key, meta.invert),
+        pending: false,
+      });
       if (key === "soundMuted") {
         state.mountedControls.soundVolume.syncDisabled();
       }
@@ -2481,6 +2797,13 @@
       && state.mountedControls.soundSummary
       && document.body.contains(state.mountedControls.soundSummary.element)) {
       state.mountedControls.soundSummary.syncFromSnapshot();
+    }
+    if (keys.includes("quotaAlertThresholds") || keys.includes("quotaAlertsEnabled")) {
+      state.mountedControls.quotaAlertThresholds.syncFromSnapshot();
+      // The master switch also drives whether the reminder rows are visible.
+      if (typeof state.mountedControls.quotaAlertThresholds.syncVisibility === "function") {
+        state.mountedControls.quotaAlertThresholds.syncVisibility();
+      }
     }
     return true;
   }
