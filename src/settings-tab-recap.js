@@ -230,20 +230,16 @@
             agentId: source.agentId,
             scope: source.scope,
             scopeInstance: source.scopeInstance,
-            sessionsStarted: 0,
             turnsCompleted: 0,
             toolCalls: 0,
             activityEvents: 0,
-            sessionsStartedPartial: false,
           };
           rows.set(key, row);
         }
         const metrics = source.metrics || {};
-        row.sessionsStarted = combineMetric(row.sessionsStarted, metrics.sessionsStarted);
         row.turnsCompleted = combineMetric(row.turnsCompleted, metrics.turnsCompleted);
         row.toolCalls = combineMetric(row.toolCalls, metrics.toolCalls);
         row.activityEvents += Number.isSafeInteger(metrics.activityEvents) ? metrics.activityEvents : 0;
-        row.sessionsStartedPartial ||= source.sessionsStartedPartial === true;
       }
     }
     return {
@@ -523,10 +519,9 @@
     return group;
   }
 
-  function metricText(value, partial = false) {
+  function metricText(value) {
     if (value === null) return t("recapMetricUnavailable");
-    const formatted = formatNumber(value);
-    return partial ? `${formatted} · ${t("recapMetricPartial")}` : formatted;
+    return formatNumber(value);
   }
 
   function buildAgentRows(summary, interaction) {
@@ -548,15 +543,14 @@
       item.setAttribute("role", "button");
       item.setAttribute("aria-pressed", view.lockedRowKey === row.key ? "true" : "false");
       const metricEntries = [
-        ["recapMetricSessions", row.sessionsStarted, row.sessionsStartedPartial],
-        ["recapMetricTurns", row.turnsCompleted, false],
-        ["recapMetricTools", row.toolCalls, false],
-        ["recapMetricSignals", row.activityEvents, false],
+        ["recapMetricTurns", row.turnsCompleted],
+        ["recapMetricTools", row.toolCalls],
+        ["recapMetricSignals", row.activityEvents],
       ];
-      const metricDescription = metricEntries.map(([labelKey, value, partial]) => {
+      const metricDescription = metricEntries.map(([labelKey, value]) => {
         const accessibleValue = value === null
           ? t("recapMetricUnavailableReason")
-          : metricText(value, partial);
+          : metricText(value);
         return `${t(labelKey)}: ${accessibleValue}`;
       }).join(". ");
       item.setAttribute("aria-label", `${replace(t("recapAgentHighlightAria"), {
@@ -581,12 +575,12 @@
       item.appendChild(identity);
       const metrics = document.createElement("dl");
       metrics.className = "recap-agent-metrics";
-      for (const [labelKey, value, partial] of metricEntries) {
+      for (const [labelKey, value] of metricEntries) {
         const pair = document.createElement("div");
         const label = document.createElement("dt");
         label.textContent = t(labelKey);
         const count = document.createElement("dd");
-        count.textContent = metricText(value, partial);
+        count.textContent = metricText(value);
         if (value === null) {
           count.title = t("recapMetricUnavailableReason");
           count.setAttribute("aria-label", `${t(labelKey)}: ${t("recapMetricUnavailableReason")}`);
@@ -1085,9 +1079,11 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
+    label.id = "recap-recording-label";
     label.textContent = t("recapRecordingLabel");
     const desc = document.createElement("span");
     desc.className = "row-desc";
+    desc.id = "recap-recording-description";
     desc.textContent = t(paused ? "recapRecordingPaused" : "recapRecordingDesc");
     if (paused) desc.setAttribute("role", "status");
     text.appendChild(label);
@@ -1095,12 +1091,6 @@
     switchRow.appendChild(text);
     const control = document.createElement("div");
     control.className = "row-control";
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("data-settings-focus-key", "recap-recording-toggle");
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", view.togglePending ? "-1" : "0");
-    helpers.setSwitchVisual(sw, enabled, { pending: view.togglePending });
     const toggle = () => {
       if (view.togglePending || !window.settingsAPI || typeof window.settingsAPI.update !== "function") return;
       view.togglePending = true;
@@ -1113,13 +1103,15 @@
         if (coreState.activeTab === "recap") ops.requestRender({ content: true, preserveScroll: true });
       });
     };
-    sw.addEventListener("click", toggle);
-    sw.addEventListener("keydown", (event) => {
-      if (event.key === " " || event.key === "Enter") {
-        event.preventDefault();
-        toggle();
-      }
+    const switchControl = helpers.buildSwitch({
+      checked: enabled,
+      pending: view.togglePending,
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: desc.id,
+      onToggle: toggle,
     });
+    const sw = switchControl.element;
+    sw.setAttribute("data-settings-focus-key", "recap-recording-toggle");
     control.appendChild(sw);
     switchRow.appendChild(control);
     rows.push(switchRow);

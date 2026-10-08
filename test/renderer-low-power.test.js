@@ -377,6 +377,7 @@ globalThis.__rendererTest = {
   get currentDragSvg() { return currentDragSvg; },
   get currentDragDirection() { return currentDragDirection; },
   get isDragReacting() { return isDragReacting; },
+  get isReacting() { return isReacting; },
   get accessoryAssetLoadTimer() { return _accessorySlots.head.assetLoadTimer; },
   get accessoryAssetSettled() { return _accessorySlots.head.assetSettled; },
   get accessorySlots() { return _accessorySlots; },
@@ -902,6 +903,27 @@ describe("renderer displayed-visual settlement", () => {
 
     assert.deepStrictEqual(settlements(harness).map((entry) => entry.visualGeneration), [11]);
   });
+
+  for (const objectChannel of [false, true]) {
+    it(`replays the displayed compaction SVG through the ${objectChannel ? "object" : "img"} channel`, () => {
+      const harness = createRendererHarness({
+        themeConfig: objectChannel ? { rendering: { objectChannelFiles: ["sweeping.svg"] } } : {},
+      });
+      harness.electronHandlers.onStateChange(visualRequest(12, "sweeping.svg", "sweeping"));
+      const first = harness.api.pendingNext;
+      first.listeners.get("load")();
+      harness.electronHandlers.onStateChange({
+        ...visualRequest(13, "sweeping.svg", "sweeping"), restartAnimation: true,
+      });
+      const replay = harness.api.pendingNext;
+      assert.ok(replay, "completion must load a fresh animation timeline");
+      assert.notStrictEqual(replay, first);
+      assert.notStrictEqual(objectChannel ? replay.data : replay.src, objectChannel ? first.data : first.src);
+      assert.strictEqual(replay.tagName, objectChannel ? "OBJECT" : "IMG");
+      replay.listeners.get("load")();
+      assert.deepStrictEqual(settlements(harness).map(entry => entry.outcome), ["swapped", "swapped"]);
+    });
+  }
 
   it("reports an object-to-img recovery as a verified fallback", () => {
     const harness = createRendererHarness({
@@ -3035,6 +3057,39 @@ describe("renderer glyph flip compensation", () => {
     }
   });
 
+  it("updates idle orientation and accessory facing when the same resting file crosses sides", () => {
+    const harness = createRendererHarness({ themeConfig: { rightSideMirrorFiles: ["bubble.svg"] } });
+    harness.electronHandlers.onPetScreenSide(false);
+    harness.electronHandlers.onStateChange("idle", "bubble.svg");
+    harness.api.pendingNext.listeners.get("load")();
+    const displayed = harness.api.clawdEl;
+    harness.electronHandlers.onPetScreenSide(true);
+    harness.electronHandlers.onStateChange("idle", "bubble.svg");
+    assert.strictEqual(harness.api.pendingNext, null);
+    assert.strictEqual(harness.api.clawdEl, displayed);
+    assert.strictEqual(harness.assetDirectionStage.style.scale, "-1 1");
+    const report = () => harness.electronCalls.filter((call) => call.name === "reportAccessoryMirror").at(-1).args[0];
+    assert.strictEqual(report(), true);
+    harness.electronHandlers.onPetScreenSide(false);
+    assert.strictEqual(harness.assetDirectionStage.style.scale, "none");
+    assert.strictEqual(report(), false);
+  });
+
+  it("keeps idle glyph variants mirrored when side arrives during an image load", () => {
+    const harness = createRendererHarness({
+      themeConfig: { rightSideMirrorFiles: ["bubble.svg", "bubble-left.svg"] },
+    });
+    harness.electronHandlers.onStateChange("idle", "bubble-left.svg");
+    const pending = harness.api.pendingNext;
+    harness.electronHandlers.onPetScreenSide(true);
+    pending.listeners.get("load")();
+    assert.strictEqual(harness.api.currentDisplayedSvg, "bubble-left.svg");
+    assert.strictEqual(harness.assetDirectionStage.style.scale, "-1 1");
+    harness.electronHandlers.onStateChange("idle", "current.svg");
+    harness.api.pendingNext.listeners.get("load")();
+    assert.strictEqual(harness.assetDirectionStage.style.scale, "none");
+  });
+
   it("tells main which way the accessory ended up facing", () => {
     // Main sizes the native hit window from this. Without the report it keeps
     // its startup default of "upright" forever and the hat is drawn on one
@@ -3294,5 +3349,100 @@ describe("renderer viewport offset X (#690)", () => {
     } finally {
       loader.restore();
     }
+  });
+});
+
+describe("renderer reaction preview lifecycle", () => {
+  it("clears a pending reaction timer before the next reaction starts", () => {
+    const harness = createRendererHarness();
+    harness.electronHandlers.onPlayClickReaction("react-drag.apng", 5600);
+    const first = harness.timers.find((timer) => timer.ms === 5600);
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600);
+    const second = harness.timers.find((timer) => timer.ms === 4600);
+
+    assert.ok(first, "first reaction timer");
+    assert.ok(second, "second reaction timer");
+    // Without the clear, the first timer would fire mid-clip and end the
+    // second reaction early — settings previews now last as long as the clip.
+    assert.strictEqual(first.cleared, true);
+    assert.strictEqual(second.cleared, false);
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      0
+    );
+  });
+
+  it("cancels a reaction preview and resumes cursor polling when settings asks", () => {
+    const harness = createRendererHarness();
+    harness.electronHandlers.onPlayClickReaction("react-drag.apng", 5600, { settingsPreview: true });
+    const timer = harness.timers.find((entry) => entry.ms === 5600);
+    harness.electronHandlers.onCancelClickReaction();
+
+    assert.ok(timer);
+    assert.strictEqual(timer.cleared, true);
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      1
+    );
+  });
+});
+
+describe("renderer reaction pause ownership", () => {
+  it("keeps the pause a drag reaction holds when a click preview is cancelled", () => {
+    const harness = createRendererHarness({
+      themeConfig: { dragSvgs: { left: "drag-left.svg", right: "drag-right.svg" } },
+    });
+    harness.electronHandlers.onStartDragReaction("right");
+    assert.strictEqual(harness.api.isDragReacting, true);
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600, { settingsPreview: true });
+    harness.electronHandlers.onCancelClickReaction();
+
+    // The drag is still running and still wants the cursor polling paused.
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      0
+    );
+
+    harness.electronHandlers.onEndDragReaction();
+    assert.strictEqual(
+      harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length,
+      1
+    );
+  });
+});
+
+describe("renderer reaction preview scope", () => {
+  const resumes = (harness) =>
+    harness.electronCalls.filter((call) => call.name === "resumeFromReaction").length;
+
+  it("leaves a reaction the user started alone when settings cancels its preview", () => {
+    const harness = createRendererHarness();
+    // No settingsPreview marker: this is a click on the pet, on the same channel.
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600);
+    const timer = harness.timers.find((entry) => entry.ms === 4600);
+    harness.electronHandlers.onCancelClickReaction();
+
+    assert.ok(timer);
+    assert.strictEqual(timer.cleared, false);
+    assert.strictEqual(harness.api.isReacting, true);
+    assert.strictEqual(resumes(harness), 0);
+
+    timer.callback();
+    assert.strictEqual(resumes(harness), 1);
+  });
+
+  it("leaves the pause to a click reaction when the drag ends first", () => {
+    const harness = createRendererHarness({
+      themeConfig: { dragSvgs: { left: "drag-left.svg", right: "drag-right.svg" } },
+    });
+    harness.electronHandlers.onStartDragReaction("right");
+    harness.electronHandlers.onPlayClickReaction("react-surprise.apng", 4600, { settingsPreview: true });
+    harness.electronHandlers.onEndDragReaction();
+
+    // The click reaction is still running and still wants polling paused.
+    assert.strictEqual(resumes(harness), 0);
+
+    harness.timers.find((entry) => entry.ms === 4600).callback();
+    assert.strictEqual(resumes(harness), 1);
   });
 });
