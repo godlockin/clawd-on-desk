@@ -60,6 +60,14 @@ class FakeWindow extends EventEmitter {
   setIgnoreMouseEvents(...args) {
     this.calls.push(["setIgnoreMouseEvents", ...args]);
   }
+
+  hookWindowMessage(...args) {
+    this.calls.push(["hookWindowMessage", ...args]);
+  }
+
+  unhookWindowMessage(...args) {
+    this.calls.push(["unhookWindowMessage", ...args]);
+  }
 }
 
 function makeTimers() {
@@ -663,6 +671,8 @@ describe("topmost runtime Windows recovery", () => {
           return 0n;
         },
         refreshStyle: () => true,
+        armMouseActivate: () => true,
+        clearMouseActivate: () => null,
       },
     });
     const setHitWinFocusable = createHitWindowFocusableSetter({
@@ -687,6 +697,8 @@ describe("topmost runtime Windows recovery", () => {
     assert.equal((style & WS_EX_NOACTIVATE) !== 0n, false);
     assert.equal(nativeWrites.length, 2);
     assert.equal(hitWin.calls.some((call) => call[0] === "setFocusable"), false);
+    assert.equal(hitWin.calls.filter((call) => call[0] === "hookWindowMessage").length, 1);
+    assert.equal(hitWin.calls.some((call) => call[0] === "unhookWindowMessage"), false);
   });
 
   it("uses one fullscreen native observation for both focusability and auto-hide per poll tick", () => {
