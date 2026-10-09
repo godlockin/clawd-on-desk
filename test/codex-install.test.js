@@ -20,6 +20,7 @@ const {
   materializeAppImageHookScript,
   materializeStableCodexHookLauncher,
   readStableCodexHookManifest,
+  registerCodexCommandHooks,
   removeStableCodexHookLauncher,
   stableCodexHookPaths,
   windowsPathToWslPath,
@@ -55,6 +56,35 @@ afterEach(() => {
 });
 
 describe("Codex official hook installer", () => {
+  it("adds PreCompact and SessionEnd to a legacy installation and preserves a foreign compaction hook", () => {
+    const previousEvents = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop"];
+    const codexDir = makeTempCodexDir({ hooks: {
+      PreCompact: [{ matcher: "manual", hooks: [{ type: "command", command: "user-compaction-hook", timeout: 9 }] }],
+    } });
+    registerCodexCommandHooks({ codexDir, silent: true, events: previousEvents,
+      marker: MARKER, scriptName: MARKER, stableLauncher: true });
+    const before = readJson(path.join(codexDir, "hooks.json"));
+    const result = registerCodexHooks({ codexDir, silent: true });
+    const after = readJson(path.join(codexDir, "hooks.json"));
+    assert.strictEqual(result.added, 2);
+    assert.deepStrictEqual(after.hooks.PreCompact[0], before.hooks.PreCompact[0]);
+    assert.strictEqual(after.hooks.PreCompact.length, 2);
+    assert.strictEqual(after.hooks.PreCompact[1].hooks[0].timeout, 30);
+    assert.strictEqual(after.hooks.SessionEnd.length, 1);
+    assert.strictEqual(after.hooks.SessionEnd[0].hooks[0].timeout, 3);
+    for (const event of previousEvents) assert.deepStrictEqual(after.hooks[event], before.hooks[event]);
+    const repeated = registerCodexHooks({ codexDir, silent: true });
+    assert.strictEqual(repeated.added, 0);
+    assert.strictEqual(repeated.updated, 0);
+    assert.deepStrictEqual(readJson(path.join(codexDir, "hooks.json")), after);
+    unregisterCodexHooks({ codexDir, silent: true });
+    assert.deepStrictEqual(readJson(path.join(codexDir, "hooks.json")).hooks.PreCompact, before.hooks.PreCompact);
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(readJson(path.join(codexDir, "hooks.json")).hooks, "SessionEnd"),
+      false
+    );
+  });
+
   it("keeps one stable artifact path while packaged/dev targets change", () => {
     const codexDir = makeTempCodexDir({});
     const sourceRoot = path.join(path.dirname(codexDir), "sources");
@@ -231,7 +261,7 @@ describe("Codex official hook installer", () => {
       assert.strictEqual(Object.prototype.hasOwnProperty.call(entry, "matcher"), false);
       const hook = entry.hooks[0];
       assert.strictEqual(hook.type, "command");
-      assert.strictEqual(hook.timeout, event === "PermissionRequest" ? 600 : 30);
+      assert.strictEqual(hook.timeout, event === "PermissionRequest" ? 600 : event === "SessionEnd" ? 3 : 30);
       assert.ok(hook.command.includes(MARKER));
       assert.ok(hook.command.includes("/bin/sh"));
       assert.ok(!hook.command.includes("/usr/local/bin/node"));
@@ -241,6 +271,25 @@ describe("Codex official hook installer", () => {
     );
     assert.strictEqual(manifest.ok, true);
     assert.strictEqual(manifest.record.nodeBin, "/usr/local/bin/node");
+  });
+
+  it("registers SessionEnd with the upstream 3-second timeout cap", () => {
+    const codexDir = makeTempCodexDir({});
+    const result = registerCodexHooks({
+      silent: true,
+      codexDir,
+      nodeBin: "/usr/local/bin/node",
+      platform: "linux",
+    });
+
+    assert.strictEqual(result.added, CODEX_OFFICIAL_HOOK_EVENTS.length);
+    const settings = readJson(path.join(codexDir, "hooks.json"));
+    assert.ok(Array.isArray(settings.hooks.SessionEnd), "SessionEnd must be registered");
+    assert.strictEqual(settings.hooks.SessionEnd.length, 1);
+    const hook = settings.hooks.SessionEnd[0].hooks[0];
+    assert.strictEqual(hook.type, "command");
+    assert.strictEqual(hook.timeout, 3);
+    assert.ok(hook.command.includes(MARKER));
   });
 
   it("does not rewrite trusted commands when the resolved Node executable changes", () => {

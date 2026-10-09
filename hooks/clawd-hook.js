@@ -10,6 +10,9 @@ const { fitStateBodyToByteBudget } = require("./state-payload-size");
 const { extractClaudeContextUsageFromEntries } = require("./context-usage");
 const { createPidResolver, readStdinJsonDetailed, getPlatformConfig, applyOrcaPaneKey } = require("./shared-process");
 const { updateRecoveryLeaseFromStateBody } = require("./session-recovery-lease");
+const { recordSessionHistoryFromStateBody } = require("./session-history");
+const { normalizeModelId } = require("./claude-rate-limits");
+const { normalizeClaudePhaseId, extractClaudeBatchToolUseIds } = require("./claude-tool-batch");
 // #634: the pid cache + lifecycle orchestration is owned by the shared resolver
 // now (hooks/shared-process.js); this adapter no longer touches pid-cache,
 // processAlive, or isWin directly.
@@ -130,25 +133,35 @@ function readTranscriptTailEntries(transcriptPath) {
   return entries;
 }
 
-function extractSessionTitleFromEntries(entries) {
+function extractSessionTitleFromEntries(entries, sessionId) {
   if (!entries) return null;
-  let latest = null;
+  // Manual titles and AI titles are tracked separately: when Claude Code
+  // rewrites its metadata it appends the ai-title record after the manual
+  // custom-title one, so a single "last record wins" pass would let the AI
+  // title overwrite a manual rename.
+  let manualTitle = null;
+  let aiTitle = null;
   for (const obj of entries) {
     const type = typeof obj.type === "string" ? obj.type : "";
-    if (type !== "custom-title" && type !== "agent-name") continue;
-    latest =
-      normalizeTitle(obj.customTitle) ||
-      normalizeTitle(obj.title) ||
-      normalizeTitle(obj.custom_title) ||
-      normalizeTitle(obj.agentName) ||
-      normalizeTitle(obj.agent_name) ||
-      latest;
+    if (type === "custom-title" || type === "agent-name") {
+      manualTitle =
+        normalizeTitle(obj.customTitle) ||
+        normalizeTitle(obj.title) ||
+        normalizeTitle(obj.custom_title) ||
+        normalizeTitle(obj.agentName) ||
+        normalizeTitle(obj.agent_name) ||
+        manualTitle;
+      continue;
+    }
+    if (type === "ai-title" && entryMatchesSession(obj, sessionId)) {
+      aiTitle = normalizeTitle(obj.aiTitle) || aiTitle;
+    }
   }
-  return latest;
+  return manualTitle || aiTitle;
 }
 
-function extractSessionTitleFromTranscript(transcriptPath) {
-  return extractSessionTitleFromEntries(readTranscriptTailEntries(transcriptPath));
+function extractSessionTitleFromTranscript(transcriptPath, sessionId) {
+  return extractSessionTitleFromEntries(readTranscriptTailEntries(transcriptPath), sessionId);
 }
 
 function normalizeAssistantOutputText(value) {
@@ -180,7 +193,7 @@ function clampAssistantOutputText(text, maxLen = ASSISTANT_OUTPUT_MAX) {
   };
 }
 
-function assistantEntryMatchesSession(entry, sessionId) {
+function entryMatchesSession(entry, sessionId) {
   if (!sessionId) return true;
   if (!entry || typeof entry !== "object") return false;
   return !entry.sessionId || entry.sessionId === sessionId;
@@ -197,7 +210,7 @@ function assistantEntryLooksSubagent(entry) {
 function assistantEntryIsTurnBoundary(entry, sessionId) {
   if (!entry || typeof entry !== "object") return false;
   if (entry.type !== "user") return false;
-  return assistantEntryMatchesSession(entry, sessionId);
+  return entryMatchesSession(entry, sessionId);
 }
 
 function assistantTextPartsFromContent(content) {
@@ -228,19 +241,45 @@ function assistantTextFromEntry(entry) {
   return normalizeAssistantOutputText(assistantTextPartsFromContent(content).join("\n\n"));
 }
 
+function assistantEntryHasToolUse(entry) {
+  if (!entry || typeof entry !== "object") return false;
+  const message = entry.message && typeof entry.message === "object" ? entry.message : null;
+  const content = message && Object.prototype.hasOwnProperty.call(message, "content")
+    ? message.content
+    : entry.content;
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => (
+    block
+    && typeof block === "object"
+    && (block.type === "tool_use" || block.type === "server_tool_use")
+  ));
+}
+
+// options.rejectToolUse — treat the newest matching assistant entry as a
+// completion predicate, not just a text source. A text-plus-tool-use preamble
+// (e.g. Claude narrates then calls Edit) still carries text, but the turn is
+// not over: the corresponding PreToolUse may not have reached state.js yet.
+// Callers that only fire once a turn has genuinely ended (the Stop-time
+// extractor) leave this off; the mid-turn completion probe turns it on so it
+// reschedules instead of synthesizing a premature completion (#908 review).
 function extractLastAssistantTextFromEntries(entries, sessionId, options = {}) {
   if (!Array.isArray(entries) || !entries.length) return null;
   const maxLen = Number.isInteger(options.maxLen) && options.maxLen > 0
     ? options.maxLen
     : ASSISTANT_OUTPUT_MAX;
+  const rejectToolUse = options.rejectToolUse === true;
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (!entry || typeof entry !== "object") continue;
     if (assistantEntryIsTurnBoundary(entry, sessionId)) break;
     if (entry.type !== "assistant") continue;
     if (entry.isApiErrorMessage === true) continue;
-    if (!assistantEntryMatchesSession(entry, sessionId)) continue;
+    if (!entryMatchesSession(entry, sessionId)) continue;
     if (assistantEntryLooksSubagent(entry)) continue;
+    // The newest in-session assistant entry decides the turn. If it still
+    // carries a tool_use block the turn is mid-flight — fail closed rather
+    // than fall back to an older, already-superseded text entry.
+    if (rejectToolUse && assistantEntryHasToolUse(entry)) return null;
     const text = assistantTextFromEntry(entry);
     if (!text) continue;
     return clampAssistantOutputText(text, maxLen);
@@ -323,8 +362,10 @@ const EVENT_TO_STATE = {
   SessionStart: "idle",
   SessionEnd: "sleeping",
   UserPromptSubmit: "thinking",
+  UserPromptExpansion: "thinking",
   PreToolUse: "working",
   PostToolUse: "working",
+  PostToolBatch: "thinking",
   PostToolUseFailure: "error",
   Stop: "attention",
   StopFailure: "error",
@@ -343,8 +384,9 @@ const EVENT_TO_STATE = {
   WorktreeCreate: "carrying",
 };
 
-// #634: maps a Claude hook event to a shared-resolver cache lifecycle. Only the
-// three boundary events are special; every other state event is an ordinary
+// #634: maps a Claude hook event to a shared-resolver cache lifecycle.
+// SessionStart, both prompt events and SessionEnd are special; every other
+// state event is an ordinary
 // `event` (cache hit = zero spawn, miss = one fresh). Stop is deliberately NOT
 // end — it is turn completion, and dropping the cache on it would force a
 // re-resolve (flash) on the next event. SessionEnd with source=clear still maps
@@ -352,6 +394,7 @@ const EVENT_TO_STATE = {
 const EVENT_TO_LIFECYCLE = {
   SessionStart: "start",
   UserPromptSubmit: "prompt",
+  UserPromptExpansion: "prompt",
   SessionEnd: "end",
 };
 
@@ -558,6 +601,22 @@ function applyResolvedFields(body, resolved, event) {
 function buildStateBody(event, payload, resolve) {
   const state = EVENT_TO_STATE[event];
   if (!state) return null;
+  const promptId = normalizeClaudePhaseId(payload.prompt_id);
+  if (event === "PostToolBatch") {
+    const toolUseIds = extractClaudeBatchToolUseIds(payload.tool_calls);
+    // A child batch cannot describe its parent's model phase. This minimal
+    // event deliberately avoids transcript reads and process-resolution work.
+    if (!promptId || !toolUseIds || !normalizeClaudePhaseId(payload.session_id)
+      || (payload.agent_id && payload.agent_id !== "claude-code")
+      || resolveReportingAgentId(payload) !== "claude-code") return null;
+    return { state, event, agent_id: "claude-code", session_id: payload.session_id,
+      prompt_id: promptId, tool_use_ids: toolUseIds };
+  }
+  // UserPromptExpansion includes structured command metadata. Only an explicit
+  // user-typed /design should select the design visual.
+  if (event === "UserPromptExpansion" && !(
+    payload.expansion_type === "slash_command" && payload.command_name === "design"
+  )) return null;
 
   const sessionId = payload.session_id || "default";
   const cwd = payload.cwd || "";
@@ -579,6 +638,13 @@ function buildStateBody(event, payload, resolve) {
   const resolvedEvent = syntheticSubagentStart ? "SubagentStart" : event;
 
   const body = { state: resolvedState, session_id: sessionId, event: resolvedEvent };
+  if (promptId) body.prompt_id = promptId;
+  if (event === "UserPromptExpansion") body.display_svg = "claude-design";
+  if (
+    event === "UserPromptSubmit"
+    && typeof payload.prompt === "string"
+    && !/^\s*\/design(?:\s|$)/.test(payload.prompt)
+  ) body.display_svg = null;
   if (syntheticSubagentStart) {
     body.subagent_lifecycle_source = "synthetic-tool";
   } else if (event === "SubagentStart" || event === "SubagentStop") {
@@ -617,6 +683,10 @@ function buildStateBody(event, payload, resolve) {
     }
   }
   if (cwd) body.cwd = cwd;
+  // Only SessionStart carries a model, and even there it is optional (`clear`
+  // omits it). state.js merges it stickily, so one report is enough.
+  const model = normalizeModelId(payload.model);
+  if (model) body.model = model;
   const toolName = typeof payload.tool_name === "string" && payload.tool_name ? payload.tool_name : null;
   const toolUseId = normalizeToolUseId(payload.tool_use_id ?? payload.toolUseId ?? payload.toolUseID);
   const toolInputFingerprint = buildToolInputFingerprint(
@@ -645,18 +715,16 @@ function buildStateBody(event, payload, resolve) {
   if (contextUsage) body.context_usage = contextUsage;
   const sessionTitle =
     normalizeTitle(payload.session_title) ||
-    extractSessionTitleFromEntries(transcriptEntries);
+    extractSessionTitleFromEntries(transcriptEntries, payload.session_id || null);
   if (sessionTitle) body.session_title = sessionTitle;
   if (event === "UserPromptSubmit" && !body.session_title) {
     const promptTitle = extractPromptTitle(payload.prompt);
     if (promptTitle) {
       body.session_title = promptTitle;
-      // The fallback is derived from prompt content. It is useful for the live
-      // snapshot but must never cross the durable recovery privacy boundary.
-      Object.defineProperty(body, "_sessionTitleFromPrompt", {
-        value: true,
-        enumerable: false,
-      });
+      // The fallback is derived from prompt content. Mark it so the server
+      // never lets it replace a formal title, and so session history and
+      // recovery leases never persist it.
+      body.session_title_from_prompt = true;
     }
   }
 
@@ -787,7 +855,20 @@ function attachStdinDiag(body, stdinRead) {
   return body;
 }
 
+function launchedByGrok(env = process.env) {
+  // Only the runner-injected official GROK_HOOK_EVENT activates the guard.
+  // GROK_HOME, an unrelated GROK_* variable, or the user's shell config must
+  // not suppress the Claude hook, and GROK_SESSION_ID alone is not official.
+  return Boolean(env && env.GROK_HOOK_EVENT && String(env.GROK_HOOK_EVENT).trim());
+}
+
 function main() {
+  // Grok scans ~/.claude/settings.json by default. Those Claude hooks must not
+  // report a phantom claude-code session; Grok events go through grok-hook.js.
+  if (launchedByGrok()) {
+    process.stdout.write("{}\n");
+    process.exit(0);
+  }
   const event = process.argv[2];
   if (!EVENT_TO_STATE[event]) process.exit(0);
   const eventAt = Date.now();
@@ -830,6 +911,10 @@ function main() {
       // same session id and last sustained state. This is best-effort and never
       // changes the hook's stdout or exit contract.
       updateRecoveryLeaseFromStateBody(body, { eventAt });
+      // The lease above is liveness-scoped and is erased once its PID dies,
+      // which is every PID after a reboot. Keep a separate durable row so a
+      // session interrupted by a restart can still be found and resumed.
+      recordSessionHistoryFromStateBody(body, { eventAt });
       postStateToRunningServer(
         JSON.stringify(fitted.body),
         { timeoutMs: statePostTimeoutMs },
@@ -848,6 +933,7 @@ module.exports = {
   isRecognizedTestCommand,
   isClaudeHeadlessCommandLine,
   attachStdinDiag,
+  launchedByGrok,
   STDIN_READ_TIMEOUT_MS,
   extractSessionTitleFromTranscript,
   normalizeToolUseId,
