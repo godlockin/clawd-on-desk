@@ -62,6 +62,18 @@ const VERIFIED_GITHUB_CONTRIBUTORS = [
   "CheeseAgent",
   "RS-Nocsi",
   "Cobb04",
+  "TalexDreamSoul",
+  "FuZoe",
+  "undefined-moe",
+  "pu-1205",
+  "Free-LZJ",
+  "easyhak",
+  "jlimcode",
+  "xfurqan0",
+  "brantshin",
+  "mantertius",
+  "VonSdite",
+  "sunnyswag",
 ];
 
 function createDeferred() {
@@ -382,17 +394,19 @@ class FakeClassList {
   }
 }
 
-// FakeElement.textContent is a plain field, not an aggregating DOM getter, so
-// reading it on a container yields "" and any "does this text appear?" check
-// against it passes vacuously. Walk the tree instead, and include innerHTML —
-// the guide rows render through it.
+// Walk the tree using each node's own text so checks can include innerHTML
+// without double-counting the aggregating textContent getter below.
 function collectText(el) {
   if (!el) return "";
   const parts = [];
-  if (el.textContent) parts.push(String(el.textContent));
+  if (el._textContent) parts.push(String(el._textContent));
   if (el.innerHTML) parts.push(String(el.innerHTML));
   for (const child of el.children || []) parts.push(collectText(child));
   return parts.join(" ");
+}
+
+function flushAsync() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 class FakeElement {
@@ -403,7 +417,7 @@ class FakeElement {
     this.dataset = {};
     this.eventListeners = {};
     this.className = "";
-    this.textContent = "";
+    this._textContent = "";
     this.title = "";
     this.type = "";
     this.disabled = false;
@@ -432,6 +446,17 @@ class FakeElement {
     child.parentNode = this;
     this.children.push(child);
     return child;
+  }
+
+  set textContent(value) {
+    this._textContent = value == null ? "" : String(value);
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+    this._innerHTML = "";
+  }
+
+  get textContent() {
+    return this._textContent + this.children.map((child) => child.textContent).join("");
   }
 
   append(...children) {
@@ -522,6 +547,7 @@ class FakeElement {
   set innerHTML(_value) {
     for (const child of this.children) child.parentNode = null;
     this.children = [];
+    this._textContent = "";
     const html = String(_value || "");
     this._innerHTML = html;
     const stack = [this];
@@ -622,6 +648,23 @@ class FakeElement {
   }
 }
 
+function loadSharedButtonHelpersForTest(document, settingsAPI = {}, getTranslate = null) {
+  const shared = loadSettingsCoreForTest(settingsAPI, { document }).helpers;
+  const translateConfig = (config = {}) => {
+    if (!Object.prototype.hasOwnProperty.call(config, "labelKey")) return config;
+    const translate = typeof getTranslate === "function" ? getTranslate() : null;
+    return {
+      ...config,
+      label: typeof translate === "function" ? translate(config.labelKey) : config.labelKey,
+    };
+  };
+  return {
+    buildButton: (config) => shared.buildButton(translateConfig(config)),
+    setButtonState: (button, patch) => shared.setButtonState(button, translateConfig(patch)),
+    buildSwitch: (config) => shared.buildSwitch(config),
+  };
+}
+
 function loadRecapTabForTest({ data, agentMetadata = [], queryRecap } = {}) {
   const body = new FakeElement("body");
   const content = new FakeElement("main");
@@ -651,12 +694,13 @@ function loadRecapTabForTest({ data, agentMetadata = [], queryRecap } = {}) {
   context.globalThis = context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-recap.js"), "utf8"), context);
+  const sharedControls = loadSharedButtonHelpersForTest(document, context.settingsAPI);
   const core = {
     state: { activeTab: "recap", snapshot: { lang: "en", recapEnabled: true } },
     runtime: { agentMetadata },
     helpers: {
       t: (key) => strings[key] || key,
-      setSwitchVisual: (element, enabled) => element.setAttribute("aria-checked", String(enabled)),
+      buildSwitch: sharedControls.buildSwitch,
       buildSection: (title, rows) => {
         const section = document.createElement("section");
         section.setAttribute("aria-label", title);
@@ -746,6 +790,10 @@ function loadSharedLanguagePickerForTest({
   transitionDuration = "0.14s",
   transitionDelay = "0s",
   lockWhilePending = false,
+  viewportPlacement = null,
+  revealWhenClosed,
+  innerWidth = 1000,
+  textZoom = 1,
 } = {}) {
   const body = new FakeElement("body");
   const boundary = new FakeElement("div");
@@ -761,12 +809,13 @@ function loadSharedLanguagePickerForTest({
   const document = {
     body,
     activeElement: body,
-    documentElement: { clientHeight: innerHeight },
+    documentElement: { clientHeight: innerHeight, clientWidth: innerWidth },
     createElement(tagName) {
       const element = new FakeElement(tagName);
-      element.focus = () => {
+      element.focus = (options = {}) => {
         element.focused = true;
         document.activeElement = element;
+        if (options.preventScroll !== true) boundary.scrollTop = 0;
       };
       return element;
     },
@@ -785,6 +834,7 @@ function loadSharedLanguagePickerForTest({
     console,
     document,
     innerHeight,
+    innerWidth,
     addEventListener(type, cb) {
       if (!windowListeners.has(type)) windowListeners.set(type, []);
       windowListeners.get(type).push(cb);
@@ -813,7 +863,8 @@ function loadSharedLanguagePickerForTest({
       timers.delete(id);
       timerDelays.delete(id);
     },
-    getComputedStyle() {
+    getComputedStyle(element) {
+      if (element === document.documentElement) return { zoom: String(textZoom) };
       return { transitionDuration, transitionDelay };
     },
     matchMedia() {
@@ -833,6 +884,8 @@ function loadSharedLanguagePickerForTest({
     ariaLabel: "Language",
     onChange,
     lockWhilePending,
+    viewportPlacement,
+    revealWhenClosed,
   });
   boundary.appendChild(control.element);
 
@@ -1023,12 +1076,14 @@ function loadGeneralLanguageRowForTest({
 function loadGeneralTabForTest({
   snapshot,
   settingsAPI = {},
+  sizeSliderExports = null,
   platform = "Win32",
   requestAnimationFrame = (cb) => {
     cb();
     return 1;
   },
 } = {}) {
+  const windowListeners = new Map();
   const body = new FakeElement("body");
   const content = new FakeElement("main");
   content.id = "content";
@@ -1055,8 +1110,11 @@ function loadGeneralTabForTest({
     getComputedStyle: () => ({
       getPropertyValue: () => "",
     }),
-    addEventListener: () => {},
-    removeEventListener: () => {},
+    addEventListener: (type, cb) => {
+      if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+      windowListeners.get(type).add(cb);
+    },
+    removeEventListener: (type, cb) => windowListeners.get(type)?.delete(cb),
     window: null,
     globalThis: null,
     settingsAPI: {
@@ -1066,7 +1124,7 @@ function loadGeneralTabForTest({
       openDashboard: () => {},
       ...settingsAPI,
     },
-    ClawdSettingsSizeSlider: {
+    ClawdSettingsSizeSlider: sizeSliderExports || {
       SIZE_UI_MIN: 1,
       SIZE_UI_MAX: 100,
       SIZE_TICK_VALUES: [25, 50, 75, 100],
@@ -1124,6 +1182,10 @@ function loadGeneralTabForTest({
       const meta = core.state.mountedControls.generalSwitches.get(key);
       return meta ? meta.element : null;
     },
+    dispatchWindowEvent: (type) => {
+      for (const cb of windowListeners.get(type) || []) cb();
+    },
+    getWindowListenerCount: (type) => windowListeners.get(type)?.size || 0,
   };
 }
 
@@ -1331,6 +1393,8 @@ function chooseSegmentedOption(group, value) {
 
 function loadThemeTabForTest({
   themes,
+  officialThemes,
+  officialCatalogStatus,
   snapshot,
   petTintOptions,
   petAccessoryOptions,
@@ -1348,7 +1412,16 @@ function loadThemeTabForTest({
   let themeListState = Array.isArray(themes) ? themes : [];
   const document = {
     body,
-    createElement: (tagName) => new FakeElement(tagName),
+    activeElement: body,
+    createElement(tagName) {
+      const element = new FakeElement(tagName);
+      element.focus = (options) => {
+        element.focused = true;
+        element.focusOptions = options;
+        document.activeElement = element;
+      };
+      return element;
+    },
     getElementById(id) {
       if (id === "content") return content;
       return null;
@@ -1445,6 +1518,9 @@ function loadThemeTabForTest({
   };
   core.state.activeTab = "theme";
   core.runtime.themeList = themeListState;
+  core.runtime.officialThemeList = Array.isArray(officialThemes) ? officialThemes : null;
+  core.runtime.officialThemeListFetched = Array.isArray(officialThemes);
+  core.runtime.officialThemeCatalogStatus = officialCatalogStatus || "ok";
   core.runtime.petTintOptions = Array.isArray(petTintOptions) ? petTintOptions : [];
   core.runtime.petAccessoryOptions = Array.isArray(petAccessoryOptions)
     ? petAccessoryOptions
@@ -1469,6 +1545,7 @@ function loadAgentsTabForTest({
   collapsedGroups = {},
   settingsAPI = {},
   doctor = null,
+  navigator: navigatorOverrides = {},
 } = {}) {
   const raf = createQueuedRaf();
   const body = new FakeElement("body");
@@ -1485,13 +1562,18 @@ function loadAgentsTabForTest({
     createElement: (tagName) => new FakeElement(tagName),
     getElementById(id) {
       if (id === "content") return content;
+      if (id === "toastStack") return toastStack;
       return null;
     },
   };
+  const toastStack = new FakeElement("div");
+  toastStack.id = "toastStack";
+  body.appendChild(toastStack);
 
+  const windowListeners = {};
   const context = {
     console,
-    navigator: { platform: "Win32" },
+    navigator: { platform: "Win32", ...navigatorOverrides },
     localStorage: {
       getItem: (key) => (Object.prototype.hasOwnProperty.call(localStorageData, key) ? localStorageData[key] : null),
       setItem: (key, value) => {
@@ -1535,6 +1617,8 @@ function loadAgentsTabForTest({
           customToolManualAdd: "Choose AI installation folder",
           customToolNotRecognized: "No launchable application found",
           customToolDetectionMissing: "Path missing",
+          customToolDetectionNotExecutable: "Not executable",
+          customToolDetectionNotFile: "Not a file",
           agentInstanceScanWsl: "Scan WSL",
           agentInstanceScanWslDesc: "Rescan WSL distros",
           customToolRescan: "Rescan",
@@ -1552,12 +1636,26 @@ function loadAgentsTabForTest({
           rowStartWithCodexDesc: "Start with Codex desc",
           rowCodexPermissionMode: "Permission mode",
           rowCodexPermissionModeDesc: "Permission mode desc",
-          codexPermissionModeNative: "Native",
+          codexPermissionModeAuto: "Auto",
           codexPermissionModeIntercept: "Intercept",
           rowCodexNativeNotificationSound: "Native sound",
           rowCodexNativeNotificationSoundDesc: "Native sound desc",
           badgePermissionBubble: "Permission bubble",
           traecodeEnableHint: "Enable hooks in Trae before they fire.",
+          minimaxEnableHint: "Enable the Clawd plugin in MiniMax Code before hooks fire.",
+          dshNoticeProfileWeb: "Web",
+          dshNoticeProfileDesktop: "Desktop",
+          dshNoticeLine: "{profile}: {text}",
+          dshNoticeRestartRequired: "The Clawd plugin was updated. Restart DeepSeek Harness desktop to load it.",
+          dshNoticeFirstInstall: "Installed in DeepSeek Harness desktop. It loads automatically while the app is open; no restart needed.",
+          dshNoticeManualCommand: "Run this in a terminal to finish. Clawd will not run it for you:",
+          dshNoticeInstallFailed: "Not installed: {message}",
+          dshNoticeUninstallFailed: "Not fully removed: {message}",
+          dshNoticeOpenDoctor: "Open Doctor and click {fix}.",
+          doctorFix: "Repair Now",
+          dshNoticeAcknowledge: "Got it",
+          dshNoticeCopy: "Copy",
+          dshNoticeCopied: "Copied",
           eventSourceHook: "Hook",
           eventSourceLogPoll: "Log poll",
           eventSourcePlugin: "Plugin",
@@ -1601,6 +1699,20 @@ function loadAgentsTabForTest({
   };
   context.window = context;
   context.globalThis = context;
+  context.addEventListener = (type, cb) => {
+    if (typeof cb !== "function") return;
+    if (!windowListeners[type]) windowListeners[type] = [];
+    windowListeners[type].push(cb);
+  };
+  context.removeEventListener = (type, cb) => {
+    const listeners = windowListeners[type];
+    if (!listeners) return;
+    const index = listeners.indexOf(cb);
+    if (index !== -1) listeners.splice(index, 1);
+  };
+  context.dispatchWindowEvent = (type) => {
+    for (const cb of [...(windowListeners[type] || [])]) cb({ type });
+  };
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(LANGUAGE_PICKER_JS, "utf8"), context);
   vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
@@ -1628,6 +1740,7 @@ function loadAgentsTabForTest({
     content,
     raf,
     getContentRenderCount: () => contentRenderCount,
+    dispatchWindowEvent: (type) => context.dispatchWindowEvent(type),
   };
 }
 
@@ -1809,6 +1922,7 @@ function loadTelegramApprovalTabForTest({
   vm.runInContext(fs.readFileSync(LANGUAGE_PICKER_JS, "utf8"), context);
   vm.runInContext(fs.readFileSync(FEISHU_APPROVAL_RECIPIENT, "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-telegram-approval.js"), "utf8"), context);
+  const buttonHelpers = loadSharedButtonHelpersForTest(document, api, () => core.helpers.t);
 
   const core = {
     state: {
@@ -1833,16 +1947,14 @@ function loadTelegramApprovalTabForTest({
     runtime: {},
     helpers: {
       t: (key) => key,
+      buildButton: buttonHelpers.buildButton,
+      setButtonState: buttonHelpers.setButtonState,
+      buildSwitch: buttonHelpers.buildSwitch,
       showSettingsConfirmModal: showConfirmModal,
       buildSection: (_title, rows) => {
         const section = document.createElement("section");
         for (const row of rows) section.appendChild(row);
         return section;
-      },
-      setSwitchVisual: (el, checked, options = {}) => {
-        el.classList.toggle("on", !!checked);
-        el.classList.toggle("pending", !!options.pending);
-        el.setAttribute("aria-checked", checked ? "true" : "false");
       },
       buildSettingsSelect: (config) => {
         const control = context.ClawdLanguagePicker.createSettingsSelect(config);
@@ -2126,6 +2238,7 @@ function loadDiscordPresenceTabForTest({ snapshot, update } = {}) {
   context.globalThis = context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(SETTINGS_TAB_DISCORD_PRESENCE, "utf8"), context);
+  const buttonHelpers = loadSharedButtonHelpersForTest(document, settingsAPI, () => core.helpers.t);
 
   const core = {
     state: {
@@ -2141,6 +2254,9 @@ function loadDiscordPresenceTabForTest({ snapshot, update } = {}) {
     },
     helpers: {
       t: (key) => key,
+      buildButton: buttonHelpers.buildButton,
+      setButtonState: buttonHelpers.setButtonState,
+      buildSwitch: buttonHelpers.buildSwitch,
       buildSection: (_title, rows) => {
         const section = document.createElement("section");
         for (const row of rows) section.appendChild(row);
@@ -2150,11 +2266,6 @@ function loadDiscordPresenceTabForTest({ snapshot, update } = {}) {
         const group = document.createElement("div");
         for (const child of children) group.appendChild(child);
         return group;
-      },
-      setSwitchVisual: (el, checked, options = {}) => {
-        el.classList.toggle("on", !!checked);
-        el.classList.toggle("pending", !!options.pending);
-        el.setAttribute("aria-checked", checked ? "true" : "false");
       },
       openExternalSafe: () => {},
     },
@@ -2329,6 +2440,7 @@ function loadAboutTabForTest({
   context.globalThis = context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-about.js"), "utf8"), context);
+  const buttonHelpers = loadSharedButtonHelpersForTest(document, context.settingsAPI, () => core.helpers.t);
 
   const core = {
     state: {
@@ -2339,6 +2451,9 @@ function loadAboutTabForTest({
     runtime: { about: { infoCache: null, clickCount: 0, updateCheckSnapshot: { state: "idle" } } },
     helpers: {
       t: (key) => key,
+      buildButton: buttonHelpers.buildButton,
+      setButtonState: buttonHelpers.setButtonState,
+      buildSwitch: buttonHelpers.buildSwitch,
       attachSettingsDisclosure: attachDisclosureForHarness,
       registerMountedDisposable: disposableHarness.register,
       disposeMountedDisposable: disposableHarness.dispose,
@@ -2347,11 +2462,6 @@ function loadAboutTabForTest({
         chevron.className = className;
         chevron.setAttribute("aria-hidden", "true");
         return chevron;
-      },
-      setSwitchVisual: (element, checked, options = {}) => {
-        element.classList.toggle("on", !!checked);
-        element.classList.toggle("pending", !!options.pending);
-        element.setAttribute("aria-checked", checked ? "true" : "false");
       },
       openExternalSafe: () => {},
       showSettingsConfirmModal: () => Promise.resolve("cancel"),
@@ -2651,7 +2761,7 @@ describe("settings renderer browser environment", () => {
     const codexRow = harness.content.querySelectorAll(".recap-agent-row")
       .find((row) => row.querySelector("strong").textContent === "codex");
     const codexMetrics = codexRow.querySelectorAll("dd");
-    assert.strictEqual(codexMetrics[2].textContent, "5");
+    assert.strictEqual(codexMetrics[1].textContent, "5");
   });
 
   it("renders the recap grid as one keyboard stop with accessible agent locks", async () => {
@@ -2700,7 +2810,8 @@ describe("settings renderer browser environment", () => {
       clearButton.getAttribute("data-settings-focus-fallback-key"),
       "recap-recording-toggle"
     );
-    assert.match(rows[0].getAttribute("aria-label"), /Sessions started: .*Turns completed: .*Tool calls: .*Activity signals:/);
+    assert.match(rows[0].getAttribute("aria-label"), /Turns completed: .*Tool calls: .*Activity signals:/);
+    assert.doesNotMatch(rows[0].getAttribute("aria-label"), /Sessions started/);
 
     const firstActiveDescendant = grid.getAttribute("aria-activedescendant");
     grid.dispatchEvent({ type: "keydown", key: "ArrowRight", bubbles: false });
@@ -2727,6 +2838,68 @@ describe("settings renderer browser environment", () => {
     active = weekGrid.querySelectorAll(".recap-cell")
       .find((cell) => cell.id === weekGrid.getAttribute("aria-activedescendant"));
     assert.strictEqual(active.getAttribute("aria-rowindex"), "7");
+  });
+
+  it("issue #1142: agent rows show turns, tool calls and activity signals without a sessions column", async () => {
+    const data = sampleRecapView();
+    data.days[0].rows[1].sessionsStartedPartial = true;
+    const harness = loadRecapTabForTest({
+      data,
+      agentMetadata: [
+        { id: "codex", name: "Codex" },
+        { id: "claude-code", name: "Claude Code" },
+      ],
+    });
+    await harness.settle();
+
+    const rowByName = new Map(
+      harness.content.querySelectorAll(".recap-agent-row")
+        .map((row) => [row.querySelector("strong").textContent, row])
+    );
+    const expectations = [
+      ["Codex", ["2", "4", "9"]],
+      ["Claude Code", ["1", "2", "3"]],
+    ];
+    for (const [name, values] of expectations) {
+      const row = rowByName.get(name);
+      assert.ok(row, name);
+      assert.deepStrictEqual(
+        row.querySelectorAll("dt").map((dt) => dt.textContent),
+        ["Turns completed", "Tool calls", "Activity signals"]
+      );
+      assert.deepStrictEqual(row.querySelectorAll("dd").map((dd) => dd.textContent), values);
+      const rowText = collectText(row);
+      assert.doesNotMatch(rowText, /Sessions started/);
+      assert.doesNotMatch(rowText, /partial/);
+    }
+  });
+
+  it("issue #1142: a metric without a reliable boundary still renders a dash with its explanation", async () => {
+    const data = sampleRecapView();
+    data.days[0].rows[0].metrics.turnsCompleted = null;
+    const harness = loadRecapTabForTest({
+      data,
+      agentMetadata: [
+        { id: "codex", name: "Codex" },
+        { id: "claude-code", name: "Claude Code" },
+      ],
+    });
+    await harness.settle();
+
+    const codexRow = harness.content.querySelectorAll(".recap-agent-row")
+      .find((row) => row.querySelector("strong").textContent === "Codex");
+    const count = codexRow.querySelectorAll("dd")[0];
+    assert.strictEqual(count.textContent, "—");
+    assert.strictEqual(
+      count.title,
+      "This agent does not provide a reliable boundary for this metric."
+    );
+    assert.strictEqual(
+      count.getAttribute("aria-label"),
+      "Turns completed: This agent does not provide a reliable boundary for this metric."
+    );
+    assert.ok(codexRow.getAttribute("aria-label")
+      .includes("Turns completed: This agent does not provide a reliable boundary for this metric."));
   });
 
   it("keeps every recap keyboard focus key stable across a live data refresh", async () => {
@@ -3278,7 +3451,7 @@ describe("settings renderer browser environment", () => {
     await Promise.resolve();
     harness.render();
     const sw = harness.content.querySelector(".feishu-approval-channel-card").querySelector(".switch");
-    assert.equal(sw.getAttribute("aria-disabled"), undefined);
+    assert.equal(sw.getAttribute("aria-disabled"), "false");
     sw.dispatchEvent({ type: "click" });
     await Promise.resolve();
     assert.deepStrictEqual(
@@ -3318,7 +3491,7 @@ describe("settings renderer browser environment", () => {
     harness.render();
     const card = harness.content.querySelector(".feishu-approval-channel-card");
     const sw = card.querySelector(".switch");
-    assert.equal(sw.disabled, false);
+    assert.equal(sw.disabled, true);
     assert.equal(sw.getAttribute("aria-disabled"), "true");
     sw.dispatchEvent({ type: "click" });
     sw.dispatchEvent({ type: "keydown", key: "Enter" });
@@ -3419,7 +3592,7 @@ describe("settings renderer browser environment", () => {
     await Promise.resolve();
     harness.render();
     const sw = harness.content.querySelector(".feishu-approval-channel-card .switch");
-    assert.equal(sw.getAttribute("aria-disabled"), undefined, "an invalid enabled setup must remain disable-able");
+    assert.equal(sw.getAttribute("aria-disabled"), "false", "an invalid enabled setup must remain disable-able");
     sw.dispatchEvent({ type: "click" });
     await Promise.resolve();
     assert.deepStrictEqual(
@@ -3608,17 +3781,19 @@ describe("settings renderer browser environment", () => {
     const offMirror = off.content.querySelectorAll(".switch")[1];
     assert.ok(offMirror.classList.contains("disabled"));
     assert.strictEqual(offMirror.getAttribute("aria-disabled"), "true");
-    assert.strictEqual(offMirror.getAttribute("tabindex"), undefined);
-    assert.strictEqual((offMirror.eventListeners.click || []).length, 0);
+    assert.strictEqual(offMirror.getAttribute("tabindex"), "-1");
+    assert.strictEqual((offMirror.eventListeners.click || []).length, 1);
 
     const deferred = createDeferred();
     const pending = loadDiscordPresenceTabForTest({ update: () => deferred.promise });
     pending.content.querySelectorAll(".switch")[1].dispatchEvent({ type: "click", bubbles: false });
     pending.render();
     const pendingMirror = pending.content.querySelectorAll(".switch")[1];
-    assert.ok(pendingMirror.classList.contains("disabled"));
+    assert.ok(!pendingMirror.classList.contains("disabled"));
     assert.ok(pendingMirror.classList.contains("pending"));
-    assert.strictEqual(pendingMirror.getAttribute("aria-disabled"), "true");
+    assert.strictEqual(pendingMirror.getAttribute("aria-disabled"), "false");
+    assert.strictEqual(pendingMirror.getAttribute("aria-busy"), "true");
+    assert.strictEqual(pendingMirror.getAttribute("tabindex"), "0");
     deferred.resolve({ status: "ok" });
     await Promise.resolve();
   });
@@ -3792,11 +3967,15 @@ describe("settings renderer browser environment", () => {
     const pendingDelete = harness.content.querySelector(".remote-ssh-btn-danger");
     assert.notStrictEqual(pendingDelete, originalDelete, "starting cleanup rebuilds the detail view");
     assert.strictEqual(pendingDelete.disabled, true);
+    assert.strictEqual(pendingDelete.classList.contains("pending"), true);
+    assert.strictEqual(pendingDelete.getAttribute("aria-busy"), "true");
 
     harness.emitStatus({ profileId: profile.id, status: "idle" });
     const afterStatusRerender = harness.content.querySelector(".remote-ssh-btn-danger");
     assert.notStrictEqual(afterStatusRerender, pendingDelete);
     assert.strictEqual(afterStatusRerender.disabled, true, "runtime status repaint preserves pending state");
+    assert.strictEqual(afterStatusRerender.classList.contains("pending"), true);
+    assert.strictEqual(afterStatusRerender.getAttribute("aria-busy"), "true");
 
     // FakeElement permits dispatching a disabled button, unlike the browser.
     // The handler guard must still prevent duplicate destructive IPC work.
@@ -3957,11 +4136,12 @@ describe("settings renderer browser environment", () => {
     assert.equal(cards.length, 3);
     assert.deepStrictEqual(cards.map((card) => card.getAttribute("role")), ["switch", "switch", "switch"]);
     assert.deepStrictEqual(cards.map((card) => card.getAttribute("aria-checked")), ["false", "false", "false"]);
+    assert.ok(cards.every((card) => card.getAttribute("aria-labelledby")));
+    assert.ok(cards.every((card) => card.getAttribute("aria-describedby")));
+    assert.ok(cards.every((card) => card.querySelector(".switch").getAttribute("aria-hidden") === "true"));
+    assert.ok(cards.every((card) => card.querySelector(".switch").getAttribute("role") === undefined));
     cards[0].dispatchEvent({ type: "click" });
     cards[2].dispatchEvent(createKeyboardEventForTest(" "));
-    // FakeElement does not synthesize a click from keyboard activation; the
-    // native button does so in Chromium. Dispatch the resulting click here.
-    cards[2].dispatchEvent({ type: "click" });
     assert.deepStrictEqual(cards.map((card) => card.getAttribute("aria-checked")), ["true", "false", "true"]);
     assert.deepStrictEqual(harness.commandCalls, [], "draft edits must not persist before Save");
 
@@ -4012,7 +4192,9 @@ describe("settings renderer browser environment", () => {
     autoUpdateSwitch.dispatchEvent({ type: "click" });
     assert.deepStrictEqual(harness.updateCalls, [{ key: "autoUpdateCheck", value: false }]);
     assert.equal(autoUpdateSwitch.classList.contains("pending"), true);
-    assert.equal(autoUpdateSwitch.getAttribute("aria-disabled"), "true");
+    assert.equal(autoUpdateSwitch.getAttribute("aria-busy"), "true");
+    assert.equal(autoUpdateSwitch.getAttribute("aria-disabled"), "false");
+    assert.equal(autoUpdateSwitch.tabIndex, 0);
 
     save.resolve({ status: "ok" });
     await new Promise((resolve) => setImmediate(resolve));
@@ -4023,6 +4205,30 @@ describe("settings renderer browser environment", () => {
     assert.equal(harness.core.tabs.about.patchInPlace({ autoUpdateCheck: true }), true);
     assert.strictEqual(harness.content.querySelector(".about-auto-update-switch"), autoUpdateSwitch);
     assert.equal(autoUpdateSwitch.getAttribute("aria-checked"), "true");
+  });
+
+  it("rolls a cancelled consent switch back without a failure toast", async () => {
+    const body = new FakeElement("body");
+    const core = loadSettingsCoreForTest({}, { document: {
+      body, getElementById: () => null,
+      createElement: () => { throw new Error("cancellation must not create a toast"); },
+    } });
+    const sw = new FakeElement("button");
+    let transient = null;
+    const control = core.helpers.buildSwitch({ element: sw, ariaLabel: "Collect Claude usage" });
+    core.helpers.attachOptimisticSwitch(control, {
+      getCommittedVisual: () => false,
+      getTransientState: () => transient,
+      setTransientState: (value) => { transient = value; },
+      clearTransientState: () => { transient = null; },
+      invoke: () => ({ status: "error", cancelled: true }),
+    });
+    sw.dispatchEvent({ type: "click" });
+    assert.equal(sw.classList.contains("pending"), true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sw.getAttribute("aria-checked"), "false");
+    assert.equal(sw.classList.contains("pending"), false);
+    assert.equal(transient, null);
   });
 
   it("rolls the About auto-update switch back when persistence fails", async () => {
@@ -4954,7 +5160,7 @@ describe("settings renderer browser environment", () => {
     }]);
   });
 
-  it("toggles Telegram Direct Send paste-only mode without changing the approval transport", async () => {
+  it("toggles Telegram completion replies without changing the approval transport", async () => {
     const commandCalls = [];
     const harness = loadTelegramApprovalTabForTest({
       snapshot: {
@@ -8431,6 +8637,365 @@ describe("settings renderer browser environment", () => {
     assert.ok(/\.size-control\.pending \.volume-slider\s*\{[\s\S]*cursor:\s*ew-resize;/.test(css));
   });
 
+  it("shows the effective current-display size and refreshes it on context and focus changes", async () => {
+    let context = { ui: 70, overMax: false, synced: false };
+    let notify;
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.resolve(context),
+        onSizeContextChanged: (cb) => { notify = cb; return () => { notify = null; }; },
+      },
+    });
+    harness.renderContent();
+    const slider = harness.content.querySelector(".size-slider");
+    const readout = harness.content.querySelector(".size-readout");
+    assert.strictEqual(slider.value, "35");
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(slider.value, "70");
+    assert.strictEqual(readout.textContent, "70%");
+    context = { ui: 35, overMax: false, synced: true };
+    notify();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(slider.value, "35");
+    context = { ui: 72, overMax: false, synced: false };
+    harness.dispatchWindowEvent("focus");
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(slider.value, "72");
+  });
+
+  it("shows the over-limit warning only until a size drag starts", async () => {
+    const previewCalls = [];
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.resolve({ ui: 100, overMax: true, synced: false }),
+        beginSizePreview: async () => ({ status: "ok" }),
+        previewSize: async (key) => { previewCalls.push(key); return { status: "ok" }; },
+        endSizePreview: async () => ({ status: "ok" }),
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    const readout = harness.content.querySelector(".size-readout");
+    const hint = harness.content.querySelector(".size-over-max-hint");
+    assert.strictEqual(slider.value, "100");
+    assert.strictEqual(readout.textContent, "100%+");
+    assert.strictEqual(hint.hidden, false);
+    assert.strictEqual(hint.classList.contains("bubble-policy-warning"), false);
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    assert.match(css, /\.size-over-max-hint\s*\{\s*color:\s*var\(--accent\);/);
+    assert.match(css, /\.size-over-max-hint\[hidden\]\s*\{\s*display:\s*none;/);
+    assert.match(css, /\.size-readout\.over-max\s*\{\s*color:\s*var\(--accent\);/);
+    slider.dispatchEvent({ type: "pointerdown", bubbles: false });
+    assert.strictEqual(readout.textContent, "100%");
+    assert.strictEqual(hint.hidden, true);
+    slider.value = "99";
+    slider.dispatchEvent({ type: "input", bubbles: false });
+    assert.strictEqual(readout.textContent, "99%");
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.deepStrictEqual(previewCalls, ["P:29.7"]);
+  });
+
+  it("restores an over-limit context after pressing and releasing the size thumb without input", async () => {
+    let contextCalls = 0;
+    const commits = [];
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => {
+          contextCalls++;
+          return Promise.resolve({ ui: 100, overMax: true, synced: false });
+        },
+        beginSizePreview: async () => ({ status: "ok" }),
+        endSizePreview: async (key) => { commits.push(key); return { status: "ok" }; },
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    const readout = harness.content.querySelector(".size-readout");
+    const hint = harness.content.querySelector(".size-over-max-hint");
+    assert.strictEqual(readout.textContent, "100%+");
+    assert.strictEqual(contextCalls, 1);
+    slider.dispatchEvent({ type: "pointerdown", bubbles: false });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(readout.textContent, "100%");
+    assert.strictEqual(hint.hidden, true);
+    slider.dispatchEvent({ type: "pointerup", bubbles: false });
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    assert.deepStrictEqual(commits, [null]);
+    assert.strictEqual(contextCalls, 2);
+    assert.strictEqual(slider.value, "100");
+    assert.strictEqual(readout.textContent, "100%+");
+    assert.strictEqual(hint.hidden, false);
+    assert.strictEqual(harness.core.state.snapshot.size, "P:10.5");
+  });
+
+  it("rechecks an unsynced size context after no-input pointer, cancel, and blur endings", async () => {
+    for (const ending of ["pointerup", "pointercancel", "blur"]) {
+      let contextCalls = 0;
+      const harness = loadGeneralTabForTest({
+        snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+        sizeSliderExports: require("../src/settings-size-slider"),
+        settingsAPI: {
+          getSizeContext: () => {
+            contextCalls++;
+            return Promise.resolve({ ui: 70, overMax: false, synced: false });
+          },
+          beginSizePreview: async () => ({ status: "ok" }),
+          endSizePreview: async () => ({ status: "ok" }),
+        },
+      });
+      harness.renderContent();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+      const slider = harness.content.querySelector(".size-slider");
+      assert.strictEqual(slider.value, "70", ending);
+      slider.dispatchEvent({ type: "pointerdown", bubbles: false });
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+      slider.dispatchEvent({ type: ending, bubbles: false });
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+      assert.strictEqual(contextCalls, 2, ending);
+      assert.strictEqual(slider.value, "70", ending);
+      assert.strictEqual(harness.content.querySelector(".size-readout").textContent, "70%", ending);
+    }
+  });
+
+  it("keeps a live size draft while late context replies and notifications arrive", async () => {
+    const late = createDeferred();
+    const end = createDeferred();
+    let calls = 0;
+    let notify;
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => ++calls === 1
+          ? Promise.resolve({ ui: 70, overMax: false, synced: false }) : late.promise,
+        onSizeContextChanged: (cb) => { notify = cb; return () => {}; },
+        beginSizePreview: async () => ({ status: "ok" }),
+        previewSize: async () => ({ status: "ok" }),
+        endSizePreview: () => end.promise,
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    notify();
+    await Promise.resolve();
+    slider.dispatchEvent({ type: "pointerdown", bubbles: false });
+    slider.value = "71";
+    slider.dispatchEvent({ type: "input", bubbles: false });
+    notify();
+    late.resolve({ ui: 80, overMax: false, synced: false });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(slider.value, "71");
+    assert.strictEqual(harness.content.querySelector(".size-readout").textContent, "71%");
+    assert.strictEqual(calls, 2, "notification during drag must defer the IPC request");
+    slider.dispatchEvent({ type: "pointerup", bubbles: false });
+    notify();
+    assert.strictEqual(slider.value, "71");
+    assert.strictEqual(calls, 2, "notification during commit must defer the IPC request");
+    end.resolve({ status: "ok" });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(calls, 3, "the settled interaction must query the latest context");
+  });
+
+  it("drops stale context before a committed size broadcast paints the new tick", async () => {
+    const stale = createDeferred();
+    const fresh = createDeferred();
+    let calls = 0;
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => {
+          calls++;
+          return calls === 1 ? Promise.resolve({ ui: 70, overMax: false, synced: false })
+            : calls === 2 ? stale.promise : fresh.promise;
+        },
+        onSizeContextChanged: (cb) => { return () => {}; },
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    assert.strictEqual(slider.value, "70");
+    harness.dispatchWindowEvent("focus");
+    await Promise.resolve();
+    harness.core.state.snapshot.size = "P:21.3";
+    assert.strictEqual(harness.core.tabs.general.patchInPlace({ size: "P:21.3" }), true);
+    assert.strictEqual(slider.value, "71");
+    stale.resolve({ ui: 70, overMax: false, synced: false });
+    await Promise.resolve(); await Promise.resolve();
+    assert.strictEqual(slider.value, "71");
+    fresh.resolve({ ui: 71, overMax: false, synced: true });
+    await Promise.resolve(); await Promise.resolve();
+    assert.strictEqual(slider.value, "71");
+    harness.core.state.snapshot.keepSizeAcrossDisplays = false;
+    assert.strictEqual(harness.core.tabs.general.patchInPlace({ keepSizeAcrossDisplays: false }), true);
+    assert.strictEqual(slider.value, "71");
+  });
+
+  it("refreshes the mounted size row when keep size across displays changes", async () => {
+    let contextCalls = 0;
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5", keepSizeAcrossDisplays: true }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.resolve({
+          ui: ++contextCalls === 1 ? 70 : 60,
+          overMax: false,
+          synced: false,
+        }),
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    assert.strictEqual(slider.value, "70");
+    assert.strictEqual(contextCalls, 1);
+
+    harness.core.state.snapshot.keepSizeAcrossDisplays = false;
+    assert.strictEqual(harness.core.tabs.general.patchInPlace({ keepSizeAcrossDisplays: false }), true);
+    assert.strictEqual(harness.content.querySelector(".size-slider"), slider);
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(contextCalls, 2);
+    assert.strictEqual(slider.value, "60");
+    assert.strictEqual(harness.content.querySelector(".size-readout").textContent, "60%");
+  });
+
+  it("keeps the submitted tick through a successful save and a full Settings redraw", async () => {
+    let saved = false;
+    const calls = [];
+    let harness;
+    harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.resolve(saved
+          ? { ui: 71, overMax: false, synced: true }
+          : { ui: 70, overMax: false, synced: false }),
+        beginSizePreview: async () => { calls.push("begin"); return { status: "ok" }; },
+        previewSize: async (key) => { calls.push(key); return { status: "ok" }; },
+        endSizePreview: async (key) => {
+          calls.push(key);
+          saved = true;
+          harness.core.state.snapshot.size = key;
+          harness.core.tabs.general.patchInPlace({ size: key });
+          return { status: "ok" };
+        },
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    assert.strictEqual(slider.value, "70");
+    slider.dispatchEvent({ type: "pointerdown", bubbles: false });
+    slider.value = "71";
+    slider.dispatchEvent({ type: "input", bubbles: false });
+    slider.dispatchEvent({ type: "pointerup", bubbles: false });
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    assert.deepStrictEqual(calls, ["begin", "P:21.3", "P:21.3"]);
+    assert.strictEqual(slider.value, "71");
+    assert.strictEqual(harness.content.querySelector(".size-readout").textContent, "71%");
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(harness.content.querySelector(".size-slider").value, "71");
+  });
+
+  it("keeps the size readout reset action on the existing preview commit IPC", async () => {
+    const calls = [];
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.resolve({ ui: 70, overMax: false, synced: false }),
+        endSizePreview: async (key) => { calls.push(key); return { status: "ok" }; },
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    harness.content.querySelector(".size-readout").click();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.deepStrictEqual(calls, ["P:9"]);
+    assert.strictEqual(harness.content.querySelector(".size-slider").value, "30");
+  });
+
+  it("restores the effective tick after a failed size commit", async () => {
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.resolve({ ui: 70, overMax: false, synced: false }),
+        beginSizePreview: async () => ({ status: "ok" }),
+        previewSize: async () => ({ status: "ok" }),
+        endSizePreview: async () => ({ status: "error", message: "save failed" }),
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    slider.dispatchEvent({ type: "pointerdown", bubbles: false });
+    slider.value = "71";
+    slider.dispatchEvent({ type: "input", bubbles: false });
+    slider.dispatchEvent({ type: "pointerup", bubbles: false });
+    for (let i = 0; i < 16; i++) await Promise.resolve();
+    assert.strictEqual(slider.value, "70");
+    assert.strictEqual(harness.content.querySelector(".size-readout").textContent, "70%");
+  });
+
+  it("falls back to the snapshot when context is unavailable and unsubscribes on disposal", async () => {
+    let notify;
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.reject(new Error("unavailable")),
+        onSizeContextChanged: (cb) => { notify = cb; return () => { notify = null; }; },
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(harness.content.querySelector(".size-slider").value, "35");
+    assert.strictEqual(harness.getWindowListenerCount("focus"), 1);
+    harness.core.state.mountedControls.size.dispose();
+    assert.strictEqual(notify, null);
+    assert.strictEqual(harness.getWindowListenerCount("focus"), 0);
+    const missing = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+    });
+    missing.renderContent();
+    assert.strictEqual(missing.content.querySelector(".size-slider").value, "35");
+  });
+
+  it("uses the snapshot when a later size context is malformed", async () => {
+    let result = { ui: 70, overMax: false, synced: false };
+    let notify;
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ size: "P:10.5" }),
+      sizeSliderExports: require("../src/settings-size-slider"),
+      settingsAPI: {
+        getSizeContext: () => Promise.resolve(result),
+        onSizeContextChanged: (cb) => { notify = cb; return () => {}; },
+      },
+    });
+    harness.renderContent();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const slider = harness.content.querySelector(".size-slider");
+    assert.strictEqual(slider.value, "70");
+    result = { ui: "100", overMax: true, synced: false };
+    notify();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(slider.value, "35");
+    assert.strictEqual(harness.content.querySelector(".size-readout").textContent, "35%");
+  });
+
   it("compensates every viewport unit for the injected text zoom", () => {
     // vh/vw resolve against the UNZOOMED window (verified by probe: a 100vh
     // box renders S× the window height under the injected root zoom), so any
@@ -9129,8 +9694,195 @@ describe("settings renderer browser environment", () => {
     assert.equal(button.disabled, true);
     assert.equal(button.getAttribute("aria-busy"), "true");
     assert.equal(button.getAttribute("aria-label"), "Delete profile");
+    assert.equal(button.querySelector(".settings-button-label").textContent, "Delete");
   });
 
+  it("preserves a DOM Node icon while updating label, pressed, pending, and disabled state", () => {
+    const document = {
+      body: new FakeElement("body"),
+      createElement: (tagName) => new FakeElement(tagName),
+      getElementById: () => null,
+    };
+    const core = loadSettingsCoreForTest({}, { document });
+    const icon = document.createElement("svg");
+    const button = core.helpers.buildButton({
+      label: "Install",
+      icon,
+      disabled: true,
+      ariaPressed: false,
+    });
+    const iconWrapper = button.querySelector(".settings-button-icon");
+    const label = button.querySelector(".settings-button-label");
+
+    assert.ok(iconWrapper);
+    assert.strictEqual(iconWrapper.children[0], icon);
+    assert.equal(iconWrapper.getAttribute("aria-hidden"), "true");
+    assert.equal(label.textContent, "Install");
+    assert.equal(button.getAttribute("aria-pressed"), "false");
+    assert.equal(button.disabled, true);
+
+    core.helpers.setButtonState(button, {
+      label: "Installing",
+      pending: true,
+      ariaPressed: true,
+    });
+    assert.strictEqual(iconWrapper.children[0], icon, "state updates must retain the icon node");
+    assert.strictEqual(button.querySelector(".settings-button-icon"), iconWrapper);
+    assert.strictEqual(button.querySelector(".settings-button-label"), label);
+    assert.equal(label.textContent, "Installing");
+    assert.equal(button.getAttribute("aria-pressed"), "true");
+    assert.equal(button.getAttribute("aria-busy"), "true");
+    assert.equal(button.disabled, true);
+
+    core.helpers.setButtonState(button, { pending: false });
+    assert.equal(button.disabled, true, "clearing pending must preserve business disabled state");
+    core.helpers.setButtonState(button, { disabled: false, ariaPressed: null });
+    assert.equal(button.disabled, false);
+    assert.equal(button.getAttribute("aria-pressed"), undefined);
+    assert.strictEqual(iconWrapper.children[0], icon);
+  });
+
+  it("rejects non-node icons and state updates for unmanaged buttons", () => {
+    const document = {
+      body: new FakeElement("body"),
+      createElement: (tagName) => new FakeElement(tagName),
+      getElementById: () => null,
+    };
+    const core = loadSettingsCoreForTest({}, { document });
+    assert.throws(
+      () => core.helpers.buildButton({ label: "Invalid", icon: "not-a-node" }),
+      /icon must be a DOM Node/,
+    );
+    const rawButton = document.createElement("button");
+    assert.throws(
+      () => core.helpers.setButtonState(rawButton, { pending: true }),
+      /requires a button built by buildButton/,
+    );
+  });
+
+  it("builds a controlled Settings switch with unified input and accessibility state", () => {
+    const document = {
+      body: new FakeElement("body"),
+      createElement: (tagName) => new FakeElement(tagName),
+      getElementById: () => null,
+    };
+    const core = loadSettingsCoreForTest({}, { document });
+    const toggles = [];
+    const control = core.helpers.buildSwitch({
+      checked: false,
+      ariaLabel: "Enable feature",
+      onToggle: (request) => toggles.push(request.nextChecked),
+    });
+
+    assert.equal(control.element.tagName, "BUTTON");
+    assert.equal(control.element.type, "button");
+    assert.equal(control.element.getAttribute("role"), "switch");
+    assert.equal(control.element.getAttribute("aria-label"), "Enable feature");
+    assert.equal(control.element.getAttribute("aria-checked"), "false");
+    assert.equal(control.element.getAttribute("aria-disabled"), "false");
+    assert.equal(control.element.getAttribute("aria-busy"), "false");
+    assert.equal(control.element.tabIndex, 0);
+
+    control.element.dispatchEvent({ type: "click" });
+    control.element.dispatchEvent({ type: "keydown", key: "Enter", preventDefault() {} });
+    control.element.dispatchEvent({ type: "keydown", key: " ", preventDefault() {} });
+    assert.deepStrictEqual(toggles, [true, true, true]);
+
+    control.setState({ checked: true, pending: true });
+    assert.equal(control.getChecked(), true);
+    assert.equal(control.element.classList.contains("on"), true);
+    assert.equal(control.element.classList.contains("pending"), true);
+    assert.equal(control.element.getAttribute("aria-checked"), "true");
+    assert.equal(control.element.getAttribute("aria-busy"), "true");
+    assert.equal(control.element.tabIndex, 0, "pending switches should retain keyboard focus");
+    control.element.dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(toggles, [true, true, true], "pending switches must ignore duplicate activation");
+
+    control.setState({ disabled: true, ariaLabel: "Enable translated feature" });
+    assert.equal(control.element.classList.contains("pending"), true);
+    assert.equal(control.element.classList.contains("disabled"), true);
+    assert.equal(control.element.getAttribute("aria-label"), "Enable translated feature");
+    control.setState({ pending: false });
+    assert.equal(control.element.classList.contains("pending"), false);
+    assert.equal(control.element.classList.contains("disabled"), true);
+    assert.equal(control.element.getAttribute("aria-disabled"), "true");
+    assert.equal(control.element.disabled, true);
+    assert.equal(control.element.tabIndex, -1);
+    control.setState({ disabled: false });
+    assert.equal(control.element.disabled, false);
+    assert.equal(control.element.tabIndex, 0);
+
+    control.dispose();
+    control.element.dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(toggles, [true, true, true]);
+  });
+
+  it("supports a separate switch host and visual track without duplicating semantics", () => {
+    const document = {
+      body: new FakeElement("body"),
+      createElement: (tagName) => new FakeElement(tagName),
+      getElementById: () => null,
+    };
+    const core = loadSettingsCoreForTest({}, { document });
+    const host = document.createElement("button");
+    const track = document.createElement("span");
+    const control = core.helpers.buildSwitch({
+      element: host,
+      visualElement: track,
+      checked: true,
+      pending: true,
+      ariaLabelledBy: "remote-option-label",
+      ariaDescribedBy: "remote-option-description",
+      className: "remote-switch-track",
+    });
+
+    assert.strictEqual(control.element, host);
+    assert.strictEqual(control.visualElement, track);
+    assert.equal(host.getAttribute("role"), "switch");
+    assert.equal(host.getAttribute("aria-labelledby"), "remote-option-label");
+    assert.equal(host.getAttribute("aria-describedby"), "remote-option-description");
+    assert.equal(host.getAttribute("aria-checked"), "true");
+    assert.equal(host.getAttribute("aria-busy"), "true");
+    assert.equal(host.classList.contains("switch"), false);
+    assert.equal(track.classList.contains("switch"), true);
+    assert.equal(track.classList.contains("remote-switch-track"), true);
+    assert.equal(track.getAttribute("aria-checked"), undefined);
+  });
+
+  it("requires every shared Settings switch to have an accessible name", () => {
+    const document = {
+      body: new FakeElement("body"),
+      createElement: (tagName) => new FakeElement(tagName),
+      getElementById: () => null,
+    };
+    const core = loadSettingsCoreForTest({}, { document });
+    assert.throws(() => core.helpers.buildSwitch({ checked: false }), /requires ariaLabel or ariaLabelledBy/);
+  });
+
+  it("keeps interactive Settings switch DOM and semantics owned by the shared primitive", () => {
+    const allowedOwner = "settings-ui-core.js";
+    const sourceFiles = fs.readdirSync(SRC_DIR)
+      .filter((name) => name.endsWith(".js") && name.startsWith("settings"));
+    const forbidden = [
+      /role=["']switch["']/,
+      /setAttribute\(["']role["'],\s*["']switch["']\)/,
+      /className\s*=\s*["'][^"']*\bswitch\b/,
+      /class=["'][^"']*\bswitch\b/,
+      /classList\.add\(["']switch["']\)/,
+      /\bsetSwitchVisual\b/,
+      /\battachAnimatedSwitch\b/,
+    ];
+    const offenders = [];
+    for (const name of sourceFiles) {
+      if (name === allowedOwner) continue;
+      const source = fs.readFileSync(path.join(SRC_DIR, name), "utf8");
+      if (forbidden.some((pattern) => pattern.test(source))) offenders.push(name);
+    }
+    assert.deepStrictEqual(offenders, []);
+
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    assert.equal((coreSource.match(/setAttribute\("role", "switch"\)/g) || []).length, 1);
+  });
   it("uses the shared Settings dialog shell with ARIA links and focus restoration", async () => {
     const body = new FakeElement("body");
     const modalRoot = new FakeElement("div");
@@ -9432,6 +10184,26 @@ describe("settings renderer browser environment", () => {
     }
   });
 
+  it("can preserve a closed Dashboard picker's scroll without changing tutorial reveal defaults", () => {
+    for (const revealWhenClosed of [false, undefined]) {
+      const harness = loadSharedLanguagePickerForTest({ revealWhenClosed });
+      harness.boundary.getBoundingClientRect = () => ({ top: 50, bottom: 300 });
+      harness.trigger.getBoundingClientRect = () => ({
+        top: 500 - harness.boundary.scrollTop, bottom: 526 - harness.boundary.scrollTop,
+      });
+      harness.dispatchWindowEvent("resize");
+      harness.flushAnimationFrames();
+      if (revealWhenClosed === false) assert.strictEqual(harness.boundary.scrollTop, 0);
+      else assert.ok(harness.boundary.scrollTop > 0);
+      harness.boundary.scrollTop = 0;
+      harness.trigger.dispatchEvent({ type: "click" });
+      harness.dispatchWindowEvent("resize");
+      harness.flushAnimationFrames();
+      assert.ok(harness.boundary.scrollTop > 0, "open menus still reveal their trigger");
+      harness.control.dispose();
+    }
+  });
+
   it("reflows an open tutorial picker after the window is resized", () => {
     const harness = loadSharedLanguagePickerForTest({
       options: ["en", "zh", "zh-TW", "ko", "ja"],
@@ -9534,6 +10306,144 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(harness.picker.classList.contains("menu-scrollable"), false);
     assert.strictEqual(harness.menu.style.maxHeight, "");
     assert.strictEqual(harness.menu.scrollTop, 0);
+  });
+
+  it("converts viewport-fixed theme picker DOMRects to unzoomed CSS lengths", () => {
+    const css = fs.readFileSync(LANGUAGE_PICKER_CSS, "utf8");
+    assert.match(css, /\.language-picker\.viewport-fixed\s+\.language-picker-menu\s*\{\s*position:\s*fixed;/);
+
+    for (const scale of [0.8, 1, 1.25, 1.5, 1.6]) {
+      const tint = loadSharedLanguagePickerForTest({
+        options: ["none", "midnight", "gold", "vaporwave", "matcha", "mono"],
+        viewportPlacement: "down",
+        textZoom: scale,
+        innerHeight: 700 * scale,
+        innerWidth: 1000 * scale,
+      });
+      tint.boundary.getBoundingClientRect = () => ({
+        top: 38 * scale, bottom: 690 * scale, left: 250 * scale, right: 982 * scale,
+      });
+      tint.trigger.getBoundingClientRect = () => ({
+        top: 220 * scale, bottom: 268 * scale, left: 690 * scale, right: 910 * scale, width: 220 * scale,
+      });
+      // Chromium reports unzoomed scroll/offset heights under root CSS zoom.
+      const tintHeight = 190;
+      Object.defineProperty(tint.menu, "scrollHeight", { value: tintHeight });
+      Object.defineProperty(tint.menu, "offsetHeight", { value: tintHeight + 2 });
+      Object.defineProperty(tint.menu, "clientHeight", { value: tintHeight });
+
+      tint.trigger.dispatchEvent({ type: "click" });
+      assert.strictEqual(tint.picker.classList.contains("viewport-fixed"), true);
+      assert.strictEqual(tint.picker.classList.contains("open-up"), false);
+      assert.ok(parseInt(tint.menu.style.top, 10) >= 274);
+      assert.ok(parseInt(tint.menu.style.top, 10) + parseInt(tint.menu.style.maxHeight, 10) <= 678);
+      assert.strictEqual(tint.menu.style.left, "690px");
+      assert.strictEqual(tint.menu.style.width, "220px");
+
+      const accessory = loadSharedLanguagePickerForTest({
+        options: ["none", "cowboy", "party", "wizard", "top", "santa", "pumpkin", "halo"],
+        viewportPlacement: "up",
+        textZoom: scale,
+        innerHeight: 700 * scale,
+        innerWidth: 1000 * scale,
+      });
+      accessory.boundary.getBoundingClientRect = tint.boundary.getBoundingClientRect;
+      accessory.trigger.getBoundingClientRect = () => ({
+        top: 450 * scale, bottom: 498 * scale, left: 690 * scale, right: 910 * scale, width: 220 * scale,
+      });
+      const accessoryHeight = 240;
+      Object.defineProperty(accessory.menu, "scrollHeight", { value: accessoryHeight });
+      Object.defineProperty(accessory.menu, "offsetHeight", { value: accessoryHeight + 2 });
+      Object.defineProperty(accessory.menu, "clientHeight", { value: accessoryHeight });
+
+      accessory.trigger.dispatchEvent({ type: "click" });
+      assert.strictEqual(accessory.picker.classList.contains("open-up"), true);
+      assert.ok(parseInt(accessory.menu.style.top, 10) >= 50);
+      assert.ok(parseInt(accessory.menu.style.top, 10) + parseInt(accessory.menu.style.maxHeight, 10) <= 444);
+      assert.ok(parseInt(accessory.menu.style.maxHeight, 10) <= 240);
+    }
+  });
+
+  it("falls back from a preferred theme-menu direction only when the other side is safer", () => {
+    const preferDown = loadSharedLanguagePickerForTest({
+      viewportPlacement: "down",
+      innerHeight: 280,
+    });
+    preferDown.boundary.getBoundingClientRect = () => ({ top: 0, bottom: 280, left: 0, right: 500 });
+    preferDown.trigger.getBoundingClientRect = () => ({
+      top: 190, bottom: 238, left: 240, right: 368, width: 128,
+    });
+    Object.defineProperty(preferDown.menu, "scrollHeight", { value: 180 });
+    Object.defineProperty(preferDown.menu, "offsetHeight", { value: 182 });
+    Object.defineProperty(preferDown.menu, "clientHeight", { value: 180 });
+    preferDown.trigger.dispatchEvent({ type: "click" });
+    assert.strictEqual(preferDown.picker.classList.contains("open-up"), true);
+    assert.ok(parseInt(preferDown.menu.style.top, 10) >= 12);
+
+    const preferUp = loadSharedLanguagePickerForTest({
+      viewportPlacement: "up",
+      innerHeight: 280,
+    });
+    preferUp.boundary.getBoundingClientRect = preferDown.boundary.getBoundingClientRect;
+    preferUp.trigger.getBoundingClientRect = () => ({
+      top: 28, bottom: 76, left: 240, right: 368, width: 128,
+    });
+    Object.defineProperty(preferUp.menu, "scrollHeight", { value: 180 });
+    Object.defineProperty(preferUp.menu, "offsetHeight", { value: 182 });
+    Object.defineProperty(preferUp.menu, "clientHeight", { value: 180 });
+    preferUp.trigger.dispatchEvent({ type: "click" });
+    assert.strictEqual(preferUp.picker.classList.contains("open-up"), false);
+    assert.ok(parseInt(preferUp.menu.style.top, 10) + parseInt(preferUp.menu.style.maxHeight, 10) <= 268);
+  });
+
+  it("cleans fixed-menu geometry and scroll listeners across repeated opens and closes", () => {
+    const harness = loadSharedLanguagePickerForTest({
+      options: ["none", "cowboy", "party", "wizard", "top", "santa", "pumpkin", "halo"],
+      viewportPlacement: "up",
+    });
+    harness.boundary.getBoundingClientRect = () => ({ top: 0, bottom: 600, left: 250, right: 982 });
+    const triggerRect = {
+      top: 390, bottom: 438, left: 690, right: 910, width: 220,
+    };
+    harness.trigger.getBoundingClientRect = () => ({ ...triggerRect });
+    Object.defineProperty(harness.menu, "scrollHeight", { value: 310 });
+    Object.defineProperty(harness.menu, "offsetHeight", { value: 312 });
+    Object.defineProperty(harness.menu, "clientHeight", { value: 310 });
+    for (let index = 0; index < 5; index += 1) {
+      harness.trigger.dispatchEvent({ type: "click" });
+      assert.strictEqual(harness.picker.classList.contains("open-up"), true);
+      harness.trigger.dispatchEvent({ type: "click" });
+      harness.flushTimers();
+      assert.strictEqual(harness.picker.classList.contains("menu-mounted"), false);
+      assert.strictEqual(harness.menu.style.top, "");
+      assert.strictEqual(harness.menu.style.left, "");
+    }
+
+    harness.trigger.dispatchEvent({ type: "click" });
+    assert.strictEqual((harness.boundary.eventListeners.scroll || []).length, 1);
+    const originalTop = harness.menu.style.top;
+    triggerRect.top -= 40;
+    triggerRect.bottom -= 40;
+    harness.dispatchWindowEvent("resize");
+    harness.flushAnimationFrames();
+    assert.notStrictEqual(harness.menu.style.top, originalTop);
+    harness.boundary.scrollTop = 180;
+    assert.strictEqual(harness.getActiveElement(), harness.optionElements[0]);
+    harness.boundary.dispatchEvent({ type: "scroll", bubbles: false });
+    assert.strictEqual(harness.picker.classList.contains("open"), false);
+    assert.strictEqual(harness.getActiveElement(), harness.trigger,
+      "scroll-close restores focus when an option owned focus");
+    assert.strictEqual(harness.boundary.scrollTop, 180,
+      "focus restoration must not change the user's scroll position");
+    assert.strictEqual((harness.boundary.eventListeners.scroll || []).length, 0);
+
+    harness.trigger.dispatchEvent({ type: "click" });
+    const externalControl = new FakeElement("button");
+    harness.body.appendChild(externalControl);
+    harness.setActiveElement(externalControl);
+    harness.boundary.dispatchEvent({ type: "scroll", bubbles: false });
+    assert.strictEqual(harness.getActiveElement(), externalControl,
+      "scroll-close does not steal focus from another control");
   });
 
   it("reveals selected and keyboard-focused options in a scrollable picker", () => {
@@ -10108,6 +11018,31 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(toasts[0].options.error, true);
   });
 
+  it("restores the General cleanup action after a failed shared pending state", async () => {
+    const commandDeferred = createDeferred();
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot(),
+      settingsAPI: {
+        command: () => commandDeferred.promise,
+      },
+    });
+    harness.renderContent();
+
+    const button = harness.content.querySelector(".session-cleanup-reset-row button");
+    assert.ok(button);
+    assert.equal(button.classList.contains("settings-button"), true);
+    button.dispatchEvent({ type: "click", bubbles: false });
+    assert.equal(button.disabled, true);
+    assert.equal(button.classList.contains("pending"), true);
+    assert.equal(button.getAttribute("aria-busy"), "true");
+
+    commandDeferred.resolve({ status: "error", message: "reset failed" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(button.disabled, false);
+    assert.equal(button.classList.contains("pending"), false);
+    assert.equal(button.getAttribute("aria-busy"), "false");
+  });
+
   it("registers the Session cleanup group with four number rows, atomic reset, and i18n keys", () => {
     const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
     const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
@@ -10177,7 +11112,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(generalSource.includes('id: "general:sound"'));
     assert.ok(generalSource.includes("sound-option-list"));
     assert.ok(generalSource.includes("state.mountedControls.soundSummary"));
-    assert.ok(generalSource.includes('sw.setAttribute("aria-label", t("rowSoundEnabled"));'));
+    assert.ok(generalSource.includes('ariaLabel: t("rowSoundEnabled")'));
     assert.ok(generalSource.includes("toggleSound"));
     assert.ok(generalSource.includes("syncVolumePreview"));
     assert.ok(!/key:\s*"soundMuted",[\s\S]{0,120}descKey:\s*"rowSoundDesc"/.test(generalSource));
@@ -10224,6 +11159,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(generalSource.includes('row.className = "row volume-slider-row"'));
     assert.match(css, /\.quota-ring-collapsible \.settings-option-list,\s*\.sound-collapsible \.settings-option-list\s*\{\s*container-type:\s*inline-size;/s);
     assert.match(css, /@container \(max-width:\s*400px\)\s*\{[\s\S]*\.quota-ring-display-mode-row,[\s\S]*\.volume-slider-row\s*\{[\s\S]*flex-direction:\s*column;/);
+    assert.match(css, /@container \(max-width:\s*400px\)\s*\{[\s\S]*\.quota-alert-thresholds-row,[\s\S]*flex-direction:\s*column;/);
     assert.match(css, /@container \(max-width:\s*400px\)\s*\{[\s\S]*\.volume-slider-row \.volume-control\s*\{[\s\S]*width:\s*100%;[\s\S]*min-width:\s*0;/);
   });
 
@@ -10395,7 +11331,7 @@ describe("settings renderer browser environment", () => {
   it("clears successful switch transient state so rerenders do not keep wait cursors", () => {
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     assert.ok(
-      /clearTransientState\(seq\);\s*setSwitchVisual\(sw,\s*nextVisual,\s*\{\s*pending:\s*false\s*\}\);/.test(coreSource),
+      /clearTransientState\(seq\);\s*control\.setState\(\{\s*checked:\s*nextVisual,\s*pending:\s*false\s*\}\);/.test(coreSource),
       "successful switch actions must delete transient pending state before any later rerender"
     );
     assert.ok(
@@ -10444,12 +11380,16 @@ describe("settings renderer browser environment", () => {
       assert.ok(dock, `showDock should render for ${JSON.stringify(entry)}`);
       assert.strictEqual(tray.getAttribute("role"), "switch");
       assert.strictEqual(dock.getAttribute("role"), "switch");
-      assert.strictEqual(tray.getAttribute("aria-label"), "Show in menu bar");
-      assert.strictEqual(dock.getAttribute("aria-label"), "Show in Dock");
+      const trayMeta = harness.getSwitchMeta("showTray");
+      const dockMeta = harness.getSwitchMeta("showDock");
+      assert.strictEqual(tray.getAttribute("aria-labelledby"), trayMeta.text.querySelector(".row-label").id);
+      assert.strictEqual(dock.getAttribute("aria-labelledby"), dockMeta.text.querySelector(".row-label").id);
+      assert.strictEqual(trayMeta.text.querySelector(".row-label").textContent, "Show in menu bar");
+      assert.strictEqual(dockMeta.text.querySelector(".row-label").textContent, "Show in Dock");
       assert.strictEqual(tray.getAttribute("aria-checked"), String(entry.showTray));
       assert.strictEqual(dock.getAttribute("aria-checked"), String(entry.showDock));
-      assert.strictEqual(tray.getAttribute("aria-disabled"), entry.trayDisabled ? "true" : undefined);
-      assert.strictEqual(dock.getAttribute("aria-disabled"), entry.dockDisabled ? "true" : undefined);
+      assert.strictEqual(tray.getAttribute("aria-disabled"), entry.trayDisabled ? "true" : "false");
+      assert.strictEqual(dock.getAttribute("aria-disabled"), entry.dockDisabled ? "true" : "false");
       assert.strictEqual(tray.tabIndex, entry.trayDisabled ? -1 : 0);
       assert.strictEqual(dock.tabIndex, entry.dockDisabled ? -1 : 0);
     }
@@ -10558,9 +11498,9 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(harness.getSwitch("showDock"), dock);
     assert.strictEqual(dock.focused, true);
     assert.strictEqual(harness.content.scrollTop, 247);
-    assert.strictEqual(tray.getAttribute("aria-disabled"), undefined);
+    assert.strictEqual(tray.getAttribute("aria-disabled"), "false");
     assert.strictEqual(tray.tabIndex, 0);
-    assert.strictEqual(dock.getAttribute("aria-disabled"), undefined);
+    assert.strictEqual(dock.getAttribute("aria-disabled"), "false");
 
     harness.core.ops.applyChanges({
       changes: { showTray: false },
@@ -10742,13 +11682,13 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(master.classList.contains("on"), true);
     assert.strictEqual(master.classList.contains("pending"), false);
     assert.strictEqual(labels.classList.contains("disabled"), false);
-    assert.strictEqual(labels.attributes["aria-disabled"], undefined);
+    assert.strictEqual(labels.attributes["aria-disabled"], "false");
     assert.strictEqual(labels.tabIndex, 0);
     assert.strictEqual(elapsed.classList.contains("disabled"), false);
-    assert.strictEqual(elapsed.attributes["aria-disabled"], undefined);
+    assert.strictEqual(elapsed.attributes["aria-disabled"], "false");
     assert.strictEqual(elapsed.tabIndex, 0);
     assert.strictEqual(contextUsage.classList.contains("disabled"), false);
-    assert.strictEqual(contextUsage.attributes["aria-disabled"], undefined);
+    assert.strictEqual(contextUsage.attributes["aria-disabled"], "false");
     assert.strictEqual(contextUsage.tabIndex, 0);
     assert.strictEqual(cleanup.classList.contains("disabled"), false);
     assert.strictEqual(cleanup.tabIndex, 0);
@@ -10867,6 +11807,55 @@ describe("settings renderer browser environment", () => {
     ]);
   });
 
+  for (const scenario of [
+    { name: "a resolved save error", reply: () => ({ status: "error", message: "disk full" }), toast: true },
+    { name: "an empty result", reply: () => undefined, toast: true },
+    { name: "a no-op without a broadcast", reply: () => ({ status: "ok", noop: true }), toast: false },
+    { name: "a rejected IPC request", reply: () => Promise.reject(new Error("IPC unavailable")), toast: true },
+    { name: "a synchronous IPC error", reply: () => { throw new Error("IPC unavailable"); }, toast: true },
+  ]) {
+    it(`recovers a quota provider switch after ${scenario.name}`, async () => {
+      const calls = [];
+      const toasts = [];
+      const harness = loadGeneralTabForTest({
+        snapshot: makeGeneralSnapshot({ quotaRingHiddenProviders: ["codexQuota"] }),
+        settingsAPI: {
+          getQuotaRingProviders: async () => ([
+            { key: "codexQuota", label: "Codex" },
+            { key: "kimiQuota", label: "Kimi" },
+          ]),
+          update: (key, value) => {
+            calls.push({ key, value });
+            return calls.length === 1 ? scenario.reply() : Promise.resolve({ status: "ok" });
+          },
+        },
+      });
+      harness.core.ops.showToast = (message) => toasts.push(message);
+      harness.renderContent();
+      await new Promise((resolve) => setImmediate(resolve));
+      const sw = harness.content.querySelectorAll(".quota-ring-provider-row")[1].querySelector(".switch");
+
+      sw.dispatchEvent({ type: "click" });
+      assert.equal(sw.getAttribute("aria-checked"), "false");
+      assert.equal(sw.getAttribute("aria-busy"), "true");
+      sw.dispatchEvent({ type: "click" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(calls.length, 1, "pending must suppress duplicate activation");
+      assert.equal(sw.getAttribute("aria-checked"), "true", "unsaved visibility must roll back");
+      assert.equal(sw.getAttribute("aria-busy"), "false", "settled requests must release pending");
+      assert.equal(toasts.length, scenario.toast ? 1 : 0);
+      assert.deepStrictEqual(harness.core.state.snapshot.quotaRingHiddenProviders, ["codexQuota"]);
+
+      sw.dispatchEvent({ type: "click" });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(calls.length, 2, "the same mounted control must allow retry");
+      assert.deepStrictEqual(calls[1], { key: "quotaRingHiddenProviders", value: ["codexQuota", "kimiQuota"] });
+      assert.equal(sw.getAttribute("aria-checked"), "false");
+      assert.equal(sw.getAttribute("aria-busy"), "false", "success must not depend on receiving a broadcast");
+    });
+  }
+
   it("offers no provider list when only one provider reports", async () => {
     // One connected provider cannot crowd anything out, so the control would be
     // a no-op switch — the same reason merge-sources stays hidden on one machine.
@@ -10922,6 +11911,283 @@ describe("settings renderer browser environment", () => {
     await Promise.resolve();
     await Promise.resolve();
     assert.deepStrictEqual(updateCalls, [{ key: "quotaMergeSources", value: false }]);
+  });
+
+  it("quota reminders: hides the reminder rows while the master switch is off", async () => {
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    assert.match(css, /\.quota-ring-option-list \.row\[hidden\]\s*\{\s*display:\s*none;/);
+    assert.match(css, /\.quota-alert-thresholds-row \.settings-select\s*\{[\s\S]*min-width:\s*216px;/);
+    const snapshot = makeGeneralSnapshot({
+      quotaAlertsEnabled: false, quotaAlertThresholds: [20, 10], quotaRecoveryAlertsEnabled: true,
+    });
+    const h = loadGeneralTabForTest({
+      snapshot,
+      settingsAPI: { update: async () => ({ status: "ok" }) },
+    });
+    h.renderContent();
+    const thresholdsRow = h.content.querySelector(".quota-alert-thresholds-row");
+    const recoveryRow = h.getSwitchMeta("quotaRecoveryAlertsEnabled").row;
+    const testRow = h.content.querySelector(".quota-notification-test-row");
+    for (const row of [thresholdsRow, recoveryRow, testRow]) {
+      assert.equal(row.hidden, true);
+      assert.equal(row.getAttribute("aria-hidden"), "true");
+    }
+
+    const before = h.getContentRenderCount();
+    h.core.ops.applyChanges({
+      changes: { quotaAlertsEnabled: true },
+      snapshot: { ...snapshot, quotaAlertsEnabled: true },
+    });
+    assert.equal(h.getContentRenderCount(), before);
+    for (const row of [thresholdsRow, recoveryRow, testRow]) {
+      assert.equal(row.hidden, false);
+      assert.equal(row.getAttribute("aria-hidden"), "false");
+    }
+    assert.strictEqual(h.content.querySelector(".quota-alert-thresholds-row"), thresholdsRow);
+
+    h.core.ops.applyChanges({
+      changes: { quotaAlertsEnabled: false },
+      snapshot: { ...snapshot, quotaAlertsEnabled: false },
+    });
+    for (const row of [thresholdsRow, recoveryRow, testRow]) {
+      assert.equal(row.hidden, true);
+      assert.equal(row.getAttribute("aria-hidden"), "true");
+    }
+  });
+
+  it("quota reminders: a preset select writes immediately and follows external values in place", async () => {
+    const writes = [];
+    const snapshot = makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [20, 10] });
+    const h = loadGeneralTabForTest({
+      snapshot,
+      settingsAPI: { update: async (key, value) => { writes.push({ key, value }); return { status: "ok" }; } },
+    });
+    h.renderContent();
+    const row = h.content.querySelector(".quota-alert-thresholds-row");
+    const select = row.querySelector(".settings-select");
+    assert.match(select.querySelector(".language-picker-trigger").textContent, /20% and 10%/);
+    assert.deepStrictEqual(
+      select.querySelectorAll(".language-picker-option").map((option) => option.getAttribute("data-lang")),
+      ["10", "20,10", "30,20,10", "50,20,10"],
+    );
+
+    select.querySelectorAll(".language-picker-option")
+      .find((option) => option.getAttribute("data-lang") === "30,20,10")
+      .dispatchEvent({ type: "click" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(writes)),
+      [{ key: "quotaAlertThresholds", value: [30, 20, 10] }],
+    );
+
+    const before = h.getContentRenderCount();
+    h.core.ops.applyChanges({
+      changes: { quotaAlertThresholds: [50, 20, 10] },
+      snapshot: { ...h.core.state.snapshot, quotaAlertThresholds: [50, 20, 10] },
+    });
+    assert.equal(h.getContentRenderCount(), before);
+    assert.strictEqual(h.content.querySelector(".quota-alert-thresholds-row"), row);
+    assert.strictEqual(row.querySelector(".settings-select"), select);
+    assert.match(select.querySelector(".language-picker-trigger").textContent, /50%, 20%, 10%/);
+  });
+
+  it("quota reminders: shows a custom option for non-preset values and drops it after a preset write", async () => {
+    const writes = [];
+    const snapshot = makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [25, 5] });
+    const h = loadGeneralTabForTest({
+      snapshot,
+      settingsAPI: { update: async (key, value) => { writes.push({ key, value }); return { status: "ok" }; } },
+    });
+    h.renderContent();
+    const row = h.content.querySelector(".quota-alert-thresholds-row");
+    assert.deepStrictEqual(
+      row.querySelectorAll(".language-picker-option").map((option) => option.getAttribute("data-lang")),
+      ["10", "20,10", "30,20,10", "50,20,10", "custom"],
+    );
+    assert.match(row.querySelector(".language-picker-trigger").textContent, /Custom: 25%, 5% left/);
+
+    // The custom option forces a fresh select, so the old registry entry must be
+    // removed as the new one is added (net count unchanged).
+    const selects = h.core.state.mountedControls.settingsSelects;
+    const selectCountBefore = selects.size;
+    const oldControl = [...selects].find((entry) => entry.element === row.querySelector(".settings-select"));
+    assert.ok(oldControl);
+
+    row.querySelectorAll(".language-picker-option")
+      .find((option) => option.getAttribute("data-lang") === "20,10")
+      .dispatchEvent({ type: "click" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(writes)), [{ key: "quotaAlertThresholds", value: [20, 10] }]);
+    assert.strictEqual(h.content.querySelector(".quota-alert-thresholds-row"), row);
+    assert.equal(selects.size, selectCountBefore);
+    assert.equal(selects.has(oldControl), false);
+    assert.deepStrictEqual(
+      row.querySelectorAll(".language-picker-option").map((option) => option.getAttribute("data-lang")),
+      ["10", "20,10", "30,20,10", "50,20,10"],
+    );
+    assert.doesNotMatch(row.querySelector(".language-picker-trigger").textContent, /Custom/);
+  });
+
+  it("quota reminders: localizes the custom option with the language list separator", async () => {
+    const snapshot = makeGeneralSnapshot({
+      lang: "zh", quotaAlertsEnabled: true, quotaAlertThresholds: [25, 5],
+    });
+    const h = loadGeneralTabForTest({
+      snapshot,
+      settingsAPI: { update: async () => ({ status: "ok" }) },
+    });
+    h.renderContent();
+    const row = h.content.querySelector(".quota-alert-thresholds-row");
+    assert.match(row.querySelector(".language-picker-trigger").textContent, /自定义：剩 25%、5%/);
+  });
+
+  it("quota reminders: a rejected preset write warns and restores the previous value", async () => {
+    const writes = [], toasts = [];
+    const snapshot = makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [20, 10] });
+    const h = loadGeneralTabForTest({
+      snapshot,
+      settingsAPI: {
+        update: async (key, value) => { writes.push({ key, value }); return { status: "error", message: "disk" }; },
+      },
+    });
+    h.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    h.renderContent();
+    const row = h.content.querySelector(".quota-alert-thresholds-row");
+    const select = row.querySelector(".settings-select");
+    select.querySelectorAll(".language-picker-option")
+      .find((option) => option.getAttribute("data-lang") === "30,20,10")
+      .dispatchEvent({ type: "click" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(writes.length, 1);
+    assert.equal(toasts.length, 1);
+    assert.equal(toasts[0].options.error, true);
+    assert.equal(select.querySelector(".language-picker-trigger").textContent, "20% and 10% left");
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(h.core.state.snapshot.quotaAlertThresholds)), [20, 10]);
+  });
+
+  it("quota reminders: an in-flight preset write locks the select against a second change", async () => {
+    const deferred = createDeferred(), writes = [];
+    const snapshot = makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [20, 10] });
+    const h = loadGeneralTabForTest({
+      snapshot,
+      settingsAPI: { update: (key, value) => { writes.push({ key, value }); return deferred.promise; } },
+    });
+    h.renderContent();
+    const row = h.content.querySelector(".quota-alert-thresholds-row");
+    const select = row.querySelector(".settings-select");
+    const options = select.querySelectorAll(".language-picker-option");
+    options.find((option) => option.getAttribute("data-lang") === "30,20,10").dispatchEvent({ type: "click" });
+    options.find((option) => option.getAttribute("data-lang") === "50,20,10").dispatchEvent({ type: "click" });
+    assert.equal(writes.length, 1);
+    assert.equal(select.querySelector(".language-picker-trigger").disabled, true);
+    deferred.resolve({ status: "ok" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(select.querySelector(".language-picker-trigger").disabled, false);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(h.core.state.snapshot.quotaAlertThresholds)), [30, 20, 10]);
+  });
+
+  it("quota reminders: a successful write adopts the server snapshot even when the click differs", async () => {
+    for (const committed of [[50, 20, 10], [35, 5]]) {
+      const h = loadGeneralTabForTest({
+        snapshot: makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [20, 10] }),
+        settingsAPI: {
+          update: async () => ({
+            status: "ok",
+            snapshot: makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: committed }),
+          }),
+        },
+      });
+      h.renderContent();
+      const old = h.content.querySelector(".quota-alert-thresholds-row .settings-select");
+      old.querySelectorAll(".language-picker-option")
+        .find((option) => option.getAttribute("data-lang") === "30,20,10")
+        .dispatchEvent({ type: "click" });
+      await new Promise((resolve) => setImmediate(resolve));
+      const current = h.content.querySelector(".quota-alert-thresholds-row .settings-select");
+      const trigger = current.querySelector(".language-picker-trigger");
+      assert.equal(trigger.textContent, committed[0] === 50 ? "50%, 20%, 10% left" : "Custom: 35%, 5% left");
+      assert.equal(trigger.disabled, false);
+      assert.equal(current === old, committed[0] === 50);
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(h.core.state.snapshot.quotaAlertThresholds)), committed);
+    }
+  });
+
+  it("quota reminders: an external replacement mid-write keeps the authoritative value on rejection", async () => {
+    const deferred = createDeferred(), toasts = [];
+    const h = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [20, 10] }),
+      settingsAPI: { update: () => deferred.promise },
+    });
+    h.core.ops.showToast = (message) => toasts.push(message);
+    h.renderContent();
+    const selectOf = () => h.content.querySelector(".quota-alert-thresholds-row .settings-select");
+    const old = selectOf();
+    old.querySelectorAll(".language-picker-option")
+      .find((option) => option.getAttribute("data-lang") === "30,20,10")
+      .dispatchEvent({ type: "click" });
+    h.core.ops.applyChanges({
+      changes: { quotaAlertThresholds: [35, 5] },
+      snapshot: { ...h.core.state.snapshot, quotaAlertThresholds: [35, 5] },
+    });
+    assert.notEqual(selectOf(), old);
+    assert.equal(selectOf().querySelector(".language-picker-trigger").disabled, true);
+    deferred.reject(new Error("probe rejection"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(selectOf().querySelector(".language-picker-trigger").textContent, "Custom: 35%, 5% left");
+    assert.equal(selectOf().querySelector(".language-picker-trigger").disabled, false);
+    assert.equal(toasts.length, 1);
+  });
+
+  it("quota reminders: a full re-render mid-write recovers the server value on success", async () => {
+    const success = createDeferred();
+    const h = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [25, 5] }),
+      settingsAPI: { update: () => success.promise },
+    });
+    h.renderContent();
+    const selectCount = h.core.state.mountedControls.settingsSelects.size;
+    h.content.querySelector(".quota-alert-thresholds-row .settings-select")
+      .querySelectorAll(".language-picker-option")
+      .find((option) => option.getAttribute("data-lang") === "30,20,10")
+      .dispatchEvent({ type: "click" });
+    h.renderContent();
+    success.resolve({
+      status: "ok",
+      snapshot: makeGeneralSnapshot({ quotaAlertsEnabled: true, quotaAlertThresholds: [30, 20, 10] }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      h.content.querySelector(".quota-alert-thresholds-row .settings-select .language-picker-trigger").textContent,
+      "30%, 20%, 10% left",
+    );
+    assert.equal(h.core.state.mountedControls.settingsSelects.size, selectCount);
+    assert.equal(h.getContentRenderCount(), 2);
+  });
+
+  it("quota reminders: the test row carries platform copy and stays single-flight", async () => {
+    const pending = createDeferred(), toasts = [];
+    let tests = 0, writes = 0;
+    const h = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({ quotaAlertsEnabled: true }),
+      settingsAPI: {
+        testQuotaNotification: () => { tests++; return pending.promise; },
+        update: async () => { writes++; return { status: "ok" }; },
+      },
+    });
+    h.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    h.renderContent();
+    const row = h.content.querySelector(".quota-notification-test-row");
+    assert.equal(row.querySelector(".row-label").textContent, "Test notification");
+    assert.match(row.querySelector(".row-desc").textContent, /Windows Settings/);
+    const button = row.querySelector("button");
+    assert.match(button.textContent, /Send/);
+    button.dispatchEvent({ type: "click" }); button.dispatchEvent({ type: "click" });
+    assert.equal(tests, 1); assert.equal(button.disabled, true);
+    pending.resolve({ ok: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(button.disabled, false); assert.equal(writes, 0);
+    assert.equal(toasts.length, 1); assert.equal(toasts[0].options.error, false);
+    assert.match(toasts[0].message, /Test notification sent/);
   });
 
   it("lets users choose used or remaining quota without rebuilding General", async () => {
@@ -11352,6 +12618,257 @@ describe("settings renderer browser environment", () => {
     harness.core.ops.requestRender({ content: true });
 
     assert.strictEqual(harness.content.querySelector(".agent-traecode-hint"), null);
+  });
+
+  it("shows the MiniMax enable hint on the card when the integration is installed", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: { minimax: { integrationInstalled: true, enabled: true } },
+      },
+      agentMetadata: [
+        { id: "minimax", name: "MiniMax Code", eventSource: "hook", capabilities: {} },
+      ],
+    });
+
+    harness.core.ops.requestRender({ content: true });
+
+    const hint = harness.content.querySelector(".agent-minimax-hint");
+    assert.ok(hint, "MiniMax hint should render on the installed card");
+    assert.match(collectText(hint), /MiniMax Code/);
+  });
+
+  it("omits the MiniMax enable hint until the integration is installed", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: { minimax: { integrationInstalled: false, enabled: false } },
+      },
+      agentMetadata: [
+        { id: "minimax", name: "MiniMax Code", eventSource: "hook", capabilities: {} },
+      ],
+    });
+
+    harness.core.ops.requestRender({ content: true });
+
+    assert.strictEqual(harness.content.querySelector(".agent-minimax-hint"), null);
+  });
+
+  function loadDshNoticesHarness({ notices = [], settingsAPI = {}, navigator: navigatorOverrides } = {}) {
+    return loadAgentsTabForTest({
+      snapshot: { agents: { "deepseek-harness": { integrationInstalled: true, enabled: true } } },
+      agentMetadata: [
+        { id: "deepseek-harness", name: "DeepSeek Harness (experimental)", eventSource: "plugin-event", capabilities: {} },
+      ],
+      navigator: navigatorOverrides,
+      settingsAPI: {
+        getDshNotices: () => Promise.resolve({ notices }),
+        acknowledgeDshNotice: () => Promise.resolve({ status: "ok", found: true }),
+        ...settingsAPI,
+      },
+    });
+  }
+
+  it("renders the DeepSeek Harness notices with per-kind wording and prefixes", async () => {
+    const harness = loadDshNoticesHarness({
+      notices: [
+        { id: "r", profile: "desktop", kind: "restart-required" },
+        { id: "f1", profile: "web", kind: "failed-target", operation: "install", reason: "plugin-disabled-in-dsh", message: "disabled" },
+        { id: "f2", profile: "web", kind: "failed-target", operation: "uninstall", reason: "version-unsupported", message: "bad version" },
+        { id: "m", profile: "web", kind: "manual-command", commands: ["line1", "line2"] },
+        { id: "d", profile: "desktop", kind: "first-install" },
+      ],
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+
+    const rows = harness.content.querySelectorAll(".agent-dsh-notice");
+    assert.deepStrictEqual(rows.map((row) => row.getAttribute("data-kind")), [
+      "restart-required",
+      "failed-target",
+      "failed-target",
+      "manual-command",
+      "first-install",
+    ]);
+    assert.match(collectText(rows[0]), /Desktop: The Clawd plugin was updated\./);
+    assert.match(collectText(rows[1]), /Web: Not installed: disabled Open Doctor and click Repair Now\./);
+    assert.match(collectText(rows[2]), /Web: Not fully removed: bad version/);
+    assert.doesNotMatch(collectText(rows[2]), /Open Doctor/);
+    assert.match(collectText(rows[3]), /Web: Run this in a terminal to finish\./);
+    assert.match(collectText(rows[3].querySelector(".agent-dsh-notice-commands")), /line1\s*\n\s*line2/);
+    assert.match(collectText(rows[4]), /Desktop: Installed in DeepSeek Harness desktop\./);
+  });
+
+  it("copies every manual command line from a DeepSeek Harness notice", async () => {
+    const copied = [];
+    const harness = loadDshNoticesHarness({
+      notices: [{ id: "m", profile: "web", kind: "manual-command", commands: ["cmd one", "cmd two"] }],
+      navigator: { clipboard: { writeText: (value) => { copied.push(value); return Promise.resolve(); } } },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+    harness.content.querySelector(".agent-dsh-notice-copy").click();
+    await flushAsync();
+
+    assert.deepStrictEqual(copied, ["cmd one\ncmd two"]);
+  });
+
+  it("acknowledges the clicked DeepSeek Harness notice and refetches", async () => {
+    const acks = [];
+    let notices = [
+      { id: "one", profile: "web", kind: "manual-command", commands: ["a"] },
+      { id: "two", profile: "desktop", kind: "first-install" },
+    ];
+    const harness = loadDshNoticesHarness({
+      settingsAPI: {
+        getDshNotices: () => Promise.resolve({ notices: notices.map((notice) => ({ ...notice })) }),
+        acknowledgeDshNotice: (profile, id) => {
+          acks.push([profile, id]);
+          notices = notices.filter((notice) => !(notice.profile === profile && notice.id === id));
+          return Promise.resolve({ status: "ok", found: true });
+        },
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+    const buttons = harness.content.querySelectorAll(".agent-dsh-notice-ack");
+    assert.strictEqual(buttons.length, 2);
+    buttons[1].click();
+    await flushAsync();
+    await flushAsync();
+
+    assert.deepStrictEqual(acks, [["desktop", "two"]]);
+    const rows = harness.content.querySelectorAll(".agent-dsh-notice");
+    assert.deepStrictEqual(rows.map((row) => row.getAttribute("data-profile")), ["web"]);
+  });
+
+  it("re-enables the acknowledge button and keeps the notice when acknowledgement fails", async () => {
+    const harness = loadDshNoticesHarness({
+      notices: [{ id: "m", profile: "web", kind: "manual-command", commands: ["a"] }],
+      settingsAPI: {
+        acknowledgeDshNotice: () => Promise.resolve({ status: "error", message: "nope" }),
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+    const button = harness.content.querySelector(".agent-dsh-notice-ack");
+    button.click();
+    await flushAsync();
+
+    const toasts = harness.content.parentNode.querySelectorAll(".toast");
+    assert.ok(toasts.some((toast) => collectText(toast).includes("nope")), "a failure toast should appear");
+    assert.strictEqual(button.disabled, false, "the acknowledge button must be clickable again");
+    assert.strictEqual(button.classList.contains("pending"), false);
+    assert.strictEqual(harness.content.querySelectorAll(".agent-dsh-notice").length, 1, "the notice stays");
+  });
+
+  it("keeps DeepSeek Harness notice buttons from toggling the row", async () => {
+    const commands = [];
+    const harness = loadAgentsTabForTest({
+      snapshot: { agents: { "deepseek-harness": { integrationInstalled: true, enabled: true } } },
+      agentMetadata: [
+        { id: "deepseek-harness", name: "DeepSeek Harness (experimental)", eventSource: "plugin-event", capabilities: { permissionApproval: true } },
+      ],
+      navigator: { clipboard: { writeText: () => Promise.resolve() } },
+      settingsAPI: {
+        command: (action, payload) => { commands.push([action, payload]); return Promise.resolve({ status: "ok" }); },
+        getDshNotices: () => Promise.resolve({ notices: [{ id: "m", profile: "web", kind: "manual-command", commands: ["a"] }] }),
+        acknowledgeDshNotice: () => Promise.resolve({ status: "ok", found: true }),
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+    const disclosure = harness.content.querySelector(".settings-disclosure-trigger");
+    assert.strictEqual(disclosure.getAttribute("aria-expanded"), "false");
+
+    // The group header toggles on click, so the notice buttons must stop the
+    // event before it reaches it. Assert after each click so one button
+    // expanding and the next collapsing cannot mask the bug.
+    harness.content.querySelector(".agent-dsh-notice-ack").dispatchEvent({ type: "click", bubbles: true });
+    harness.raf.flushFrame();
+    await flushAsync();
+    assert.strictEqual(disclosure.getAttribute("aria-expanded"), "false", "acknowledge must not expand the group");
+
+    harness.content.querySelector(".agent-dsh-notice-copy").dispatchEvent({ type: "click", bubbles: true });
+    harness.raf.flushFrame();
+    await flushAsync();
+    assert.strictEqual(disclosure.getAttribute("aria-expanded"), "false", "copy must not expand the group");
+    assert.deepStrictEqual(commands, []);
+  });
+
+  it("refetches DeepSeek Harness notices after an install result and on window focus", async () => {
+    let getCalls = 0;
+    const harness = loadDshNoticesHarness({
+      settingsAPI: {
+        command: () => Promise.resolve({ status: "ok" }),
+        getDshNotices: () => { getCalls += 1; return Promise.resolve({ notices: [] }); },
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+    const afterRender = getCalls;
+
+    harness.content.querySelector(".agent-integration-action").click();
+    await flushAsync();
+    await flushAsync();
+    const afterInstall = getCalls;
+    assert.ok(afterInstall > afterRender, "an install/uninstall result must refetch notices");
+
+    harness.dispatchWindowEvent("focus");
+    await flushAsync();
+    assert.ok(getCalls > afterInstall, "focusing the window must refetch notices");
+  });
+
+  it("drops stale DeepSeek Harness notice responses", async () => {
+    const pending = [];
+    const harness = loadDshNoticesHarness({
+      settingsAPI: {
+        getDshNotices: () => new Promise((resolve) => { pending.push(resolve); }),
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+    assert.strictEqual(pending.length, 1);
+
+    harness.dispatchWindowEvent("focus");
+    await flushAsync();
+    assert.strictEqual(pending.length, 2);
+
+    pending[1]({ notices: [{ id: "new", profile: "web", kind: "first-install" }] });
+    await flushAsync();
+    pending[0]({ notices: [{ id: "old", profile: "web", kind: "restart-required" }] });
+    await flushAsync();
+
+    const rows = harness.content.querySelectorAll(".agent-dsh-notice");
+    assert.deepStrictEqual(rows.map((row) => row.getAttribute("data-kind")), ["first-install"]);
+  });
+
+  it("leaves the DeepSeek Harness notice container empty and others without one", async () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "deepseek-harness": { integrationInstalled: true, enabled: true },
+          codex: { integrationInstalled: true, enabled: true },
+        },
+      },
+      agentMetadata: [
+        { id: "deepseek-harness", name: "DeepSeek Harness (experimental)", eventSource: "plugin-event", capabilities: {} },
+        { id: "codex", name: "Codex", eventSource: "hook", capabilities: {} },
+      ],
+      settingsAPI: { getDshNotices: () => Promise.resolve({ notices: [] }) },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    await flushAsync();
+
+    const containers = harness.content.querySelectorAll(".agent-dsh-notices");
+    assert.strictEqual(containers.length, 1);
+    assert.strictEqual(containers[0].querySelectorAll(".agent-dsh-notice").length, 0);
   });
 
   it("keeps Start with Codex independent and commits through the preference API", async () => {
@@ -11970,7 +13487,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(tabSource.includes("handleRefreshThemes"));
     assert.ok(tabSource.includes("handleRemoveCodexPet"));
     assert.ok(tabSource.includes("themeUninstallPetLabel"));
-    assert.ok(tabSource.includes('footer.className = "theme-card-footer";'));
+    assert.ok(tabSource.includes('"theme-card-footer theme-card-footer-official"'));
     assert.ok(tabSource.includes('btn.className = "theme-customize-btn";'));
     assert.ok(tabSource.includes("function renderThemeDetail(parent, theme)"));
     assert.ok(tabSource.includes("function supportsThemeCustomization(theme)"));
@@ -12001,6 +13518,8 @@ describe("settings renderer browser environment", () => {
     assert.ok(css.includes(".theme-detail-hero"));
     assert.ok(css.includes(".theme-customization-row"));
     assert.ok(/\.theme-card-footer\s*\{[^}]*min-height:\s*26px;[^}]*margin-top:\s*auto;[^}]*\}/.test(css));
+    assert.ok(/\.theme-card-footer-official\s*\{[^}]*flex-wrap:\s*wrap;[^}]*justify-content:\s*flex-start;[^}]*\}/.test(css));
+    assert.ok(css.includes(".theme-official-showcase-btn"));
     assert.ok(/\.theme-card-check\s*\{[^}]*white-space:\s*nowrap;[^}]*\}/.test(css));
     assert.ok(i18nSource.includes("themeImportPetZip"));
     assert.ok(i18nSource.includes("themeImportUserThemeZip"));
@@ -12100,8 +13619,346 @@ describe("settings renderer browser environment", () => {
     assert.deepStrictEqual(commands, []);
   });
 
-  it("renders Codex Pet atlas previews with V1, V2, and legacy grid ratios", () => {
+  it("renders official themes in their own section without duplicating an installed card", () => {
     const { content } = loadThemeTabForTest({
+      themes: [
+        { id: "clawd", name: "Clawd", builtin: true, active: true },
+        {
+          id: "hash-sage",
+          name: "Hash Sage",
+          officialTheme: true,
+          active: true,
+          officialThemeState: "installed",
+          officialThemeInstalledVersion: "1.0.0",
+          officialThemeCanUninstall: true,
+        },
+        { id: "user", name: "User Theme", active: false },
+      ],
+      officialThemes: [
+        {
+          id: "hash-sage",
+          name: "Hash Sage",
+          officialTheme: true,
+          active: false,
+          officialThemeState: "installed",
+          officialThemeInstalledVersion: "1.0.0",
+          officialThemeCanUninstall: true,
+        },
+      ],
+    });
+
+    const sections = content.querySelectorAll(".theme-section");
+    const officialSection = sections.find(
+      (section) => section.querySelector(".theme-section-title").textContent === "Official themes"
+    );
+    assert.ok(officialSection, "official section must render");
+    assert.strictEqual(officialSection.querySelectorAll(".theme-card").length, 1);
+    const userSection = sections.find(
+      (section) => section.querySelector(".theme-section-title").textContent === "User Themes"
+    );
+    assert.ok(userSection);
+    // The installed official card must not also appear as a user card.
+    const allCards = content.querySelectorAll(".theme-card");
+    const hashCards = allCards.filter(
+      (card) => card.querySelector(".theme-card-name-text").textContent === "Hash Sage"
+    );
+    assert.strictEqual(hashCards.length, 1);
+    assert.strictEqual(hashCards[0].getAttribute("aria-checked"), "true");
+    assert.ok(hashCards[0].classList.contains("active"));
+    assert.ok(hashCards[0].querySelector(".theme-card-footer-official"));
+    assert.strictEqual(
+      hashCards[0].querySelector(".theme-uninstall-btn").getAttribute("data-settings-focus-key"),
+      "official-uninstall:hash-sage",
+    );
+  });
+
+  it("keeps a local theme in the user section when the confirmed catalog never listed its id", () => {
+    const { content } = loadThemeTabForTest({
+      themes: [
+        { id: "clawd", name: "Clawd", builtin: true, active: true },
+        { id: "hash-sage", name: "My Local Sage", builtin: false, active: false },
+      ],
+      officialThemes: [
+        { id: "whale-chan", name: "Whale-chan", officialTheme: true, active: false, officialThemeState: "available" },
+      ],
+      officialCatalogStatus: "ok",
+    });
+
+    const sections = content.querySelectorAll(".theme-section");
+    const userSection = sections.find(
+      (section) => section.querySelector(".theme-section-title").textContent === "User Themes"
+    );
+    assert.ok(userSection, "the local theme must stay in the user section");
+    assert.strictEqual(userSection.querySelectorAll(".theme-card").length, 1);
+    assert.ok(collectText(userSection.querySelector(".theme-card")).includes("My Local Sage"));
+    assert.strictEqual(userSection.querySelector(".theme-card-footer-official"), null);
+  });
+
+  it("returns a stale official local theme to the user section once the catalog drops its id", async () => {
+    const { content, commands } = loadThemeTabForTest({
+      themes: [
+        { id: "clawd", name: "Clawd", builtin: true, active: true },
+        {
+          id: "hash-sage",
+          name: "My Local Sage",
+          builtin: false,
+          active: false,
+          // Decoration left behind by the catalog version that still listed this id.
+          officialTheme: true,
+          officialThemeState: "conflict",
+          officialThemeConflict: true,
+          officialThemeCanUninstall: false,
+        },
+      ],
+      officialThemes: [
+        { id: "whale-chan", name: "Whale-chan", officialTheme: true, active: false, officialThemeState: "available" },
+      ],
+      officialCatalogStatus: "ok",
+    });
+
+    const sections = content.querySelectorAll(".theme-section");
+    const userSection = sections.find(
+      (section) => section.querySelector(".theme-section-title").textContent === "User Themes"
+    );
+    assert.ok(userSection, "the withdrawn local theme must return to the user section");
+    const cards = userSection.querySelectorAll(".theme-card");
+    assert.strictEqual(cards.length, 1);
+    assert.ok(collectText(cards[0]).includes("My Local Sage"));
+    assert.strictEqual(cards[0].querySelector(".theme-card-footer-official"), null);
+    assert.ok(cards[0].querySelector(".theme-delete-btn"), "plain user themes offer delete");
+
+    cards[0].dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(commands)),
+      [{ name: "setThemeSelection", payload: { themeId: "hash-sage" } }],
+    );
+  });
+
+  it("shows official download, progress and uninstall affordances", async () => {
+    const installCalls = [];
+    const cancelCalls = [];
+    const openExternalCalls = [];
+    const showcaseUrl = "https://hash-sage-art.pages.dev/progress/";
+    const harness = loadThemeTabForTest({
+      themes: [{ id: "clawd", name: "Clawd", builtin: true, active: true }],
+      officialThemes: [
+        {
+          id: "hash-sage",
+          name: "Hash Sage",
+          officialTheme: true,
+          active: false,
+          officialThemeState: "available",
+          officialThemeBytes: 5 * 1024 * 1024,
+          officialThemeDescription: { en: "A cloud-riding pixel sage." },
+          officialThemeShowcaseUrl: showcaseUrl,
+        },
+      ],
+      settingsAPI: {
+        openExternal: (url) => {
+          openExternalCalls.push(url);
+          return Promise.resolve({ status: "ok" });
+        },
+        installOfficialTheme: (themeId) => {
+          installCalls.push(themeId);
+          return Promise.resolve({ status: "ok" });
+        },
+        cancelOfficialThemeInstall: () => {
+          cancelCalls.push("cancel");
+          return Promise.resolve({ status: "ok", cancelled: true });
+        },
+      },
+    });
+
+    const download = harness.content.querySelector(".theme-official-download-btn");
+    const showcaseButton = harness.content.querySelector(".theme-official-showcase-btn");
+    assert.ok(download);
+    assert.strictEqual(
+      harness.content.querySelector(".theme-card-description").textContent,
+      "A cloud-riding pixel sage."
+    );
+    assert.strictEqual(harness.content.querySelector(".theme-official-license-summary"), null);
+    assert.strictEqual(harness.content.querySelector(".theme-official-license-notice"), null);
+    assert.strictEqual(harness.content.querySelector(".theme-official-license-link"), null);
+    assert.ok(showcaseButton);
+    assert.strictEqual(showcaseButton.textContent, "View animations");
+    showcaseButton.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    assert.deepStrictEqual(openExternalCalls, [showcaseUrl]);
+    assert.ok(download.textContent.includes("5 MB"));
+    download.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    assert.deepStrictEqual(installCalls, ["hash-sage"]);
+
+    // A live main-owned operation renders a progress bar + cancel.
+    harness.core.runtime.officialThemeOperation = {
+      id: "hash-sage",
+      phase: "downloading",
+      receivedBytes: 1024 * 1024,
+      totalBytes: 5 * 1024 * 1024,
+    };
+    harness.renderContent();
+    const cancel = harness.content.querySelector(".theme-official-cancel-btn");
+    const progress = harness.content.querySelector(".theme-official-progress");
+    assert.ok(cancel);
+    assert.ok(harness.content.querySelector(".theme-official-progress-bar"));
+    assert.strictEqual(cancel.getAttribute("data-settings-focus-key"), "official-cancel:hash-sage");
+    assert.strictEqual(progress.getAttribute("role"), "progressbar");
+    assert.strictEqual(progress.getAttribute("aria-valuenow"), "20");
+    cancel.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    assert.deepStrictEqual(cancelCalls, ["cancel"]);
+
+    harness.core.runtime.officialThemeOperation = {
+      id: "hash-sage",
+      phase: "installing",
+      receivedBytes: 5 * 1024 * 1024,
+      totalBytes: 5 * 1024 * 1024,
+    };
+    harness.renderContent();
+    assert.strictEqual(harness.content.querySelector(".theme-official-cancel-btn"), null);
+  });
+
+  it("gives retry a stable keyboard focus key", () => {
+    const harness = loadThemeTabForTest({
+      themes: [{ id: "clawd", name: "Clawd", builtin: true, active: true }],
+      officialThemes: [{
+        id: "hash-sage",
+        name: "Hash Sage",
+        officialTheme: true,
+        officialThemeState: "error",
+        officialThemeError: { message: "offline" },
+      }],
+    });
+    const retry = harness.content.querySelector(".theme-official-retry-btn");
+    assert.ok(retry);
+    assert.strictEqual(retry.getAttribute("data-settings-focus-key"), "official-retry:hash-sage");
+  });
+
+  it("uses the localized catalog-unavailable copy for that install failure code", async () => {
+    const toasts = [];
+    const harness = loadThemeTabForTest({
+      themes: [{ id: "clawd", name: "Clawd", builtin: true, active: true }],
+      officialThemes: [{
+        id: "hash-sage",
+        name: "Hash Sage",
+        officialTheme: true,
+        active: false,
+        officialThemeState: "available",
+        officialThemeBytes: 5 * 1024 * 1024,
+      }],
+      settingsAPI: {
+        installOfficialTheme: () => Promise.resolve({
+          status: "error",
+          code: "OFFICIAL_THEME_CATALOG_UNAVAILABLE",
+          message: "official theme catalog is unavailable",
+        }),
+      },
+    });
+    harness.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    harness.content.querySelector(".theme-official-download-btn").dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(toasts.length, 1);
+    assert.strictEqual(toasts[0].message, harness.core.helpers.t("toastOfficialThemeCatalogUnavailable"));
+    assert.ok(!toasts[0].message.includes("official theme catalog is unavailable"));
+    assert.strictEqual(toasts[0].options.error, true);
+  });
+
+  it("keeps the generic install-failure copy for other error codes", async () => {
+    const toasts = [];
+    const harness = loadThemeTabForTest({
+      themes: [{ id: "clawd", name: "Clawd", builtin: true, active: true }],
+      officialThemes: [{
+        id: "hash-sage",
+        name: "Hash Sage",
+        officialTheme: true,
+        active: false,
+        officialThemeState: "available",
+        officialThemeBytes: 5 * 1024 * 1024,
+      }],
+      settingsAPI: {
+        installOfficialTheme: () => Promise.resolve({
+          status: "error",
+          code: "OFFICIAL_THEME_INSTALL_FAILED",
+          message: "boom",
+        }),
+      },
+    });
+    harness.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    harness.content.querySelector(".theme-official-download-btn").dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(toasts.length, 1);
+    assert.strictEqual(toasts[0].message, harness.core.helpers.t("toastOfficialThemeInstallFailed")("boom"));
+  });
+
+  it("localizes a catalog-unavailable card error instead of showing the English message", () => {
+    const { content, core } = loadThemeTabForTest({
+      themes: [{ id: "clawd", name: "Clawd", builtin: true, active: true }],
+      officialThemes: [{
+        id: "hash-sage",
+        name: "Hash Sage",
+        officialTheme: true,
+        active: false,
+        officialThemeState: "error",
+        officialThemeError: {
+          code: "OFFICIAL_THEME_CATALOG_UNAVAILABLE",
+          message: "official theme catalog is unavailable",
+        },
+      }],
+    });
+    const note = content.querySelector(".theme-official-note");
+    assert.ok(note);
+    assert.strictEqual(note.textContent, core.helpers.t("toastOfficialThemeCatalogUnavailable"));
+    assert.ok(!collectText(content).includes("official theme catalog is unavailable"));
+  });
+
+  it("shows a retry banner when the official catalog is offline without hiding installed cards", () => {
+    const { content } = loadThemeTabForTest({
+      themes: [{ id: "clawd", name: "Clawd", builtin: true, active: true }],
+      officialCatalogStatus: "offline",
+      officialThemes: [
+        {
+          id: "hash-sage",
+          name: "Hash Sage",
+          officialTheme: true,
+          active: false,
+          officialThemeState: "installed",
+          officialThemeInstalledVersion: "1.0.0",
+          officialThemeCanUninstall: true,
+        },
+      ],
+    });
+    const banner = content.querySelector(".theme-official-offline-banner");
+    assert.ok(banner);
+    assert.ok(content.querySelector(".theme-official-offline-retry"));
+    assert.ok(content.querySelector(".theme-uninstall-btn"));
+    assert.strictEqual(content.querySelector(".theme-official-offline-note"), null);
+  });
+
+  it("keeps the official section with a no-list banner when the offline catalog returned nothing", () => {
+    const { content, core } = loadThemeTabForTest({
+      themes: [{ id: "clawd", name: "Clawd", builtin: true, active: true }],
+      officialCatalogStatus: "invalid",
+      officialThemes: [],
+    });
+    const banner = content.querySelector(".theme-official-offline-banner");
+    assert.ok(banner);
+    assert.strictEqual(
+      content.querySelector(".theme-official-offline-retry").textContent,
+      core.helpers.t("themeOfficialRetry"),
+    );
+    assert.strictEqual(
+      content.querySelector(".theme-official-offline-message").textContent,
+      core.helpers.t("themeOfficialOfflineNoList"),
+    );
+  });
+
+  it("renders Codex Pet atlas previews with V1, V2, and legacy grid ratios", () => {    const { content } = loadThemeTabForTest({
       themes: [
         {
           id: "pet-v1",
@@ -12230,6 +14087,8 @@ describe("settings renderer browser environment", () => {
       .find((button) => collectText(findAncestorByClass(button, "theme-card")).includes("Cloudling"));
     assert.ok(cloudlingButton);
 
+    harness.content.scrollTop = 211;
+    cloudlingButton.focus();
     cloudlingButton.dispatchEvent({ type: "click" });
     assert.deepStrictEqual(
       JSON.parse(JSON.stringify(harness.commands)),
@@ -12247,7 +14106,17 @@ describe("settings renderer browser environment", () => {
     assert.ok(harness.content.querySelector(".pet-accessory-select"));
     assert.strictEqual(harness.content.querySelector(".pet-tint-select"), null);
     assert.strictEqual(harness.content.querySelector(".theme-grid"), null);
+    assert.strictEqual(harness.content.scrollTop, 0);
+    assert.strictEqual(harness.core.state.activeTab, "theme");
+    assert.strictEqual(harness.content.querySelector(".theme-detail-back").focused, true);
     assert.strictEqual(listThemesCalls, 0, "opening details should not depend on a second theme fetch");
+
+    harness.content.querySelector(".theme-detail-back").dispatchEvent({ type: "click" });
+    const restoredCloudlingButton = harness.content.querySelectorAll(".theme-customize-btn")
+      .find((button) => collectText(findAncestorByClass(button, "theme-card")).includes("Cloudling"));
+    assert.strictEqual(harness.content.scrollTop, 211);
+    assert.strictEqual(restoredCloudlingButton.focused, true);
+    assert.strictEqual(restoredCloudlingButton.focusOptions.preventScroll, true);
   });
 
   it("does not open stale customization when the activated runtime disables it", async () => {
@@ -12380,6 +14249,81 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(harness.content.querySelectorAll(".theme-card").length, 1);
   });
 
+  it("does not let a pending official catalog block the local theme first paint", async () => {
+    let resolveOfficial;
+    const officialPending = new Promise((resolve) => { resolveOfficial = resolve; });
+    const localThemes = [{ id: "clawd", name: "Clawd", builtin: true, active: true }];
+    const harness = loadThemeTabForTest({
+      themes: localThemes,
+      settingsAPI: {
+        listThemes: () => Promise.resolve(localThemes),
+        listOfficialThemes: () => officialPending,
+      },
+    });
+
+    let settled = false;
+    let result = null;
+    harness.core.ops.fetchThemes().then((themes) => {
+      settled = true;
+      result = themes;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.strictEqual(settled, true);
+    assert.deepStrictEqual(result, localThemes);
+
+    resolveOfficial({ status: "ok", catalogStatus: "ok", catalogVersion: 1, themes: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  it("does not re-enter theme fetching when the official catalog wins the first-paint race", async () => {
+    let resolveLocal;
+    const localThemes = [{ id: "clawd", name: "Clawd", builtin: true, active: true }];
+    const localPending = new Promise((resolve) => { resolveLocal = resolve; });
+    let localCalls = 0;
+    let officialCalls = 0;
+    const harness = loadThemeTabForTest({
+      themes: [],
+      settingsAPI: {
+        listThemes: () => {
+          localCalls += 1;
+          return localPending;
+        },
+        listOfficialThemes: () => {
+          officialCalls += 1;
+          return Promise.resolve({ status: "ok", catalogStatus: "ok", catalogVersion: 1, themes: [] });
+        },
+      },
+    });
+    let requestedRenders = 0;
+    harness.core.ops.installRenderHooks({
+      content: () => {
+        requestedRenders += 1;
+        harness.renderContent();
+      },
+    });
+    harness.core.runtime.themeList = null;
+    harness.renderContent();
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.strictEqual(localCalls, 1);
+    assert.strictEqual(officialCalls, 1);
+    assert.strictEqual(requestedRenders, 0, "official completion must not render before local themes settle");
+
+    resolveLocal(localThemes);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.strictEqual(localCalls, 1);
+    assert.strictEqual(officialCalls, 1);
+    assert.strictEqual(requestedRenders, 1);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.core.runtime.themeList)), localThemes);
+  });
+
   it("opens the active pet detail and saves color independently for that theme", async () => {
     const harness = loadThemeTabForTest({
       themes: [
@@ -12418,13 +14362,20 @@ describe("settings renderer browser environment", () => {
       ],
     });
 
-    harness.content.querySelector(".theme-customize-btn").dispatchEvent({ type: "click" });
+    harness.content.scrollTop = 173;
+    const customizeButton = harness.content.querySelector(".theme-customize-btn");
+    customizeButton.focus();
+    customizeButton.dispatchEvent({ type: "click" });
     assert.ok(harness.content.querySelector(".theme-detail-back"));
     assert.ok(harness.content.querySelector(".theme-detail-hero"));
     assert.strictEqual(harness.content.querySelectorAll(".theme-customization-row").length, 4);
     assert.strictEqual(harness.content.querySelector(".theme-grid"), null);
+    assert.strictEqual(harness.content.scrollTop, 0);
+    assert.strictEqual(harness.content.querySelector(".theme-detail-back").focused, true);
+    assert.strictEqual(harness.content.querySelector(".theme-detail-back").focusOptions.preventScroll, true);
 
     const select = harness.content.querySelector(".pet-tint-select");
+    assert.strictEqual(select.classList.contains("viewport-fixed"), true);
     assert.strictEqual(getSelectedPickerValue(select), "matcha");
     assert.deepStrictEqual(
       select.querySelectorAll(".language-picker-option").map((option) => option.textContent),
@@ -12450,6 +14401,7 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(select.classList.contains("pending"), false);
 
     const accessorySelect = harness.content.querySelector(".pet-accessory-select");
+    assert.strictEqual(accessorySelect.classList.contains("viewport-fixed"), true);
     assert.strictEqual(getSelectedPickerValue(accessorySelect), "wizard-hat");
     assert.deepStrictEqual(
       accessorySelect.querySelectorAll(".language-picker-option").map((option) => option.textContent),
@@ -12518,6 +14470,39 @@ describe("settings renderer browser environment", () => {
     harness.content.querySelector(".theme-detail-back").dispatchEvent({ type: "click" });
     assert.ok(harness.content.querySelector(".theme-grid"));
     assert.strictEqual(harness.content.querySelector(".theme-detail-hero"), null);
+    assert.strictEqual(harness.content.scrollTop, 173);
+    const restoredCustomizeButton = harness.content.querySelector(".theme-customize-btn");
+    assert.strictEqual(restoredCustomizeButton.focused, true);
+    assert.strictEqual(restoredCustomizeButton.focusOptions.preventScroll, true);
+  });
+
+  it("resolves holiday switch labels for theme directory names containing spaces", () => {
+    for (const themeId of ["clawd", "pixel-cat", "pixel cat"]) {
+      const harness = loadThemeTabForTest({
+        themes: [{
+          id: themeId,
+          name: "Test pet",
+          builtin: themeId === "clawd",
+          active: true,
+          capabilities: { accessories: true },
+        }],
+      });
+      harness.content.querySelector(".theme-customize-btn").dispatchEvent({ type: "click" });
+      const row = harness.content.querySelector(".holiday-accessory-row");
+      const sw = row.querySelector(".holiday-accessory-switch");
+      for (const [attribute, labelKey] of [
+        ["aria-labelledby", "rowHolidayAccessory"],
+        ["aria-describedby", "themeHolidayAccessoryDesc"],
+      ]) {
+        const refs = (sw.getAttribute(attribute) || "").trim().split(/[\t\n\f\r ]+/);
+        const text = refs.map((ref) => {
+          const targets = row.querySelectorAll("span").filter((element) => element.id === ref);
+          assert.strictEqual(targets.length, 1, `${themeId}: ${attribute} must resolve each ID reference`);
+          return targets[0].textContent;
+        }).join(" ");
+        assert.strictEqual(text, harness.core.helpers.t(labelKey), `${themeId}: ${attribute}`);
+      }
+    }
   });
 
   it("patches theme customization broadcasts in place without replacing the detail view", () => {
@@ -12739,8 +14724,11 @@ describe("settings renderer browser environment", () => {
     input.value = "sk-renderer-secret";
     connectPrimary[0].dispatchEvent({ type: "click", stopPropagation() {} });
     assert.strictEqual(input.value, "", "the DOM must drop the key immediately after submission");
+    assert.strictEqual(connectPrimary[0].classList.contains("pending"), true);
+    assert.strictEqual(connectPrimary[0].getAttribute("aria-busy"), "true");
     await flush();
     assert.strictEqual(connectedKey, "sk-renderer-secret");
+    assert.strictEqual(connectPrimary[0].classList.contains("pending"), false);
     assert.strictEqual(
       genericCommands.some((call) => JSON.stringify(call).includes("sk-renderer-secret")),
       false,
@@ -12759,9 +14747,16 @@ describe("settings renderer browser environment", () => {
     // The password field only appears after opting into the replace flow.
     const replaceToggle = primaryRow.querySelectorAll("button")
       .find((button) => button.classList.contains("quiet"));
+    assert.strictEqual(replaceToggle.getAttribute("aria-pressed"), "false");
     replaceToggle.dispatchEvent({ type: "click", stopPropagation() {} });
     assert.strictEqual(replacePanel.hidden, false);
+    assert.strictEqual(replaceToggle.getAttribute("aria-pressed"), "true");
     assert.ok(replacePanel.querySelector(".kimi-quota-key-input"));
+    const replaceCancel = replacePanel.querySelectorAll("button")
+      .find((button) => button.textContent === "kimiQuotaCancel");
+    replaceCancel.dispatchEvent({ type: "click", stopPropagation() {} });
+    assert.strictEqual(replacePanel.hidden, true);
+    assert.strictEqual(replaceToggle.getAttribute("aria-pressed"), "false");
 
     // Destructive / low-frequency actions live in the separated danger zone,
     // each with its own consequence note — never beside Refresh.
@@ -12879,15 +14874,20 @@ describe("settings renderer browser environment", () => {
 
     // Losing the executable no longer moves the agent out of Connected, so the
     // row itself has to report it.
-    harness.core.runtime.agentInstallationHints = {
-      checkedAt: 2,
-      agents: [],
-      customAgents: [{ agentId: id, detectedInstalled: false, confidence: "high" }],
-      customTools: [],
-      skippedAgentIds: [],
+    const showUnavailableReason = (reason, checkedAt) => {
+      harness.core.runtime.agentInstallationHints = {
+        checkedAt,
+        agents: [],
+        customAgents: [{ agentId: id, detectedInstalled: false, confidence: "low", reason }],
+        customTools: [],
+        skippedAgentIds: [],
+      };
+      harness.core.ops.requestRender({ content: true });
+      harness.raf.flush();
+      return harness.content.querySelector(".agent-section-connected .custom-missing");
     };
-    harness.core.ops.requestRender({ content: true });
-    harness.raf.flush();
+
+    const missing = showUnavailableReason("not-found", 2);
 
     const stillConnected = harness.content.querySelector(".agent-section-connected");
     assert.deepStrictEqual(
@@ -12895,9 +14895,10 @@ describe("settings renderer browser environment", () => {
       ["Nova AI", "QoderWork"],
       "a vanished executable must not evict the agent from Connected"
     );
-    const missing = stillConnected.querySelector(".custom-missing");
     assert.ok(missing, "the row reports the missing executable");
     assert.strictEqual(missing.textContent, "Path missing");
+    assert.strictEqual(showUnavailableReason("not-executable", 3).textContent, "Not executable");
+    assert.strictEqual(showUnavailableReason("not-file", 4).textContent, "Not a file");
   });
 
   it("renders Custom AI detection under one manual folder picker", () => {
@@ -13070,7 +15071,7 @@ describe("settings renderer browser environment", () => {
     const subtabs = harness.content.querySelector(".agents-subtabs");
     assert.ok(subtabs, "the Agents tab should render a subtab switcher");
     const pills = subtabs.querySelectorAll(".segmented button");
-    assert.deepStrictEqual(pills.map((pill) => pill.textContent), ["Connected", "Discover and add"]);
+    assert.deepStrictEqual(pills.map((pill) => pill._textContent), ["Connected", "Discover and add"]);
     assert.strictEqual(pills[0].classList.contains("active"), true);
     assert.strictEqual(pills[0].getAttribute("aria-selected"), "true");
     // The badge counts what can be acted on now, not the whole catalog.
@@ -13820,6 +15821,54 @@ describe("settings renderer browser environment", () => {
     assert.notStrictEqual(toasts[0].options.error, true);
   });
 
+  it("restores an Agent integration action after a failed shared pending state", async () => {
+    const commandDeferred = createDeferred();
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: { "qwen-code": { integrationInstalled: false, enabled: false } },
+        customApplications: [],
+        customToolDiscoveryPaths: [],
+        dismissedAgentCleanupHints: {},
+        dismissedAgentInstallHints: {},
+      },
+      agentMetadata: [{
+        id: "qwen-code",
+        name: "Qwen Code",
+        eventSource: "hook",
+        capabilities: {},
+      }],
+      settingsAPI: {
+        command: () => commandDeferred.promise,
+      },
+    });
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1,
+      agents: [],
+      customAgents: [],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+
+    const button = harness.content.querySelector(".agent-integration-action");
+    assert.ok(button);
+    assert.equal(button.querySelector(".settings-button-label").textContent, "Install");
+    button.dispatchEvent({ type: "click", bubbles: false });
+    assert.equal(button.disabled, true);
+    assert.equal(button.classList.contains("pending"), true);
+    assert.equal(button.getAttribute("aria-busy"), "true");
+
+    commandDeferred.resolve({ status: "error", message: "install failed" });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(button.disabled, false);
+    assert.equal(button.classList.contains("pending"), false);
+    assert.equal(button.getAttribute("aria-busy"), "false");
+    assert.equal(button.querySelector(".settings-button-label").textContent, "Install");
+  });
+
   it("shows a non-error toast when a manual agent install is skipped", async () => {
     const toasts = [];
     const harness = loadAgentsTabForTest({
@@ -14048,7 +16097,23 @@ describe("settings renderer browser environment", () => {
     );
   });
 
-  it("disables the Codex Permissions switch in place when Permission mode changes to Native", () => {
+  it("General exposes the Codex approval owner and links to its Agents control", () => {
+    for (const mode of ["auto", "intercept"]) {
+      const harness = loadGeneralTabForTest({ snapshot: { agents: { codex: {
+        integrationInstalled: true, enabled: true, permissionMode: mode } } } });
+      harness.renderContent();
+      const row = harness.content.querySelector(".codex-approval-owner-row");
+      assert.ok(row);
+      assert.ok(row.querySelector(".row-desc").textContent.includes(mode === "auto" ? "Auto" : "Intercept"));
+      const selected = [];
+      harness.core.ops.selectTab = (tab) => selected.push(tab);
+      row.querySelector("button").dispatchEvent({ type: "click" });
+      assert.deepStrictEqual(selected, ["agents"]);
+      assert.strictEqual(harness.core.runtime.agentsSubtab, "connected");
+    }
+  });
+
+  it("keeps manual Codex Permissions available when switching to Auto", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {
         agents: {
@@ -14101,9 +16166,9 @@ describe("settings renderer browser environment", () => {
       .find((meta) => meta.agentId === "codex" && meta.flag === "permissionsEnabled");
     assert.ok(permissionsSwitch, "Codex Permissions switch should stay mounted");
     assert.strictEqual(harness.getContentRenderCount(), before);
-    assert.strictEqual(permissionsSwitch.element.classList.contains("disabled"), true);
-    assert.strictEqual(permissionsSwitch.element.attributes["aria-disabled"], "true");
-    assert.strictEqual(permissionsSwitch.element.attributes.tabindex, "-1");
+    assert.strictEqual(permissionsSwitch.element.classList.contains("disabled"), false);
+    assert.strictEqual(permissionsSwitch.element.attributes["aria-disabled"], "false");
+    assert.strictEqual(permissionsSwitch.element.attributes.tabindex, "0");
   });
 
   it("enables the Codex native sound switch only in Native permission mode", () => {
@@ -14499,13 +16564,13 @@ describe("settings renderer browser environment", () => {
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     assert.ok(animMapSource.includes("state.transientUiState.animMapSwitches"));
     assert.ok(animMapSource.includes("state.mountedControls.animMapSwitches"));
-    assert.ok(animMapSource.includes("helpers.attachAnimatedSwitch(sw, {"));
+    assert.ok(animMapSource.includes("helpers.attachOptimisticSwitch(switchControl, {"));
     assert.ok(animMapSource.includes('command("setThemeOverrideDisabled"'));
     assert.ok(!animMapSource.includes("helpers.attachActivation(sw"));
     assert.ok(animMapSource.includes("function renderMapSubtab(parent)"));
     assert.ok(animMapSource.includes("function patchMapInPlace(changes)"));
     assert.ok(animMapSource.includes('Object.prototype.hasOwnProperty.call(changes, "themeOverrides")'));
-    assert.ok(animMapSource.includes("helpers.setSwitchVisual(meta.element, readAnimMapVisualOn(meta.themeId, meta.stateKey), { pending: false });"));
+    assert.ok(animMapSource.includes("meta.control.setState({"));
     // Folded in: the Animation & Sound Overrides tab renders + patches the map subtab.
     assert.ok(overridesSource.includes("ClawdSettingsTabAnimMap.renderMapSubtab"));
     assert.ok(overridesSource.includes("ClawdSettingsTabAnimMap.patchMapInPlace"));
@@ -14594,7 +16659,13 @@ describe("settings renderer browser environment", () => {
     const sw = new FakeElement("div");
     sw.className = "switch on";
     harness.content.appendChild(sw);
+    const control = harness.core.helpers.buildSwitch({
+      element: sw,
+      checked: true,
+      ariaLabel: "Error animation",
+    });
     harness.core.state.mountedControls.animMapSwitches.set("clawd:error", {
+      control,
       element: sw,
       themeId: "clawd",
       stateKey: "error",
@@ -14638,7 +16709,13 @@ describe("settings renderer browser environment", () => {
     const sw = new FakeElement("div");
     sw.className = "switch on";
     harness.content.appendChild(sw);
+    const control = harness.core.helpers.buildSwitch({
+      element: sw,
+      checked: true,
+      ariaLabel: "Error animation",
+    });
     harness.core.state.mountedControls.animMapSwitches.set("clawd:error", {
+      control,
       element: sw,
       themeId: "clawd",
       stateKey: "error",
@@ -14704,7 +16781,13 @@ describe("settings renderer browser environment", () => {
     const sw = new FakeElement("div");
     sw.className = "switch on";
     harness.content.appendChild(sw);
+    const control = harness.core.helpers.buildSwitch({
+      element: sw,
+      checked: true,
+      ariaLabel: "Error animation",
+    });
     harness.core.state.mountedControls.animMapSwitches.set("clawd:error", {
+      control,
       element: sw,
       themeId: "clawd",
       stateKey: "error",

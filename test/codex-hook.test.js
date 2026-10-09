@@ -22,6 +22,9 @@ const {
   startClawdAndWait,
 } = require("../hooks/codex-hook");
 const { readCodexThreadName } = require("../hooks/codex-session-index");
+const {
+  CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+} = require("../hooks/codex-internal-worker");
 const { CODEX_WINDOWS_STABLE_ARG, CODEX_WSL_INTEROP_ARG } = require("../hooks/server-config");
 
 const mockResolve = () => ({
@@ -61,6 +64,20 @@ function withTempCodexIndex(lines, fn) {
 }
 
 describe("Codex official hook", () => {
+  // A developer running these tests from a Codex Desktop terminal inherits
+  // CODEX_INTERNAL_ORIGINATOR_OVERRIDE. Most hooks here pass no env and no
+  // transcript, so clear it around the suite; client-ephemeral tests pass the
+  // variable explicitly through options.
+  let savedOriginatorOverride;
+  before(() => {
+    savedOriginatorOverride = process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
+    delete process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
+  });
+  after(() => {
+    if (savedOriginatorOverride === undefined) delete process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
+    else process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE = savedOriginatorOverride;
+  });
+
   it("applies a matching native Windows sidecar atomically", () => {
     const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hook-sidecar-"));
     const stableDir = path.join(codexHome, "clawd-hooks");
@@ -151,6 +168,19 @@ describe("Codex official hook", () => {
     assert.strictEqual(normalizeCodexSessionId("official-session", "/tmp/rollout.jsonl"), "codex:official-session");
   });
 
+  it("uses the parent thread id for Codex Desktop turn-suffixed rollouts", () => {
+    const transcriptPath = "/tmp/rollout-2026-09-01T09-35-17-01a04e10-d510-7be1-9577-ba8145e64c2c_01a05a9b-3a56-7af3-b0c3-d599832f7b06.jsonl";
+
+    assert.strictEqual(
+      extractCodexSessionIdFromTranscriptPath(transcriptPath),
+      "01a04e10-d510-7be1-9577-ba8145e64c2c"
+    );
+    assert.strictEqual(
+      normalizeCodexSessionId("official-session", transcriptPath),
+      "codex:01a04e10-d510-7be1-9577-ba8145e64c2c"
+    );
+  });
+
   it("builds SessionStart state payloads", () => {
     const body = buildStateBody({
       hook_event_name: "SessionStart",
@@ -176,6 +206,49 @@ describe("Codex official hook", () => {
     assert.strictEqual(body.agent_pid, 456);
     assert.strictEqual(body.editor, "code");
     assert.deepStrictEqual(body.pid_chain, [789, 456, 123]);
+  });
+
+  for (const event of ["PreCompact", "PostCompact"]) {
+    for (const trigger of ["auto", "manual"]) {
+      it(`reports ${trigger} ${event} as sweeping without completing the turn`, async () => {
+        const payload = {
+          hook_event_name: event, session_id: "compact-start",
+          turn_id: "compact-turn", cwd: "/repo", transcript_path: null, trigger,
+        };
+        const posted = [];
+        const result = await runCodexHook(payload, {
+          platform: "linux", env: {},
+          createPidResolver: () => mockResolve,
+          postState(body, _options, callback) {
+            posted.push(JSON.parse(body));
+            callback(true, 23333);
+          },
+        });
+        assert.strictEqual(posted.length, 1);
+        assert.strictEqual(posted[0].event, event);
+        assert.strictEqual(posted[0].state, "sweeping");
+        assert.strictEqual(posted[0].turn_id, "compact-turn");
+        assert.strictEqual(posted[0].session_id, "codex:compact-start");
+        assert.strictEqual(posted[0].hook_source, "codex-official");
+        assert.ok(!Object.hasOwn(posted[0], "assistant_last_output"));
+        assert.strictEqual(result.stdout, "");
+        assert.strictEqual(require("../agents/codex").eventMap[event], "sweeping");
+      });
+    }
+  }
+
+  it("reports official Interrupt as idle without a completion or approval decision", async () => {
+    const posted = [];
+    const result = await runCodexHook({ hook_event_name: "Interrupt", session_id: "interrupted",
+      turn_id: "T1", cwd: "/repo", transcript_path: null }, {
+      platform: "linux", env: {}, createPidResolver: () => mockResolve,
+      postState(body, _options, callback) { posted.push(JSON.parse(body)); callback(true, 23333); },
+    });
+    assert.equal(posted[0].event, "Interrupt");
+    assert.equal(posted[0].state, "idle");
+    assert.equal(posted[0].turn_id, "T1");
+    assert.equal(result.stdout, "");
+    assert.equal(require("../agents/codex").eventMap.Interrupt, "idle");
   });
 
   it("includes foreground WT HWND only on foreground-safe state events", () => {
@@ -286,6 +359,45 @@ describe("Codex official hook", () => {
     assert.strictEqual(body.state, "idle");
     assert.strictEqual(body.event, "Stop");
     assert.strictEqual(body.stop_hook_active, false);
+  });
+
+  it("issue #1073 follow-up: reports SessionEnd as sleeping with an end lifecycle and no cold start", async () => {
+    const posted = [];
+    let lifecycle = null;
+    let autoStarts = 0;
+    let gateReads = 0;
+    const result = await runCodexHook({
+      hook_event_name: "SessionEnd",
+      session_id: "s1",
+      reason: "other",
+      cwd: "/repo",
+    }, {
+      env: {},
+      resolveWslDistro: () => null,
+      resolvePid(input) {
+        lifecycle = input.lifecycle;
+        return mockResolve();
+      },
+      readCodexAutoStartGate() {
+        gateReads += 1;
+        return true;
+      },
+      postState(body, _options, callback) {
+        posted.push(JSON.parse(body));
+        callback(false, null);
+      },
+      async runAutoStart() {
+        autoStarts += 1;
+      },
+    });
+
+    assert.strictEqual(posted.length, 1);
+    assert.strictEqual(posted[0].state, "sleeping");
+    assert.strictEqual(posted[0].event, "SessionEnd");
+    assert.strictEqual(lifecycle, "end");
+    assert.strictEqual(gateReads, 0);
+    assert.strictEqual(autoStarts, 0);
+    assert.strictEqual(result.posted, false);
   });
 
   it("extracts the latest Codex assistant text without tool or reasoning records", () => {
@@ -927,6 +1039,635 @@ describe("Codex official hook", () => {
     assert.strictEqual(postedOptions[1].runtimePort, 23335);
     assert.strictEqual(postedOptions[1].windowsProcessChain.runtimeObservation.agentMode, "b1a-authoritative");
     assert.strictEqual(result.posted, true);
+  });
+
+  describe("issue #1073: internal memory consolidation worker", () => {
+    const EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
+
+    async function withMemoriesHome(fn) {
+      const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-memories-"));
+      try {
+        return await fn(codexHome);
+      } finally {
+        fs.rmSync(codexHome, { recursive: true, force: true });
+      }
+    }
+
+    function workerPayload(event, codexHome, extra = {}) {
+      return {
+        hook_event_name: event,
+        session_id: "s1",
+        cwd: path.join(codexHome, "memories"),
+        ...extra,
+      };
+    }
+
+    const WINDOWS_CODEX_HOME = "C:\\Users\\Tester\\.codex";
+
+    async function expectDropped(event, options, extraPayload = {}) {
+      const calls = {
+        posts: 0,
+        autoStarts: 0,
+        gates: 0,
+        resolves: 0,
+        identities: 0,
+        processChains: 0,
+      };
+      const probe = (name) => () => {
+        calls[name] += 1;
+        throw new Error(`${name} must not run for a worker event`);
+      };
+      const result = await runCodexHook({
+        hook_event_name: event,
+        session_id: "s1",
+        ...extraPayload,
+      }, {
+        resolveWslDistro: () => null,
+        readCodexAutoStartGate: probe("gates"),
+        resolvePid: probe("resolves"),
+        readRuntimeIdentity: probe("identities"),
+        readWindowsProcessChainHookContext: probe("processChains"),
+        postState() {
+          calls.posts += 1;
+        },
+        postPermission() {
+          throw new Error("permission path must not run for state events");
+        },
+        async runAutoStart() {
+          calls.autoStarts += 1;
+        },
+        ...options,
+      });
+
+      assert.deepStrictEqual(result, { body: null, posted: false, stdout: "" });
+      assert.deepStrictEqual(calls, {
+        posts: 0,
+        autoStarts: 0,
+        gates: 0,
+        resolves: 0,
+        identities: 0,
+        processChains: 0,
+      });
+    }
+
+    for (const event of EVENTS) {
+      it(`drops a ${event} win32 worker event without touching any downstream path`, async () => {
+        await expectDropped(event, {
+          env: { CODEX_HOME: WINDOWS_CODEX_HOME },
+          platform: "win32",
+        }, {
+          cwd: `${WINDOWS_CODEX_HOME}\\memories`,
+        });
+      });
+    }
+
+    for (const event of EVENTS) {
+      it(`drops a ${event} worker event on the host platform without touching any downstream path`, async () => {
+        await withMemoriesHome(async (codexHome) => {
+          await expectDropped(event, { env: { CODEX_HOME: codexHome } }, {
+            cwd: path.join(codexHome, "memories"),
+          });
+        });
+      });
+    }
+
+    it("passes the platform option through to the worker detector", async () => {
+      await expectDropped("PreToolUse", {
+        env: { CODEX_HOME: WINDOWS_CODEX_HOME },
+        platform: "win32",
+      }, {
+        cwd: "c:/users/tester/.CODEX/memories",
+      });
+    });
+
+    it("does not resolve a relative CODEX_HOME against the hook process cwd", async () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "codex-memories-cwd-"));
+      const memoriesDir = path.join(base, "proj", "memories");
+      fs.mkdirSync(memoriesDir, { recursive: true });
+      const originalCwd = process.cwd();
+      process.chdir(memoriesDir);
+      try {
+        let posts = 0;
+        const result = await runCodexHook({
+          hook_event_name: "PreToolUse",
+          session_id: "s1",
+          cwd: process.cwd(),
+        }, {
+          env: { CODEX_HOME: ".." },
+          resolvePid: mockResolve,
+          postState(_body, _options, callback) {
+            posts += 1;
+            callback(true, 23333);
+          },
+          async runAutoStart() { throw new Error("unexpected auto-start"); },
+        });
+
+        assert.strictEqual(posts, 1, "an ordinary project directory must still post");
+        assert.strictEqual(result.posted, true);
+      } finally {
+        process.chdir(originalCwd);
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it("still posts for a real session under a CODEX_HOME containing a parent segment", async () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "codex-memories-dotdot-"));
+      const target = path.join(base, "target");
+      const sub = path.join(target, "sub");
+      const link = path.join(base, "link");
+      const memoriesDir = path.join(base, "memories");
+      fs.mkdirSync(sub, { recursive: true });
+      fs.mkdirSync(memoriesDir, { recursive: true });
+      fs.symlinkSync(sub, link, process.platform === "win32" ? "junction" : "dir");
+      try {
+        let posts = 0;
+        const result = await runCodexHook({
+          hook_event_name: "PreToolUse",
+          session_id: "s1",
+          cwd: memoriesDir,
+        }, {
+          env: { CODEX_HOME: `${link}${path.sep}..` },
+          resolvePid: mockResolve,
+          postState(_body, _options, callback) {
+            posts += 1;
+            callback(true, 23333);
+          },
+          async runAutoStart() { throw new Error("unexpected auto-start"); },
+        });
+
+        assert.strictEqual(posts, 1, "a real session must still post");
+        assert.strictEqual(result.posted, true);
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it("still posts the same events when cwd is an ordinary project directory", async () => {
+      await withMemoriesHome(async (codexHome) => {
+        for (const event of EVENTS) {
+          let posts = 0;
+          const result = await runCodexHook({
+            hook_event_name: event,
+            session_id: "s1",
+            cwd: path.join(codexHome, "project"),
+          }, {
+            env: { CODEX_HOME: codexHome },
+            resolvePid: mockResolve,
+            postState(_body, _options, callback) {
+              posts += 1;
+              callback(true, 23333);
+            },
+            async runAutoStart() { throw new Error("unexpected auto-start"); },
+          });
+
+          assert.strictEqual(posts, 1, `${event} must still post`);
+          assert.strictEqual(result.posted, true);
+        }
+      });
+    });
+
+    it("still posts worker-cwd events when a transcript_path is present", async () => {
+      await withMemoriesHome(async (codexHome) => {
+        let posts = 0;
+        const result = await runCodexHook(workerPayload("PreToolUse", codexHome, {
+          transcript_path: "/tmp/rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl",
+        }), {
+          env: { CODEX_HOME: codexHome },
+          resolvePid: mockResolve,
+          postState(_body, _options, callback) {
+            posts += 1;
+            callback(true, 23333);
+          },
+          async runAutoStart() { throw new Error("unexpected auto-start"); },
+        });
+
+        assert.strictEqual(posts, 1);
+        assert.strictEqual(result.posted, true);
+      });
+    });
+
+    it("still routes a worker-directory PermissionRequest through the permission path", async () => {
+      await withMemoriesHome(async (codexHome) => {
+        let permissions = 0;
+        const result = await runCodexHook({
+          hook_event_name: "PermissionRequest",
+          session_id: "s1",
+          cwd: path.join(codexHome, "memories"),
+          tool_name: "Bash",
+          tool_input: { command: "npm test" },
+        }, {
+          env: { CODEX_HOME: codexHome },
+          resolvePid: mockResolve,
+          postPermission(_body, _requestOptions, callback) {
+            permissions += 1;
+            callback(true, 23333, JSON.stringify({
+              hookSpecificOutput: {
+                hookEventName: "PermissionRequest",
+                decision: { behavior: "allow" },
+              },
+            }));
+          },
+        });
+
+        assert.strictEqual(permissions, 1, "permission requests must not be silently dropped");
+        assert.strictEqual(result.posted, true);
+      });
+    });
+  });
+
+  describe("issue #1073 follow-up: Codex desktop client ephemeral state events", () => {
+    const CLIENT_ENV = { CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "Codex" };
+    const AMBIENT_GENERATION_PROMPT = "# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex in this local project: /repo";
+    const AMBIENT_SAFETY_PROMPT = "You are an expert at upholding safety and compliance standards for Codex ambient suggestions";
+
+    async function runClientEphemeralSessionStart(options = {}) {
+      const calls = {
+        posts: 0,
+        autoStarts: 0,
+        gates: 0,
+        identities: 0,
+        processChains: 0,
+      };
+      const resolveInputs = [];
+      const probe = (name) => () => {
+        calls[name] += 1;
+        throw new Error(`${name} must not run for a client ephemeral SessionStart`);
+      };
+      const result = await runCodexHook({
+        hook_event_name: "SessionStart",
+        session_id: "s1",
+        cwd: "/repo",
+      }, {
+        env: CLIENT_ENV,
+        platform: "linux",
+        resolveWslDistro: () => null,
+        readCodexAutoStartGate: probe("gates"),
+        resolvePid(input) {
+          resolveInputs.push(input);
+          return mockResolve();
+        },
+        readRuntimeIdentity: probe("identities"),
+        readWindowsProcessChainHookContext: probe("processChains"),
+        postState() {
+          calls.posts += 1;
+        },
+        postPermission() {
+          throw new Error("permission path must not run for state events");
+        },
+        async runAutoStart() {
+          calls.autoStarts += 1;
+        },
+        ...options,
+      });
+      return { result, calls, resolveInputs };
+    }
+
+    it("issue #1073 follow-up: prewarms the process cache for a dropped client SessionStart", async () => {
+      const { result, calls, resolveInputs } = await runClientEphemeralSessionStart();
+
+      assert.deepStrictEqual(result, { body: null, posted: false, stdout: "" });
+      assert.strictEqual(resolveInputs.length, 1, "the dropped SessionStart must resolve the process once");
+      assert.strictEqual(resolveInputs[0].lifecycle, "start");
+      assert.strictEqual(resolveInputs[0].cacheable, true);
+      assert.deepStrictEqual(calls, {
+        posts: 0,
+        autoStarts: 0,
+        gates: 0,
+        identities: 0,
+        processChains: 0,
+      });
+    });
+
+    it("issue #1073 follow-up: prewarms with the same resolver ctx as a normal SessionStart", async () => {
+      const captureResolveCtx = async (env) => {
+        const inputs = [];
+        await runCodexHook({
+          hook_event_name: "SessionStart",
+          session_id: "s1",
+          cwd: "/repo",
+        }, {
+          env,
+          platform: "linux",
+          resolveWslDistro: () => null,
+          resolvePid(input) {
+            inputs.push(input);
+            return mockResolve();
+          },
+          postState(_body, _options, callback) {
+            callback(true, 23333);
+          },
+          async runAutoStart() { throw new Error("unexpected auto-start"); },
+        });
+        return inputs;
+      };
+
+      const clientInputs = await captureResolveCtx(CLIENT_ENV);
+      const normalInputs = await captureResolveCtx({});
+      assert.strictEqual(clientInputs.length, 1);
+      assert.strictEqual(normalInputs.length, 1);
+      assert.deepStrictEqual(clientInputs[0], normalInputs[0]);
+    });
+
+    it("issue #1073 follow-up: a dropped SessionStart warms the cache the first UserPromptSubmit reads", async () => {
+      // Models the Windows contract: `start` populates the pid cache, `prompt`
+      // is cache-only. The real resolver cannot run its Windows path off win32,
+      // so this pins the lifecycle sequence and shared key the hook must produce.
+      const cache = new Map();
+      const resolve = (ctx) => {
+        const key = `${ctx.namespace}|${ctx.sessionId}|${ctx.cacheCwd}`;
+        if (ctx.lifecycle === "start") {
+          cache.set(key, { stablePid: 111, agentPid: 222 });
+          return { stablePid: 111, agentPid: 222, pidChain: [111, 222] };
+        }
+        if (ctx.lifecycle === "prompt") {
+          return cache.has(key)
+            ? { ...cache.get(key), pidChain: [111, 222] }
+            : { stablePid: null, agentPid: null, pidChain: [] };
+        }
+        return { stablePid: 111, agentPid: 222, pidChain: [111, 222] };
+      };
+
+      await runCodexHook({
+        hook_event_name: "SessionStart",
+        session_id: "s1",
+        cwd: "/repo",
+      }, {
+        env: CLIENT_ENV,
+        platform: "linux",
+        resolveWslDistro: () => null,
+        resolvePid: resolve,
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      const posted = [];
+      await runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "s1",
+        cwd: "/repo",
+        prompt: "hello from the side chat",
+      }, {
+        env: CLIENT_ENV,
+        platform: "linux",
+        resolvePid: resolve,
+        postState(body, _options, callback) {
+          posted.push(JSON.parse(body));
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posted.length, 1);
+      assert.strictEqual(posted[0].source_pid, 111);
+      assert.strictEqual(posted[0].agent_pid, 222);
+    });
+
+    for (const [name, prompt] of [
+      ["generation", "# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex in this local project: /repo"],
+      ["safety-review", "You are an expert at upholding safety and compliance standards for Codex ambient suggestions"],
+    ]) {
+      it(`issue #1073 follow-up: tags a client ${name} ambient-suggestion UserPromptSubmit without the prompt text`, async () => {
+        const posted = [];
+        const result = await runCodexHook({
+          hook_event_name: "UserPromptSubmit",
+          session_id: "s1",
+          prompt,
+        }, {
+          env: CLIENT_ENV,
+          resolvePid: mockResolve,
+          postState(body, _options, callback) {
+            posted.push(JSON.parse(body));
+            callback(true, 23333);
+          },
+          async runAutoStart() { throw new Error("unexpected auto-start"); },
+        });
+
+        assert.strictEqual(posted.length, 1);
+        assert.strictEqual(posted[0].codex_internal_thread, CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS);
+        const serialized = JSON.stringify(posted[0]);
+        assert.strictEqual(serialized.includes("hyperpersonalized"), false);
+        assert.strictEqual(serialized.includes("safety and compliance"), false);
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(posted[0], "prompt"), false);
+        assert.strictEqual(result.posted, true);
+      });
+    }
+
+    it("issue #1073 follow-up: recognizes the ambient prompt after leading whitespace", async () => {
+      const posted = [];
+      await runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "s1",
+        prompt: `\n\t  ${AMBIENT_GENERATION_PROMPT}`,
+      }, {
+        env: CLIENT_ENV,
+        resolvePid: mockResolve,
+        postState(body, _options, callback) {
+          posted.push(JSON.parse(body));
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posted.length, 1);
+      assert.strictEqual(posted[0].codex_internal_thread, CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS);
+    });
+
+    it("issue #1073 follow-up: leaves an ordinary client UserPromptSubmit untagged", async () => {
+      const posted = [];
+      await runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "s1",
+        prompt: "refactor the parser and run the tests",
+      }, {
+        env: CLIENT_ENV,
+        resolvePid: mockResolve,
+        postState(body, _options, callback) {
+          posted.push(JSON.parse(body));
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posted.length, 1);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(posted[0], "codex_internal_thread"), false);
+    });
+
+    it("issue #1073 follow-up: does not tag a prompt that only contains the ambient text", async () => {
+      const posted = [];
+      await runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "s1",
+        prompt: `please explain this line: ${AMBIENT_SAFETY_PROMPT}`,
+      }, {
+        env: CLIENT_ENV,
+        resolvePid: mockResolve,
+        postState(body, _options, callback) {
+          posted.push(JSON.parse(body));
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posted.length, 1);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(posted[0], "codex_internal_thread"), false);
+    });
+
+    it("issue #1073 follow-up: never tags a transcript-backed session that pastes the ambient prompt", async () => {
+      const posted = [];
+      await runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "s1",
+        prompt: AMBIENT_GENERATION_PROMPT,
+        transcript_path: "/tmp/rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl",
+      }, {
+        env: CLIENT_ENV,
+        resolvePid: mockResolve,
+        postState(body, _options, callback) {
+          posted.push(JSON.parse(body));
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posted.length, 1);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(posted[0], "codex_internal_thread"), false);
+    });
+
+    for (const [event, promptState] of [
+      ["PreToolUse", "working"],
+      ["PostToolUse", "working"],
+      ["PreCompact", "sweeping"],
+      ["Stop", "idle"],
+    ]) {
+      it(`issue #1073 follow-up: still posts a no-transcript client ${event} (side chat)`, async () => {
+        const posted = [];
+        const result = await runCodexHook({
+          hook_event_name: event,
+          session_id: "s1",
+          tool_name: event === "PreToolUse" || event === "PostToolUse" ? "Bash" : undefined,
+        }, {
+          env: CLIENT_ENV,
+          resolvePid: mockResolve,
+          postState(body, _options, callback) {
+            posted.push(JSON.parse(body));
+            callback(true, 23333);
+          },
+          async runAutoStart() { throw new Error("unexpected auto-start"); },
+        });
+
+        assert.strictEqual(posted.length, 1);
+        assert.strictEqual(posted[0].event, event);
+        assert.strictEqual(posted[0].state, promptState);
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(posted[0], "codex_internal_thread"), false);
+        assert.strictEqual(result.posted, true);
+      });
+    }
+
+    it("issue #1073 follow-up: still posts a no-transcript client SessionStart that carries a transcript", async () => {
+      let posts = 0;
+      const result = await runCodexHook({
+        hook_event_name: "SessionStart",
+        session_id: "s1",
+        transcript_path: "/tmp/rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl",
+      }, {
+        env: CLIENT_ENV,
+        resolvePid: mockResolve,
+        postState(_body, _options, callback) {
+          posts += 1;
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posts, 1);
+      assert.strictEqual(result.posted, true);
+    });
+
+    it("issue #1073 follow-up: still posts a no-transcript SessionStart without the client variable", async () => {
+      let posts = 0;
+      const result = await runCodexHook({
+        hook_event_name: "SessionStart",
+        session_id: "s1",
+      }, {
+        env: {},
+        resolvePid: mockResolve,
+        postState(_body, _options, callback) {
+          posts += 1;
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posts, 1);
+      assert.strictEqual(result.posted, true);
+    });
+
+    for (const originator of ["", "   "]) {
+      it(`issue #1073 follow-up: still posts a no-transcript client UserPromptSubmit when the client variable is ${JSON.stringify(originator)}`, async () => {
+        const posted = [];
+        await runCodexHook({
+          hook_event_name: "UserPromptSubmit",
+          session_id: "s1",
+          prompt: AMBIENT_GENERATION_PROMPT,
+        }, {
+          env: { CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originator },
+          resolvePid: mockResolve,
+          postState(body, _options, callback) {
+            posted.push(JSON.parse(body));
+            callback(true, 23333);
+          },
+          async runAutoStart() { throw new Error("unexpected auto-start"); },
+        });
+
+        assert.strictEqual(posted.length, 1);
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(posted[0], "codex_internal_thread"), false);
+      });
+    }
+
+    it("issue #1073 follow-up: still routes a no-transcript client PermissionRequest through permissions", async () => {
+      let permissions = 0;
+      const result = await runCodexHook({
+        hook_event_name: "PermissionRequest",
+        session_id: "s1",
+        tool_name: "Bash",
+        tool_input: { command: "npm test" },
+      }, {
+        env: CLIENT_ENV,
+        resolvePid: mockResolve,
+        postPermission(_body, _requestOptions, callback) {
+          permissions += 1;
+          callback(true, 23333, JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: "PermissionRequest",
+              decision: { behavior: "allow" },
+            },
+          }));
+        },
+      });
+
+      assert.strictEqual(permissions, 1);
+      assert.strictEqual(result.posted, true);
+    });
+
+    it("issue #1073 follow-up: still posts a no-transcript client SessionEnd", async () => {
+      const posted = [];
+      const result = await runCodexHook({
+        hook_event_name: "SessionEnd",
+        session_id: "s1",
+        reason: "other",
+      }, {
+        env: CLIENT_ENV,
+        resolvePid: mockResolve,
+        postState(body, _options, callback) {
+          posted.push(JSON.parse(body));
+          callback(true, 23333);
+        },
+        async runAutoStart() { throw new Error("unexpected auto-start"); },
+      });
+
+      assert.strictEqual(posted.length, 1);
+      assert.strictEqual(posted[0].event, "SessionEnd");
+      assert.strictEqual(result.posted, true);
+    });
   });
 
   describe("startClawdAndWait", () => {
