@@ -25,14 +25,14 @@
 </p>
 
 <p align="center">
-  <img src="assets/hero.gif" alt="Clawd on Desk のアニメーションデモ。AI コーディングエージェントの状態に合わせて、ピクセルのカニが睡眠、思考、ツール実行中のタイピング、サブエージェント 1 個ではヘッドホングルーヴ、複数では3ボールジャグリング、権限リクエストの通知、タスク完了後のお祝いへリアルタイムに切り替わります。Claude Code、Codex、Cursor、Copilot、Gemini、Antigravity、Qwen、Pi、OpenClaw などに対応しています。">
+  <img src="assets/hero.gif" alt="Clawd on Desk のアニメーションデモ。AI コーディングエージェントの状態に合わせて、ピクセルのカニが睡眠、思考、ツール実行中のタイピング、サブエージェント 1 個ではヘッドホングルーヴ、複数では3ボールジャグリング、権限リクエストの通知、タスク完了後のお祝いへリアルタイムに切り替わります。Claude Code、Codex、Cursor、Copilot、Gemini、Antigravity、Qwen、Pi、OMP、OpenClaw などに対応しています。">
 </p>
 
 Clawd はデスクトップに住むペットで、AI コーディングエージェントが今何をしているかにリアルタイムで反応します。長いタスクを開始したら席を外し、Clawd が完了を知らせたら戻ってくるだけです。
 
-プロンプトを入力すると考え、ツールが動くとタイピングし、サブエージェントが動くとヘッドホングルーヴや3ボールジャグリングになり、権限確認ではカードを表示し、タスク完了時には喜び、離席中は眠ります。組み込みテーマとして **Clawd**（ピクセルのカニ）、**Calico**（三毛猫）、**Cloudling**（云宝）を同梱し、カスタムテーマと Codex Pet アニメーションパックのインポートにも対応しています。
+プロンプトを入力すると考え、ツールが動くとタイピングし、サブエージェントが動くとヘッドホングルーヴや3ボールジャグリングになり、権限確認ではカードを表示し、タスク完了時には喜び、離席中は眠ります。組み込みテーマとして **Clawd**（ピクセルのカニ）、**Calico**（三毛猫）、**Cloudling**（云宝）を同梱し、カスタムテーマと Codex Pet アニメーションパックのインポートにも対応しています。設定 → テーマからオプションの公式テーマ **Hash Sage**（哈希仙人）と **Whale-chan**（鲸鱼娘）をダウンロードできます。
 
-> Windows 11、macOS、Ubuntu/Linux に対応しています。Windows リリースでは x64 と ARM64 のインストーラーを個別に提供します。ソースから実行するには Node.js が必要です。**Claude Code**、**Codex CLI**、**Copilot CLI**、**Gemini CLI**、**Antigravity CLI (agy)**、**Cursor Agent**、**CodeBuddy**、**WorkBuddy**、**Kiro CLI**、**Kimi Code CLI (Kimi-CLI)**、**Qwen Code**、**ZCode**、**CodeWhale**、**opencode**、**MiMo Code**、**Pi**、**OpenClaw**、**Hermes Agent**、**Qoder**、**QoderWork**、**QwenWork（千问办公）**、**Reasonix CLI**、**DeepSeek Harness** と連携します。
+> Windows 11、macOS、Ubuntu/Linux に対応しています。Windows リリースでは x64 と ARM64 のインストーラーを個別に提供します。ソースから実行するには Node.js が必要です。**Claude Code**、**Codex CLI**、**Copilot CLI**、**Gemini CLI**、**Antigravity CLI (agy)**、**Cursor Agent**、**CodeBuddy**、**WorkBuddy**、**Grok Build**、**Kiro CLI**、**Kimi Code CLI (Kimi-CLI)**、**Qwen Code**、**ZCode**、**CodeWhale**、**opencode**、**MiMo Code**、**Pi**、**OMP**、**OpenClaw**、**Hermes Agent**、**Qoder**、**QoderWork**、**QwenWork（千问办公）**、**Reasonix CLI**、**DeepSeek Harness**、**TraeCode (Trae CN)**、**MiniMax Code** と連携します。
 
 ## 機能
 
@@ -46,18 +46,25 @@ Clawd はデスクトップに住むペットで、AI コーディングエー�
 - **CodeBuddy** — `~/.codebuddy/settings.json` 経由で Claude Code 互換の command hook と HTTP permission hook に対応（Clawd 起動時に自動登録、または `node hooks/codebuddy-install.js`）
 - **カスタム HTTP Agent** — Settings で別のローカルアプリを登録し、アプリまたは adapter から Clawd の動的 `/state` エンドポイントへイベントを送信します。登録だけでは hook はインストールされず、v1 は state-only です。詳細は[カスタム HTTP Agent ガイド](docs/guides/custom-agent-http.md)を参照してください
 - **WorkBuddy** — `~/.workbuddy-ai/settings.json`（現行）または `~/.workbuddy/settings.json`（旧版）の Claude Code 互換 command hook に対応（Settings → Agents からインストール、または `node hooks/workbuddy-install.js`）。状態と Notification のみを同期し、権限判断は WorkBuddy のネイティブ GUI に残ります
+- **Grok Build** — `~/.grok/hooks/clawd-on-desk.json` に登録する任意の Claude Code 互換 command hook です（Settings → Agents からインストール、または `node hooks/grok-install.js`）。状態と通知のみを同期します。Grok には blocking `PermissionRequest` hook がないため、Allow / Deny は Grok TUI で処理します。
 - **Kiro CLI** — `~/.kiro/agents/` 配下のカスタムエージェント設定に command hook を注入。Clawd 起動時には Kiro 組み込みの `kiro_default` から再同期される `clawd` エージェントも自動作成されるため、`kiro-cli --agent clawd` または `/agent swap clawd` で挙動差を抑えながら hook を利用できます（Clawd 起動時に自動登録、または `npm run install:kiro-hooks`）。state hook は macOS と Windows で検証済みです。
 - **Kimi Code CLI (Kimi-CLI)** — `~/.kimi/config.toml` の command hook（`[[hooks]]` エントリ）に対応（Clawd 起動時に自動登録、または `npm run install:kimi-hooks`）
 - **Qwen Code** — `~/.qwen/settings.json` の command hook に対応（Clawd 起動時に自動登録、または `npm run install:qwen-hooks`）。状態追跡と Qwen `PermissionRequest` のデスクトップ権限バブルに対応します
 - **ZCode** — `~/.zcode/cli/config.json` の `hooks.events.*` に登録する、任意の状態 hook + blocking `PermissionRequest` hook（Settings → Agents から導入、または `npm run install:zcode-hooks`）。Clawd は手動 Allow / Deny バブルを表示し、global / per-session の permission automation は defer のままです。明示的な global または hook 単位の `enabled:false` を保持し、第三者の `PermissionRequest` hook がある場合は上書きしません
+- **CodeWhale** — `~/.codewhale/config.toml` の任意の状態専用 lifecycle hooks（`[[hooks.hooks]]`；Settings → Agents または `npm run install:codewhale-hooks` でインストール）。Phase 1 は状態アニメーションのみで、権限バブルやサブエージェント追跡は行いません
+- **Reasonix CLI** — `<Reasonix home>/settings.json` の任意の状態専用 command hooks（macOS/Linux: `~/.reasonix/settings.json`、Windows: `%APPDATA%\reasonix\settings.json`；Settings → Agents または `npm run install:reasonix-hooks`）。ライフサイクル、ツール、通知、圧縮、サブエージェント終了を表示し、権限決定は Reasonix に残ります
 - **opencode** — `~/.config/opencode/` 配下の有効なファイル（`config.json` → `opencode.json` → `opencode.jsonc`、後のファイルが優先）経由の任意の [plugin integration](https://opencode.ai/docs/plugins)（Settings → Agents からインストール）。遅延のないイベントストリーミングと Allow/Always/Deny 付きの権限バブルに対応します。`task` の子セッションは headless で、表示中のマルチセッションアニメーション集約には参加しません
 - **MiMo Code** — `~/.config/mimocode/mimocode.jsonc` 経由の任意の [plugin integration](https://opencode.ai/docs/plugins)（Settings → Agents からインストール、または `node hooks/mimocode-install.js`）。opencode と同じ `@mimo-ai/plugin` SDK と権限動作を共有し、`task` の子セッションも headless です
 - **Pi** — `~/.pi/agent/extensions/clawd-on-desk` のグローバル extension で連携します（Clawd 起動時に自動登録、または `npm run install:pi-extension`）。インタラクティブな Pi セッションのライフサイクルとツール活動だけを状態同期し、Pi のデフォルト YOLO 動作を維持します
+- **OMP (oh-my-pi)** — `~/.omp/agent/extensions/clawd-on-desk` の任意のグローバル extension（Settings → Agents または `npm run install:omp-extension`）。対話セッションとツールの状態のみを報告します。`session_stop` で完了候補を記録し、後続の終端 `agent_end` で extension の継続要求がないと確認してから完了します。コミュニティ bridge `clawd-on-desk-omp.ts` がある場合は保持して自身のインストールをスキップします
 - **OpenClaw** — `~/.openclaw/openclaw.json` の plugin path で state-only 連携します（OpenClaw config が既にある場合は Clawd 起動時に自動登録、または `npm run install:openclaw-plugin`）。Phase 1 はローカル `openclaw tui --local` セッションのアニメーションのみを対象とし、権限バブルやターミナルフォーカスには対応しません
 - **Hermes Agent** — Hermes の管理 plugin ディレクトリ経由の [plugin integration](https://hermes-agent.org/)（Hermes インストール済みの場合は Clawd 起動時に自動登録、または `npm run install:hermes-plugin`）。状態、セッション、SessionEnd、ターミナルフォーカスに対応
 - **Qoder** — `~/.qoder/settings.json` の command hook で state-only 連携します（`~/.qoder/` ディレクトリがある場合は Clawd 起動時に自動登録、または `npm run install:qoder-hooks`）。Phase 1 はアニメーションのみを対象とし、権限リクエストは通知として観察するだけで、Clawd は権限バブルを表示せず代わりに応答もしません。Allow / Deny は Qoder 自身の権限フローで選択します
+- **QoderWork** — `~/.qoderwork/settings.json` の任意の状態専用 command hooks（Settings → Agents または `npm run install:qoderwork-hooks`）。Phase 1 はアニメーションと Session HUD を表示し、権限イベントを作業状態として静かに観察します。Allow / Deny は QoderWork のネイティブフローに残ります
 - **QwenWork（千问办公）** — `~/.QwenWorkCN/settings.json` の command hook による hook-only / state-only 連携です（Settings → Agents から導入、または `npm run install:qwenwork-hooks`。削除は `npm run uninstall:qwenwork-hooks`）。対応プラットフォームは macOS / Windows デスクトップのみで、[qwenwork.cn/download](https://qwenwork.cn/download) に Linux クライアントはないため WSL ペアリングも提供しません。Phase 1 はアニメーションと Session HUD を駆動します。`PermissionRequest` / `PermissionDenied` は観察のみで `working` にマップされ、hook の stdout は常に `{}`、Clawd は allow/deny を返しません。権限の決定は QwenWork 自身のフローだけが行います。startup recovery はありません（デスクトップの常駐プロセスはターン実行中を意味しないため）
-- **DeepSeek Harness** — Clawd 管理の DSH in-process plugin を使う、実験的な web-profile-only 連携です。公開 session event が session ごとの順序で Clawd の状態を駆動し、公開の blocking `approval/request` は Allow Once / Deny バブルを表示できます。決定がなければ常に DSH ネイティブの web answerer に戻ります。`ask_user_question` は完全に DSH ネイティブ provider に残り、Clawd は DSH projection storage を一切読みません。詳細は [DeepSeek Harness ガイド](docs/guides/dsh-setup.md)
+- **DeepSeek Harness** — DSH の web profile と DeepSeek Harness デスクトップアプリ（macOS / Windows）に対応する、Clawd 管理の DSH in-process plugin を使った実験的な連携です。公開 session event が session ごとの順序で Clawd の状態を駆動し、公開の blocking `approval/request` は Allow Once / Deny バブルを表示できます。決定がなければ常に DSH 自身の承認フロー（web answerer、またはデスクトップアプリ自身の承認ダイアログ）に戻ります。`ask_user_question` は完全に DSH ネイティブ provider に残り、Clawd は DSH projection storage を一切読みません。詳細は [DeepSeek Harness ガイド](docs/guides/dsh-setup.md)
+- **TraeCode (Trae CN)** — `~/.trae-cn/hooks.json` を使う実験的な状態専用 hook 連携です（Settings → Agents からインストール、または `npm run install:traecode-hooks`。削除は `npm run uninstall:traecode-hooks`）。Trae 側で hooks を手動で有効化してください（**Settings → Hooks → Enable**、実行モードは **Sandbox**。詳細は [Trae 公式 hooks ドキュメント](https://docs.trae.cn/ide/automate-actions-with-hooks)）。初回リリースは Trae 中国版のみが対象です。Clawd は最初のプロンプトからセッション名を作成し、権限判断は行いません。`SessionEnd` がないため、閉じた会話はデスクトップのアイドルタイムアウトで整理されます。
+- **MiniMax Code** — `<MINIMAX_DATA_DIR または MAVIS_DATA_DIR または ~/.minimax>/plugins/clawd-state/` の実験的な状態専用ローカル plugin（Settings → Agents または `npm run install:minimax-hooks`；アンインストール: `npm run uninstall:minimax-hooks`）。mcode CLI とデスクトップアプリで `SessionEnd` を含む10個の状態イベントを報告します。handler は1–10秒に制限されるため blocking 承認はできず、`PermissionRequest` を登録せず stdout は常に `{}` です。読み込まれない場合は `mcode plugin enable clawd-state@local` または plugin パネルで有効化してください。タイトルは最初の prompt から取得して保持します
 - **複数エージェントの共存** — すべてのエージェントを同時に動かせます。Clawd は各セッションを個別に追跡します
 
 ### アニメーションと操作
@@ -152,6 +159,12 @@ Clawd はマルチモニター環境に適応します。起動したディス�
 - **Windows**: `Clawd-on-Desk-Setup-<version>-x64.exe` または `Clawd-on-Desk-Setup-<version>-arm64.exe`
 - **macOS**: `.dmg`
 - **Linux**: `.AppImage` または `.deb`
+
+macOS、または Linux x86_64 では Homebrew でもインストールできます。
+
+```bash
+brew install --cask clawd-on-desk
+```
 
 インストール後に Clawd を起動してください。対応エージェントの hook/plugin は起動時に自動同期されます。
 
@@ -368,6 +381,31 @@ Clawd をより良くしてくれたすべての方に感謝します。
     <td align="center" valign="top" width="110"><a href="https://github.com/eugenewang5425"><img src="https://github.com/eugenewang5425.png" width="50" style="border-radius:50%" /><br /><sub>eugenewang5425</sub></a></td>
     <td align="center" valign="top" width="110"><a href="https://github.com/draintovmasyan783-creator"><img src="https://github.com/draintovmasyan783-creator.png" width="50" style="border-radius:50%" /><br /><sub>draintovmasyan783-creator</sub></a></td>
     <td align="center" valign="top" width="110"><a href="https://github.com/Yueh-H"><img src="https://github.com/Yueh-H.png" width="50" style="border-radius:50%" /><br /><sub>Yueh-H</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/TalexDreamSoul"><img src="https://github.com/TalexDreamSoul.png" width="50" style="border-radius:50%" /><br /><sub>TalexDreamSoul</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/FuZoe"><img src="https://github.com/FuZoe.png" width="50" style="border-radius:50%" /><br /><sub>FuZoe</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/undefined-moe"><img src="https://github.com/undefined-moe.png" width="50" style="border-radius:50%" /><br /><sub>undefined-moe</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/pu-1205"><img src="https://github.com/pu-1205.png" width="50" style="border-radius:50%" /><br /><sub>pu-1205</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/Free-LZJ"><img src="https://github.com/Free-LZJ.png" width="50" style="border-radius:50%" /><br /><sub>Free-LZJ</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/easyhak"><img src="https://github.com/easyhak.png" width="50" style="border-radius:50%" /><br /><sub>easyhak</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/jlimcode"><img src="https://github.com/jlimcode.png" width="50" style="border-radius:50%" /><br /><sub>jlimcode</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/xfurqan0"><img src="https://github.com/xfurqan0.png" width="50" style="border-radius:50%" /><br /><sub>xfurqan0</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/brantshin"><img src="https://github.com/brantshin.png" width="50" style="border-radius:50%" /><br /><sub>brantshin</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/mantertius"><img src="https://github.com/mantertius.png" width="50" style="border-radius:50%" /><br /><sub>mantertius</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/VonSdite"><img src="https://github.com/VonSdite.png" width="50" style="border-radius:50%" /><br /><sub>VonSdite</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/sunnyswag"><img src="https://github.com/sunnyswag.png" width="50" style="border-radius:50%" /><br /><sub>sunnyswag</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/hanzhe-one"><img src="https://github.com/hanzhe-one.png" width="50" style="border-radius:50%" /><br /><sub>hanzhe-one</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/52mzd"><img src="https://github.com/52mzd.png" width="50" style="border-radius:50%" /><br /><sub>52mzd</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/gzx19990101"><img src="https://github.com/gzx19990101.png" width="50" style="border-radius:50%" /><br /><sub>gzx19990101</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="110"><a href="https://github.com/ypjn"><img src="https://github.com/ypjn.png" width="50" style="border-radius:50%" /><br /><sub>ypjn</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/jin-codes"><img src="https://github.com/jin-codes.png" width="50" style="border-radius:50%" /><br /><sub>jin-codes</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/LetitiaChan"><img src="https://github.com/LetitiaChan.png" width="50" style="border-radius:50%" /><br /><sub>LetitiaChan</sub></a></td>
+    <td align="center" valign="top" width="110"><a href="https://github.com/sanzanazaman"><img src="https://github.com/sanzanazaman.png" width="50" style="border-radius:50%" /><br /><sub>sanzanazaman</sub></a></td>
   </tr>
 </table>
 
@@ -385,4 +423,5 @@ Clawd をより良くしてくれたすべての方に感謝します。
 - **Clawd** キャラクターは [Anthropic](https://www.anthropic.com) の所有物です。このプロジェクトは非公式のファンプロジェクトであり、Anthropic との提携または承認を受けたものではありません。
 - **Calico cat (三毛猫)** のアートワークは 鹿鹿 ([@rullerzhou-afk](https://github.com/rullerzhou-afk)) によるものです。All rights reserved.
 - **Cloudling (云宝)** のアートワークは 鹿鹿 ([@rullerzhou-afk](https://github.com/rullerzhou-afk)) によるものです。All rights reserved. Cloudling のビジュアル方針には OpenAI Codex ロゴへのオマージュが含まれています。Codex/OpenAI の標章は OpenAI に帰属し、このプロジェクトは OpenAI との提携または承認を受けたものではありません。
+- **Whale-chan（鲸鱼娘）** は [`rullerzhou-afk/clawd-themes`](https://github.com/rullerzhou-afk/clawd-themes) から任意の公式テーマとして別途配布されます。元のキャラクター・設定・素材の権利は各原作者に帰属し、テーマは [Neko3000/deepseek-whalechan](https://github.com/Neko3000/deepseek-whalechan) に記載された ZipZipPipe と上善无形をクレジットします。鹿鹿 ([@rullerzhou-afk](https://github.com/rullerzhou-afk)) による新しいアニメーションとエフェクトは CC BY-NC-SA 4.0 です。全文はテーマパッケージをご覧ください。非公式・非商用のファン作品であり、DeepSeek との関係や承認はなく、本プロジェクトの AGPL-3.0 ソースライセンスの対象外です。
 - **サードパーティのコントリビューション**: 著作権は各アーティストに帰属します。
