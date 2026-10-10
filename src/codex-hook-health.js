@@ -3,10 +3,11 @@
 // Single source of truth for "is the official Codex hook actually live?".
 //
 // As of the JSONL-approval-heuristic removal, Codex approval awareness flows
-// ONLY through the official PermissionRequest hook. If that hook silently fails
-// to register (or [features].hooks=false, or it needs Codex /hooks review), the
-// user gets NO approval signal at all. This module surfaces that health so the
-// Agents-tab badge and the startup nudge agree with the Doctor modal — they all
+// ONLY through the official PermissionRequest hook. If PermissionRequest itself
+// fails to register, is disabled, or needs Codex /hooks review, Clawd cannot
+// show approval prompts. Optional hooks awaiting review do not affect approval
+// prompts. This module surfaces that health so the Agents-tab badge and startup
+// nudge agree with the Doctor modal — they all
 // reuse the same per-agent integration check (checkAgentIntegrations on just the
 // Codex descriptor), so there is one verdict, not three drifting ones.
 
@@ -54,7 +55,10 @@ function classifyCodexHookDetail(detail) {
     ? detail.codexHookTrust
     : null;
   if (status === "needs-review" || (trust && trust.value === "needs-review")) {
-    return { signature: "needs-review", reasonKey: "codexHookHealthReasonNeedsReview", status };
+    const optional = trust && trust.value === "needs-review"
+      && Array.isArray(trust.missingEvents) && !trust.missingEvents.includes("PermissionRequest");
+    return { signature: optional ? "needs-review-optional" : "needs-review",
+      reasonKey: "codexHookHealthReasonNeedsReview", status };
   }
   // Remaining breakages (not registered / broken script path / any other non-ok
   // status) share one user-facing message — "the hook isn't active, repair it" —
@@ -141,8 +145,16 @@ function decideCodexHookNotification(verdict, prevSignature, opts = {}) {
   return { shouldNotify: true, nextSignature: current, changed: true };
 }
 
+function getCodexHookNudgeKeys(verdict) {
+  if (verdict && verdict.signature === "needs-review-optional") {
+    return { title: "codexHookHealthOptionalNudgeTitle", body: "codexHookHealthOptionalNudgeBody" };
+  }
+  return { title: "codexHookHealthNudgeTitle", body: "codexHookHealthNudgeBody" };
+}
+
 module.exports = {
   getCodexHookHealth,
   classifyCodexHookDetail,
   decideCodexHookNotification,
+  getCodexHookNudgeKeys,
 };

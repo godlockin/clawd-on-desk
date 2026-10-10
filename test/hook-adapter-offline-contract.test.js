@@ -3,13 +3,9 @@
 // The claim this file has to earn: tightening the SHARED resolver to return an
 // unavailable shape is safe for all 16 adapters WITHOUT touching any of them.
 //
-// It is not enough to assert the shape in isolation. Seven adapters (codex,
-// copilot, cursor, kimi, kiro, codebuddy, workbuddy) do a bare `pidChain.length`
-// with no Array.isArray guard, and three of those (cursor, codebuddy, workbuddy)
-// would swallow the resulting TypeError in a .catch() that rewrites their gating
-// stdout — cursor's {"continue":true} and codebuddy's {"decision":"allow"}
-// would silently become {}; WorkBuddy intentionally emits {} on every path.
-// A shape-only unit test cannot
+// It is not enough to assert the shape in isolation. Three adapters (copilot,
+// kimi, workbuddy) do a bare `pidChain.length` with no Array.isArray guard; a
+// null would throw. A shape-only unit test cannot
 // see that. So each adapter is run here as its
 // REAL script, in a subprocess, with:
 //
@@ -60,7 +56,7 @@ const ADAPTERS = [
   { name: "gemini-hook.js", payload: { hook_event_name: "SessionStart", cwd: "D:/repo" }, stdout: null },
   { name: "kimi-hook.js", payload: { hook_event_name: "PreToolUse", session_id: "s-681", cwd: "D:/repo" }, stdout: "" },
   { name: "kiro-hook.js", payload: { hook_event_name: "preToolUse", cwd: "D:/repo" }, stdout: "" },
-  { name: "codebuddy-hook.js", payload: { hook_event_name: "PreToolUse", cwd: "D:/repo" }, stdout: `${JSON.stringify({ decision: "allow" })}\n` },
+  { name: "codebuddy-hook.js", payload: { hook_event_name: "PreToolUse", cwd: "D:/repo" }, stdout: "{}\n" },
   { name: "antigravity-hook.js", payload: { hook_event_name: "PreToolUse", cwd: "D:/repo" }, stdout: null },
   { name: "qoder-hook.js", payload: { hook_event_name: "PreToolUse", session_id: "s-681", cwd: "D:/repo" }, stdout: null },
   { name: "qoderwork-hook.js", payload: { hook_event_name: "PreToolUse", session_id: "s-681", cwd: "D:/repo" }, stdout: null },
@@ -88,6 +84,10 @@ const ADAPTERS = [
   // session_id is required so the resolver cache context is non-default and
   // the vacuity guard sees the one PowerShell snapshot when Clawd is alive.
   { name: "traecode-hook.js", payload: { hook_event_name: "PreToolUse", session_id: "s-681", cwd: "D:/repo" }, stdout: "{}\n" },
+  // MiniMax Code is state-only via its local plugin: every event emits {}.
+  // session_id is required so the vacuity guard sees the one snapshot spawn
+  // when Clawd is alive.
+  { name: "minimax-hook.js", payload: { hook_event_name: "PreToolUse", session_id: "s-681", cwd: "D:/repo" }, stdout: "{}\n" },
 ];
 
 let hookHarness;
@@ -167,7 +167,7 @@ describe("#681 — every adapter survives a clean offline with zero spawn", { sk
       .sort();
     assert.deepStrictEqual(consumers, ADAPTERS.map((a) => a.name).sort(),
       "a new createPidResolver adapter must be added to ADAPTERS above and proven offline-safe");
-    assert.strictEqual(consumers.length, 17, "traecode-hook.js and qwenwork-hook.js joined the createPidResolver consumers");
+    assert.strictEqual(consumers.length, 18, "traecode-hook.js, qwenwork-hook.js and minimax-hook.js joined the createPidResolver consumers");
   });
 });
 
