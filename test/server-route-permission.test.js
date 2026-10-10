@@ -11,6 +11,7 @@ const {
   CLAWD_HOOK_PID_HEADER,
   CLAWD_PROCESS_INSTANCE_HEADER,
 } = require("../hooks/server-config");
+const { PREVIEW_MAX } = require("../src/server-permission-utils");
 const {
   MAX_PERMISSION_BODY_BYTES,
   handlePermissionPost,
@@ -91,6 +92,7 @@ function makeCtx(overrides = {}) {
     permLog: (message) => calls.logs.push(message),
     isAgentEnabled: () => true,
     isAgentPermissionsEnabled: () => true,
+    isCodexPermissionInterceptEnabled: () => true,
     isAgentSubagentPermissionsEnabled: () => true,
     updateSession: (...args) => calls.updateSession.push(args),
     showPermissionBubble: (entry) => calls.showPermissionBubble.push(entry),
@@ -283,6 +285,7 @@ describe("server-route-permission helpers", () => {
     }), true);
     assert.strictEqual(shouldBypassCopilotBubble({
       isAgentPermissionsEnabled: () => true,
+    isCodexPermissionInterceptEnabled: () => true,
     }), false);
   });
 
@@ -740,6 +743,278 @@ describe("server-route-permission POST", () => {
     assert.deepStrictEqual(res.ctx.calls.showPermissionBubble, [entry]);
     assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, [entry]);
     assert.deepStrictEqual(res.ctx.calls.addPendingPermission, [entry]);
+  });
+
+  it("strips Codex permission process metadata on the profile-bound ingress", async () => {
+    const sessionId = "codex:019e115a-4df2-7ed0-b90e-8e6345aca777";
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "codex",
+      session_id: sessionId,
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      source_pid: 456,
+      agent_pid: 456,
+      pid_chain: [789, 456, -1],
+      editor: "cursor",
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
+      orca_pane_key: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/repo",
+      host: "spoofed-by-hook",
+      platform: "webui",
+      model: "gpt-5.4",
+      codex_originator: "Codex Desktop",
+      codex_source: "vscode",
+      hook_source: "codex-official",
+    }), {
+      options: {
+        remoteProfile: { profileId: "ssh-work", displayHost: "workbox" },
+      },
+    });
+
+    const remoteSessionId = makeSessionKey({ profileId: "ssh-work", rawSessionId: sessionId });
+    assert.deepStrictEqual(res.ctx.calls.updateSession, [[
+      remoteSessionId,
+      "notification",
+      "PermissionRequest",
+      {
+        agentId: "codex",
+        hookSource: "codex-official",
+        sourcePid: null,
+        agentPid: null,
+        pidChain: null,
+        editor: null,
+        tmuxSocket: null,
+        tmuxClient: null,
+        // Survives the gate — it is the one terminal identity the secure
+        // transport is still allowed to send.
+        orcaPaneKey: "8ce1fff7-tab:9813824b-leaf",
+        cwd: "/repo",
+        host: "workbox",
+        platform: "webui",
+        model: "gpt-5.4",
+        codexOriginator: "Codex Desktop",
+        codexSource: "vscode",
+        profileId: "ssh-work",
+        rawSessionId: sessionId,
+        sessionAutomationIdentity: {
+          eligible: false,
+          reason: "remote-session-lifecycle-not-authoritative",
+        },
+      },
+    ]]);
+    // The Codex permEntry never carried an `editor` key, hence the `?? null`.
+    const entry = res.ctx.pendingPermissions[0];
+    assert.deepStrictEqual({
+      sourcePid: entry.sourcePid ?? null,
+      agentPid: entry.agentPid ?? null,
+      pidChain: entry.pidChain ?? null,
+      editor: entry.editor ?? null,
+      tmuxSocket: entry.tmuxSocket ?? null,
+      tmuxClient: entry.tmuxClient ?? null,
+      orcaPaneKey: entry.orcaPaneKey ?? null,
+      cwd: entry.cwd ?? null,
+    }, {
+      sourcePid: null,
+      agentPid: null,
+      pidChain: null,
+      editor: null,
+      tmuxSocket: null,
+      tmuxClient: null,
+      orcaPaneKey: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/repo",
+    });
+  });
+
+  it("strips WSL permission process metadata without changing Codex automation eligibility", async () => {
+    const sessionId = "codex:019e115a-4df2-7ed0-b90e-8e6345aca777";
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "codex",
+      session_id: sessionId,
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      source_pid: 456,
+      agent_pid: 456,
+      pid_chain: [789, 456, -1],
+      editor: "cursor",
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
+      orca_pane_key: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/repo",
+      wsl_distro: "Ubuntu",
+      host: "wsl:Ubuntu",
+      platform: "cli",
+      model: "gpt-5.4",
+      codex_originator: "codex-tui",
+      codex_source: "cli",
+      hook_source: "codex-official",
+    }));
+
+    const opts = res.ctx.calls.updateSession[0][3];
+    assert.strictEqual(opts.sourcePid ?? null, null);
+    assert.strictEqual(opts.agentPid ?? null, null);
+    assert.strictEqual(opts.pidChain ?? null, null);
+    assert.strictEqual(opts.editor ?? null, null);
+    assert.strictEqual(opts.tmuxSocket ?? null, null);
+    assert.strictEqual(opts.tmuxClient ?? null, null);
+    assert.strictEqual(opts.orcaPaneKey, "8ce1fff7-tab:9813824b-leaf");
+    assert.strictEqual(opts.cwd, "/repo");
+    assert.strictEqual(opts.host, "wsl:Ubuntu");
+    assert.deepStrictEqual(opts.sessionAutomationIdentity, {
+      eligible: true,
+      reason: "eligible",
+    });
+
+    assert.ok(res.ctx.pendingPermissions[0], "the WSL request must produce a permission entry");
+    const entry = res.ctx.pendingPermissions[0];
+    assert.strictEqual(entry.sourcePid ?? null, null);
+    assert.strictEqual(entry.agentPid ?? null, null);
+    assert.strictEqual(entry.pidChain ?? null, null);
+    assert.deepStrictEqual(entry.sessionAutomationIdentity, {
+      eligible: true,
+      reason: "eligible",
+    });
+  });
+
+  it("keeps a WSL Codex interactive subagent eligible for global auto-approval", async () => {
+    const sessionId = "codex:019e115a-4df2-7ed0-b90e-8e6345aca778";
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "codex",
+      session_id: sessionId,
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      hook_source: "codex-official",
+      codex_session_role: "subagent",
+      codex_originator: "codex-tui",
+      codex_source: "cli",
+      source_pid: 456,
+      agent_pid: 456,
+      pid_chain: [789, 456, -1],
+      wsl_distro: "Ubuntu",
+      host: "wsl:Ubuntu",
+    }));
+
+    assert.ok(res.ctx.pendingPermissions[0], "the WSL subagent request must produce a permission entry");
+    const entry = res.ctx.pendingPermissions[0];
+    assert.strictEqual(entry.codexInteractiveSubagent, true);
+    assert.deepStrictEqual(entry.sessionAutomationIdentity, {
+      eligible: true,
+      reason: "eligible",
+    });
+    assert.strictEqual(entry.sourcePid ?? null, null);
+    assert.strictEqual(entry.agentPid ?? null, null);
+    assert.strictEqual(entry.pidChain ?? null, null);
+  });
+
+  it("strips WSL process metadata for the qwen-code permission builder", async () => {
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "qwen-code",
+      session_id: "qwen-code:wsl-session",
+      tool_name: "Bash",
+      tool_input: { command: "ls" },
+      source_pid: 111,
+      agent_pid: 222,
+      pid_chain: [333, 222, -1],
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
+      orca_pane_key: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/repo",
+      wsl_distro: "Ubuntu",
+    }));
+
+    const opts = res.ctx.calls.updateSession[0][3];
+    assert.strictEqual(opts.sourcePid ?? null, null);
+    assert.strictEqual(opts.agentPid ?? null, null);
+    assert.strictEqual(opts.pidChain ?? null, null);
+    assert.strictEqual(opts.tmuxSocket ?? null, null);
+    assert.strictEqual(opts.tmuxClient ?? null, null);
+    assert.strictEqual(opts.orcaPaneKey, "8ce1fff7-tab:9813824b-leaf");
+    assert.strictEqual(opts.cwd, "/repo");
+
+    assert.ok(res.ctx.pendingPermissions[0], "the WSL request must produce a permission entry");
+    const entry = res.ctx.pendingPermissions[0];
+    assert.strictEqual(entry.sourcePid ?? null, null);
+    assert.strictEqual(entry.agentPid ?? null, null);
+    assert.strictEqual(entry.pidChain ?? null, null);
+  });
+
+  it("strips Hermes permission process metadata on the profile-bound ingress", async () => {
+    const sessionId = "hermes:01HQABCD";
+    const body = JSON.stringify({
+      agent_id: "hermes",
+      session_id: sessionId,
+      tool_name: "execute_bash",
+      tool_input: { command: "rm -rf /tmp/test" },
+      tool_use_id: "tool-1",
+      source_pid: 1234,
+      agent_pid: 1234,
+      pid_chain: [9999, 1234, -1],
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
+      orca_pane_key: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/home/user/repo",
+      editor: "cursor",
+    });
+    const processFields = (opts) => ({
+      sourcePid: opts.sourcePid ?? null,
+      agentPid: opts.agentPid ?? null,
+      pidChain: opts.pidChain ?? null,
+      editor: opts.editor ?? null,
+      tmuxSocket: opts.tmuxSocket ?? null,
+      tmuxClient: opts.tmuxClient ?? null,
+      orcaPaneKey: opts.orcaPaneKey ?? null,
+      cwd: opts.cwd ?? null,
+    });
+
+    const remote = await callPermissionPost(body, {
+      options: {
+        remoteProfile: { profileId: "ssh-work", displayHost: "workbox" },
+      },
+    });
+    const remoteOpts = remote.ctx.calls.updateSession[0][3];
+    assert.deepStrictEqual(remote.ctx.calls.updateSession[0].slice(0, 3), [
+      makeSessionKey({ profileId: "ssh-work", rawSessionId: sessionId }),
+      "notification",
+      "PermissionRequest",
+    ]);
+    assert.deepStrictEqual(processFields(remoteOpts), {
+      sourcePid: null,
+      agentPid: null,
+      pidChain: null,
+      editor: null,
+      tmuxSocket: null,
+      tmuxClient: null,
+      orcaPaneKey: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/home/user/repo",
+    });
+    assert.strictEqual(remoteOpts.host, "workbox");
+    assert.deepStrictEqual(processFields(remote.ctx.pendingPermissions[0]), {
+      sourcePid: null,
+      agentPid: null,
+      pidChain: null,
+      editor: null,
+      tmuxSocket: null,
+      tmuxClient: null,
+      orcaPaneKey: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/home/user/repo",
+    });
+
+    // Regression: the local path must stay exactly what it was before the gate.
+    const local = await callPermissionPost(body);
+    assert.deepStrictEqual(processFields(local.ctx.calls.updateSession[0][3]), {
+      sourcePid: 1234,
+      agentPid: 1234,
+      pidChain: [9999, 1234],
+      editor: "cursor",
+      tmuxSocket: "/tmp/tmux-1000/work",
+      tmuxClient: "/dev/pts/7",
+      orcaPaneKey: "8ce1fff7-tab:9813824b-leaf",
+      cwd: "/home/user/repo",
+    });
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(local.ctx.calls.updateSession[0][3], "host"),
+      false,
+    );
   });
 
   it("keeps every permission focus entry carrying the same terminal identity fields", () => {
@@ -2225,6 +2500,36 @@ describe("server-route-permission POST", () => {
     assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, [entry]);
   });
 
+  it("carries the desktop marker into the DSH permission record only for bridge-local traffic", async () => {
+    const base = {
+      agent_id: "deepseek-harness",
+      hook_source: "dsh-plugin",
+      session_id: "deepseek-harness:carrier",
+      tool_name: "execute_shell",
+      tool_input: {},
+      dsh_carrier: "desktop",
+    };
+
+    const local = await callPermissionPost(JSON.stringify(base));
+    assert.strictEqual(local.ctx.calls.updateSession[0][3].dshCarrier, "desktop");
+    assert.strictEqual(local.ctx.pendingPermissions[0].dshCarrier, "desktop");
+
+    const web = await callPermissionPost(JSON.stringify({ ...base, dsh_carrier: "web" }));
+    assert.strictEqual(web.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+    assert.strictEqual(web.ctx.pendingPermissions[0].dshCarrier, undefined);
+
+    const foreignSource = await callPermissionPost(JSON.stringify({ ...base, hook_source: "external" }));
+    assert.strictEqual(foreignSource.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+
+    const remote = await callPermissionPost(JSON.stringify(base), {
+      options: { remoteProfile: { profileId: "remote-1", displayHost: "remote-host" } },
+    });
+    assert.strictEqual(remote.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+
+    const wsl = await callPermissionPost(JSON.stringify({ ...base, wsl_distro: "Ubuntu" }));
+    assert.strictEqual(wsl.ctx.calls.updateSession[0][3].dshCarrier, undefined);
+  });
+
   it("leaves DSH ask_user_question with the native provider", async () => {
     const res = await callPermissionPost(JSON.stringify({
       agent_id: "deepseek-harness",
@@ -2835,5 +3140,167 @@ describe("server-route-permission POST — CC subagent requests (#451)", () => {
     assert.strictEqual(res.destroyed, true);
     assert.deepStrictEqual(res.ctx.pendingPermissions, []);
     assert.deepStrictEqual(res.recorder.map((item) => item.outcome).filter(Boolean), ["disabled"]);
+  });
+});
+
+// The destructive-action reminder is decided in two places, and these lanes own
+// the route's half: whether the *stamp* on the pending entry is derived from the
+// accepted request. Whether a stamp then holds the request is the automation
+// chokepoint's half, in test/permission-destructive-reminder.test.js.
+describe("destructive-action reminder — the route stamps what it accepted", () => {
+  const ADAPTERS = [
+    { agentId: "claude-code", body: {} },
+    { agentId: "codebuddy", body: {} },
+    { agentId: "codex", body: { tool_input_description: "Run a generated command" } },
+    { agentId: "qwen-code", body: {} },
+    { agentId: "zcode", body: {} },
+    { agentId: "copilot-cli", body: {} },
+    { agentId: "hermes", body: {} },
+  ];
+
+  async function stampFor(agentId, extra, command) {
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: agentId,
+      session_id: `${agentId}:reminder`,
+      tool_name: "Bash",
+      tool_input: { command },
+      ...extra,
+    }));
+    assert.strictEqual(res.ctx.pendingPermissions.length, 1, agentId);
+    return res.ctx.pendingPermissions[0].permissionReminder;
+  }
+
+  it("stamps a recognized destructive command on every permission adapter", async () => {
+    for (const { agentId, body } of ADAPTERS) {
+      assert.deepStrictEqual(
+        await stampFor(agentId, body, "git push --force origin main"),
+        { hold: true, tag: "force-push" },
+        agentId
+      );
+    }
+  });
+
+  it("stamps nothing for an ordinary command", async () => {
+    for (const { agentId, body } of ADAPTERS) {
+      assert.strictEqual(await stampFor(agentId, body, "npm test"), null, agentId);
+    }
+  });
+
+  it("stamps a deliberate exception as excused rather than as a hold", async () => {
+    assert.deepStrictEqual(
+      await stampFor("claude-code", {}, "git push --force-with-lease origin main"),
+      { hold: false, tag: "force-push", exception: "force-with-lease" }
+    );
+    assert.deepStrictEqual(
+      await stampFor("claude-code", {}, "npm publish --dry-run"),
+      { hold: false, tag: "publish", exception: "dry-run" }
+    );
+  });
+
+  it("fails closed on takeover regressions before an automatic allow can use the stamp", async () => {
+    const cases = [
+      ["psql -c --dry-run -c 'DROP TABLE users'", "db-destroy"],
+      [
+        `echo "$(git push --force-with-lease origin main && printf ')' && git reset --hard HEAD^)"`,
+        "history-rewrite",
+      ],
+      [`echo "it's $(rm -rf /etc)"`, "file-delete"],
+      ["git push --force-with-lease -fu origin main", "force-push"],
+      ["rm -rf dist <&0 /etc", "file-delete"],
+      [[...new Array(300).fill("x"), "&&", "rm", "-rf", "/etc"], "file-delete"],
+      [["rm", "-rf", "/etc", 5], "scan-error"],
+      [null, "scan-error"],
+    ];
+    for (const [command, tag] of cases) {
+      assert.deepStrictEqual(
+        await stampFor("claude-code", {}, command),
+        { hold: true, tag },
+        command
+      );
+    }
+  });
+
+  it("keeps an incomplete quote caused only by the scan budget as unmatched", async () => {
+    assert.strictEqual(
+      await stampFor("claude-code", {}, `echo "${"x".repeat(5000)}"`),
+      null
+    );
+  });
+
+  it("carries a view on every accepted request", async () => {
+    // The invariant that matters is totality at runtime, not a source-text count.
+    // An earlier version of this lane compared call counts against the display-view
+    // helper; those counts stayed equal while the remote-only path spread neither,
+    // so it could not see that a bubbles-disabled install had no reminder at all.
+    const { NOT_INSPECTED_TAG } = require("../src/permission-reminder");
+    for (const { agentId, body } of ADAPTERS) {
+      const res = await callPermissionPost(JSON.stringify({
+        agent_id: agentId,
+        session_id: `${agentId}:reminder-total`,
+        tool_name: "Bash",
+        tool_input: { command: "git push --force origin main" },
+        ...body,
+      }));
+      const [entry] = res.ctx.pendingPermissions;
+      assert.ok(entry, agentId);
+      assert.notStrictEqual(entry.permissionReminder, undefined, agentId);
+      assert.notStrictEqual(entry.permissionReminder.tag, NOT_INSPECTED_TAG,
+        `${agentId}: the safety net must be unreachable on a real path`);
+      assert.deepStrictEqual(entry.permissionReminder, { hold: true, tag: "force-push" }, agentId);
+    }
+  });
+
+  it("carries a view on the remote-only path too, where bubbles are disabled", async () => {
+    // This is the path a reminder would otherwise miss entirely: with bubbles off
+    // the entry is built by tryRemoteOnlyApproval from its own field list, and a
+    // session grant resolves it through maybeAutoResolveSessionPermission without
+    // a card ever existing. claude-code and codebuddy reach it AND are eligible for
+    // an automatic allow, so an unstamped entry there is a silent miss.
+    const { NOT_INSPECTED_TAG } = require("../src/permission-reminder");
+    const bubblesOff = { ctx: { getBubblePolicy: () => ({ enabled: false, autoCloseMs: 0 }) } };
+    const cases = [
+      ["claude-code", {}, { hold: true, tag: "force-push" }],
+      ["codebuddy", {}, { hold: true, tag: "force-push" }],
+      ["zcode", {}, { hold: true, tag: "force-push" }],
+      // DeepSeek Harness deliberately exposes no tool arguments, so there is
+      // nothing to recognize -- but the view is still derived, which is what
+      // distinguishes "inspected, no match" from "nobody looked".
+      ["deepseek-harness", { reason: "run a generated command" }, null],
+    ];
+    for (const [agentId, extra, expected] of cases) {
+      const res = await callPermissionPost(JSON.stringify({
+        agent_id: agentId,
+        session_id: `${agentId}:reminder-remote-only`,
+        tool_name: "Bash",
+        tool_input: { command: "git push --force origin main" },
+        ...extra,
+      }), bubblesOff);
+      const [entry] = res.ctx.pendingPermissions;
+      assert.ok(entry, `${agentId}: a remote-only request must still be pending`);
+      assert.strictEqual(res.ctx.calls.showPermissionBubble.length, 0,
+        `${agentId}: this arm must exercise the remote-only branch, not the ordinary one`);
+      assert.notStrictEqual(entry.permissionReminder, undefined,
+        `${agentId}: a remote-only entry must carry a view`);
+      if (entry.permissionReminder) {
+        assert.notStrictEqual(entry.permissionReminder.tag, NOT_INSPECTED_TAG, agentId);
+      }
+      assert.deepStrictEqual(entry.permissionReminder, expected, agentId);
+    }
+  });
+
+  it("stamps from the accepted input, not from the truncated display copy", async () => {
+    const command = `echo ${"x".repeat(PREVIEW_MAX + 100)} && npm publish`;
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "claude-code",
+      session_id: "claude:reminder-long",
+      tool_name: "Bash",
+      tool_input: { command },
+    }));
+    const entry = res.ctx.pendingPermissions[0];
+    assert.ok(
+      !String(entry.toolInput.command).includes("npm publish"),
+      "the display copy really has lost the destructive part -- otherwise this proves nothing"
+    );
+    assert.deepStrictEqual(entry.permissionReminder, { hold: true, tag: "publish" });
   });
 });
