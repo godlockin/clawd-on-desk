@@ -1891,7 +1891,12 @@ test("pure helpers validate payloads and card action events", () => {
     summary: "",
     suggestions: [],
     canOfferSessionTrust: false,
+    canOfferTerminal: true,
   });
+  assert.strictEqual(
+    normalizeApprovalPayload({ title: "hi", canOfferTerminal: false }).canOfferTerminal,
+    false
+  );
   assert.throws(() => normalizeApprovalPayload({ title: "" }), /title/);
   assert.deepEqual(normalizeActionEvent({
     operator: { open_id: "ou_1" },
