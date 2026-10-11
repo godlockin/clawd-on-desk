@@ -13,8 +13,9 @@ const dsh = require("../hooks/dsh-install");
 const zcode = require("../hooks/zcode-install");
 const codebuddy = require("../hooks/codebuddy-install");
 const openclaw = require("../hooks/openclaw-install");
+const grok = require("../hooks/grok-install");
 const { commandMatchesMarker } = require("../hooks/json-utils");
-const { identifyCustomApplication } = require("./custom-applications");
+const { identifyCustomApplication, isLaunchable } = require("./custom-applications");
 
 // Agents whose detector parent dir the DEFAULT startup sync creates on its own,
 // before the agent has left any evidence of its own. For those, "the directory
@@ -206,6 +207,16 @@ function resolveAgentPaths(descriptor, options) {
       parentDir: dshHome,
       configPath: dsh.resolveDshProfileDir(dshHome),
       commandPaths: dsh.dshCommandPathsSync({ fs: options.fs, env, platform }),
+    }, options);
+  }
+
+  if (descriptor.agentId === "grok-build") {
+    // Dynamic GROK_HOME path + structured ownership both come from the shared
+    // inspector so Doctor, the installation detector, and the installer agree.
+    const inspected = grok.inspectGrokHookFile({ fs: options.fs, env, homeDir });
+    return finalizeAgentPaths(descriptor, {
+      parentDir: inspected.grokHome,
+      configPath: inspected.configPath,
     }, options);
   }
 
@@ -445,6 +456,19 @@ function detectHermesInstallation(paths, options) {
   return notFound();
 }
 
+function dshDesktopDiscoveryForAgent(options = {}) {
+  // Static on purpose: detectors must never spawn PowerShell. Windows reads the
+  // registry cache that the startup / Doctor preheat fills.
+  return dsh.discoverDshDesktopSync({
+    fs: options.fs || fs,
+    platform: options.platform,
+    env: options.env,
+    homeDir: options.homeDir,
+    desktopDiscovery: options.dshDesktopDiscovery,
+    windowsRegistrySnapshot: options.windowsRegistrySnapshot,
+  });
+}
+
 function detectInstallation(descriptor, paths, options) {
   const fsImpl = options.fs;
   const custom = detectCustomDiscoveryPath(paths.customDiscoveryPaths, options);
@@ -476,6 +500,9 @@ function detectInstallation(descriptor, paths, options) {
       }
       if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
       return notFound();
+    case "grok-build":
+      if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
+      return notFound();
     case "copilot-cli":
     case "cursor-agent":
     case "qwen-code":
@@ -485,6 +512,7 @@ function detectInstallation(descriptor, paths, options) {
     case "qoderwork":
     case "traecode":
     case "qwenwork":
+    case "minimax":
       if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
       return notFound();
     case "zcode":
@@ -503,6 +531,7 @@ function detectInstallation(descriptor, paths, options) {
       if (dirExists(fsImpl, paths.configPath)) return installationResult(true, "medium", "config-dir", `${paths.configPath} exists`);
       return notFound();
     case "pi":
+    case "omp":
       if (dirExists(fsImpl, paths.parentDir)) return installationResult(true, "high", "parent-dir", `${paths.parentDir} exists`);
       return notFound();
     case "openclaw":
@@ -514,6 +543,11 @@ function detectInstallation(descriptor, paths, options) {
         if (fileExists(fsImpl, commandPath)) {
           return installationResult(true, "high", "command-path", `${commandPath} exists`);
         }
+      }
+      // A desktop-only user has no ~/.dsh and no global CLI; the app bundle is
+      // the only signal. Static discovery reads the cache on Windows.
+      if (dshDesktopDiscoveryForAgent(options).status === "found") {
+        return installationResult(true, "high", "desktop-app", "DeepSeek Harness desktop app found");
       }
       if (dirExists(fsImpl, paths.parentDir)) {
         const home = paths.parentDir;
@@ -565,6 +599,7 @@ function detectCustomTools(options = {}) {
 
 function detectCustomAgents(options = {}) {
   const fsImpl = options.fs || fs;
+  const platform = options.platform || process.platform;
   const applications = Array.isArray(options.snapshot && options.snapshot.customApplications)
     ? options.snapshot.customApplications
     : [];
@@ -574,15 +609,27 @@ function detectCustomAgents(options = {}) {
       ? application.executablePath
       : "";
     const kind = executablePath ? statPath(fsImpl, executablePath) : null;
+    let launchable = false;
+    if (kind === "file") {
+      try { launchable = isLaunchable(executablePath, fsImpl.statSync(executablePath), platform, path, fsImpl); } catch {}
+    }
+    const reason = launchable
+      ? "registered-executable"
+      : (kind === "file" ? "not-executable" : (kind ? "not-file" : "not-found"));
+    const detail = launchable
+      ? `Registered executable exists: ${executablePath} (${kind})`
+      : reason === "not-executable"
+        ? `Registered executable is not launchable: ${executablePath}`
+        : reason === "not-file"
+          ? `Registered executable path is not a regular file: ${executablePath} (${kind})`
+          : `Registered executable was not found: ${executablePath}`;
     return {
       agentId,
       executablePath,
-      detectedInstalled: !!kind,
-      confidence: kind ? "high" : LOW_CONFIDENCE,
-      reason: kind ? "registered-executable" : "not-found",
-      detail: kind
-        ? `Registered executable exists: ${executablePath} (${kind})`
-        : `Registered executable was not found: ${executablePath}`,
+      detectedInstalled: launchable,
+      confidence: launchable ? "high" : LOW_CONFIDENCE,
+      reason,
+      detail,
     };
   }).filter((entry) => entry.agentId && entry.executablePath);
 }
@@ -604,34 +651,64 @@ function markerInDirectoryFiles(fsImpl, dirPath, marker, options = {}) {
 function detectClawdIntegration(descriptor, paths, options) {
   const fsImpl = options.fs;
   if (descriptor.agentId === "deepseek-harness") {
-    const health = dsh.inspectDeepSeekHarnessDiskSync({
+    const base = {
       fs: fsImpl,
       dshHome: paths.parentDir,
-      dshInstallRoot: options.dshInstallRoot,
       managedRoot: options.dshManagedRoot,
       homeDir: options.homeDir,
       env: options.env,
       platform: options.platform,
+    };
+    const webHealth = dsh.inspectDeepSeekHarnessDiskSync({
+      ...base,
+      profile: "web",
+      dshInstallRoot: options.dshInstallRoot,
     });
-    return health.status === "healthy"
-      ? {
+    const desktopDiscovery = dshDesktopDiscoveryForAgent(options);
+    const desktopHealth = dsh.inspectDeepSeekHarnessDiskSync({
+      ...base,
+      profile: "desktop",
+      dshInstallRoot: null,
+      hostVersion: desktopDiscovery.status === "found" ? desktopDiscovery.staticVersion : null,
+    });
+    const webHealthy = webHealth.status === "healthy";
+    const desktopHealthy = desktopHealth.status === "healthy";
+    // desktopProfileDir is always present; desktopPluginDir only once verified.
+    const desktopPaths = {
+      ...(desktopHealth.profileDir ? { desktopProfileDir: desktopHealth.profileDir } : {}),
+      ...(desktopHealthy && desktopHealth.resolved ? { desktopPluginDir: desktopHealth.resolved.packageDir } : {}),
+    };
+    if (webHealthy || desktopHealthy) {
+      const pluginHealth = webHealthy ? webHealth : desktopHealth;
+      return {
         detected: true,
         reason: "managed-plugin",
-        detail: `${health.profileDir} contains the verified Clawd bridge`,
-        paths: { profileDir: health.profileDir, pluginDir: health.resolved.packageDir },
-      }
-      : {
-        detected: false,
-        reason: health.status,
-        detail: `DeepSeek Harness bridge is ${health.status}`,
-        paths: { profileDir: health.profileDir },
+        detail: `${pluginHealth.profileDir} contains the verified Clawd bridge`,
+        paths: {
+          profileDir: webHealth.profileDir,
+          pluginDir: pluginHealth.resolved && pluginHealth.resolved.packageDir,
+          ...desktopPaths,
+        },
       };
+    }
+    // Neither side is healthy: report web's status, unless web has no Clawd
+    // state at all while desktop still does (then desktop's status says more).
+    const webHasState = webHealth.status !== "absent" && webHealth.status !== "profile-missing";
+    const desktopHasState = desktopHealth.status !== "absent" && desktopHealth.status !== "profile-missing";
+    const chosen = !webHasState && desktopHasState ? desktopHealth : webHealth;
+    return {
+      detected: false,
+      reason: chosen.status,
+      detail: `DeepSeek Harness bridge is ${chosen.status}`,
+      paths: { profileDir: webHealth.profileDir, ...desktopPaths },
+    };
   }
-  if (descriptor.agentId === "pi") {
+  if (descriptor.agentId === "pi" || descriptor.agentId === "omp") {
+    const label = descriptor.agentId === "omp" ? "OMP" : "Pi";
     const markerPath = path.join(paths.configPath, descriptor.markerFile || ".clawd-managed.json");
     return fileExists(fsImpl, markerPath)
       ? { detected: true, reason: "marker-file", detail: `${markerPath} exists`, paths: { markerPath } }
-      : { detected: false, reason: "not-found", detail: "No Clawd-managed Pi extension marker found" };
+      : { detected: false, reason: "not-found", detail: `No Clawd-managed ${label} extension marker found` };
   }
   if (descriptor.agentId === "hermes") {
     const files = Array.isArray(descriptor.managedFiles) ? descriptor.managedFiles : [];
@@ -639,6 +716,33 @@ function detectClawdIntegration(descriptor, paths, options) {
     return found
       ? { detected: true, reason: "managed-files", detail: `${paths.configPath} contains Clawd plugin files`, paths: { pluginDir: paths.configPath } }
       : { detected: false, reason: "not-found", detail: "No Clawd-managed Hermes plugin files found" };
+  }
+  if (descriptor.configMode === "grok-hooks") {
+    const inspected = grok.inspectGrokHookFile({
+      fs: fsImpl,
+      env: options.env,
+      homeDir: options.homeDir,
+      grokHome: paths.parentDir,
+      configPath: paths.configPath,
+    });
+    if (inspected.health === "healthy") {
+      return {
+        detected: true,
+        reason: "structured-marker",
+        detail: `${inspected.configPath} contains the verified Clawd handler marker`,
+        paths: { configPath: inspected.configPath },
+        stalePreview: inspected.stalePreview,
+        warnings: inspected.warnings,
+      };
+    }
+    return {
+      detected: false,
+      reason: inspected.health,
+      detail: inspected.detail || `Grok Build hook file is ${inspected.health}`,
+      paths: { configPath: inspected.configPath },
+      stalePreview: inspected.stalePreview,
+      warnings: inspected.warnings,
+    };
   }
   if (descriptor.configMode === "dir") {
     return markerInDirectoryFiles(fsImpl, paths.configPath, descriptor.marker)
