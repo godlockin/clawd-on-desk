@@ -144,11 +144,7 @@ describe("startup session recovery regressions", () => {
 
   it("never persists a title synthesized from the prompt", () => {
     recoveryDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recovery-title-"));
-    const body = leaseBody({ session_title: "Sensitive prompt used as fallback" });
-    Object.defineProperty(body, "_sessionTitleFromPrompt", {
-      value: true,
-      enumerable: false,
-    });
+    const body = leaseBody({ session_title: "Sensitive prompt used as fallback", session_title_from_prompt: true });
 
     const result = updateRecoveryLeaseFromStateBody(
       body,

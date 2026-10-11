@@ -30,12 +30,16 @@ test("the user guide names Footprints and documents Today bars", () => {
   assert.match(guide, /newly accepted activity refreshes the visible range automatically/);
   assert.doesNotMatch(guide, /Settings → Recap|Open Recap|Record recap|Clear recap data/);
   assert.doesNotMatch(guide, /\| Active days \|/);
+  assert.doesNotMatch(guide, /\| Sessions started \|/);
 });
 
 test("every supported Settings locale has the complete recap key set", () => {
   const i18n = loadI18n();
   const englishKeys = Object.keys(i18n.STRINGS.en).filter((key) => key === "sidebarRecap" || key.startsWith("recap"));
-  const removedKeys = ["recapActiveDays", "recapDayActivity", "recapCoverageFootnote", "recapPausedFootnote"];
+  const removedKeys = [
+    "recapActiveDays", "recapDayActivity", "recapCoverageFootnote", "recapPausedFootnote",
+    "recapMetricSessions", "recapMetricPartial",
+  ];
   assert.ok(englishKeys.length > 30);
   for (const lang of ["en", "zh", "zh-TW", "ko", "ja", "pt-BR", "es"]) {
     for (const key of englishKeys) {
@@ -69,14 +73,14 @@ test("recap tab stays browser-only and aggregates scope rows without turning nul
           agentId: "codex",
           scope: "local",
           scopeInstance: "local-1",
-          metrics: { sessionsStarted: null, turnsCompleted: 2, toolCalls: 3, activityEvents: 4 },
+          metrics: { sessionsStarted: null, turnsCompleted: null, toolCalls: 3, activityEvents: 4 },
           sessionsStartedPartial: true,
         },
         {
           agentId: "codex",
           scope: "remote",
           scopeInstance: "remote-1",
-          metrics: { sessionsStarted: 1, turnsCompleted: 1, toolCalls: 1, activityEvents: 2 },
+          metrics: { sessionsStarted: 1, turnsCompleted: 1, toolCalls: null, activityEvents: 2 },
           sessionsStartedPartial: false,
         },
       ],
@@ -84,8 +88,16 @@ test("recap tab stays browser-only and aggregates scope rows without turning nul
   });
   assert.equal(summary.agentCount, 1);
   assert.equal(summary.rows.length, 2);
-  assert.equal(summary.rows.find((row) => row.scope === "local").sessionsStarted, null);
-  assert.equal(summary.rows.find((row) => row.scope === "remote").sessionsStarted, 1);
+  const localRow = summary.rows.find((row) => row.scope === "local");
+  const remoteRow = summary.rows.find((row) => row.scope === "remote");
+  assert.equal(localRow.turnsCompleted, null);
+  assert.equal(remoteRow.turnsCompleted, 1);
+  assert.equal(localRow.toolCalls, 3);
+  assert.equal(remoteRow.toolCalls, null);
+  assert.equal(Object.hasOwn(localRow, "sessionsStarted"), false);
+  assert.equal(Object.hasOwn(remoteRow, "sessionsStarted"), false);
+  assert.equal(Object.hasOwn(localRow, "sessionsStartedPartial"), false);
+  assert.equal(Object.hasOwn(remoteRow, "sessionsStartedPartial"), false);
 });
 
 test("recap card keeps day grids square, makes only today a bar chart, and exposes no export surface", () => {
@@ -102,6 +114,8 @@ test("recap card keeps day grids square, makes only today a bar chart, and expos
   assert.match(css, /\.recap-grid-dim \.recap-cell\s*\{\s*opacity:\s*0\.13/);
   assert.match(css, /@media \(max-width:\s*980px\)[\s\S]*\.recap-page-header\s*\{\s*grid-template-columns:\s*1fr/);
   assert.match(css, /@media \(max-width:\s*780px\)[\s\S]*\.recap-agent-row\s*\{\s*grid-template-columns:\s*1fr/);
+  assert.match(css, /\.recap-agent-metrics\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/);
+  assert.doesNotMatch(css, /\.recap-agent-metrics\s*\{[^}]*grid-template-columns:\s*repeat\(2,/);
   assert.match(css, /@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*\.recap-cell-popover/);
   assert.match(preload, /queryRecap:\s*\(period\)/);
   assert.match(preload, /onRecapChanged:\s*\(cb\)/);

@@ -12,10 +12,12 @@ function buildSettingsAgentOrderExports() {
     "mimocode",
     "codebuddy",
     "workbuddy",
+    "grok-build",
     "qoder",
     "qoderwork",
     "traecode",
     "qwenwork",
+    "minimax",
   ];
 
   const NON_COLLAPSIBLE_AGENT_PRIORITY = [
@@ -24,6 +26,7 @@ function buildSettingsAgentOrderExports() {
     "copilot-cli",
     "kiro-cli",
     "pi",
+    "omp",
     "openclaw",
     "hermes",
     "reasonix",

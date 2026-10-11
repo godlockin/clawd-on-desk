@@ -7,6 +7,7 @@ const { PassThrough } = require("node:stream");
 const {
   getPlatformConfig,
   createPidResolver,
+  DEFAULT_AGENT_CMDLINE_NAMES,
   readStdinJsonDetailed,
   DEFAULT_STDIN_READ_TIMEOUT_MS,
   buildElectronLaunchConfig,
@@ -163,6 +164,57 @@ describe("createPidResolver()", () => {
   });
 });
 
+describe("createPidResolver() — POSIX Desktop preference boundary", () => {
+  const { loadSharedProcessWithMock } = require("./helpers/load-shared-process-with-mock");
+  const pidCache = require("../hooks/pid-cache");
+
+  for (const platform of ["darwin", "linux"]) {
+    it(`keeps the ${platform} terminal anchor before reading the Windows-only preference`, (t) => {
+      let preferenceReads = 0;
+      let windowsSnapshots = 0;
+      const tree = new Map([
+        [610, { name: "sh", parent: 620, command: "hook" }],
+        [620, { name: "codex", parent: 630, command: "codex app-server" }],
+        [630, { name: "terminal", parent: 640, command: "terminal" }],
+        [640, { name: "init", parent: 0, command: "init" }],
+      ]);
+      t.mock.method(pidCache, "cacheFilePathV2", () => { throw new Error("POSIX must not enter the V2 disk cache"); });
+      const { mod, cleanup } = loadSharedProcessWithMock({
+        platform,
+        env: { TMUX: undefined, TMUX_PANE: undefined },
+        execFileSyncMock(command, args) {
+          assert.strictEqual(command, "ps", "no real process command is allowed");
+          const row = tree.get(Number(args[3]));
+          assert.ok(row, `unexpected synthetic PID ${args[3]}`);
+          if (args[1] === "ppid=") return `${row.parent}\n`;
+          if (args[1] === "comm=") return `${row.name}\n`;
+          if (args[1] === "command=") return `${row.command}\n`;
+          throw new Error(`unexpected ps probe ${args[1]}`);
+        },
+      });
+      try {
+        const resolve = mod.createPidResolver({
+          startPid: 610,
+          platformConfig: { terminalNames: new Set(["terminal"]), systemBoundary: new Set(["init"]), editorMap: {}, editorPathChecks: [] },
+          agentNames: { mac: new Set(["codex"]), linux: new Set(["codex"]) },
+          readRuntimeIdentity: () => { throw new Error("POSIX must not read a Windows cache owner"); },
+          getWindowsProcessSnapshot: () => { windowsSnapshots++; throw new Error("POSIX must not take a Windows snapshot"); },
+        });
+        for (const lifecycle of ["start", "event", "prompt", "end"]) {
+          const result = resolve({ namespace: "codex", sessionId: "codex:posix-desktop", cacheCwd: "/synthetic/project",
+            cacheable: true, lifecycle, get preferAgentPid() { preferenceReads++; return true; } });
+          assert.strictEqual(result.stablePid, 630, lifecycle);
+          assert.strictEqual(result.terminalPid, 630, lifecycle);
+          assert.strictEqual(result.agentPid, 620, lifecycle);
+        }
+        assert.strictEqual(resolve().stablePid, 630);
+        assert.strictEqual(preferenceReads, 0, "!isWin must return before interpreting the preference");
+        assert.strictEqual(windowsSnapshots, 0);
+      } finally { cleanup(); }
+    });
+  }
+});
+
 describe("createPidResolver() — POSIX non-Node command-line probe", () => {
   const { loadSharedProcessWithMock } = require("./helpers/load-shared-process-with-mock");
 
@@ -228,6 +280,144 @@ describe("createPidResolver() — POSIX non-Node command-line probe", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// createPidResolver() — default command-line process names
+// ═════════════════════════════════════════════════════════════════════════════
+
+// On Linux, current Node is not "node" to `ps -o comm=` unless it set
+// process.title: 23.8+ names its main thread "MainThread" (25.5+
+// "node-MainThread"), and Linux reports the main thread's name as the process
+// name. With only node/node.exe in the default, no adapter relying on it ever
+// ran its command-line check there (seen on Linux CI in PR #1049).
+describe("createPidResolver() — default command-line process names", () => {
+  const { loadSharedProcessWithMock } = require("./helpers/load-shared-process-with-mock");
+
+  it("lists every name of a node process that never set process.title, in lowercase", () => {
+    for (const name of ["node", "node.exe", "mainthread", "node-mainthread"]) {
+      assert.ok(DEFAULT_AGENT_CMDLINE_NAMES.includes(name), name);
+    }
+    for (const name of DEFAULT_AGENT_CMDLINE_NAMES) {
+      assert.strictEqual(name, name.toLowerCase(), `${name} can never match a lowercased basename`);
+    }
+    assert.ok(Object.isFrozen(DEFAULT_AGENT_CMDLINE_NAMES), "adapters spread it; none may change it");
+  });
+
+  // What Linux `ps -o comm=` prints for such a process: Node <= 23.7, 23.8–25.4,
+  // and >= 25.5.
+  for (const comm of ["node", "MainThread", "node-MainThread"]) {
+    it(`runs the command-line check for a Linux node process listed as ${comm}`, () => {
+      let commandProbes = 0;
+      const { mod, cleanup } = loadSharedProcessWithMock({
+        execFileSyncMock: (command, args) => {
+          const invocation = `${command} ${args.join(" ")}`;
+          if (invocation === "ps -o ppid= -p 700") return "1\n";
+          if (invocation === "ps -o comm= -p 700") return `${comm}\n`;
+          if (invocation === "ps -o command= -p 700") {
+            commandProbes++;
+            return "node /usr/lib/node_modules/@example/agent-cli/cli.js\n";
+          }
+          const err = new Error(`unexpected command: ${invocation}`);
+          err.code = "ENOENT";
+          throw err;
+        },
+        platform: "linux",
+      });
+      try {
+        const result = mod.createPidResolver({
+          ...LIVE_GATE,
+          platformConfig: mod.getPlatformConfig(),
+          startPid: 700,
+          agentCmdlineCheck: (cmdline) => cmdline.includes("@example/agent-cli"),
+        })();
+        assert.strictEqual(result.agentPid, 700);
+        assert.strictEqual(commandProbes, 1);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+
+  // The same through the real `ps` and the Node running this suite, so Linux
+  // CI notices if Node renames its main thread again. The probe runs as a
+  // short `node <marker>.js`, keeping the marker near the front of
+  // `ps -o command=`, and without COLUMNS, which procps otherwise applies as
+  // the width of piped output.
+  it("finds a real node process that never set process.title by its command line", {
+    skip: process.platform === "win32",
+  }, () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const { spawnSync } = require("node:child_process");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-cmdline-"));
+    const probe = `clawd-cmdline-probe-${process.pid}.js`;
+    fs.writeFileSync(path.join(dir, probe), [
+      `const sp = require(${JSON.stringify(path.join(__dirname, "..", "hooks", "shared-process.js"))});`,
+      "const { agentPid } = sp.createPidResolver({",
+      "  platformConfig: sp.getPlatformConfig(),",
+      "  startPid: process.pid,",
+      "  maxDepth: 1,",
+      `  agentCmdlineCheck: (cmdline) => cmdline.includes(${JSON.stringify(probe)}),`,
+      "})();",
+      "const comm = require(\"node:child_process\")",
+      "  .execFileSync(\"ps\", [\"-o\", \"comm=\", \"-p\", String(process.pid)], { encoding: \"utf8\" }).trim();",
+      "process.stdout.write(JSON.stringify({ pid: process.pid, agentPid, comm }));",
+    ].join("\n"));
+    const env = { ...process.env };
+    delete env.NODE_OPTIONS; // a --title there would rename the process
+    delete env.COLUMNS;
+    try {
+      const child = spawnSync(process.execPath, [probe], { cwd: dir, encoding: "utf8", env, timeout: 10000 });
+      assert.strictEqual(child.status, 0, child.stderr);
+      const { pid, agentPid, comm } = JSON.parse(child.stdout);
+      assert.strictEqual(agentPid, pid,
+        `ps lists this node process as ${JSON.stringify(comm)}, which DEFAULT_AGENT_CMDLINE_NAMES lacks`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Passing agentCmdlineNames replaces the default, so an adapter that only
+  // means to add a name must spread the default back in; a hand-written or
+  // trimmed node list silently goes stale again on Linux. This is a text
+  // check, not a parser, so it accepts one shape and reports everything else:
+  // `agentCmdlineNames: new Set([..., ...DEFAULT_AGENT_CMDLINE_NAMES])`, where
+  // the brackets hold only plain string literals and the spread itself (one
+  // line or several, no comments). A shorthand property, a variable, or any
+  // other mention not in that shape (one in a comment included) is reported,
+  // not guessed at; deliberately disguised keys (a computed property name) are
+  // beyond a text check. The one exception is a probe deliberately scoped to a
+  // non-Node host process.
+  it("keeps every adapter that passes agentCmdlineNames on the shared node names", () => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const hooksDir = path.join(__dirname, "..", "hooks");
+    // WorkBuddy's check only matches its bundled macOS Electron task runner.
+    const scopedToNonNodeHost = new Set(["workbuddy-hook.js"]);
+    // The bracket contents: anything but "]" or a comment opener.
+    const setLiteral = /^agentCmdlineNames\s*:\s*new Set\(\[((?:(?!\/[/*])[^\]])*)\]\)/;
+    const stringLiteral = /^(?:"[^"\\\n]*"|'[^'\\\n]*')$/;
+    const spread = "...DEFAULT_AGENT_CMDLINE_NAMES";
+    const spreadsDefault = (contents) => {
+      const elements = contents.split(",").map((element) => element.trim());
+      if (elements[elements.length - 1] === "") elements.pop(); // trailing comma
+      return elements.includes(spread)
+        && elements.every((element) => element === spread || stringLiteral.test(element));
+    };
+    const stale = [];
+    for (const file of fs.readdirSync(hooksDir).sort()) {
+      if (!file.endsWith(".js") || file === "shared-process.js" || scopedToNonNodeHost.has(file)) continue;
+      const src = fs.readFileSync(path.join(hooksDir, file), "utf8");
+      for (const { index } of src.matchAll(/\bagentCmdlineNames\b/g)) {
+        const rest = src.slice(index);
+        const set = setLiteral.exec(rest);
+        if (!set || !spreadsDefault(set[1])) stale.push(`${file}: ${rest.split("\n", 1)[0].trim()}`);
+      }
+    }
+    assert.deepStrictEqual(stale, []);
   });
 });
 
@@ -450,6 +640,57 @@ describe("createPidResolver() — Windows PowerShell path", { skip: process.plat
       foreground,
     });
   }
+
+  it("keeps snapshot overrides bounded and invalid values on the default deadline", () => {
+    const seen = [];
+    const cfg = getPlatformConfig();
+    withMockedExec((_file, _args, options) => {
+      seen.push(options.timeout);
+      return snapshotJson([{ pid: 1000, name: "cmd.exe", ppid: 0 }]);
+    }, () => {
+      for (const value of [undefined, 0, -1, Infinity, "5000", 3000.5, 5000, 60000]) {
+        createPidResolver({ ...LIVE_GATE, platformConfig: cfg, startPid: 1000,
+          windowsSnapshotTimeoutMs: value })();
+      }
+    });
+    assert.deepStrictEqual(seen, [3000, 3000, 3000, 3000, 3000, 3000, 5000, 5000]);
+  });
+
+  it("requests only the required CIM properties while preserving full CLI and foreground metadata", () => {
+    let seen;
+    withMockedExec((file, args, options) => {
+      seen = { file, args, options };
+      return snapshotEnvelopeJson([
+        { pid: 300, name: "powershell.exe", ppid: 301, startIdentity: "wrapper-start" },
+        { pid: 301, name: "codex.exe", ppid: 302, cmd: "codex --model test", startIdentity: "agent-start" },
+        { pid: 302, name: "windowsterminal.exe", ppid: 303, startIdentity: "terminal-start" },
+        { pid: 303, name: "explorer.exe", ppid: 0 },
+      ], { hwnd: "123456", pid: 302, className: "CASCADIA_HOSTING_WINDOW_CLASS" });
+    }, () => {
+      const result = createPidResolver({ ...LIVE_GATE, platformConfig: getPlatformConfig(), startPid: 300,
+        agentNames: { win: new Set(["codex.exe"]) } })();
+      assert.strictEqual(seen.file, "powershell.exe");
+      assert.deepStrictEqual(seen.args.slice(0, 5), ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command"]);
+      const script = seen.args[5];
+      assert.strictEqual(script.includes("Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate -ErrorAction SilentlyContinue"), true, "CIM requests exactly the required five properties");
+      assert.match(script, /Select-Object ProcessId, ParentProcessId, Name, CommandLine, @\{Name='StartIdentity';Expression=\{try \{ \$_\.CreationDate\.ToUniversalTime\(\)\.Ticks\.ToString\(\)/);
+      assert.match(script, /Add-Type -TypeDefinition \$typeDef/);
+      assert.match(script, /\[ClawdWin32\]::GetForegroundWindow\(\)/);
+      assert.match(script, /\[ClawdWin32\]::GetWindowThreadProcessId/);
+      assert.strictEqual(result.stablePid, 302, "CLI/noarg retains the terminal anchor");
+      assert.strictEqual(result.agentPid, 301);
+      assert.strictEqual(result.agentCommandLine, "codex --model test");
+      assert.strictEqual(result.foregroundWtHwnd, "123456");
+      assert.deepStrictEqual(result.pidChain, [300, 301, 302, 303]);
+      assert.strictEqual(result.agentProcessStartIdentity, "win32:agent-start");
+      assert.strictEqual(result.sourceProcessStartIdentity, "win32:terminal-start");
+      assert.strictEqual(Object.getOwnPropertyDescriptor(result, "agentProcessStartIdentity").enumerable, false);
+      assert.strictEqual(Object.getOwnPropertyDescriptor(result, "sourceProcessStartIdentity").enumerable, false);
+      assert.strictEqual(seen.options.timeout, 3000, "generic default is unchanged");
+      assert.strictEqual(seen.options.windowsHide, true);
+      assert.strictEqual(seen.options.maxBuffer, 8 * 1024 * 1024);
+    });
+  });
 
   it("populates pidChain by walking the snapshot Map", () => {
     const cfg = getPlatformConfig();
