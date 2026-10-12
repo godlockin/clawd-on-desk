@@ -772,3 +772,128 @@ test("remote route change tightens indexed active grants to off and cancels cand
     ["retire", "stale-grant"],
   ]);
 });
+
+function unverified(reason = "missing-codex-process-lifecycle") {
+  return Object.freeze({ eligible: false, reason });
+}
+
+test("an unverified request keeps a stricter per-session off record against the global mode", () => {
+  for (const globalMode of ["unattended", "auto-tools"]) {
+    const h = createHarness({ globalMode });
+    const entry = toolEntry({ sessionAutomationIdentity: unverified() });
+    h.store.compareAndSet(
+      { agentId: entry.agentId, sessionId: entry.sessionId },
+      "off",
+      { expectedGrantId: null, nextGrantId: `off-${globalMode}` }
+    );
+    assert.equal(h.coordinator.getEffectiveMode(entry), "off");
+  }
+});
+
+test("an unverified request is capped by an auto-tools record instead of widened globally", () => {
+  for (const [globalMode, expected] of [
+    ["unattended", "auto-tools"],
+    ["off", "off"],
+    ["auto-tools", "auto-tools"],
+  ]) {
+    const h = createHarness({ globalMode });
+    const entry = toolEntry({ sessionAutomationIdentity: unverified() });
+    h.store.compareAndSet(
+      { agentId: entry.agentId, sessionId: entry.sessionId },
+      "auto-tools",
+      { expectedGrantId: null, nextGrantId: `auto-${globalMode}` }
+    );
+    assert.equal(h.coordinator.getEffectiveMode(entry), expected);
+  }
+});
+
+test("an unverified session-only request stays off even with an auto-tools record", () => {
+  const h = createHarness({ globalMode: "unattended" });
+  const entry = toolEntry({ sessionAutomationIdentity: unverified() });
+  h.store.compareAndSet(
+    { agentId: entry.agentId, sessionId: entry.sessionId },
+    "auto-tools",
+    { expectedGrantId: null, nextGrantId: "auto-session-only" }
+  );
+  assert.equal(h.coordinator.getEffectiveMode(entry, { sessionOnly: true }), "off");
+});
+
+test("an unverified request without a record keeps the existing fallback", () => {
+  const h = createHarness({ globalMode: "unattended" });
+  const entry = toolEntry({ sessionAutomationIdentity: unverified() });
+  assert.equal(h.coordinator.getEffectiveMode(entry), "unattended");
+  assert.equal(h.coordinator.getEffectiveMode(entry, { sessionOnly: true }), "off");
+
+  const offHarness = createHarness({ globalMode: "off" });
+  const offEntry = toolEntry({ sessionAutomationIdentity: unverified() });
+  assert.equal(offHarness.coordinator.getEffectiveMode(offEntry), "off");
+});
+
+test("a verified request still uses its exact record regardless of the global mode", () => {
+  const h = createHarness({ globalMode: "off" });
+  const entry = toolEntry();
+  h.store.compareAndSet(
+    { agentId: entry.agentId, sessionId: entry.sessionId },
+    "auto-tools",
+    { expectedGrantId: null, nextGrantId: "auto-verified" }
+  );
+  assert.equal(h.coordinator.getEffectiveMode(entry), "auto-tools");
+});
+
+test("only an exact claimed identity consults a record for unverified requests", () => {
+  const h = createHarness({ globalMode: "unattended" });
+  const entry = toolEntry({ sessionAutomationIdentity: unverified() });
+  h.store.compareAndSet(
+    { agentId: entry.agentId, sessionId: entry.sessionId },
+    "off",
+    { expectedGrantId: null, nextGrantId: "off-exact" }
+  );
+
+  const otherAgent = toolEntry({
+    agentId: "codex",
+    sessionAutomationIdentity: unverified(),
+  });
+  assert.equal(h.coordinator.getEffectiveMode(otherAgent), "unattended");
+
+  const otherSession = toolEntry({
+    sessionId: "local|claude-code|other",
+    sessionAutomationIdentity: unverified(),
+  });
+  assert.equal(h.coordinator.getEffectiveMode(otherSession), "unattended");
+});
+
+test("absent, null, or non-boolean eligibility is treated as unverified", () => {
+  const h = createHarness({ globalMode: "unattended" });
+  const withNull = toolEntry({ sessionAutomationIdentity: null });
+  const missing = toolEntry();
+  delete missing.sessionAutomationIdentity;
+  const spoofed = toolEntry({
+    sessionAutomationIdentity: { eligible: "true", reason: "spoofed" },
+  });
+  h.store.compareAndSet(
+    { agentId: withNull.agentId, sessionId: withNull.sessionId },
+    "off",
+    { expectedGrantId: null, nextGrantId: "off-unverified" }
+  );
+  for (const entry of [withNull, missing, spoofed]) {
+    assert.equal(h.coordinator.getEffectiveMode(entry), "off");
+    assert.equal(h.coordinator.getRecordForEntry(entry), null);
+  }
+});
+
+test("an unrecognized stored mode is treated as off against a broader fallback", () => {
+  const store = {
+    get: () => Object.freeze({
+      agentId: "claude-code",
+      sessionId: "local|claude-code|s1",
+      mode: "unexpected-mode",
+      grantId: "stub",
+    }),
+  };
+  const coordinator = createSessionAutomationCoordinator({
+    store,
+    getGlobalMode: () => "unattended",
+  });
+  const entry = toolEntry({ sessionAutomationIdentity: unverified() });
+  assert.equal(coordinator.getEffectiveMode(entry), "off");
+});

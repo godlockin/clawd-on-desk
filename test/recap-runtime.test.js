@@ -49,6 +49,27 @@ function readDailyActivityCount(store, localDate) {
     .reduce((sum, row) => sum + row.metrics.activityEvents, 0);
 }
 
+// Tool-call totals for each day that has any, keyed by local date.
+function toolCallTotals(runtime, anchorDate = "2026-08-31") {
+  const totals = {};
+  for (const day of runtime.query("month", { anchorDate }).days) {
+    const count = day.rows.reduce((sum, row) => sum + (row.metrics.toolCalls || 0), 0);
+    if (count) totals[day.localDate] = count;
+  }
+  return totals;
+}
+
+function readMonthToolCallTotal(store, month = "2026-08") {
+  const parsed = JSON.parse(fs.readFileSync(store.childPath(`daily-${month}.json`), "utf8"));
+  return Object.values(parsed.days).reduce(
+    (sum, day) => sum + Object.values(day.rows).reduce(
+      (rowSum, row) => rowSum + (row.metrics.toolCalls || 0),
+      0
+    ),
+    0
+  );
+}
+
 function waitForChildLine(child, expected, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     let output = "";
@@ -85,6 +106,56 @@ async function waitFor(predicate, timeoutMs = 2000) {
   assert.fail("timed out waiting for condition");
 }
 
+function pausedRetainedJournal(reader, yieldEvery = 1) {
+  let release;
+  let announce;
+  let paused = false;
+  const pausedAt = new Promise((resolve) => { announce = resolve; });
+  return {
+    pausedAt,
+    release: () => release(),
+    journal: {
+      ...reader,
+      forEachRetainedAsync(anchorDate, onRecord) {
+        return reader.forEachRetainedAsync(anchorDate, onRecord, {
+          yieldEvery,
+          yieldToMain: () => {
+            if (paused) return Promise.resolve();
+            paused = true;
+            return new Promise((resolve) => {
+              release = resolve;
+              announce();
+            });
+          },
+        });
+      },
+    },
+  };
+}
+
+function seedSplitAggregateJournal(store, journal, publishedCount, eventCount) {
+  const published = createRecapAggregate({ store, flushDelayMs: 100000 });
+  published.load();
+  published.replaceDates(["2026-08-30"], Array.from({ length: publishedCount }, (_, index) => journal.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 30, 3 + index),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  })));
+  published.flush();
+  published.resetMemory();
+  const events = Array.from({ length: eventCount }, (_, index) => journal.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 30, 3 + index),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  }));
+  fs.writeFileSync(
+    store.childPath("events", "2026-08-30.jsonl"),
+    events.map((value) => JSON.stringify(value)).join("\n") + "\n"
+  );
+}
+
 function createManualTimers() {
   const scheduled = [];
   const cleared = [];
@@ -117,7 +188,7 @@ function createStorageRetryDependencies(initialize) {
       }),
     },
     journal: {
-      loadRetainedAsync: async () => ({ dates: [], records: [], truncated: false }),
+      forEachRetainedAsync: async () => ({ dates: [], truncated: false, restoredDedupeKeys: new Map() }),
       prune() {},
       resetMemory() {},
     },
@@ -129,7 +200,7 @@ function createStorageRetryDependencies(initialize) {
       load() {},
       prune() {},
       query: () => [],
-      replaceDates() {},
+      replaceDays() {},
       resetMemory() {},
     },
     coverage: {
@@ -251,8 +322,8 @@ test("a stable event replayed while hydration yields is not double counted", asy
   const hydrationPaused = new Promise((resolve) => { hydrationYielded = resolve; });
   const journal = {
     ...reader,
-    loadRetainedAsync(anchorDate) {
-      return reader.loadRetainedAsync(anchorDate, {
+    forEachRetainedAsync(anchorDate, onRecord) {
+      return reader.forEachRetainedAsync(anchorDate, onRecord, {
         yieldEvery: 1,
         yieldToMain: () => {
           if (paused) return Promise.resolve();
@@ -287,8 +358,8 @@ test("a stable event replayed while hydration yields is not double counted", asy
   assert.equal(rebuilt.runtime.query("today").days[0].rows[0].metrics.toolCalls, 1);
 });
 
-test("aggregate hydration yields in bounded batches without losing later live events", async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-apply-batches-"));
+test("hydration yields during the read without losing a later live event", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-read-yield-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const now = Date.UTC(2026, 7, 30, 1);
   const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
@@ -305,93 +376,74 @@ test("aggregate hydration yields in bounded batches without losing later live ev
     Array.from({ length: 600 }, () => JSON.stringify(diskRecord)).join("\n") + "\n"
   );
 
-  let releaseApply;
-  let announceApplyYield;
-  let yieldCalls = 0;
-  const applyYielded = new Promise((resolve) => { announceApplyYield = resolve; });
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader, 100);
   const runtime = createRecapRuntime({
     store,
+    journal: pause.journal,
     now: () => now,
     getTimeZone: () => "UTC",
-    hydrationApplyBatchSize: 100,
-    yieldHydrationApply: () => {
-      yieldCalls += 1;
-      if (yieldCalls > 1) return Promise.resolve();
-      return new Promise((resolve) => {
-        releaseApply = resolve;
-        announceApplyYield();
-      });
-    },
     setTimeout: () => ({ unref() {} }),
     clearTimeout: () => {},
   });
   runtime.start();
-  await applyYielded;
+  await pause.pausedAt;
   assert.equal(runtime.record({
     occurredAt: now + 1,
     agentId: "codex",
     scope: "local",
     metrics: ["activity"],
   }), true);
-  releaseApply();
+  pause.release();
   await runtime.whenReady();
 
-  assert.equal(yieldCalls, 5);
   assert.equal(runtime.query("today").days[0].rows[0].metrics.activityEvents, 601);
   runtime.dispose();
 });
 
-test("dispose never flushes a partially rebuilt aggregate", async (t) => {
+test("dispose during the hydration read keeps a complete aggregate on the same object", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-partial-dispose-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const now = Date.UTC(2026, 7, 30, 1);
   const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
   store.initialize();
-  const writer = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
-  const diskRecord = writer.buildRecord({
+  const journal = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  seedSplitAggregateJournal(store, journal, 5, 7);
+
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader, 100);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  const count = () => runtime.query("today").days[0].rows.reduce(
+    (sum, row) => sum + row.metrics.activityEvents,
+    0
+  );
+  runtime.start();
+  const firstReady = runtime.whenReady();
+  await pause.pausedAt;
+  assert.equal(runtime.record({
     occurredAt: now,
     agentId: "codex",
     scope: "local",
     metrics: ["activity"],
-  });
-  fs.writeFileSync(
-    store.childPath("events", "2026-08-30.jsonl"),
-    Array.from({ length: 600 }, () => JSON.stringify(diskRecord)).join("\n") + "\n"
-  );
-
-  let releaseApply;
-  let announceApplyYield;
-  let yieldCalls = 0;
-  const applyYielded = new Promise((resolve) => { announceApplyYield = resolve; });
-  const runtime = createRecapRuntime({
-    store,
-    now: () => now,
-    getTimeZone: () => "UTC",
-    hydrationApplyBatchSize: 100,
-    yieldHydrationApply: () => {
-      yieldCalls += 1;
-      if (yieldCalls > 1) return Promise.resolve();
-      return new Promise((resolve) => {
-        releaseApply = resolve;
-        announceApplyYield();
-      });
-    },
-    setTimeout: () => ({ unref() {} }),
-    clearTimeout: () => {},
-  });
-  runtime.start();
-  const ready = runtime.whenReady();
-  await applyYielded;
+  }), true);
   runtime.dispose();
-  releaseApply();
-  await ready;
-  assert.equal(fs.existsSync(store.childPath("daily-2026-08.json")), false);
+  assert.equal(count(), 6);
+  assert.equal(readDailyActivityCount(store, "2026-08-30"), 6);
 
-  const rebuilt = fixture(t, { root, now });
-  rebuilt.runtime.start();
-  await rebuilt.runtime.whenReady();
-  assert.equal(rebuilt.runtime.query("today").days[0].rows[0].metrics.activityEvents, 600);
-  rebuilt.runtime.dispose();
+  assert.equal(runtime.start(), true);
+  assert.equal(count(), 6);
+  pause.release();
+  await firstReady;
+  await runtime.whenReady();
+  assert.equal(count(), 8);
+  runtime.dispose();
 });
 
 test("a final hydration flush failure keeps the complete in-memory projection retryable", async (t) => {
@@ -446,7 +498,7 @@ test("a final hydration flush failure keeps the complete in-memory projection re
   runtime.dispose();
 });
 
-test("hydration overflow restores the last complete cache before a retry can be flushed", async (t) => {
+test("hydration overflow retries without dropping live events or a partial projection", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-overflow-retry-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const now = Date.UTC(2026, 7, 30, 1);
@@ -465,44 +517,48 @@ test("hydration overflow restores the last complete cache before a retry can be 
   );
 
   let loadCalls = 0;
-  let releaseRetryLoad;
-  let announceRetryLoad;
-  const retryLoadPaused = new Promise((resolve) => { announceRetryLoad = resolve; });
+  let releaseFirstRead;
+  let announceFirstRead;
+  let releaseRetryRead;
+  let announceRetryRead;
+  const firstReadPaused = new Promise((resolve) => { announceFirstRead = resolve; });
+  const retryReadPaused = new Promise((resolve) => { announceRetryRead = resolve; });
   const journal = {
     ...actualJournal,
-    loadRetainedAsync(anchorDate) {
+    forEachRetainedAsync(anchorDate, onRecord) {
       loadCalls += 1;
-      if (loadCalls === 1) return actualJournal.loadRetainedAsync(anchorDate);
-      return new Promise((resolve, reject) => {
-        releaseRetryLoad = () => actualJournal.loadRetainedAsync(anchorDate).then(resolve, reject);
-        announceRetryLoad();
+      const call = loadCalls;
+      let paused = false;
+      return actualJournal.forEachRetainedAsync(anchorDate, onRecord, {
+        yieldEvery: 1,
+        yieldToMain: () => {
+          if (paused) return Promise.resolve();
+          paused = true;
+          if (call === 1) {
+            return new Promise((resolve) => {
+              releaseFirstRead = resolve;
+              announceFirstRead();
+            });
+          }
+          return new Promise((resolve) => {
+            releaseRetryRead = resolve;
+            announceRetryRead();
+          });
+        },
       });
     },
   };
-  let releaseApply;
-  let announceApplyYield;
-  let applyYieldCalls = 0;
-  const applyPaused = new Promise((resolve) => { announceApplyYield = resolve; });
   const runtime = createRecapRuntime({
     store,
     journal,
     now: () => now,
     getTimeZone: () => "UTC",
-    hydrationApplyBatchSize: 100,
-    yieldHydrationApply: () => {
-      applyYieldCalls += 1;
-      if (applyYieldCalls > 1) return Promise.resolve();
-      return new Promise((resolve) => {
-        releaseApply = resolve;
-        announceApplyYield();
-      });
-    },
     setTimeout: () => ({ unref() {} }),
     clearTimeout: () => {},
   });
   runtime.start();
   const ready = runtime.whenReady();
-  await applyPaused;
+  await firstReadPaused;
   for (let index = 0; index < 4097; index += 1) {
     assert.equal(runtime.record({
       occurredAt: now + index + 1,
@@ -511,14 +567,91 @@ test("hydration overflow restores the last complete cache before a retry can be 
       metrics: ["activity"],
     }), true);
   }
-  releaseApply();
-  await retryLoadPaused;
+  releaseFirstRead();
+  await retryReadPaused;
 
   runtime.flush();
-  assert.equal(fs.existsSync(store.childPath("daily-2026-08.json")), false);
-  releaseRetryLoad();
+  assert.equal(fs.existsSync(store.childPath("daily-2026-08.json")), true);
+  assert.equal(readDailyActivityCount(store, "2026-08-30"), 4097);
+  releaseRetryRead();
   await ready;
   assert.equal(runtime.query("today").days[0].rows[0].metrics.activityEvents, 4597);
+  runtime.dispose();
+});
+
+test("issue #1141: an overflow retry that hits the bound still keeps the live events", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-overflow-bound-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 1);
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
+  store.initialize();
+  const actualJournal = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const diskRecord = actualJournal.buildRecord({
+    occurredAt: now,
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  });
+  fs.writeFileSync(
+    store.childPath("events", "2026-08-30.jsonl"),
+    Array.from({ length: 500 }, () => JSON.stringify(diskRecord)).join("\n") + "\n"
+  );
+
+  let loadCalls = 0;
+  let releaseFirstRead;
+  let announceFirstRead;
+  const firstReadPaused = new Promise((resolve) => { announceFirstRead = resolve; });
+  const journal = {
+    ...actualJournal,
+    forEachRetainedAsync(anchorDate, onRecord) {
+      loadCalls += 1;
+      if (loadCalls === 1) {
+        let paused = false;
+        return actualJournal.forEachRetainedAsync(anchorDate, onRecord, {
+          yieldEvery: 1,
+          yieldToMain: () => {
+            if (paused) return Promise.resolve();
+            paused = true;
+            return new Promise((resolve) => {
+              releaseFirstRead = resolve;
+              announceFirstRead();
+            });
+          },
+        });
+      }
+      return actualJournal.forEachRetainedAsync(anchorDate, onRecord, { maxRecords: 10 });
+    },
+  };
+  const warnings = [];
+  const runtime = createRecapRuntime({
+    store,
+    journal,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+    logWarn: (...args) => warnings.push(args),
+  });
+  runtime.start();
+  const ready = runtime.whenReady();
+  await firstReadPaused;
+  for (let index = 0; index < 4097; index += 1) {
+    assert.equal(runtime.record({
+      occurredAt: now + index + 1,
+      agentId: "codex",
+      scope: "local",
+      metrics: ["activity"],
+    }), true);
+  }
+  releaseFirstRead();
+  await ready;
+
+  assert.equal(runtime.query("today").days[0].rows[0].metrics.activityEvents, 4097);
+  assert.equal(readDailyActivityCount(store, "2026-08-30"), 4097);
+  assert.equal(
+    warnings.some((args) => args.some((value) => String(value).includes("exceeded its safety bound"))),
+    true
+  );
   runtime.dispose();
 });
 
@@ -555,29 +688,22 @@ test("a failed clear during hydration never overwrites the last complete aggrega
       throw error;
     },
   };
-  const journal = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
-  let releaseApply;
-  let announceApplyYield;
-  const applyPaused = new Promise((resolve) => { announceApplyYield = resolve; });
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader, 100);
   const runtime = createRecapRuntime({
     store,
-    journal,
+    journal: pause.journal,
     now: () => now,
     getTimeZone: () => "UTC",
-    hydrationApplyBatchSize: 100,
-    yieldHydrationApply: () => new Promise((resolve) => {
-      releaseApply = resolve;
-      announceApplyYield();
-    }),
     setTimeout: () => ({ unref() {} }),
     clearTimeout: () => {},
     logWarn: () => {},
   });
   runtime.start();
   const ready = runtime.whenReady();
-  await applyPaused;
+  await pause.pausedAt;
   assert.equal(runtime.clear(), false);
-  releaseApply();
+  pause.release();
   await ready;
   assert.equal(readDailyActivityCount(actualStore, "2026-08-30"), 600);
   runtime.dispose();
@@ -607,8 +733,8 @@ test("dispose aborts a yielded hydration before another file-read batch", async 
   const yielded = new Promise((resolve) => { announceYield = resolve; });
   const journal = {
     ...reader,
-    loadRetainedAsync(anchorDate) {
-      return reader.loadRetainedAsync(anchorDate, {
+    forEachRetainedAsync(anchorDate, onRecord) {
+      return reader.forEachRetainedAsync(anchorDate, onRecord, {
         yieldEvery: 100,
         yieldToMain: () => {
           yieldCalls += 1;
@@ -783,8 +909,16 @@ test("runtime recovery restarts midnight coverage and hydrates retained journal 
   let coverageStarts = 0;
   let hydrationLoads = 0;
   const replacedDates = [];
-  const applied = [];
-  const retained = { dedupeKeyHash: null, marker: "retained" };
+  const projectedRows = [];
+  const retained = {
+    agentId: "codex",
+    scope: "local",
+    localDate: "2026-08-29",
+    localHour: 8,
+    timeZoneId: "UTC",
+    metrics: ["activity", "tool-call"],
+    support: { sessionsStarted: false, turnsCompleted: true, toolCalls: true },
+  };
   const dependencies = createStorageRetryDependencies(() => {
     initializeCalls += 1;
     if (initializeCalls === 1) {
@@ -796,12 +930,16 @@ test("runtime recovery restarts midnight coverage and hydrates retained journal 
     }
   });
   dependencies.coverage.start = () => { coverageStarts += 1; };
-  dependencies.journal.loadRetainedAsync = async () => {
+  dependencies.journal.forEachRetainedAsync = async (anchorDate, onRecord) => {
     hydrationLoads += 1;
-    return { dates: ["2026-08-29"], records: [retained], truncated: false };
+    onRecord(retained);
+    return { dates: ["2026-08-29"], truncated: false, restoredDedupeKeys: new Map() };
   };
-  dependencies.aggregate.replaceDates = (dates) => { replacedDates.push(...dates); };
-  dependencies.aggregate.apply = (record) => { applied.push(record); };
+  dependencies.aggregate.replaceDays = (dates, projection) => {
+    replacedDates.push(...dates);
+    const day = projection.getDay("2026-08-29");
+    if (day) projectedRows.push(...Object.values(day.rows));
+  };
   const runtime = createRecapRuntime({
     ...dependencies,
     now: () => Date.UTC(2026, 7, 29, 10),
@@ -820,7 +958,8 @@ test("runtime recovery restarts midnight coverage and hydrates retained journal 
   assert.equal(coverageStarts, 1);
   assert.equal(hydrationLoads, 1);
   assert.deepEqual(replacedDates, ["2026-08-29"]);
-  assert.deepEqual(applied, [retained]);
+  assert.equal(projectedRows.length, 1);
+  assert.equal(projectedRows[0].metrics.toolCalls, 1);
   assert.equal(timers.scheduled.length, 2, "storage recovery must re-arm the midnight timer");
   assert.ok(timers.scheduled[1].delay > 1000);
   runtime.dispose();
@@ -1030,8 +1169,8 @@ test("an overbound journal cannot postpone the aggregate privacy allowlist rewri
   const actualJournal = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
   const journal = {
     ...actualJournal,
-    async loadRetainedAsync(anchorDate) {
-      return { dates: actualJournal.retainedDates(anchorDate), records: [], truncated: true };
+    async forEachRetainedAsync(anchorDate) {
+      return { dates: actualJournal.retainedDates(anchorDate), truncated: true };
     },
   };
   const runtime = createRecapRuntime({
@@ -1049,4 +1188,465 @@ test("an overbound journal cannot postpone the aggregate privacy allowlist rewri
   assert.match(disk, /"schemaVersion":2/);
   assert.equal(disk.includes("scopeKeyHash"), false);
   assert.equal(disk.includes("timeZone"), false);
+});
+
+test("issue #1141: startup reconciliation keeps working past the old line bound", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-line-bound-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 1);
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
+  store.initialize();
+  const journal = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const recordValue = journal.buildRecord({
+    occurredAt: now,
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  });
+  fs.writeFileSync(
+    store.childPath("events", "2026-08-30.jsonl"),
+    `${JSON.stringify(recordValue)}\n${"\n".repeat(100000)}`
+  );
+
+  const warnings = [];
+  const runtime = createRecapRuntime({
+    store,
+    journal,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+    logWarn: (...args) => warnings.push(args),
+  });
+  runtime.start();
+  await runtime.whenReady();
+
+  const row = runtime.query("today").days[0].rows[0];
+  assert.equal(row.metrics.toolCalls, 1);
+  assert.equal(row.metrics.activityEvents, 1);
+  assert.equal(
+    warnings.some((args) => args.some((value) => String(value).includes("exceeded its safety bound"))),
+    false
+  );
+  runtime.dispose();
+});
+
+test("issue #1141: a replayed live event defers to the disk copy during hydration", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-disk-wins-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 9);
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
+  store.initialize();
+  const writer = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const identity = { sessionId: "s", dedupeId: "tool-1" };
+  const diskEvent = {
+    occurredAt: Date.UTC(2026, 7, 30, 3),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  };
+  assert.equal(writer.append(writer.buildRecord(diskEvent, identity)), true);
+
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pause.pausedAt;
+  assert.equal(runtime.record({ ...diskEvent, occurredAt: Date.UTC(2026, 7, 30, 8) }, identity), true);
+  pause.release();
+  await runtime.whenReady();
+
+  const row = runtime.query("today").days[0].rows[0];
+  assert.equal(row.metrics.toolCalls, 1);
+  assert.equal(row.hours[3], 1);
+  assert.equal(row.hours[8], 0);
+  runtime.dispose();
+
+  const restarted = createRecapRuntime({
+    root,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  restarted.start();
+  await restarted.whenReady();
+  const after = restarted.query("today").days[0].rows[0];
+  assert.equal(after.metrics.toolCalls, 1);
+  assert.equal(after.hours[3], 1);
+  assert.equal(after.hours[8], 0);
+  restarted.dispose();
+});
+
+test("issue #1141: a live replay older than the disk copy is not counted twice", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-earlier-replay-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 9);
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
+  store.initialize();
+  const writer = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const identity = { sessionId: "s", dedupeId: "tool-1" };
+  const diskEvent = {
+    occurredAt: Date.UTC(2026, 7, 30, 3),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  };
+  assert.equal(writer.append(writer.buildRecord(diskEvent, identity)), true);
+
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pause.pausedAt;
+  // The replay arrives on an earlier day than the disk ticket. This hydration
+  // keeps the disk copy; a later restart may assign it to the earlier day
+  // because that file is read first. Only the total is pinned here.
+  assert.equal(runtime.record({ ...diskEvent, occurredAt: Date.UTC(2026, 7, 29, 8) }, identity), true);
+  pause.release();
+  await runtime.whenReady();
+
+  const month = runtime.query("month");
+  const total = month.days.reduce(
+    (sum, day) => sum + day.rows.reduce((rowSum, row) => rowSum + (row.metrics.toolCalls || 0), 0),
+    0
+  );
+  assert.equal(total, 1);
+  runtime.dispose();
+});
+
+test("issue #1141: a new day recorded during hydration is counted once", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-midnight-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let clock = Date.UTC(2026, 7, 30, 23, 59, 59, 900);
+  const store = createRecapStore({ root, now: () => clock, getTimeZone: () => "UTC" });
+  store.initialize();
+  const writer = createRecapJournal({ store, now: () => clock, getTimeZone: () => "UTC" });
+  assert.equal(writer.append(writer.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 30, 12),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  })), true);
+
+  const reader = createRecapJournal({ store, now: () => clock, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => clock,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pause.pausedAt;
+  clock = Date.UTC(2026, 7, 31, 0, 0, 0, 100);
+  assert.equal(runtime.record({
+    occurredAt: clock,
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  }), true);
+  pause.release();
+  await runtime.whenReady();
+
+  const view = runtime.query("today");
+  assert.equal(view.days[0].localDate, "2026-08-31");
+  const activity = view.days[0].rows.reduce((sum, row) => sum + row.metrics.activityEvents, 0);
+  assert.equal(activity, 1);
+  runtime.dispose();
+});
+
+test("issue #1141: the previous aggregate stays visible until the projection is swapped in", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-no-half-swap-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 1);
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
+  store.initialize();
+  const journal = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  seedSplitAggregateJournal(store, journal, 5, 7);
+
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pause.pausedAt;
+  assert.equal(runtime.query("today").days[0].rows[0].metrics.activityEvents, 5);
+  pause.release();
+  await runtime.whenReady();
+  assert.equal(runtime.query("today").days[0].rows[0].metrics.activityEvents, 7);
+  runtime.dispose();
+});
+
+test("issue #1141: a failed swap rolls back to the last complete aggregate", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-swap-failure-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 1);
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
+  store.initialize();
+  const journal = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  seedSplitAggregateJournal(store, journal, 5, 7);
+
+  const actualAggregate = createRecapAggregate({ store, flushDelayMs: 100000, logWarn: () => {} });
+  actualAggregate.load();
+  let failed = false;
+  const aggregate = {
+    ...actualAggregate,
+    replaceDays(dates, projection) {
+      actualAggregate.replaceDays(dates, projection);
+      if (!failed) {
+        failed = true;
+        throw Object.assign(new Error("injected replace failure"), { code: "EIO" });
+      }
+    },
+  };
+  const warnings = [];
+  const runtime = createRecapRuntime({
+    store,
+    journal,
+    aggregate,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+    logWarn: (...args) => warnings.push(args),
+  });
+  runtime.start();
+  await runtime.whenReady();
+
+  assert.equal(runtime.query("today").days[0].rows[0].metrics.activityEvents, 5);
+  assert.equal(readDailyActivityCount(store, "2026-08-30"), 5);
+  assert.equal(
+    warnings.some((args) => args.some((value) => String(value).includes("reconciliation failed"))),
+    true
+  );
+  runtime.dispose();
+});
+
+test("issue #1141: a keyed replay across midnight is counted once", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-keyed-midnight-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let clock = Date.UTC(2026, 7, 30, 23, 59, 59, 900);
+  const store = createRecapStore({ root, now: () => clock, getTimeZone: () => "UTC" });
+  store.initialize();
+  const writer = createRecapJournal({ store, now: () => clock, getTimeZone: () => "UTC" });
+  const event = {
+    occurredAt: Date.UTC(2026, 7, 30, 12),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  };
+  const identity = { sessionId: "s", dedupeId: "tool-1" };
+  assert.equal(writer.append(writer.buildRecord(event, identity)), true);
+
+  const reader = createRecapJournal({ store, now: () => clock, getTimeZone: () => "UTC" });
+  const pause = pausedRetainedJournal(reader);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => clock,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pause.pausedAt;
+  clock = Date.UTC(2026, 7, 31, 0, 0, 0, 100);
+  assert.equal(runtime.record({ ...event, occurredAt: clock }, identity), true);
+  pause.release();
+  await runtime.whenReady();
+
+  assert.deepEqual(toolCallTotals(runtime), { "2026-08-30": 1 });
+  assert.equal(readMonthToolCallTotal(store), 1);
+  runtime.dispose();
+
+  const restarted = createRecapRuntime({
+    root,
+    now: () => clock,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  restarted.start();
+  await restarted.whenReady();
+  assert.deepEqual(toolCallTotals(restarted), { "2026-08-30": 1 });
+  restarted.dispose();
+});
+
+test("issue #1141: a permanent timezone move to the previous day is counted once", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-tz-back-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 0, 5);
+  let timeZone = "UTC";
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => timeZone });
+  store.initialize();
+  const writer = createRecapJournal({ store, now: () => now, getTimeZone: () => timeZone });
+  const event = {
+    occurredAt: Date.UTC(2026, 7, 30, 0),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  };
+  const identity = { sessionId: "s", dedupeId: "tool-1" };
+  const diskRecord = writer.buildRecord(event, identity);
+  fs.writeFileSync(store.childPath("events", "2026-08-30.jsonl"), `${JSON.stringify(diskRecord)}\n`);
+  const published = createRecapAggregate({ store, flushDelayMs: 100000 });
+  published.apply(diskRecord, { flush: true });
+  published.resetMemory();
+
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => timeZone });
+  let reads = 0;
+  let release;
+  let announce;
+  let paused = false;
+  const pausedAt = new Promise((resolve) => { announce = resolve; });
+  const journal = {
+    ...reader,
+    forEachRetainedAsync(anchorDate, onRecord) {
+      reads += 1;
+      return reader.forEachRetainedAsync(anchorDate, onRecord, {
+        yieldEvery: 1,
+        yieldToMain: () => {
+          if (paused) return Promise.resolve();
+          paused = true;
+          return new Promise((resolve) => {
+            release = resolve;
+            announce();
+          });
+        },
+      });
+    },
+  };
+  const runtime = createRecapRuntime({
+    store,
+    journal,
+    now: () => now,
+    getTimeZone: () => timeZone,
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pausedAt;
+  // UTC-7/8 takes the same instant back to the previous local day.
+  timeZone = "America/Los_Angeles";
+  assert.equal(runtime.record({ ...event, occurredAt: now }, identity), true);
+  release();
+  await runtime.whenReady();
+
+  assert.equal(reads, 1);
+  assert.deepEqual(toolCallTotals(runtime, "2026-08-31"), { "2026-08-30": 1 });
+  assert.equal(readMonthToolCallTotal(store), 1);
+  runtime.dispose();
+});
+
+test("issue #1141: the date filter still guards a timezone flip", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-tz-flip-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 10);
+  let timeZone = "UTC";
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => timeZone });
+  store.initialize();
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => timeZone });
+  const diskRecord = reader.buildRecord({
+    occurredAt: now,
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  });
+  fs.writeFileSync(store.childPath("events", "2026-08-30.jsonl"), `${JSON.stringify(diskRecord)}\n`);
+
+  const pause = pausedRetainedJournal(reader);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => now,
+    getTimeZone: () => timeZone,
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pause.pausedAt;
+  // UTC+14 pushes the same instant into the next local day.
+  timeZone = "Pacific/Kiritimati";
+  assert.equal(runtime.record({
+    occurredAt: now,
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  }), true);
+  timeZone = "UTC";
+  pause.release();
+  await runtime.whenReady();
+
+  const nextDay = runtime.query("today", { anchorDate: "2026-08-31" }).days[0];
+  const activity = nextDay.rows.reduce((sum, row) => sum + row.metrics.activityEvents, 0);
+  assert.equal(activity, 1);
+  runtime.dispose();
+});
+
+test("issue #1141: a live replay before its disk copy is counted once", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-live-before-disk-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.UTC(2026, 7, 30, 10);
+  const store = createRecapStore({ root, now: () => now, getTimeZone: () => "UTC" });
+  store.initialize();
+  const reader = createRecapJournal({ store, now: () => now, getTimeZone: () => "UTC" });
+  const event = {
+    occurredAt: Date.UTC(2026, 7, 30, 3),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  };
+  const identity = { sessionId: "s", dedupeId: "tool-1" };
+  const filler = reader.buildRecord({ ...event, metrics: ["activity"] });
+  const keyed = reader.buildRecord(event, identity);
+  fs.writeFileSync(
+    store.childPath("events", "2026-08-30.jsonl"),
+    [filler, keyed].map((value) => JSON.stringify(value)).join("\n") + "\n"
+  );
+
+  const pause = pausedRetainedJournal(reader);
+  const runtime = createRecapRuntime({
+    store,
+    journal: pause.journal,
+    now: () => now,
+    getTimeZone: () => "UTC",
+    setTimeout: () => ({ unref() {} }),
+    clearTimeout: () => {},
+  });
+  runtime.start();
+  await pause.pausedAt;
+  assert.equal(runtime.record({ ...event, occurredAt: Date.UTC(2026, 7, 30, 8) }, identity), true);
+  pause.release();
+  await runtime.whenReady();
+
+  const row = runtime.query("today").days[0].rows[0];
+  assert.equal(row.metrics.activityEvents, 2);
+  assert.equal(row.metrics.toolCalls, 1);
+  assert.equal(row.hours[3], 2);
+  assert.equal(row.hours[8], 0);
+  assert.equal(runtime.record(event, identity), false);
+  runtime.dispose();
 });
