@@ -147,6 +147,67 @@ function normalizeDay(localDate, value) {
   return { rows, hourCapacities };
 }
 
+// The single per-record counting rule. The live aggregate's apply() and the
+// throwaway hydration projection must produce identical days, so both route
+// through this function instead of repeating the support/hour bookkeeping.
+function applyRecordToDay(day, record) {
+  const capacities = describeLocalDay(record.localDate, record.timeZoneId).map((cell) => cell.minutes);
+  for (let hour = 0; hour < 24; hour += 1) {
+    day.hourCapacities[hour] = Math.max(day.hourCapacities[hour] || 0, capacities[hour] || 0);
+  }
+  const key = rowKey(record);
+  const row = day.rows[key] || (day.rows[key] = createRow(record));
+  for (const metric of ["sessionsStarted", "turnsCompleted", "toolCalls"]) {
+    if (row.support[metric] !== true || record.support[metric] !== true) {
+      row.support[metric] = false;
+      row.metrics[metric] = null;
+    }
+  }
+  if (!row.support.sessionsStarted) row.sessionsStartedPartial = true;
+  row.metrics.activityEvents += 1;
+  row.hours[record.localHour] += 1;
+  if (record.metrics.includes("session-start") && row.metrics.sessionsStarted !== null) {
+    row.metrics.sessionsStarted += 1;
+  }
+  if (record.metrics.includes("turn-complete") && row.metrics.turnsCompleted !== null) {
+    row.metrics.turnsCompleted += 1;
+  }
+  if (record.metrics.includes("tool-call") && row.metrics.toolCalls !== null) {
+    row.metrics.toolCalls += 1;
+  }
+  if (record.sessionStartPartial === true) row.sessionsStartedPartial = true;
+  return row;
+}
+
+// An in-memory-only daily projection for hydration. It has no store, files, or
+// timers, so reading a bounded window of journal records costs memory
+// proportional to the summary rows and never to the number of events.
+function createRecapDayProjection() {
+  const days = new Map();
+
+  function ensureDay(localDate) {
+    let day = days.get(localDate);
+    if (!day) {
+      day = { rows: {}, hourCapacities: Array(24).fill(0) };
+      days.set(localDate, day);
+    }
+    return day;
+  }
+
+  function apply(record) {
+    return applyRecordToDay(ensureDay(record.localDate), record);
+  }
+
+  // Returns the projection's own day object, which replaceDays() takes over
+  // by reference. This is safe because the projection is thrown away once the
+  // swap is done.
+  function getDay(localDate) {
+    return days.get(localDate);
+  }
+
+  return Object.freeze({ apply, getDay });
+}
+
 function createRecapAggregate(options = {}) {
   if (!options.store) throw new Error("createRecapAggregate requires store");
   const store = options.store;
@@ -248,36 +309,12 @@ function createRecapAggregate(options = {}) {
       rows: {},
       hourCapacities: Array(24).fill(0),
     };
-    const capacities = describeLocalDay(record.localDate, record.timeZoneId).map((cell) => cell.minutes);
-    for (let hour = 0; hour < 24; hour += 1) {
-      day.hourCapacities[hour] = Math.max(day.hourCapacities[hour] || 0, capacities[hour] || 0);
-    }
     return { month, day };
   }
 
   function apply(record, options = {}) {
     const { month, day } = ensureDay(record);
-    const key = rowKey(record);
-    const row = day.rows[key] || (day.rows[key] = createRow(record));
-    for (const metric of ["sessionsStarted", "turnsCompleted", "toolCalls"]) {
-      if (row.support[metric] !== true || record.support[metric] !== true) {
-        row.support[metric] = false;
-        row.metrics[metric] = null;
-      }
-    }
-    if (!row.support.sessionsStarted) row.sessionsStartedPartial = true;
-    row.metrics.activityEvents += 1;
-    row.hours[record.localHour] += 1;
-    if (record.metrics.includes("session-start") && row.metrics.sessionsStarted !== null) {
-      row.metrics.sessionsStarted += 1;
-    }
-    if (record.metrics.includes("turn-complete") && row.metrics.turnsCompleted !== null) {
-      row.metrics.turnsCompleted += 1;
-    }
-    if (record.metrics.includes("tool-call") && row.metrics.toolCalls !== null) {
-      row.metrics.toolCalls += 1;
-    }
-    if (record.sessionStartPartial === true) row.sessionsStartedPartial = true;
+    const row = applyRecordToDay(day, record);
     markDirty(month.month);
     if (options.flush === true) flush();
     return row;
@@ -292,6 +329,22 @@ function createRecapAggregate(options = {}) {
       changed.add(monthName);
     }
     for (const record of records) apply(record);
+    for (const month of changed) markDirty(month);
+  }
+
+  // Swap the named days to a projection's result: a projected day replaces any
+  // current one, an absent day is deleted. Days outside localDates are left
+  // alone. This is replaceDates(dates, []) plus the projection's records.
+  function replaceDays(localDates, projection) {
+    const changed = new Set();
+    for (const localDate of localDates) {
+      const monthName = monthOf(localDate);
+      const month = ensureMonth(monthName);
+      const projected = projection.getDay(localDate);
+      if (projected) month.days[localDate] = projected;
+      else delete month.days[localDate];
+      changed.add(monthName);
+    }
     for (const month of changed) markDirty(month);
   }
 
@@ -357,13 +410,25 @@ function createRecapAggregate(options = {}) {
     dirtyMonths.clear();
   }
 
-  return Object.freeze({ apply, beginBatch, endBatch, flush, load, prune, query, replaceDates, resetMemory });
+  return Object.freeze({
+    apply,
+    beginBatch,
+    endBatch,
+    flush,
+    load,
+    prune,
+    query,
+    replaceDates,
+    replaceDays,
+    resetMemory,
+  });
 }
 
 module.exports = {
   MAX_AGGREGATE_ROWS_PER_DAY,
   MAX_DAYS_PER_MONTH,
   createRecapAggregate,
+  createRecapDayProjection,
   hasSafeAggregateFanout,
   normalizeDay,
 };
