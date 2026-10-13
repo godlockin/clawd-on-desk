@@ -200,9 +200,23 @@ function getPlatformConfig(options) {
 //   platformConfig       — result of getPlatformConfig()
 //   agentNames           — { win: Set, mac: Set, linux?: Set }  (linux falls back to mac)
 //   agentCmdlineCheck    — (cmdline: string) => boolean  (optional command-line probe)
-//   agentCmdlineNames    — Set<string> (optional; defaults to node/node.exe)
+//   agentCmdlineNames    — Set<string> (optional; replaces DEFAULT_AGENT_CMDLINE_NAMES)
 //   startPid             — number (default process.ppid)
 //   maxDepth             — number (default 8)
+//   windowsSnapshotTimeoutMs — positive integer, capped at 5000 (default 3000)
+
+// The process names whose command line agentCmdlineCheck is run against when
+// the caller passes no agentCmdlineNames: every name a node process that never
+// set process.title is listed under.
+//   node, node.exe   — the executable's name (macOS, Windows, Linux Node <= 23.7)
+//   mainthread       — Linux, Node 23.8–25.4 (so all of 24.x): Node names its
+//                      main thread "MainThread" (nodejs/node#56416), and Linux
+//                      reports the main thread's name as the process name
+//   node-mainthread  — Linux, Node >= 25.5: renamed "node-MainThread"
+//                      (nodejs/node#61307; 15 characters, so never truncated)
+// Lowercase, because the walk compares lowercased basenames. An adapter that
+// passes its own agentCmdlineNames to add names must spread these back in.
+const DEFAULT_AGENT_CMDLINE_NAMES = Object.freeze(["node", "node.exe", "mainthread", "node-mainthread"]);
 
 function normalizeHwndString(value) {
   if (value === null || value === undefined) return null;
@@ -242,7 +256,7 @@ if ($fg -ne [IntPtr]::Zero) {
   [void][ClawdWin32]::GetClassName($fg, $sb, $sb.Capacity)
   $fgClass = $sb.ToString()
 }
-$processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId, ParentProcessId, Name, CommandLine, @{Name='StartIdentity';Expression={try { $_.CreationDate.ToUniversalTime().Ticks.ToString() } catch { $null }}})
+$processes = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate -ErrorAction SilentlyContinue | Select-Object ProcessId, ParentProcessId, Name, CommandLine, @{Name='StartIdentity';Expression={try { $_.CreationDate.ToUniversalTime().Ticks.ToString() } catch { $null }}})
 [pscustomobject]@{
   processes = $processes
   foreground = [pscustomobject]@{
@@ -255,7 +269,7 @@ $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Sel
 
 // One PS spawn per resolve, not per ancestor — PowerShell cold-start (~270 ms)
 // would dominate the walk otherwise. Returns an empty process map on failure.
-function getWindowsProcessSnapshot(execFileSync) {
+function getWindowsProcessSnapshot(execFileSync, timeoutMs = 3000) {
   try {
     const out = execFileSync(
       "powershell.exe",
@@ -267,7 +281,7 @@ function getWindowsProcessSnapshot(execFileSync) {
         "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
         WINDOWS_PROCESS_SNAPSHOT_SCRIPT,
       ],
-      { encoding: "utf8", timeout: 3000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }
+      { encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }
     );
     const trimmed = (out || "").trim();
     if (!trimmed) return { processes: new Map(), foregroundWtHwnd: null };
@@ -342,12 +356,12 @@ const SKIP_REASON_SNAPSHOT_FAILED = "snapshot-failed";
 // the wrong path.
 const SKIP_REASON_SELF_NOT_FOUND = "snapshot-self-not-found";
 
-// pidChain MUST be [] and never null: six adapters (codex, copilot, cursor,
-// kimi, kiro, codebuddy) do a bare `pidChain.length` with no Array.isArray
-// guard, and in cursor/codebuddy that TypeError would unwind past
-// writeStdoutOnce and silently downgrade their gating stdout ({"continue":true}
-// / {"decision":"allow"}) to {}. [] is falsy-length everywhere, so all 13
-// adapters skip the field cleanly. stablePid:null is safe to ship: the six
+// pidChain MUST be [] and never null: three adapters (copilot, kimi, workbuddy)
+// do a bare `pidChain.length` with no Array.isArray guard, so null would throw.
+// cursor, whose beforeSubmitPrompt gating stdout is {"continue":true}, is
+// already Array.isArray-guarded and no longer at risk. [] is falsy-length
+// everywhere, so all 18 adapters skip the field cleanly. stablePid:null is safe
+// to ship: the six
 // adapters that assign source_pid unconditionally emit an explicit null, which
 // src/server-route-state.js normalizes identically to an absent field
 // (Number.isFinite(null) === false), and src/state.js merges it as
@@ -528,6 +542,10 @@ function createPidResolver(options) {
   const { terminalNames, systemBoundary, editorMap, editorPathChecks } = platformConfig;
   const startPid = options.startPid || process.ppid;
   const maxDepth = options.maxDepth || 8;
+  const windowsSnapshotTimeoutMs = Number.isInteger(options.windowsSnapshotTimeoutMs)
+    && options.windowsSnapshotTimeoutMs > 0
+    ? Math.min(options.windowsSnapshotTimeoutMs, 5000)
+    : 3000;
 
   const isWin = process.platform === "win32";
   const isLinux = process.platform === "linux";
@@ -538,7 +556,7 @@ function createPidResolver(options) {
   const agentCmdlineCheck = options.agentCmdlineCheck || null;
   const agentCmdlineNames = options.agentCmdlineNames instanceof Set
     ? options.agentCmdlineNames
-    : new Set(["node.exe", "node"]);
+    : new Set(DEFAULT_AGENT_CMDLINE_NAMES);
 
   // #681 seams. Injected so tests never read the real ~/.clawd/runtime.json and
   // never depend on whether the developer's Clawd happens to be running.
@@ -593,7 +611,7 @@ function createPidResolver(options) {
     }
 
     const { execFileSync } = require("child_process");
-    const winSnapshotResult = isWin ? getWindowsProcessSnapshotFn(execFileSync) : null;
+    const winSnapshotResult = isWin ? getWindowsProcessSnapshotFn(execFileSync, windowsSnapshotTimeoutMs) : null;
     const winSnapshot = winSnapshotResult ? winSnapshotResult.processes : null;
     const foregroundWtHwnd = winSnapshotResult ? winSnapshotResult.foregroundWtHwnd : null;
 
@@ -778,7 +796,7 @@ function createPidResolver(options) {
   // Reuses the prewarmed in-process _cached (SessionStart) so a `start` context
   // after a no-arg prewarm never spawns a second time. Spreads into a NEW object
   // (never mutates _cached) so the no-arg shape stays pristine.
-  function freshMetadata() {
+  function freshMetadata(preferAgentPid = false) {
     const meta = freshResolve();
     const result = {
       ...meta,
@@ -791,13 +809,20 @@ function createPidResolver(options) {
       // make the offline path indistinguishable from a real walk in logs.
       cacheSource: meta.snapshotOk ? "fresh" : "none",
     };
+    // A verified Codex Desktop client uses its persistent app-server as both
+    // source and cache anchor. A hook's terminal match can be its short-lived
+    // PowerShell wrapper; retaining that anchor would invalidate both cached
+    // PIDs as soon as the wrapper exits. Preserve the raw terminal observation
+    // and the no-arg result, and never promote a headless or failed walk.
+    const useAgentAnchor = preferAgentPid && meta.snapshotOk && meta.agentPid && !result.headless;
+    if (useAgentAnchor) result.stablePid = meta.agentPid;
     // Object spread deliberately skips the recovery-only non-enumerable
     // identities attached by computeFreshSnapshot(). Reattach them privately
     // so the hook can seed the durable lease from this one live snapshot while
     // keeping the public resolver shape and sanitized v2 cache unchanged.
     Object.defineProperties(result, {
       agentProcessStartIdentity: { value: meta.agentProcessStartIdentity, enumerable: false },
-      sourceProcessStartIdentity: { value: meta.sourceProcessStartIdentity, enumerable: false },
+      sourceProcessStartIdentity: { value: useAgentAnchor ? meta.agentProcessStartIdentity : meta.sourceProcessStartIdentity, enumerable: false },
     });
     return result;
   }
@@ -840,9 +865,9 @@ function createPidResolver(options) {
   // The walk-usable condition stays: a degraded walk writes nothing and keeps
   // v1, since promotion is then the session's only remaining cache path. No
   // extra fresh for the cleanup.
-  function startLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk) {
+  function startLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk, preferAgentPid) {
     if (canDisk) maybeSweep(pidCache);
-    const meta = freshMetadata();
+    const meta = freshMetadata(preferAgentPid);
     if (canDisk && meta.snapshotOk && meta.agentPid) {
       pidCache.writePidCacheV2(namespace, sessionId, cacheCwd, v2SubsetFrom(meta));
       claudeDropV1SameKey(pidCache, namespace, sessionId, cacheCwd);
@@ -879,7 +904,7 @@ function createPidResolver(options) {
   // event: a hit (or promotion) is zero spawn; a miss is at most ONE fresh, then
   // repopulate v2 if the walk was usable. Non-cacheable events may fresh (the
   // no-fallback contract is prompt/end only).
-  function eventLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk) {
+  function eventLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk, preferAgentPid) {
     if (canDisk) {
       const hit = readLiveV2(pidCache, namespace, sessionId, cacheCwd);
       if (hit) {
@@ -898,7 +923,7 @@ function createPidResolver(options) {
       const promoted = claudePromote(pidCache, namespace, sessionId, cacheCwd, deriveHeadless);
       if (promoted) return promoted;
     }
-    const meta = freshMetadata();
+    const meta = freshMetadata(preferAgentPid);
     if (canDisk && meta.snapshotOk && meta.agentPid) {
       // v1 drop mirrors start: unconditional once a usable fresh walk is in
       // hand (privacy-first even when the v2 write fails — see startLifecycle).
@@ -968,13 +993,17 @@ function createPidResolver(options) {
     // is the adapter's declaration; the path check guards a stray empty
     // ingredient. It never relaxes the prompt/end no-fallback contract below.
     const canDisk = cacheable && !!pidCache.cacheFilePathV2(namespace, sessionId, cacheCwd);
+    // Opt-in only: codex-hook verifies the known Desktop originator and local
+    // interactive provenance. Other namespaces retain terminal-first anchors
+    // and the existing double-liveness requirement, even with this flag set.
+    const preferAgentPid = namespace === "codex" && ctx.preferAgentPid === true;
 
     switch (lifecycle) {
-      case "start":  return startLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk);
+      case "start":  return startLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk, preferAgentPid);
       case "prompt": return promptLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk);
       case "end":    return endLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk);
       case "event":
-      default:       return eventLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk);
+      default:       return eventLifecycle(pidCache, namespace, sessionId, cacheCwd, canDisk, preferAgentPid);
     }
   }
 
@@ -1085,6 +1114,7 @@ function buildElectronLaunchConfig(projectDir, options = {}) {
 module.exports = {
   getPlatformConfig,
   createPidResolver,
+  DEFAULT_AGENT_CMDLINE_NAMES,
   readStdinJson,
   readStdinJsonDetailed,
   DEFAULT_STDIN_READ_TIMEOUT_MS,

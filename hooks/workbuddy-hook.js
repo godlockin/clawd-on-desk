@@ -19,17 +19,33 @@ const HOOK_MAP = {
   PreCompact:       { state: "sweeping",     event: "PreCompact" },
 };
 
-const config = getPlatformConfig({
-  extraTerminals: { win: ["workbuddy.exe"] },
-  extraEditors: {
-    win: { "workbuddy.exe": "workbuddy" },
-    mac: { "workbuddy": "workbuddy" },
-    linux: { "workbuddy": "workbuddy" },
-  },
-  extraEditorPathChecks: [["workbuddy", "workbuddy"]],
-});
+// WorkBuddy's own lifecycle chatter, not a blocked request for the user.
+// `idle_prompt` is a "send another message" reminder (observed on 5.2.6,
+// ~60 seconds after Stop; 5.6.2's per-turn host exits before it can fire, so it
+// was not observed there) and `auth_success` is the login-success toast (5.6.2,
+// emitted at the start of every turn). Forwarding either would create or settle
+// a session — a phantom idle row before the first UserPromptSubmit, or knocking
+// a running turn back to idle. Real permission/input prompts and untyped legacy
+// notifications still follow the native-control path in run().
+const IGNORED_NOTIFICATION_TYPES = new Set(["idle_prompt", "auth_success"]);
+
+function getWorkBuddyPlatformConfig(factory = getPlatformConfig) {
+  return factory({
+    extraTerminals: { win: ["workbuddy.exe"] },
+    extraEditors: {
+      win: { "workbuddy.exe": "workbuddy" },
+      mac: { "workbuddy": "workbuddy" },
+      linux: { "workbuddy": "workbuddy" },
+    },
+    extraEditorPathChecks: [["workbuddy", "workbuddy"]],
+  });
+}
+
 const WORKBUDDY_AGENT_NAMES = Object.freeze({
-  win: new Set(["workbuddy.exe"]),
+  // Every Windows WorkBuddy role runs the same WorkBuddy.exe, so no process
+  // NAME can single out the long-lived GUI main process. It is identified by
+  // command line (isWorkBuddyMainProcessCommand) instead of by name.
+  win: new Set(),
   // Fallback for builds that spawn hooks under a Helper. Current WorkBuddy AI
   // 5.2.3 instead spawns them under its bundled CLI task runner, matched below.
   mac: new Set([
@@ -64,12 +80,48 @@ function isWorkBuddyCliCommand(commandLine) {
     && /\s--session-id(?:[=\s]|$)/.test(normalized);
 }
 
-const resolve = createPidResolver({
-  agentNames: WORKBUDDY_AGENT_NAMES,
-  agentCmdlineCheck: isWorkBuddyCliCommand,
-  agentCmdlineNames: new Set(["electron"]),
-  platformConfig: config,
-});
+// Windows WorkBuddy 5.6.x runs each turn in a short-lived, prewarmed host
+// ("...\app.asar.unpacked\cli\bin\codebuddy" --prewarm) that exits a few
+// seconds after Stop, and its daemon, sidecar, edge-sync connector, and 5.2.6
+// conversation processes all execute scripts out of app.asar / app.asar.unpacked
+// too. The GUI main process is the only WorkBuddy.exe that runs no app.asar
+// script and carries no Chromium --type= role switch, and it lives exactly as
+// long as the app. Anchor agent_pid there so a finished turn is not retired by
+// agent-exit when its per-turn host goes away. An empty/unreadable command line
+// is deliberately "not the main process": no agent_pid is better than crediting
+// the per-turn host.
+function isWorkBuddyMainProcessCommand(commandLine) {
+  const normalized = String(commandLine || "").replace(/\\/g, "/").toLowerCase();
+  if (!normalized.trim()) return false;
+  if (normalized.includes("app.asar")) return false;
+  // Chromium role switches can arrive as a bare argument or as a whole quoted
+  // argument (`"--type=renderer"` on Windows).
+  if (/(^|[\s"])--type=/.test(normalized)) return false;
+  return true;
+}
+
+// The resolver picks its platform at construction time, so the command-line
+// predicate is selected here too. Tests pass an explicit platform to exercise
+// both branches against the same options shape the hook ships.
+function getWorkBuddyPidResolverOptions(platformConfig, platform = process.platform) {
+  return {
+    agentNames: WORKBUDDY_AGENT_NAMES,
+    agentCmdlineCheck: platform === "win32"
+      ? isWorkBuddyMainProcessCommand
+      : isWorkBuddyCliCommand,
+    // Replaces DEFAULT_AGENT_CMDLINE_NAMES. On macOS `electron` is the CLI host
+    // name; on Windows every WorkBuddy role is the same `workbuddy.exe`, so the
+    // command-line predicate (not the name) picks out the main process.
+    agentCmdlineNames: new Set(["electron", "workbuddy.exe"]),
+    // Windows 5.7.6 validation captured a 4.17s snapshot: the shared 3s
+    // deadline omitted both PIDs, making application-exit cleanup impossible.
+    // Stdout is answered before this bounded walk; native approval stays fast.
+    ...(platform === "win32" ? { windowsSnapshotTimeoutMs: 5000 } : {}),
+    platformConfig,
+  };
+}
+
+const resolve = createPidResolver(getWorkBuddyPidResolverOptions(getWorkBuddyPlatformConfig()));
 
 // State-only integration: never make a tool or permission decision. WorkBuddy's
 // hook contract treats an empty JSON object as "continue with the native flow";
@@ -79,6 +131,8 @@ function stdoutForEvent() {
 }
 
 const SESSION_TITLE_MAX = 60;
+// Check the complete fallback line before truncating it (same policy as Claude).
+const PROMPT_TITLE_SECRET_RE = /\b(api[_-]?key|authorization|bearer|password|passwd|private[_-]?key|secret|token)\b|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9+/=_-]{32,}/i;
 
 // Derive the session title Clawd shows in the HUD. Without it the HUD falls
 // back to the agent label ("WorkBuddy") and two same-session bubbles can't be
@@ -102,6 +156,7 @@ function deriveSessionTitle(hookName, payload) {
     for (const line of payload.prompt.split(/\r?\n/)) {
       const candidate = line.trim();
       if (candidate) {
+        if (PROMPT_TITLE_SECRET_RE.test(candidate)) return null;
         return candidate.length > SESSION_TITLE_MAX
           ? `${candidate.slice(0, SESSION_TITLE_MAX - 1)}\u2026`
           : candidate;
@@ -115,6 +170,17 @@ function deriveSessionTitle(hookName, payload) {
 // or the process tree walk hangs. Without this WorkBuddy would see empty stdout
 // which is invalid JSON and logs an error on every hook invocation.
 const SAFETY_TIMEOUT_MS = 800;
+// Once stdout has been answered, the 800ms guard above has served its purpose.
+// The fire-and-forget POST to Clawd still needs the process alive to leave the
+// socket: on Windows the synchronous process-tree snapshot alone takes ~1.5s,
+// so an overdue safety timer firing right after the walk would process.exit()
+// before the POST completed and the session state would never reach Clawd
+// (pet never reacts even though hooks fire). After answering stdout we re-arm
+// a generous backstop whose only job is to reap a truly hung process; the
+// POST's own 100ms timeout settles the normal path in well under that.
+// Leave room after the Windows snapshot's 5s limit for the POST to settle.
+// An overdue exit timer must not reap the hook before socket I/O can run.
+const POST_EXIT_BACKSTOP_MS = process.platform === "win32" ? 7500 : 5000;
 let _wrote = false;
 let _exited = false;
 let safetyTimer = null;
@@ -126,6 +192,10 @@ function writeStdoutOnce(outLine) {
   if (_wrote) return;
   _wrote = true;
   process.stdout.write(outLine + "\n");
+  if (!_exited && safetyTimer) {
+    clearTimeout(safetyTimer);
+    safetyTimer = setTimeout(() => finish(outLine), POST_EXIT_BACKSTOP_MS);
+  }
 }
 
 function finish(outLine) {
@@ -150,6 +220,14 @@ function run() {
         return;
       }
 
+      // Only WorkBuddy's own lifecycle notifications are swallowed here (see
+      // IGNORED_NOTIFICATION_TYPES); real permission/input prompts and untyped
+      // legacy notifications still follow the native-control path below.
+      if (hookName === "Notification" && IGNORED_NOTIFICATION_TYPES.has(payload.notification_type)) {
+        finish(outLine);
+        return;
+      }
+
       const { state, event } = mapped;
 
       // #618 / #648: a hook event with no session_id cannot be attributed to a
@@ -166,6 +244,13 @@ function run() {
         return;
       }
 
+      // Answer WorkBuddy before the process-tree walk: the walk is synchronous
+      // and takes ~1.5s on Windows, which would otherwise delay the gate
+      // response on every event. The POST below still runs to completion
+      // afterwards — writeStdoutOnce re-arms the exit backstop for exactly
+      // that — so no state is lost by answering early.
+      writeStdoutOnce(outLine);
+
       if (hookName === "SessionStart" && !process.env.CLAWD_REMOTE) resolve();
 
       const cwd = (payload && payload.cwd) || "";
@@ -176,8 +261,23 @@ function run() {
       body.agent_id = "workbuddy";
       if (cwd) body.cwd = cwd;
 
+      // WorkBuddy 5.6.x delivers UserPromptSubmit ~0.1s BEFORE SessionStart on
+      // every turn (SessionStart source is "startup" on the first turn and
+      // "resume" afterwards). SessionStart maps to idle, so without
+      // preserve_state that late event would flip the just-started turn back to
+      // idle and the HUD would read "idle" until the next event.
+      if (hookName === "SessionStart") body.preserve_state = true;
+
       const sessionTitle = deriveSessionTitle(hookName, payload);
-      if (sessionTitle) body.session_title = sessionTitle;
+      if (sessionTitle) {
+        body.session_title = sessionTitle;
+        // A later prompt must not overwrite a native or explicitly named chat.
+        body.session_title_from_prompt = !(typeof payload.session_title === "string"
+          && payload.session_title.trim());
+      }
+      if (typeof payload.transcript_path === "string" && payload.transcript_path.trim()) {
+        body.transcript_path = payload.transcript_path.trim();
+      }
 
       if (process.env.CLAWD_REMOTE) {
         body.host = readHostPrefix();
@@ -192,11 +292,9 @@ function run() {
         applyOrcaPaneKey(body);
       }
 
-      // Answer WorkBuddy immediately so it never sees empty stdout, but don't
-      // exit yet — the fire-and-forget POST below still needs to leave the
-      // process, so we exit in its callback (with the safety timer as backstop).
-      writeStdoutOnce(outLine);
-
+      // Stdout was already answered above; don't exit yet — the
+      // fire-and-forget POST below still needs to leave the process, so we
+      // exit in its callback (with the re-armed backstop timer as last resort).
       postStateToRunningServer(JSON.stringify(body), { timeoutMs: 100 }, () => {
         finish(outLine);
       });
@@ -219,5 +317,9 @@ module.exports = {
   deriveSessionTitle,
   SESSION_TITLE_MAX,
   WORKBUDDY_AGENT_NAMES,
+  IGNORED_NOTIFICATION_TYPES,
   isWorkBuddyCliCommand,
+  isWorkBuddyMainProcessCommand,
+  getWorkBuddyPlatformConfig,
+  getWorkBuddyPidResolverOptions,
 };

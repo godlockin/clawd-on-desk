@@ -2,6 +2,8 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const {
   createSpawnedHookHarness,
@@ -52,6 +54,53 @@ describe("spawned-hook test harness", () => {
       assert.strictEqual(env.nodeOptions, null);
     } finally {
       harness.cleanup();
+    }
+  });
+
+  it("does not leak inherited Claude, Grok or Orca environment into the child", () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-ambient-config-"));
+    const setters = {
+      CLAUDE_CONFIG_DIR: configDir,
+      GROK_HOOK_EVENT: "Stop",
+      ORCA_PANE_KEY: "test-pane",
+    };
+    const previous = {};
+    for (const key of Object.keys(setters)) {
+      previous[key] = process.env[key];
+      process.env[key] = setters[key];
+    }
+    try {
+      const result = runSpawnedHook({
+        script: FIXTURE,
+        args: ["none"],
+        httpContract: "expect-none",
+      });
+      const env = JSON.parse(result.stdout);
+      assert.strictEqual(env.claudeConfigDir, null);
+      assert.strictEqual(env.grokHookEvent, null);
+      assert.strictEqual(env.orcaPaneKey, null);
+    } finally {
+      for (const key of Object.keys(setters)) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it("passes an explicitly provided CLAUDE_CONFIG_DIR through to the child", () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-explicit-config-"));
+    try {
+      const result = runSpawnedHook({
+        script: FIXTURE,
+        args: ["none"],
+        httpContract: "expect-none",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      });
+      const env = JSON.parse(result.stdout);
+      assert.strictEqual(env.claudeConfigDir, configDir);
+    } finally {
+      fs.rmSync(configDir, { recursive: true, force: true });
     }
   });
 

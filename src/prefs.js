@@ -51,6 +51,7 @@ const {
   MAX_AUTO_CLOSE_SECONDS,
 } = require("./bubble-policy");
 const { normalizeSessionAliases } = require("./session-alias");
+const { normalizeQuotaAlertThresholds } = require("./quota-alerts");
 const {
   TEXT_SCALE_MIN,
   TEXT_SCALE_MAX,
@@ -63,7 +64,7 @@ const {
   PET_MOUTH_ACCESSORY_IDS,
 } = require("./pet-customization-catalog");
 
-const CURRENT_VERSION = 19;
+const CURRENT_VERSION = 21;
 const DEFAULT_INTEGRATION_INSTALLED_IDS = Object.freeze(["claude-code", "codex"]);
 const DEFAULT_INTEGRATION_INSTALLED_SET = new Set(DEFAULT_INTEGRATION_INSTALLED_IDS);
 
@@ -195,6 +196,9 @@ const SCHEMA = {
   // Preserve the historical used-percentage presentation for existing users;
   // remaining is a display-only choice and never changes stored quota data.
   quotaRingDisplayMode: { type: "string", default: "used", enum: ["used", "remaining"] },
+  quotaAlertsEnabled: { type: "boolean", default: false },
+  quotaAlertThresholds: { type: "array", defaultFactory: () => [20, 10], normalize: normalizeQuotaAlertThresholds },
+  quotaRecoveryAlertsEnabled: { type: "boolean", default: true },
   // Empty by default, i.e. every connected provider draws — matching the
   // behaviour before this preference existed. Storing what is HIDDEN rather
   // than what is shown is the reason a newly connected provider appears on its
@@ -262,6 +266,12 @@ const SCHEMA = {
   // never suppress the stronger unattended warning.
   permissionAutomationAutoToolsWarningDismissed: { type: "boolean", default: false },
   permissionAutomationUnattendedWarningDismissed: { type: "boolean", default: false },
+  // Opt-in reminder that pauses an otherwise-automatic allow for recognized
+  // high-risk operations so a human sees the card. Off by default, and
+  // deliberately NOT command-gated like the keys above: those widen what runs
+  // without a human, this only narrows it, so there is no trust transition to
+  // confirm.
+  destructiveActionReminder: { type: "boolean", default: false },
   // One-release tombstone for old files/tests. It can never become the current
   // automation source: validation forces ephemeral fields to defaults, save()
   // drops them, and no product writer targets this key.
@@ -401,7 +411,7 @@ const SCHEMA = {
       // normalizeAgents drops it for agents whose default entry lacks it.
       "claude-code": { integrationInstalled: true, enabled: true, permissionsEnabled: true, subagentPermissionsEnabled: true, notificationHookEnabled: true },
       "deepseek-harness": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
-      "codex": { integrationInstalled: true, enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
+      "codex": { integrationInstalled: true, enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "auto", nativeNotificationSoundEnabled: false },
       "copilot-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "cursor-agent": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "gemini-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
@@ -422,6 +432,12 @@ const SCHEMA = {
       // TraeCode is state-only: hook protocol is Claude Code-compatible but it
       // has no PermissionRequest event, so permission bubbles default off.
       "traecode": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      // MiniMax Code is state-only via a Clawd-owned local plugin under
+      // ~/.minimax/plugins/clawd-state. PermissionRequest is not registered
+      // (the plugin-hook runner's 1–10s timeout budget makes blocking approval
+      // impossible) and there is no Notification event, so both flags default
+      // off.
+      "minimax": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: false },
       "kiro-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "kimi-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "qwen-code": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
@@ -434,6 +450,7 @@ const SCHEMA = {
       "opencode": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "mimocode": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       "pi": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      "omp": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
       "openclaw": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
       "hermes": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       // Qoder is state-only (Phase 1) — permission bubbles default off.
@@ -443,6 +460,17 @@ const SCHEMA = {
       "qoderwork": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
       // QwenWork (千问办公) is state-only (Phase 1) — permission bubbles default off.
       "qwenwork": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      // Grok Build is state + Notification only: it has no PermissionRequest
+      // hook, so permission bubbles default off. Opt-in like other non-default
+      // agents — agent-gate fail-opens missing entries.
+      "grok-build": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      // KiroCrew is a state-only bridge over the gateway's chat lifecycle
+      // hooks. It has no PermissionRequest and no Notification hook event, so
+      // both flags default off (like minimax). Opt-in like every other
+      // non-default agent — agent-gate.js fail-opens a MISSING entry, so this
+      // default MUST exist or startup sync would write the hooks for any user
+      // who merely has a ~/.kiro/crew directory.
+      "kirocrew": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: false },
     }),
     normalize: normalizeAgents,
   },
@@ -932,6 +960,34 @@ function migrate(raw) {
     });
     out.codexWorkingStaleMs = Math.max(SCHEMA.codexWorkingStaleMs.default, legacy.workingStaleMs);
   }
+
+  // v19 -> v20: Telegram Direct Send changed from the old paste-only
+  // experiment (which explicitly never pressed Enter) to submitting a reply
+  // directly through the target Console/ConPTY. A persisted true only records
+  // consent to the narrower behavior, so require every upgrading user to read
+  // the new Settings description and opt in again. Fresh installs already use
+  // the schema default false, while a true written by v20 is preserved.
+  if (out.version < 20) {
+    if (out.tgApproval && typeof out.tgApproval === "object") {
+      out.tgApproval.r3DirectSendEnabled = false;
+    }
+    out.version = 20;
+  }
+  // v20 -> v21: Codex approval routing gained Auto (#1155). save() bakes the
+  // full snapshot, so every earlier install has the old default "intercept"
+  // on disk and an explicit choice cannot be told apart from it. Move every
+  // upgrading user to Auto once; Intercept chosen after this release is kept.
+  // Fresh installs never run migrate() and already use the Auto default.
+  if (out.version < 21) {
+    const agents = out.agents;
+    const codex = agents && typeof agents === "object" && !Array.isArray(agents)
+      ? agents.codex : null;
+    if (codex && typeof codex === "object" && !Array.isArray(codex)
+      && (codex.permissionMode === "intercept" || codex.permissionMode === "native")) {
+      out.agents = { ...agents, codex: { ...codex, permissionMode: "auto" } };
+    }
+    out.version = 21;
+  }
   if ((typeof out.version === "number" ? out.version : 0) < CURRENT_VERSION) {
     out.version = CURRENT_VERSION;
   }
@@ -947,7 +1003,7 @@ const AGENT_FLAGS = [
   "notificationHookEnabled",
   "nativeNotificationSoundEnabled",
 ];
-const CODEX_PERMISSION_MODES = ["native", "intercept"];
+const CODEX_PERMISSION_MODES = ["auto", "intercept"];
 const MAX_CUSTOM_DISCOVERY_PATHS = 64;
 const MAX_CUSTOM_DISCOVERY_PATH_LENGTH = 2048;
 
