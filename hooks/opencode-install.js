@@ -17,6 +17,9 @@ module.exports = {
   registerOpencodePlugin: installer.register,
   unregisterOpencodePlugin: installer.unregister,
   resolvePluginDir: installer.resolvePluginDir,
+  resolveSourcePluginDir: installer.resolveSourcePluginDir,
+  resolveManagedTarget: installer.resolveManagedTarget,
+  resolveManagedPluginDir: installer.resolveManagedPluginDir,
   __test: installer.__test,
 };
 

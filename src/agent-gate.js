@@ -57,8 +57,10 @@ const isCodexNativeNotificationSoundEnabled = (snapshot) =>
   readFlag(snapshot, "codex", "nativeNotificationSoundEnabled", false);
 function getCodexPermissionMode(snapshot) {
   const entry = snapshot && snapshot.agents && snapshot.agents.codex;
-  if (entry && entry.permissionMode === "native") return "native";
-  return "intercept";
+  if (entry && entry.permissionMode === "intercept") return "intercept";
+  // Legacy Native values migrate to Auto; unreadable/missing modes must not
+  // take approvals away from Codex by default.
+  return "auto";
 }
 const isCodexPermissionInterceptEnabled = (snapshot) => getCodexPermissionMode(snapshot) === "intercept";
 
@@ -112,6 +114,9 @@ function createRuntimeAgentGate({ getSnapshot, isAuthoritative = () => true } = 
     },
     isCodexNativeNotificationSoundEnabled() {
       return withSnapshot((current) => isCodexNativeNotificationSoundEnabled(current));
+    },
+    getCodexPermissionMode() {
+      return withSnapshot((current) => getCodexPermissionMode(current)) || "auto";
     },
     isCodexPermissionInterceptEnabled() {
       return withSnapshot((current) => isCodexPermissionInterceptEnabled(current));

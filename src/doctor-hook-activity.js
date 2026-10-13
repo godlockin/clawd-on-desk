@@ -160,7 +160,8 @@ function evaluateConnectionTest(input = {}) {
   const codexHookHealth = input.codexHookHealth && typeof input.codexHookHealth === "object"
     ? input.codexHookHealth
     : null;
-  if (codexActivity && codexHookHealth && codexHookHealth.signature === "needs-review") {
+  if (codexActivity && codexHookHealth
+    && (codexHookHealth.signature === "needs-review" || codexHookHealth.signature === "needs-review-optional")) {
     return {
       status: "hooks-need-review",
       level: "warning",
