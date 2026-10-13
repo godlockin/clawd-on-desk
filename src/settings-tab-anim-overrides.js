@@ -20,6 +20,8 @@
   let i18n = null;
   let readers = null;
   let mountedSubtabBody = null;
+  let mountedSubtabs = null;
+  let mountedHost = null;
 
   function t(key) {
     return helpers.t(key);
@@ -902,9 +904,11 @@
       case "mini-enter-sleep": return "Mini enter sleep";
       case "mini-crabwalk": return "Mini crabwalk";
       case "mini-peek": return "Mini peek";
+      case "mini-peek-hold": return "Mini peek hold";
       case "mini-alert": return "Mini alert";
       case "mini-happy": return "Mini happy";
       case "mini-sleep": return "Mini sleep";
+      case "mini-sleep-peek": return "Mini sleep peek";
       case "dragReaction": return t("animReactionDrag");
       case "clickLeftReaction": return t("animReactionClickLeft");
       case "clickRightReaction": return t("animReactionClickRight");
@@ -942,7 +946,7 @@
   }
 
   // #509: default idle visual picker — which look the pet rests in while
-  // idle. Options come from the active theme (states.idle + idleAnimations);
+  // idle. Options come from states.idle, idleAnimations, and idleVisualOptions;
   // selection applies live, so the pet itself is the preview.
   function buildIdleVisualPickerRow() {
     const info = runtime.animationOverridesData && runtime.animationOverridesData.idleDefaultVisual;
@@ -1064,15 +1068,6 @@
     return value === "sounds" ? "sounds" : value === "map" ? "map" : "animations";
   }
 
-  function restoreSubtabScroll(scroller, subtab) {
-    if (!scroller) return;
-    const saved = Number(getSubtabScrollPositions()[subtab]);
-    requestAnimationFrame(() => {
-      if (state.activeTab !== "animOverrides" || normalizeSubtab() !== subtab) return;
-      scroller.scrollTop = Number.isFinite(saved) && saved > 0 ? saved : 0;
-    });
-  }
-
   function clearSubtabControls() {
     if (typeof ops.clearMountedControls === "function") {
       ops.clearMountedControls();
@@ -1115,9 +1110,9 @@
         if (state.activeTab !== "animOverrides" || mountedSubtabBody !== body) return;
         if (normalizeSubtab() !== subtab) return;
         if (runtime.animationOverridesData === null) return;
-        clearSubtabControls();
-        renderSubtabBody(body);
-        restoreSubtabScroll(document.getElementById("content"), subtab);
+        mountedHost.render(body, renderSubtabBody, {
+          scrollTop: getSubtabScrollPositions()[subtab] || 0,
+        });
       });
       return;
     }
@@ -1144,9 +1139,7 @@
     const scroller = document.getElementById("content");
     const subtab = normalizeSubtab();
     if (scroller) getSubtabScrollPositions()[subtab] = scroller.scrollTop;
-    clearSubtabControls();
-    renderSubtabBody(mountedSubtabBody);
-    restoreSubtabScroll(scroller, subtab);
+    mountedHost.render(mountedSubtabBody, renderSubtabBody);
     return true;
   }
 
@@ -1159,21 +1152,25 @@
     subtitle.className = "subtitle";
     subtitle.textContent = t("animOverridesSubtitle");
     parent.appendChild(subtitle);
+    if (mountedSubtabs) mountedSubtabs.dispose();
+    if (mountedHost) mountedHost.dispose();
+    mountedHost = helpers.createSubpageHost({ disposeBody: clearSubtabControls });
     const switcher = buildSubtabSwitcher();
-    parent.appendChild(switcher);
-    const body = document.createElement("div");
-    body.className = "anim-override-subtab-body";
-    parent.appendChild(body);
-    renderSubtabBody(body);
-    restoreSubtabScroll(document.getElementById("content"), normalizeSubtab());
+    mountedSubtabs = switcher.control;
+    parent.appendChild(switcher.wrap);
+    for (const panel of mountedSubtabs.panels.values()) {
+      panel.className = "anim-override-subtab-body";
+      parent.appendChild(panel);
+    }
+    const body = mountedSubtabs.panels.get(normalizeSubtab());
+    mountedHost.render(body, renderSubtabBody, {
+      scrollTop: getSubtabScrollPositions()[normalizeSubtab()] || 0,
+    });
   }
 
   function buildSubtabSwitcher() {
     const wrap = document.createElement("div");
     wrap.className = "anim-override-subtabs";
-    const group = document.createElement("div");
-    group.className = "segmented";
-    group.setAttribute("role", "tablist");
 
     const current = runtime.animOverridesSubtab === "sounds" ? "sounds"
       : runtime.animOverridesSubtab === "map" ? "map" : "animations";
@@ -1182,34 +1179,25 @@
       { key: "animations", label: t("animOverridesSubtabAnimations") },
       { key: "sounds", label: t("animOverridesSubtabSounds") },
     ];
-    for (const entry of entries) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = entry.label;
-      btn.dataset.animOverridesSubtab = entry.key;
-      if (entry.key === current) btn.classList.add("active");
-      btn.addEventListener("click", () => {
-        if (runtime.animOverridesSubtab === entry.key) return;
+    const control = helpers.buildTabs({
+      id: "settings-animations",
+      ariaLabel: t("animOverridesTitle"),
+      value: current,
+      options: entries.map((entry) => ({ value: entry.key, label: entry.label })),
+      renderLabel(button, option) { button.dataset.animOverridesSubtab = option.value; },
+      onBeforeChange(_value, previousSubtab) {
         const scroller = document.getElementById("content");
-        const previousSubtab = normalizeSubtab();
         if (scroller) getSubtabScrollPositions()[previousSubtab] = scroller.scrollTop;
-        runtime.animOverridesSubtab = entry.key;
-        for (const candidate of group.querySelectorAll("button")) {
-          candidate.classList.toggle("active", candidate.dataset.animOverridesSubtab === entry.key);
-        }
-        clearSubtabControls();
-        renderSubtabBody(mountedSubtabBody);
-        restoreSubtabScroll(scroller, entry.key);
-        requestAnimationFrame(() => {
-          if (typeof btn.focus === "function") {
-            try { btn.focus({ preventScroll: true }); } catch (_) { btn.focus(); }
-          }
+      },
+      onChange(value) {
+        runtime.animOverridesSubtab = value;
+        mountedHost.render(control.panels.get(value), renderSubtabBody, {
+          scrollTop: getSubtabScrollPositions()[value] || 0,
         });
-      });
-      group.appendChild(btn);
-    }
-    wrap.appendChild(group);
-    return wrap;
+      },
+    });
+    wrap.appendChild(control.element);
+    return { wrap, control };
   }
 
   function getSoundOverrideLabel(slot) {
@@ -2300,6 +2288,10 @@
     const scroller = document.getElementById("content");
     if (scroller) getSubtabScrollPositions()[normalizeSubtab()] = scroller.scrollTop;
     mountedSubtabBody = null;
+    if (mountedSubtabs) mountedSubtabs.dispose();
+    mountedSubtabs = null;
+    if (mountedHost) mountedHost.dispose();
+    mountedHost = null;
     ops.closeAssetPicker();
   }
 

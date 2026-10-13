@@ -19,6 +19,9 @@ const initPermission = require("../src/permission");
 const {
   classifyPermissionInteraction,
 } = require("../src/permission-automation-policy");
+const { preparePermissionReminder } = require("../src/permission-reminder");
+const { createSessionAutomationStore } = require("../src/session-automation-store");
+const { createSessionAutomationCoordinator } = require("../src/session-automation-coordinator");
 
 function makeCtx(overrides = {}) {
   return {
@@ -331,6 +334,152 @@ describe("permission automation: showPermissionBubble chokepoint", () => {
   });
 });
 
+describe("permission automation: unverified session overrides", () => {
+  function withRealSessionAutomation(globalMode) {
+    let grant = 0;
+    const store = createSessionAutomationStore({
+      makeGrantId: () => `grant-${++grant}`,
+    });
+    const coordinator = createSessionAutomationCoordinator({
+      store,
+      getGlobalMode: () => globalMode,
+    });
+    return { store, coordinator };
+  }
+
+  // Only the actual bubble-construction failure counts here: giving valid pet
+  // geometry means the manual path reaches `new BrowserWindow(...)`, which is
+  // undefined under plain Node. A missing/null geometry would throw earlier
+  // (getAnchorWorkArea) and mask whether automation really deferred.
+  const BUBBLE_BUILD_ERROR = /BrowserWindow is not a constructor/;
+
+  function ctxFor(coordinator) {
+    const modes = [];
+    const ctx = makeCtx({
+      getPermissionAutomationMode: () => "unattended",
+      getEffectivePermissionAutomationMode: (entry, options) => {
+        const mode = coordinator.getEffectiveMode(entry, options);
+        modes.push(mode);
+        return mode;
+      },
+      hasSessionAutomationOverride: (entry) => !!coordinator.getRecordForEntry(entry),
+      getPetWindowBounds: () => ({ x: 0, y: 0, width: 64, height: 64 }),
+    });
+    return { ctx, modes };
+  }
+
+  function assertDefersToBubble(perm, entry, res, modes, expectedMode) {
+    assert.throws(() => perm.showPermissionBubble(entry), BUBBLE_BUILD_ERROR);
+    assert.equal(perm.pendingPermissions.includes(entry), true);
+    assert.equal(res.captured.statusCode, null);
+    assert.ok(modes.length > 0, "effective automation mode was consulted");
+    assert.ok(
+      modes.every((mode) => mode === expectedMode),
+      `expected effective mode ${expectedMode}, saw ${modes.join(",")}`
+    );
+  }
+
+  it("does not auto-allow an unverified request that claims a stricter per-session off record", () => {
+    const res = makeCapturingRes();
+    const { store, coordinator } = withRealSessionAutomation("unattended");
+    store.compareAndSet(
+      { agentId: "claude-code", sessionId: "session-test" },
+      "off",
+      { expectedGrantId: null, nextGrantId: "off-1" }
+    );
+    const { ctx, modes } = ctxFor(coordinator);
+    const perm = initPermission(ctx);
+    const entry = makePermEntry({
+      res,
+      agentId: "claude-code",
+      sessionId: "session-test",
+      sessionAutomationIdentity: {
+        eligible: false,
+        reason: "missing-codex-process-lifecycle",
+      },
+    });
+    perm.pendingPermissions.push(entry);
+
+    assertDefersToBubble(perm, entry, res, modes, "off");
+  });
+
+  it("does not auto-allow an unverified unknown tool capped by an auto-tools record", () => {
+    const res = makeCapturingRes();
+    const { store, coordinator } = withRealSessionAutomation("unattended");
+    store.compareAndSet(
+      { agentId: "claude-code", sessionId: "session-test" },
+      "auto-tools",
+      { expectedGrantId: null, nextGrantId: "auto-1" }
+    );
+    const { ctx, modes } = ctxFor(coordinator);
+    const perm = initPermission(ctx);
+    const entry = makePermEntry({
+      res,
+      agentId: "claude-code",
+      sessionId: "session-test",
+      toolName: "SomeNewBuiltinTool",
+      sessionAutomationIdentity: {
+        eligible: false,
+        reason: "missing-codex-process-lifecycle",
+      },
+    });
+    perm.pendingPermissions.push(entry);
+
+    assertDefersToBubble(perm, entry, res, modes, "auto-tools");
+  });
+
+  it("still auto-allows the same unverified request when no per-session record exists", () => {
+    const res = makeCapturingRes();
+    const { coordinator } = withRealSessionAutomation("unattended");
+    const { ctx } = ctxFor(coordinator);
+    const perm = initPermission(ctx);
+    const entry = makePermEntry({
+      res,
+      agentId: "claude-code",
+      sessionId: "session-test",
+      sessionAutomationIdentity: {
+        eligible: false,
+        reason: "missing-codex-process-lifecycle",
+      },
+    });
+    perm.pendingPermissions.push(entry);
+
+    perm.showPermissionBubble(entry);
+    assert.equal(perm.pendingPermissions.includes(entry), false);
+    assert.equal(res.captured.statusCode, 200);
+    assert.equal(
+      JSON.parse(res.captured.body).hookSpecificOutput.decision.behavior,
+      "allow"
+    );
+  });
+
+  it("still auto-allows the unverified unknown tool globally without a record", () => {
+    const res = makeCapturingRes();
+    const { coordinator } = withRealSessionAutomation("unattended");
+    const { ctx } = ctxFor(coordinator);
+    const perm = initPermission(ctx);
+    const entry = makePermEntry({
+      res,
+      agentId: "claude-code",
+      sessionId: "session-test",
+      toolName: "SomeNewBuiltinTool",
+      sessionAutomationIdentity: {
+        eligible: false,
+        reason: "missing-codex-process-lifecycle",
+      },
+    });
+    perm.pendingPermissions.push(entry);
+
+    perm.showPermissionBubble(entry);
+    assert.equal(perm.pendingPermissions.includes(entry), false);
+    assert.equal(res.captured.statusCode, 200);
+    assert.equal(
+      JSON.parse(res.captured.body).hookSpecificOutput.decision.behavior,
+      "allow"
+    );
+  });
+});
+
 // ── Per-agent coverage ──────────────────────────────────────────────────────
 // Unattended mode must emit each agent's own "allow" wire format, not just resolve
 // the entry. resolvePermissionEntry(entry, "allow") branches on the is* flags,
@@ -479,5 +628,56 @@ describe("unattended: per-agent allow wire formats", () => {
     assert.equal(received.body.request_id, "per_test_123");
     assert.equal(received.body.reply, "once");
     assert.equal(received.auth, "Bearer tok_test");
+  });
+});
+
+describe("permission automation: Codex Auto claim (#1186)", () => {
+  function codexEntry(overrides = {}) {
+    return makePermEntry({
+      agentId: "codex",
+      isCodex: true,
+      codexAutoManual: true,
+      toolInput: { command: "ssh box uptime" },
+      ...overrides,
+    });
+  }
+
+  it("answers true only when global automation would allow at once", () => {
+    const on = initPermission(makeCtx({ getPermissionAutomationMode: () => "auto-tools" }));
+    assert.equal(on.wouldAutoAllowPermission(codexEntry()), true);
+    const off = initPermission(makeCtx({ getPermissionAutomationMode: () => "off" }));
+    assert.equal(off.wouldAutoAllowPermission(codexEntry()), false);
+  });
+
+  it("leaves a destructive-reminder hold with Codex", () => {
+    const perm = initPermission(makeCtx({
+      getPermissionAutomationMode: () => "auto-tools",
+      isDestructiveReminderEnabled: () => true,
+    }));
+    const toolInput = { command: "rm -rf /" };
+    const entry = codexEntry({ toolInput, ...preparePermissionReminder("Bash", toolInput) });
+    assert.equal(perm.wouldAutoAllowPermission(entry), false);
+  });
+
+  it("leaves session overrides and interactive subagents with Codex", () => {
+    const override = initPermission(makeCtx({
+      getPermissionAutomationMode: () => "auto-tools",
+      hasSessionAutomationOverride: () => true,
+    }));
+    assert.equal(override.wouldAutoAllowPermission(codexEntry()), false);
+    const perm = initPermission(makeCtx({ getPermissionAutomationMode: () => "auto-tools" }));
+    assert.equal(perm.wouldAutoAllowPermission(codexEntry({ codexInteractiveSubagent: true })), false);
+  });
+
+  it("returns a claimed request to Codex instead of opening a bubble", () => {
+    const ctx = makeCtx({ getPermissionAutomationMode: () => "off" });
+    const perm = initPermission(ctx);
+    const permEntry = codexEntry({ codexAutomationClaim: true });
+    perm.pendingPermissions.push(permEntry);
+
+    perm.showPermissionBubble(permEntry);
+
+    assert.equal(permEntry.bubble, null, "no BrowserWindow should be created");
+    assert.equal(perm.pendingPermissions.indexOf(permEntry), -1);
   });
 });

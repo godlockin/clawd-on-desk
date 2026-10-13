@@ -308,27 +308,22 @@ test("only open-stage Windows sharing and lock violations are transient", () => 
 test("Windows ACL opening retries a transient sharing violation", {
   skip: process.platform !== "win32",
   timeout: 10000,
-}, async (t) => {
+}, (t) => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-recap-acl-retry-"));
   const root = path.join(parent, "recap-v1");
   fs.mkdirSync(root);
   t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
-  const fixture = path.join(__dirname, "fixtures", "recap-private-permissions-share-holder.js");
-  const child = spawn(process.execPath, [fixture, root, "25"], {
-    stdio: ["ignore", "pipe", "pipe"],
+  const fixture = path.join(__dirname, "fixtures", "recap-private-permissions-retry.js");
+  const result = spawnSync(process.execPath, [fixture, root], {
+    encoding: "utf8",
     windowsHide: true,
+    timeout: 8000,
   });
-  t.after(() => {
-    if (child.exitCode === null) child.kill();
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    hardened: true, retrySleeps: 1, firstOpenError: 32, openAttempts: 2,
   });
-  await waitForChildLine(child, "READY");
-  const moved = path.join(parent, "moved-recap-v1");
-  assert.throws(() => fs.renameSync(root, moved), (error) =>
-    error && ["EBUSY", "EPERM"].includes(error.code));
-  assert.equal(hardenRecapPrivateDirectory(root, {
-    expectedCanonicalRoot: fs.realpathSync.native(root),
-  }), true);
-  assert.equal(await waitForChildExit(child), 0);
 });
 
 test("Windows ACL handles block rename until identity-bound mutation is done", {
