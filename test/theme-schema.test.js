@@ -30,6 +30,56 @@ function validThemeJson(overrides = {}) {
 }
 
 describe("theme schema validation", () => {
+  it("keeps absent idleVisualOptions absent and drops malformed authored entries", () => {
+    const plain = schema.mergeDefaults(validThemeJson());
+    assert.strictEqual(Object.hasOwn(plain, "idleVisualOptions"), false);
+    const warn = mock.method(console, "warn", () => {});
+    const raw = validThemeJson({ idleVisualOptions: [
+      { file: "pool.apng" }, {}, { file: 12 }, { file: "../escape.svg" }, null,
+    ] });
+    const theme = schema.mergeDefaults(raw);
+    assert.deepStrictEqual(theme.idleVisualOptions, [{ file: "pool.apng" }]);
+    assert.strictEqual(warn.mock.calls.length, 4);
+    assert.ok(warn.mock.calls.every((call) => /\[theme-loader\] idleVisualOptions\[\d+\] dropped/.test(call.arguments[0])));
+    assert.strictEqual(schema.deriveIdleMode(raw), schema.deriveIdleMode(validThemeJson()));
+    assert.strictEqual(schema.collectRequiredAssetFiles(plain).includes("pool.apng"), false);
+    assert.strictEqual(schema.collectRequiredAssetFiles(theme).includes("pool.apng"), true);
+  });
+
+  it("keeps mini peek motion opt-in and drops invalid fields with warnings", () => {
+    const plain = schema.mergeDefaults(validThemeJson({ miniMode: { supported: true, states: {} } }));
+    assert.equal(Object.hasOwn(plain.miniMode, "peek"), false);
+    assert.equal(Object.hasOwn(plain.miniMode, "sleepPeek"), false);
+
+    const warn = mock.method(console, "warn", () => {});
+    const theme = schema.mergeDefaults(validThemeJson({
+      miniMode: {
+        supported: true, states: {},
+        peek: { offsetRatio: 0.0806, delayMs: 375, durationMs: 125 },
+        sleepPeek: { offsetRatio: 0.7, delayMs: "0", durationMs: 750 },
+      },
+    }));
+    assert.deepStrictEqual(theme.miniMode.peek, { offsetRatio: 0.0806, delayMs: 375, durationMs: 125 });
+    assert.deepStrictEqual(theme.miniMode.sleepPeek, { durationMs: 750 });
+    assert.equal(warn.mock.calls.length, 2);
+    assert.match(warn.mock.calls[0].arguments[0], /miniMode\.sleepPeek\.offsetRatio dropped/);
+    assert.match(warn.mock.calls[1].arguments[0], /miniMode\.sleepPeek\.delayMs dropped/);
+  });
+
+  it("accepts optional mini peek visuals only as declared file arrays", () => {
+    const states = Object.fromEntries(schema.MINI_REQUIRED_STATES.map((state) => [state, [`${state}.svg`]]));
+    const base = validThemeJson({ miniMode: { supported: true, states } });
+    assert.deepStrictEqual(schema.validateTheme(base), []);
+    assert.deepStrictEqual(schema.validateTheme(validThemeJson({ miniMode: {
+      supported: true,
+      states: { ...states, "mini-peek-hold": ["hold.svg"], "mini-sleep-peek": ["sleep-peek.svg"] },
+    } })), []);
+    const invalid = schema.validateTheme(validThemeJson({ miniMode: {
+      supported: true, states: { ...states, "mini-peek-hold": [] },
+    } }));
+    assert.ok(invalid.some((error) => error.includes("miniMode.states.mini-peek-hold")));
+  });
+
   it("validates schema, rendering, and update bubble anchor shape", () => {
     const errors = schema.validateTheme({
       schemaVersion: 2,
@@ -115,6 +165,64 @@ describe("theme schema validation", () => {
         `expected a roamFlipAssets error for ${JSON.stringify(bad)}`
       );
     }
+  });
+
+  it("rejects a non-boolean idleAnimations[].mirrorOnRightSide", () => {
+    const withFlag = (mirrorOnRightSide) => validThemeJson({
+      idleAnimations: [{ file: "idle.svg", duration: 5000, mirrorOnRightSide }],
+    });
+    assert.deepStrictEqual(schema.validateTheme(withFlag(true)), []);
+    assert.deepStrictEqual(schema.validateTheme(withFlag(false)), []);
+
+    for (const bad of ["true", 1, {}]) {
+      const errors = schema.validateTheme(withFlag(bad));
+      assert.ok(
+        errors.some((error) => error.includes("idleAnimations[0].mirrorOnRightSide must be a boolean")),
+        `expected a mirrorOnRightSide error for ${JSON.stringify(bad)}`
+      );
+    }
+  });
+
+  it("validates mirroredFiles as a map to distinct file names", () => {
+    const withMap = (mirroredFiles) => validThemeJson({ mirroredFiles });
+    assert.deepStrictEqual(schema.validateTheme(withMap({ "mini-happy.apng": "mini-happy-left.apng" })), []);
+
+    for (const bad of ["mini-happy-left.apng", ["mini-happy-left.apng"], 1, null]) {
+      const errors = schema.validateTheme(withMap(bad));
+      assert.ok(
+        errors.some((error) => error.includes("mirroredFiles must be an object")),
+        `expected a mirroredFiles shape error for ${JSON.stringify(bad)}`
+      );
+    }
+    for (const bad of [{ "mini-happy.apng": "" }, { "mini-happy.apng": 3 }, { "mini-happy.apng": "../mini-happy.apng" }]) {
+      const errors = schema.validateTheme(withMap(bad));
+      assert.ok(
+        errors.some((error) => error.includes('mirroredFiles["mini-happy.apng"]')),
+        `expected a mirroredFiles entry error for ${JSON.stringify(bad)}`
+      );
+    }
+  });
+
+  it("mergeDefaults normalizes mirroredFiles to basenames and defaults it to {}", () => {
+    assert.deepStrictEqual(schema.mergeDefaults(validThemeJson()).mirroredFiles, {});
+    const theme = schema.mergeDefaults(validThemeJson({
+      mirroredFiles: {
+        "../mini-happy.apng": "nested/mini-happy-left.apng",
+        "bad.apng": 7,
+        "same.apng": "same.apng",
+      },
+    }));
+    assert.deepStrictEqual(theme.mirroredFiles, { "mini-happy.apng": "mini-happy-left.apng" });
+  });
+
+  it("collectRequiredAssetFiles includes mirrored-display variants", () => {
+    const files = schema.collectRequiredAssetFiles({
+      states: { idle: ["idle.svg"], roam: ["walk.apng"] },
+      mirroredFiles: { "walk.apng": "../walk-left.apng", "odd.apng": 4 },
+    });
+    assert.ok(files.includes("walk.apng"));
+    assert.ok(files.includes("walk-left.apng"));
+    assert.ok(!files.includes("4"));
   });
 
   it("validates and derives the explicit pet tint capability", () => {
@@ -694,5 +802,78 @@ describe("theme schema defaults and normalization", () => {
     assert.strictEqual(usages[0].stateFamily, "mini:mini-idle");
     assert.deepStrictEqual(usages[0].effectiveViewBox, { x: 0, y: 0, width: 32, height: 32 });
     assert.ok(schema.collectRequiredAssetFiles(theme).includes("mini-idle.svg"));
+  });
+});
+
+describe("multi-file working / juggling tiers", () => {
+  it("accepts files pools, alone or next to the legacy file", () => {
+    const errors = schema.validateTheme(validThemeJson({
+      workingTiers: [
+        { minSessions: 2, files: ["two-a.svg", "two-b.svg"] },
+        { minSessions: 1, file: "one.svg", files: ["one.svg", "one-b.svg"] },
+      ],
+      jugglingTiers: [{ minSessions: 1, file: "juggle.svg" }],
+    }));
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it("rejects empty, non-array, and non-string files pools", () => {
+    const errors = schema.validateTheme(validThemeJson({
+      workingTiers: [
+        { minSessions: 3, files: [] },
+        { minSessions: 2, files: "two.svg" },
+        { minSessions: 1, file: "one.svg", files: ["one.svg", ""] },
+      ],
+      jugglingTiers: [{ minSessions: 1, files: [42] }],
+    }));
+    assert.deepStrictEqual(errors, [
+      "workingTiers[0].files must be a non-empty array of file names when present",
+      "workingTiers[1].files must be a non-empty array of file names when present",
+      "workingTiers[2].files must be a non-empty array of file names when present",
+      "jugglingTiers[0].files must be a non-empty array of file names when present",
+    ]);
+  });
+
+  it("prefers files over file and keys a tier by file when both are declared", () => {
+    assert.deepStrictEqual(schema.getTierFiles({ file: "one.svg" }), ["one.svg"]);
+    assert.deepStrictEqual(schema.getTierFiles({ file: "one.svg", files: ["a.svg", "b.svg"] }), ["a.svg", "b.svg"]);
+    assert.deepStrictEqual(schema.getTierFiles({ files: [], file: "one.svg" }), ["one.svg"]);
+    assert.deepStrictEqual(schema.getTierFiles(null), []);
+    assert.strictEqual(schema.getTierKeyFile({ file: "one.svg", files: ["a.svg", "b.svg"] }), "one.svg");
+    assert.strictEqual(schema.getTierKeyFile({ files: ["a.svg", "b.svg"] }), "a.svg");
+    assert.strictEqual(schema.getTierKeyFile({}), null);
+  });
+
+  it("basenames every pool file during normalization", () => {
+    const theme = schema.mergeDefaults(validThemeJson({
+      workingTiers: [{ minSessions: 1, file: "../one.svg", files: ["../one.svg", "nested/two.svg"] }],
+      jugglingTiers: [{ minSessions: 1, files: ["..\\juggle.svg"] }],
+    }), "demo", false);
+    assert.strictEqual(theme.workingTiers[0].file, "one.svg");
+    assert.deepStrictEqual(theme.workingTiers[0].files, ["one.svg", "two.svg"]);
+    assert.deepStrictEqual(theme.jugglingTiers[0].files, ["juggle.svg"]);
+  });
+
+  it("treats every pool file as a reachable, required visual", () => {
+    const cfg = {
+      states: { idle: ["idle.svg"] },
+      workingTiers: [{ minSessions: 1, file: "legacy-only.svg", files: ["../work-a.svg", "work-b.svg"] }],
+      jugglingTiers: [{ minSessions: 1, files: ["juggle-a.svg", "juggle-b.svg"] }],
+    };
+    assert.deepStrictEqual(schema.collectRequiredAssetFiles(cfg).sort(), [
+      "idle.svg",
+      "juggle-a.svg",
+      "juggle-b.svg",
+      "work-a.svg",
+      "work-b.svg",
+    ]);
+    const tierUsages = schema.projectThemeVisualUsages(cfg)
+      .filter((usage) => usage.source === "workingTiers" || usage.source === "jugglingTiers");
+    assert.deepStrictEqual(tierUsages.map((usage) => [usage.stateFamily, usage.file]), [
+      ["normal:workingTiers", "work-a.svg"],
+      ["normal:workingTiers", "work-b.svg"],
+      ["normal:jugglingTiers", "juggle-a.svg"],
+      ["normal:jugglingTiers", "juggle-b.svg"],
+    ]);
   });
 });

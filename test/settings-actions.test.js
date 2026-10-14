@@ -11,6 +11,7 @@ const {
   requireBoolean,
   requireFiniteNumber,
   requireEnum,
+  applyThemeSelection,
 } = require("../src/settings-actions");
 const prefs = require("../src/prefs");
 
@@ -37,6 +38,66 @@ describe("validator helpers", () => {
     const v = requireEnum("k", ["a", "b"]);
     assert.strictEqual(v("a").status, "ok");
     assert.strictEqual(v("c").status, "error");
+  });
+});
+
+describe("mobile permission preview consent commands", () => {
+  it("keeps the preference command-only and shares the mobilePreview lock", () => {
+    assert.strictEqual(updateRegistry.mobilePermissionPreviewEnabled.commandOnly, true);
+    assert.strictEqual(updateRegistry.mobilePermissionPreviewEnabled.lockKey, "mobilePreview");
+    assert.strictEqual(updateRegistry.mobilePreviewEnabled.lockKey, "mobilePreview");
+    for (const name of [
+      "setMobilePermissionPreviewEnabled",
+      "mobilePreview.regenerateToken",
+      "mobilePreview.resetAccess",
+    ]) {
+      assert.strictEqual(commandRegistry[name].lockKey, "mobilePreview", name);
+    }
+  });
+
+  it("requires parent enable and current confirmation", () => {
+    const command = commandRegistry.setMobilePermissionPreviewEnabled;
+    assert.strictEqual(command({ enabled: true, confirmed: true, resetAccess: false }, {
+      snapshot: { mobilePreviewEnabled: false, mobilePermissionPreviewEnabled: false },
+    }).status, "error");
+    assert.strictEqual(command({ enabled: true, confirmed: false, resetAccess: false }, {
+      snapshot: { mobilePreviewEnabled: true, mobilePermissionPreviewEnabled: false },
+    }).status, "error");
+    assert.strictEqual(command({ enabled: true, confirmed: true, resetAccess: "yes" }, {
+      snapshot: { mobilePreviewEnabled: true, mobilePermissionPreviewEnabled: false },
+    }).status, "error");
+  });
+
+  it("resets before commit, reconnects keep-token clients, and noops before a second reset", () => {
+    const command = commandRegistry.setMobilePermissionPreviewEnabled;
+    let resets = 0;
+    let disconnects = 0;
+    const reset = command({ enabled: true, confirmed: true, resetAccess: true }, {
+      snapshot: { mobilePreviewEnabled: true, mobilePermissionPreviewEnabled: false },
+      resetMobileAccess: () => { resets++; return "token"; },
+    });
+    assert.deepStrictEqual(reset, {
+      status: "ok",
+      tokenReset: true,
+      rePairRequired: true,
+      commit: { mobilePermissionPreviewEnabled: true },
+    });
+    assert.strictEqual(resets, 1);
+
+    const keep = command({ enabled: true, confirmed: true, resetAccess: false }, {
+      snapshot: { mobilePreviewEnabled: true, mobilePermissionPreviewEnabled: false },
+      disconnectMobilePreviewClients: () => { disconnects++; },
+    });
+    assert.strictEqual(keep.status, "ok");
+    assert.strictEqual(keep.tokenReset, false);
+    assert.strictEqual(disconnects, 1);
+
+    const noop = command({ enabled: true, confirmed: true, resetAccess: true }, {
+      snapshot: { mobilePreviewEnabled: true, mobilePermissionPreviewEnabled: true },
+      resetMobileAccess: () => { resets++; },
+    });
+    assert.deepStrictEqual(noop, { status: "ok", noop: true });
+    assert.strictEqual(resets, 1);
   });
 });
 
@@ -171,13 +232,33 @@ describe("updateRegistry pure-data validators", () => {
       "miniMode", "openAtLoginHydrated", "soundMuted", "bubbleFollowPet",
       "hideBubbles", "permissionBubblesEnabled", "lowPowerIdleMode",
       "testReactionsEnabled",
-      "allowEdgePinning", "disableMiniMode", "keepSizeAcrossDisplays", "codexHookHealthNotifyEnabled",
+      "allowEdgePinning", "disableMiniMode", "codexHookHealthNotifyEnabled",
       "quotaMergeSources", "freeRoam", "roamConstrainAxis",
     ]) {
       assert.strictEqual(updateRegistry[key](true, deps).status, "ok", `${key}(true)`);
       assert.strictEqual(updateRegistry[key](false, deps).status, "ok", `${key}(false)`);
       assert.strictEqual(updateRegistry[key]("yes", deps).status, "error", `${key}("yes")`);
     }
+  });
+
+  it("keepSizeAcrossDisplays validates booleans through its object-form entry", () => {
+    const entry = updateRegistry.keepSizeAcrossDisplays;
+    assert.strictEqual(typeof entry, "object");
+    assert.strictEqual(entry.validate(true).status, "ok");
+    assert.strictEqual(entry.validate(false).status, "ok");
+    assert.strictEqual(entry.validate("yes").status, "error");
+  });
+
+  it("keepSizeAcrossDisplays rebases once only when turning off", () => {
+    const entry = updateRegistry.keepSizeAcrossDisplays;
+    let calls = 0;
+    const deps = { rebaseSizeToRealizedPixels: () => { calls += 1; } };
+    assert.deepStrictEqual(entry.effect(false, deps), { status: "ok" });
+    assert.strictEqual(calls, 1);
+    assert.deepStrictEqual(entry.effect(true, deps), { status: "ok" });
+    assert.strictEqual(calls, 1);
+    assert.deepStrictEqual(entry.effect(false, {}), { status: "ok" });
+    assert.deepStrictEqual(entry.effect(false), { status: "ok" });
   });
 
   it("accepts only supported quota ring display modes", () => {
@@ -2233,6 +2314,7 @@ describe("shortcut commands", () => {
         globalShortcut,
         shortcutHandlers: {
           togglePet: () => {},
+          quickSelectSession: () => {},
           permissionAllow: () => {},
           permissionDeny: () => {},
         },
@@ -2779,6 +2861,43 @@ describe("setThemeSelection command", () => {
   });
 });
 
+// Shared non-recursive runtime selection helper used by BOTH setThemeSelection
+// and officialTheme.uninstall (the latter while already holding the theme lock).
+describe("applyThemeSelection shared helper", () => {
+  it("activates with the given variant/overrides and returns the resolved variant", () => {
+    const calls = [];
+    const deps = {
+      activateTheme: (themeId, variantId, overrideMap) => {
+        calls.push({ themeId, variantId, overrideMap });
+        return { themeId, variantId: variantId === "dead" ? "default" : variantId };
+      },
+      getActiveTheme: () => ({ _id: "clawd", _capabilities: { petTint: true, accessories: true } }),
+    };
+    const r = applyThemeSelection("clawd", "dead", { sounds: { complete: { file: "x.mp3" } } }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.themeId, "clawd");
+    assert.strictEqual(r.variantId, "default", "dead variant resolves to default");
+    assert.deepStrictEqual(r.customizationCapabilities, {
+      petTint: true,
+      accessories: true,
+      mouthAccessories: false,
+    });
+    assert.deepStrictEqual(calls, [{
+      themeId: "clawd",
+      variantId: "dead",
+      overrideMap: { sounds: { complete: { file: "x.mp3" } } },
+    }]);
+    // The helper performs the runtime switch only; the caller owns the commit.
+    assert.strictEqual(r.commit, undefined);
+  });
+
+  it("errors when activateTheme is missing", () => {
+    const r = applyThemeSelection("clawd", "default", null, {});
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /activateTheme/);
+  });
+});
+
 // #509: default idle visual picker command.
 describe("setIdleVisual command", () => {
   const activeTheme = {
@@ -2832,6 +2951,18 @@ describe("setIdleVisual command", () => {
     );
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /not an idle visual/);
+  });
+
+  it("accepts a selectable-only idle visual through the existing setting command", () => {
+    const theme = {
+      ...activeTheme,
+      idleVisualOptions: [{ file: "pool.apng" }],
+    };
+    const result = commandRegistry.setIdleVisual(
+      { themeId: "clawd", file: "pool.apng" },
+      makeDeps({ getActiveTheme: () => theme })
+    );
+    assert.deepStrictEqual(result, { status: "ok", commit: { idleVisual: { clawd: "pool.apng" } } });
   });
 
   it("commits the merged map for a valid pool file, preserving other themes", () => {
