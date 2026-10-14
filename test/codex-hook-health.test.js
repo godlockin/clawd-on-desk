@@ -7,6 +7,7 @@ const {
   getCodexHookHealth,
   classifyCodexHookDetail,
   decideCodexHookNotification,
+  getCodexHookNudgeKeys,
 } = require("../src/codex-hook-health");
 
 describe("classifyCodexHookDetail", () => {
@@ -46,6 +47,31 @@ describe("classifyCodexHookDetail", () => {
     assert.strictEqual(broken.signature, "broken-path");
   });
 
+  it("distinguishes optional hook review from permission hook review", () => {
+    const optionalEvents = ["PreCompact", "PostCompact", "Interrupt", "SessionEnd"];
+    const detail = (missingEvents) => ({ status: "needs-review",
+      codexHookTrust: { value: "needs-review", missingEvents } });
+    const optional = classifyCodexHookDetail(detail(optionalEvents));
+    assert.strictEqual(optional.signature, "needs-review-optional");
+    assert.strictEqual(optional.reasonKey, "codexHookHealthReasonNeedsReview");
+    for (const events of [["PermissionRequest"], ["PermissionRequest", ...optionalEvents]]) {
+      assert.strictEqual(classifyCodexHookDetail(detail(events)).signature, "needs-review");
+    }
+  });
+
+  it("keeps uncertain missing-event evidence on the existing review warning", () => {
+    for (const missingEvents of [undefined, null, "PreCompact", {}]) {
+      assert.strictEqual(classifyCodexHookDetail({ status: "needs-review",
+        codexHookTrust: { value: "needs-review", missingEvents } }).signature, "needs-review");
+    }
+  });
+
+  it("keeps needs-review without a trust object on the existing review warning", () => {
+    const result = classifyCodexHookDetail({ status: "needs-review" });
+    assert.strictEqual(result.signature, "needs-review");
+    assert.strictEqual(result.reasonKey, "codexHookHealthReasonNeedsReview");
+  });
+
   it("surfaces any other non-ok status generically instead of swallowing it", () => {
     const r = classifyCodexHookDetail({ status: "weird-new-status" });
     assert.strictEqual(r.signature, "weird-new-status");
@@ -56,6 +82,19 @@ describe("classifyCodexHookDetail", () => {
     assert.strictEqual(classifyCodexHookDetail(null).signature, null);
     assert.strictEqual(classifyCodexHookDetail(undefined).signature, null);
     assert.strictEqual(classifyCodexHookDetail(42).signature, null);
+  });
+});
+
+describe("getCodexHookNudgeKeys", () => {
+  it("selects accurate copy for optional hooks and retains existing copy for other warnings", () => {
+    assert.deepStrictEqual(getCodexHookNudgeKeys({ signature: "needs-review-optional" }), {
+      title: "codexHookHealthOptionalNudgeTitle", body: "codexHookHealthOptionalNudgeBody",
+    });
+    for (const signature of ["needs-review", "feature-disabled", "not-registered", "broken-path", null]) {
+      assert.deepStrictEqual(getCodexHookNudgeKeys({ signature }), {
+        title: "codexHookHealthNudgeTitle", body: "codexHookHealthNudgeBody",
+      });
+    }
   });
 });
 
@@ -119,6 +158,14 @@ describe("decideCodexHookNotification (edge-triggered dedup)", () => {
     const d = decideCodexHookNotification(broken("feature-disabled"), "needs-review");
     assert.strictEqual(d.shouldNotify, true);
     assert.strictEqual(d.nextSignature, "feature-disabled");
+  });
+
+  it("notifies again when review switches between optional and permission hooks", () => {
+    for (const [current, previous] of [["needs-review-optional", "needs-review"], ["needs-review", "needs-review-optional"]]) {
+      const decision = decideCodexHookNotification(broken(current), previous);
+      assert.strictEqual(decision.shouldNotify, true);
+      assert.strictEqual(decision.nextSignature, current);
+    }
   });
 
   it("resets the remembered signature once healthy, so a later break re-fires", () => {

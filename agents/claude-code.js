@@ -14,6 +14,7 @@ module.exports = {
     UserPromptSubmit: "thinking",
     PreToolUse: "working",
     PostToolUse: "working",
+    PostToolBatch: "thinking",
     PostToolUseFailure: "error",
     Stop: "attention",
     StopFailure: "error",
@@ -28,6 +29,7 @@ module.exports = {
   capabilities: {
     httpHook: true,
     permissionApproval: true,
+    mobilePermissionObservation: true,
     notificationHook: true,
     sessionEnd: true,
     subagent: true,

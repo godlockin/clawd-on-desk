@@ -44,6 +44,32 @@ const OPENCODE_FAMILY = Object.freeze({
     configCandidates: Object.freeze(["opencode.jsonc", "opencode.json", "config.json"]),
     jsonc: true,
     schema: "https://opencode.ai/config.json",
+    // #1026: register a user-writable, content-addressed managed generation
+    // under the target home instead of pointing opencode at the packaged
+    // source dir (Program Files / app.asar.unpacked paths are silently
+    // skipped by the loader). This flag ALSO gates the managed ownership
+    // classifier, managed Doctor inspection and generation cleanup. It is an
+    // explicit per-member switch — never inferred from runtime/platform.
+    managedMaterialization: true,
+    // OpenCode 2.x (npm @opencode/cli) reads the renamed top-level `plugins`
+    // key with a `{ id, setup }` object plugin API — the v1 function entry
+    // under `plugin` fails the v2 loader schema. Earlier 2.0.x only logged a
+    // load warning for that entry (docs/investigations/opencode-v2-e1-evidence.md,
+    // probed on 2.0.15), but the loader got stricter: opencode 2.0.26 loads the
+    // legacy `plugin` key through the SAME strict loader and surfaces the
+    // failure as "Plugin failed: <path>" (id `-` in `opencode plugin list`).
+    // The installer therefore registers the v2 `plugins` key ALONE on a
+    // detected v2 host (hooks/opencode-host-detect.js) and sweeps any
+    // proven-owned v1 `plugin` entry; a 1.x host gets only the v1 key (and
+    // leftover v2 entries are swept), an unknown host never touches the v2 key.
+    // `v2PluginDirName` is materialized as an extra single-file
+    // entry directory inside the generation; `v2HookSource` is the wire
+    // identity that routes v2 blocking permission POSTs; `v2PluginId` is the
+    // stable v2 loader id. MiMo stays v1-only (managedMaterialization:false,
+    // no v2 fields).
+    v2PluginDirName: "opencode-plugin-v2",
+    v2HookSource: "opencode-plugin-v2",
+    v2PluginId: "clawd-on-desk-opencode",
   }),
   // MiMo Code — opencode-derived runtime with the identical plugin loader +
   // event wire contract. Its config is JSONC (comments/trailing commas
@@ -70,6 +96,10 @@ const OPENCODE_FAMILY = Object.freeze({
     configCandidates: Object.freeze(["mimocode.jsonc", "mimocode.json", "config.json"]),
     jsonc: true,
     schema: "https://mimo.xiaomi.com/mimocode/config.json",
+    // MiMo keeps the legacy direct-source register/unregister/Doctor behavior
+    // in this change (#1026 §1.2). Flipping this to true requires real MiMo
+    // loader evidence and explicit review authorization.
+    managedMaterialization: false,
   }),
 });
 
@@ -97,6 +127,7 @@ const FAMILY_EVENT_MAP = Object.freeze({
 const FAMILY_CAPABILITIES = Object.freeze({
   httpHook: false,          // family permission goes via plugin event forward, not HTTP blocking
   permissionApproval: true, // Clawd bubble → host REST reply through the reverse bridge
+  mobilePermissionObservation: false,
   sessionEnd: true,
   subagent: false,          // Phase 3 will flip to true once subtask lifecycle verified
 });
