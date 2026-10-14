@@ -112,6 +112,18 @@ describe("displayed visual projection", () => {
     assert.strictEqual(result.committed.displayState, "roam");
   });
 
+  it("preserves an animation restart through delivery and timeout recovery", () => {
+    const clock = createClock();
+    const delivered = [];
+    const projection = createDisplayedVisualProjection({ ...clock, deadlineMs: 100 });
+    projection.request(requestInput(payload => delivered.push(payload), { restartAnimation: true }));
+    assert.strictEqual(delivered[0].restartAnimation, true);
+    clock.advance(100);
+    assert.strictEqual(delivered[1].restartAnimation, true);
+    assert.ok(delivered[1].visualGeneration > delivered[0].visualGeneration);
+    projection.dispose();
+  });
+
   it("projects a verified different-file fallback and never pairs it with the requested hitbox", () => {
     const projection = createDisplayedVisualProjection({
       projectActualFile: ({ actualFile }) => actualFile === "clawd-idle-static.png"

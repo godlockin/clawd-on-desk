@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { isDeepStrictEqual } = require("util");
 
 const {
   isAgentEnabled,
@@ -10,8 +11,10 @@ const {
 } = require("../agent-gate");
 const { getAgent } = require("../../agents/registry");
 const { commandMatchesMarker, findHookCommands } = require("../../hooks/json-utils");
+const { isOwnedKiroCrewCommand } = require("../../hooks/kirocrew-command");
 const { GEMINI_HOOK_EVENTS } = require("../../hooks/gemini-install");
 const { ANTIGRAVITY_HOOK_EVENTS, HOOK_GROUP_ID: ANTIGRAVITY_HOOK_GROUP_ID } = require("../../hooks/antigravity-install");
+const cursor = require("../../hooks/cursor-install");
 const {
   hasUserPermissionHookInOtherFiles,
   hasUserPermissionHookInSettingsJson,
@@ -24,6 +27,7 @@ const {
   KIMI_HOOK_EVENTS,
 } = require("../../hooks/kimi-install");
 const { parseTomlSections: parseCodewhaleTomlSections } = require("../../hooks/codewhale-install");
+const { findStandaloneBridge, listOtherOmpProfileAgentDirs } = require("../../hooks/omp-install");
 const { getAgentDescriptors } = require("./agent-descriptors");
 const {
   commandContainsFragment,
@@ -33,11 +37,22 @@ const {
 const { checkCodexHookTrust, checkCodexHooksFeature } = require("./codex-features-check");
 const { inspectStableCodexHookCommand } = require("../../hooks/codex-install-utils");
 const { validateOpencodeEntry } = require("./opencode-entry-validator");
+const { inspectManagedOpencode } = require("./opencode-managed-inspector");
 const { validateOpenClawEntry } = require("./openclaw-entry-validator");
+const { inspectGrokHookFile } = require("../../hooks/grok-install");
 const { hasIncludeDirective } = require("../../hooks/openclaw-install");
-const { inspectDeepSeekHarnessDiskSync } = require("../../hooks/dsh-install");
+const { inspectDshTargetsSync } = require("../../hooks/dsh-install");
+const minimaxInstall = require("../../hooks/minimax-install");
 
-const REPAIRABLE_AGENT_STATUSES = new Set(["not-connected", "broken-path"]);
+const REPAIRABLE_AGENT_STATUSES = new Set([
+  "not-connected",
+  "broken-path",
+  // #1026 managed OpenCode: a safe migration (legacy source / verified copy /
+  // owned stale generation / single missing legacy path) and safe duplicate
+  // convergence both have a real Repair path.
+  "legacy-path",
+  "duplicate-entry",
+]);
 const GEMINI_HOOKS_DISABLED_DETAIL = "Gemini hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events";
 const ANTIGRAVITY_HOOKS_DISABLED_DETAIL = "Antigravity Clawd hooks are disabled in hooks.json; Clawd preserves this user setting and will not receive hook events";
 const QWEN_HOOKS_DISABLED_DETAIL = "Qwen Code hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events";
@@ -249,6 +264,21 @@ function withTraeCodeEnableNotice(detail, descriptor) {
   };
 }
 
+// MiniMax Code keeps plugin enable state inside the app (or `mcode plugin
+// enable`); the on-disk plugin directory alone proves nothing about whether
+// hooks fire. Verified on macOS the app auto-discovers the directory, so this
+// is a fallback hint rather than a required step — same annotation contract as
+// the TraeCode notice: informational, and only on an "ok" status.
+function withMinimaxEnableNotice(detail, descriptor) {
+  if (descriptor.agentId !== "minimax" || !detail) return detail;
+  if (detail.status !== "ok") return detail;
+  const base = typeof detail.detail === "string" && detail.detail ? detail.detail : "MiniMax Code plugin installed";
+  return {
+    ...detail,
+    detail: `${base}. If hooks do not fire, enable the plugin inside MiniMax Code: run "mcode plugin enable clawd-state@local" or enable it in the app's plugin panel.`,
+  };
+}
+
 function withAgentFixAction(detail, descriptor) {
   if (
     descriptor.agentId === "kimi-cli"
@@ -263,6 +293,27 @@ function withAgentFixAction(detail, descriptor) {
   }
   if (!descriptor.autoInstall || !REPAIRABLE_AGENT_STATUSES.has(detail.status)) return detail;
   if (detail.supplementary && detail.supplementary.key === "hook_group") return detail;
+  if (
+    descriptor.agentId === "grok-build"
+    && detail.supplementary
+    && detail.supplementary.key === "grok_hooks"
+    && (detail.supplementary.value === "foreign-file" || detail.supplementary.value === "config-corrupt")
+  ) {
+    // Re-running the installer on a foreign or unparseable file fails closed,
+    // so a Fix button would be an ineffective loop.
+    return detail;
+  }
+  if (
+    descriptor.agentId === "minimax"
+    && detail.supplementary
+    && detail.supplementary.key === "minimax_plugin"
+    && (detail.supplementary.value === "foreign" || detail.supplementary.value === "uninspectable")
+  ) {
+    // Install fails closed on a directory whose ownership cannot be proven
+    // (ownership marker) and on one it cannot inspect at all, so a Fix button
+    // would be an ineffective loop. Surface the finding without a Fix.
+    return detail;
+  }
   if (
     descriptor.agentId === "gemini-cli"
     && detail.supplementary
@@ -355,6 +406,8 @@ function statusLevel(status) {
     || status === "broken-path"
     || status === "config-corrupt"
     || status === "needs-review"
+    || status === "legacy-path"
+    || status === "duplicate-entry"
   ) {
     return "warning";
   }
@@ -476,6 +529,54 @@ function validateCommandList(descriptor, commands, options) {
     scriptPath: first.scriptPath || null,
     commandFragment: first.fragment || String(commands[0] || "").slice(0, 128),
   });
+}
+
+function validateCursorCommandList(descriptor, settings, options) {
+  const runtime = cursor.resolveCursorHookRuntime({
+    platform: options.platform || process.platform,
+    processEnv: options.env,
+    homeDir: options.homeDir,
+    sourceScript: descriptor.scriptPath || cursor.resolveCursorHookScript(),
+    fs: options.fs,
+  }, { materialize: false });
+  if (!runtime.ok) {
+    return makeDetail(descriptor, "needs-review", {
+      level: "warning",
+      detail: `Cursor hook runtime could not be resolved: ${runtime.message || runtime.reason}`,
+      hookCommandIssue: runtime.reason || "cursor-hook-runtime-unavailable",
+    });
+  }
+  const records = [];
+  if (settings && settings.hooks && typeof settings.hooks === "object") {
+    for (const [event, entries] of Object.entries(settings.hooks)) {
+      if (!Array.isArray(entries)) continue;
+      entries.forEach((entry, index) => {
+        if (!entry || typeof entry.command !== "string") return;
+        const verdict = cursor.classifyCursorHookCommand(
+          entry.command,
+          runtime.target,
+          options.platform || process.platform,
+          { homeDir: options.homeDir, materializedRoot: runtime.materializedRoot }
+        );
+        records.push({ event, index, command: entry.command, ...verdict });
+      });
+    }
+  }
+  const ambiguous = records.filter((record) => record.classification === "ambiguous");
+  if (ambiguous.length) {
+    const first = ambiguous[0];
+    return makeDetail(descriptor, "needs-review", {
+      level: "warning",
+      detail: `${descriptor.configPath} has ${ambiguous.length} Cursor hook command(s) with ambiguous ownership`,
+      hookCommandIssue: "cursor-hook-conflict",
+      commandFragment: String(first.command || "").slice(0, 128),
+      conflictingHookEvent: first.event,
+    });
+  }
+  const owned = records
+    .filter((record) => record.classification === "owned")
+    .map((record) => record.command);
+  return validateCommandList(descriptor, owned, options);
 }
 
 function findHookCommandsForEvent(settings, eventName, marker, options) {
@@ -759,20 +860,42 @@ function validateFileHookEvents(descriptor, settings, options) {
   const missingKey = descriptor.agentId === "qwen-code" ? "missingQwenHookEvents" : "missingHookEvents";
   const brokenKey = descriptor.agentId === "qwen-code" ? "brokenQwenHookEvent" : "brokenHookEvent";
   const missingEvents = [];
+  const disabledEvents = [];
   let commandCount = 0;
   let firstOk = null;
   let firstFailure = null;
 
   for (const eventName of events) {
-    const commands = findHookCommandsForEvent(settings, eventName, descriptor.marker, {
-      nested: !!descriptor.nested,
-      hookEventsContainer: descriptor.hookEventsContainer,
-    });
+    let commands;
+    if (descriptor.flatArrayHookEvents) {
+      const entries = settings && Array.isArray(settings.hooks)
+        ? settings.hooks.filter((entry) => (
+          entry && typeof entry === "object"
+          && entry.event === eventName
+          && typeof entry.command === "string"
+          && (descriptor.agentId === "kirocrew"
+            ? isOwnedKiroCrewCommand(entry.command)
+            : commandContainsFragment(entry.command, descriptor.marker))
+        ))
+        : [];
+      const active = entries.filter((entry) => entry.enabled !== false);
+      if (!active.length) {
+        if (entries.length) disabledEvents.push(eventName);
+        else missingEvents.push(eventName);
+      }
+      commands = active.map((entry) => entry.command);
+    } else {
+      commands = findHookCommandsForEvent(settings, eventName, descriptor.marker, {
+        nested: !!descriptor.nested,
+        hookEventsContainer: descriptor.hookEventsContainer,
+      });
+    }
     commandCount += commands.length;
-    if (!commands.length) {
+    if (!commands.length && !descriptor.flatArrayHookEvents) {
       missingEvents.push(eventName);
       continue;
     }
+    if (!commands.length) continue;
 
     const results = commands.map((command) => options.validateCommand(command, {
       platform: options.platform,
@@ -792,12 +915,16 @@ function validateFileHookEvents(descriptor, settings, options) {
     }
   }
 
-  if (missingEvents.length) {
+  if (missingEvents.length || disabledEvents.length) {
     return makeDetail(descriptor, "not-connected", {
       level: "warning",
-      detail: `${descriptor.configPath} missing ${agentName} hook event(s): ${missingEvents.join(", ")}`,
+      detail: `${descriptor.configPath} ${[
+        missingEvents.length ? `missing ${agentName} hook event(s): ${missingEvents.join(", ")}` : null,
+        disabledEvents.length ? `disabled ${agentName} hook event(s): ${disabledEvents.join(", ")}` : null,
+      ].filter(Boolean).join("; ")}`,
       commandCount,
       [missingKey]: missingEvents,
+      ...(descriptor.flatArrayHookEvents ? { disabledHookEvents: disabledEvents } : {}),
     });
   }
 
@@ -1449,6 +1576,11 @@ function applyAntigravitySupplementary(detail, descriptor, settings) {
 // miss the live one (#607 review). Only opencode-family JSONC members set
 // configCandidates, so this always funnels into checkOpencodeSettings.
 function checkMergedJsoncConfig(descriptor, options) {
+  // #1026: managed members use the ownership/manifest/generation inspector.
+  // MiMo (managedMaterialization:false) keeps the baseline path below.
+  if (descriptor.managedMaterialization === true) {
+    return inspectManagedOpencode(descriptor, options);
+  }
   const existing = [];
   for (const candidate of descriptor.configCandidates) {
     if (!fileExists(options.fs, candidate)) continue;
@@ -1536,10 +1668,12 @@ function checkFileMode(descriptor, options) {
       findCodexPlatformHookCommands(settings, descriptor.marker, options.platform || process.platform),
       options
     );
+  } else if (descriptor.agentId === "cursor-agent") {
+    detail = validateCursorCommandList(descriptor, settings, options);
   } else {
     detail = validateCommandList(
       descriptor,
-      findHookCommands(settings, descriptor.marker, { nested: !!descriptor.nested }),
+      findHookCommands(settings, descriptor.marker, { nested: !!descriptor.nested, flatArray: !!descriptor.flatArray }),
       options
     );
   }
@@ -1600,6 +1734,86 @@ function checkCopilotHooksMode(descriptor, options) {
     configFileExists: true,
     configPath: descriptor.configPath,
   };
+}
+
+// Grok Build uses a dedicated inspector: the resolved path depends on
+// GROK_HOME, and ownership is the structured handler marker in `env`, not a
+// filename substring. Doctor and the installation detector share this verdict,
+// so a misreported state can never send Fix to a different path than Install.
+function checkGrokHooksMode(descriptor, options) {
+  const inspected = inspectGrokHookFile({
+    fs: options.fs,
+    env: options.env,
+    homeDir: options.homeDir,
+  });
+  const base = {
+    parentDirExists: inspected.parentDirExists,
+    configFileExists: inspected.configFileExists,
+    configPath: inspected.configPath,
+    grokHealth: inspected.health,
+  };
+  let detail;
+  if (inspected.health === "healthy") {
+    detail = makeDetail(descriptor, "ok", {
+      level: null,
+      detail: `Verified structured Clawd handler in ${inspected.configPath}`,
+      ...base,
+    });
+  } else if (inspected.health === "incomplete") {
+    // Re-running the installer repairs a partial or non-canonical managed set,
+    // so this stays a repairable "broken-path" (with a Fix action).
+    detail = makeDetail(descriptor, "broken-path", {
+      level: "warning",
+      detail: inspected.detail || "Clawd-managed Grok handlers are incomplete",
+      ...base,
+    });
+  } else if (inspected.health === "needs-review") {
+    // Stale PR-preview `clawd.json`: Clawd must not mutate either file, so no
+    // Fix action is offered. Settings Install is blocked by the installer's
+    // needs-review result.
+    detail = makeDetail(descriptor, "needs-review", {
+      level: "warning",
+      detail: inspected.detail || "A stale PR-preview Grok hook file requires manual review",
+      ...base,
+      supplementary: { key: "grok_hooks", value: "stale-preview" },
+      stalePreviewPath: inspected.previewPath,
+    });
+  } else if (inspected.health === "foreign-file") {
+    detail = makeDetail(descriptor, "needs-review", {
+      level: "warning",
+      detail: `${inspected.configPath} exists but is not owned by Clawd; Clawd will not modify it`,
+      ...base,
+      supplementary: { key: "grok_hooks", value: "foreign-file" },
+    });
+  } else if (inspected.health === "config-corrupt") {
+    detail = makeDetail(descriptor, "config-corrupt", {
+      level: "warning",
+      detail: inspected.detail || `${inspected.configPath} could not be parsed`,
+      ...base,
+      supplementary: { key: "grok_hooks", value: "config-corrupt" },
+    });
+  } else if (inspected.health === "not-connected") {
+    detail = makeDetail(descriptor, "not-connected", {
+      level: "warning",
+      detail: `${inspected.configPath} missing`,
+      ...base,
+    });
+  } else {
+    detail = makeDetail(descriptor, "not-installed", {
+      level: "info",
+      detail: `${inspected.grokHome} missing`,
+      ...base,
+    });
+  }
+  if (inspected.stalePreview) {
+    detail = {
+      ...detail,
+      stalePreview: true,
+      stalePreviewPath: inspected.previewPath,
+      detail: `${detail.detail}. ${inspected.warnings.join(" ")}`.trim(),
+    };
+  }
+  return detail;
 }
 
 function checkTomlTextMode(descriptor, options) {
@@ -1861,7 +2075,7 @@ function checkKiroDirMode(descriptor, options) {
       continue;
     }
 
-    const commands = findHookCommands(settings, descriptor.marker, { nested: !!descriptor.nested });
+    const commands = findHookCommands(settings, descriptor.marker, { nested: !!descriptor.nested, flatArray: !!descriptor.flatArray });
     if (!commands.length) {
       scan.noMarkerFiles.push(file);
       continue;
@@ -1997,6 +2211,134 @@ function checkPluginDirMode(descriptor, options) {
     pluginConfigPath: configFilePath,
     pluginEnabled: true,
     detail: `${pluginDir} plugin files present and enabled`,
+  });
+}
+
+// True when a handler names an absolute node binary that no longer exists
+// (a removed nvm version, an uninstalled Homebrew node).
+function minimaxHooksNameMissingNode(hooks, nodeBin, fsImpl) {
+  const eventGroups = hooks && typeof hooks.hooks === "object" && hooks.hooks !== null && !Array.isArray(hooks.hooks)
+    ? Object.values(hooks.hooks)
+    : [];
+  return eventGroups.some((groups) => Array.isArray(groups) && groups.some(
+    (group) => Array.isArray(group && group.hooks) && group.hooks.some(
+      (handler) => handler
+        && typeof handler.command === "string"
+        && handler.command !== nodeBin
+        && (path.posix.isAbsolute(handler.command) || path.win32.isAbsolute(handler.command))
+        && !fileExists(fsImpl, handler.command)
+    )
+  ));
+}
+
+// MiniMax Code: verifies the plugin directory against the SAME shared helpers
+// the installer uses (hooks/minimax-install.js) instead of just checking that
+// files exist. A directory without a valid ownership marker (or with any
+// managed path symlinked) is reported as foreign and never offered a Fix:
+// re-running the installer fails closed there, so the button would be an
+// ineffective loop. An owned directory that is incomplete or drifted from the
+// current canonical document (node path, script path, event set, timeout) is
+// broken-path with a working Repair: reinstall rewrites the owned directory.
+function checkMinimaxPluginMode(descriptor, options) {
+  const pluginDir = descriptor.configPath;
+  // readOwnership distinguishes "missing" from "cannot be inspected", so a
+  // permission error on the root is never reported as an absent plugin with an
+  // Install Fix that the installer would then refuse.
+  const ownership = minimaxInstall.readOwnership(pluginDir, options.fs);
+  if (!ownership.owned && ownership.reason === "missing") {
+    return makeDetail(descriptor, "not-connected", {
+      level: "warning",
+      parentDirExists: true,
+      configFileExists: false,
+      configPath: pluginDir,
+      detail: `${pluginDir} missing`,
+      missingPluginFiles: descriptor.managedFiles || [],
+    });
+  }
+  if (!ownership.owned && ownership.reason === "empty-directory") {
+    // An empty directory is unclaimed and Install publishes over it, so from
+    // the user's point of view it is the same as no plugin at all.
+    return makeDetail(descriptor, "not-connected", {
+      level: "warning",
+      parentDirExists: true,
+      configFileExists: false,
+      configPath: pluginDir,
+      detail: `${pluginDir} is an empty directory`,
+      missingPluginFiles: descriptor.managedFiles || [],
+    });
+  }
+  if (!ownership.owned && ownership.reason === "uninspectable-root") {
+    return makeDetail(descriptor, "broken-path", {
+      level: "warning",
+      parentDirExists: true,
+      configFileExists: true,
+      configPath: pluginDir,
+      supplementary: { key: "minimax_plugin", value: "uninspectable" },
+      detail: `${pluginDir} could not be inspected; Clawd cannot verify the plugin or repair it`,
+    });
+  }
+  if (!ownership.owned) {
+    // Still running Clawd's hook without a provable owner (for example a
+    // pre-release install written before the ownership marker existed): the
+    // only safe recovery is a manual delete followed by Install.
+    const runsClawdHook = minimaxInstall.hooksReferenceClawdHook(pluginDir, options.fs) === true;
+    return makeDetail(descriptor, "broken-path", {
+      level: "warning",
+      parentDirExists: true,
+      configFileExists: true,
+      configPath: pluginDir,
+      supplementary: { key: "minimax_plugin", value: "foreign" },
+      detail: runsClawdHook
+        ? `${pluginDir} runs Clawd's hook but Clawd cannot prove it owns the directory (${ownership.reason}); Clawd will not modify or delete it — delete it manually, then use Install`
+        : `${pluginDir} exists but is not a verifiably Clawd-managed plugin (${ownership.reason}); Clawd will not modify or delete it. Installation will refuse to write there until you remove or rename that directory`,
+    });
+  }
+
+  // Ownership is proven at this point, so a missing or corrupt file is simply
+  // part of what Repair rewrites (e.g. an install interrupted between writes).
+  const readOwnedFile = (relativePath) => {
+    try {
+      return { value: readJson(options.fs, path.join(pluginDir, relativePath)), problem: null };
+    } catch (err) {
+      return { value: undefined, problem: err && err.code === "ENOENT" ? "missing" : "unreadable" };
+    }
+  };
+  const manifest = readOwnedFile(path.join(".claude-plugin", "plugin.json"));
+  const hooks = readOwnedFile(path.join("hooks", "hooks.json"));
+  // Same node-path decision as the installer (including keeping a recorded
+  // absolute path when detection fails), so Doctor never flags drift that a
+  // Repair would immediately write back.
+  const nodeBin = minimaxInstall.resolveDesiredNodeBin({ existingHooks: hooks.value, fs: options.fs });
+  const desiredManifest = minimaxInstall.desiredManifest();
+  const desiredHooks = minimaxInstall.buildDesiredHooksDocument(minimaxInstall.resolveHookScriptPath(), nodeBin);
+
+  // Spell out what drifted so the user knows what Repair rewrites.
+  const drifted = [];
+  if (manifest.problem) drifted.push(`manifest ${manifest.problem}`);
+  else if (!isDeepStrictEqual(manifest.value, desiredManifest)) drifted.push("manifest");
+  if (hooks.problem) drifted.push(`hooks ${hooks.problem}`);
+  else if (!isDeepStrictEqual(hooks.value, desiredHooks)) {
+    drifted.push(minimaxHooksNameMissingNode(hooks.value, nodeBin, options.fs)
+      ? "hooks (node path no longer exists)"
+      : "hooks");
+  }
+  if (drifted.length > 0) {
+    return makeDetail(descriptor, "broken-path", {
+      level: "warning",
+      parentDirExists: true,
+      configFileExists: true,
+      configPath: pluginDir,
+      supplementary: { key: "minimax_plugin", value: "outdated" },
+      detail: `${pluginDir} Clawd plugin files are outdated or were modified (${drifted.join(", ")}); repair rewrites them`,
+    });
+  }
+
+  return makeDetail(descriptor, "ok", {
+    level: null,
+    parentDirExists: true,
+    configFileExists: true,
+    configPath: pluginDir,
+    detail: `${pluginDir} Clawd plugin verified (ownership marker, manifest, events, node and script paths)`,
   });
 }
 
@@ -2309,22 +2651,57 @@ function readJsonIfPresent(fsImpl, filePath) {
   }
 }
 
-function isPiManagedMarker(value) {
+// Pi and OMP install the same shape: a Clawd-managed directory holding the
+// entry file, the core it imports next to it, and an ownership marker. The
+// integration id lives in the config mode ("pi-extension" → "pi",
+// "omp-extension" → "omp"), so one checker serves both instead of a copy per
+// agent. The marker check in particular must not be hard-coded to Pi: an OMP
+// install writes `integration: "omp"`, and a Pi-only validator reports that
+// healthy install as needs-review forever.
+const EXTENSION_CONFIG_MODES = Object.freeze(["pi-extension", "omp-extension"]);
+
+function isExtensionConfigMode(configMode) {
+  return EXTENSION_CONFIG_MODES.includes(configMode);
+}
+
+function extensionIntegrationId(descriptor) {
+  return String(descriptor.configMode || "").replace(/-extension$/, "");
+}
+
+function isExtensionManagedMarker(value, integrationId) {
   return !!(
     value
     && value.app === "clawd-on-desk"
-    && value.integration === "pi"
+    && value.integration === integrationId
     && value.managed === true
   );
 }
 
-function checkPiExtensionMode(descriptor, options) {
+function checkExtensionMode(descriptor, options) {
+  const integrationId = extensionIntegrationId(descriptor);
+  const agentName = descriptor.agentName || integrationId;
   const extensionDir = descriptor.configPath;
   const markerPath = path.join(extensionDir, descriptor.markerFile || ".clawd-managed.json");
   const extensionPath = path.join(extensionDir, descriptor.marker || "index.ts");
-  const corePath = path.join(extensionDir, descriptor.coreFile || "pi-extension-core.js");
+  const corePath = path.join(extensionDir, descriptor.coreFile || `${integrationId}-extension-core.js`);
+  const extensionDirExists = dirExists(options.fs, extensionDir);
+  const standaloneBridge = integrationId === "omp"
+    ? findStandaloneBridge({ extensionDir, fs: options.fs })
+    : null;
 
-  if (!dirExists(options.fs, extensionDir)) {
+  if (!extensionDirExists && standaloneBridge) {
+    return makeDetail(descriptor, "manual-managed", {
+      level: "info",
+      parentDirExists: true,
+      configFileExists: true,
+      configPath: standaloneBridge,
+      extensionDir,
+      standaloneBridge,
+      detail: `${standaloneBridge} community bridge is active; the Clawd-managed OMP extension is intentionally absent`,
+    });
+  }
+
+  if (!extensionDirExists) {
     return makeDetail(descriptor, "not-connected", {
       level: "warning",
       parentDirExists: true,
@@ -2336,7 +2713,19 @@ function checkPiExtensionMode(descriptor, options) {
   }
 
   const marker = readJsonIfPresent(options.fs, markerPath);
-  if (!isPiManagedMarker(marker)) {
+  if (standaloneBridge && isExtensionManagedMarker(marker, integrationId)) {
+    return makeDetail(descriptor, "broken-path", {
+      level: "warning",
+      parentDirExists: true,
+      configFileExists: true,
+      configPath: extensionDir,
+      extensionDir,
+      markerPath,
+      standaloneBridge,
+      detail: `${extensionDir} and ${standaloneBridge} are both active; Fix retires Clawd's managed copy to prevent duplicate OMP events`,
+    });
+  }
+  if (!isExtensionManagedMarker(marker, integrationId)) {
     return makeDetail(descriptor, "needs-review", {
       level: "warning",
       parentDirExists: true,
@@ -2344,7 +2733,10 @@ function checkPiExtensionMode(descriptor, options) {
       configPath: extensionDir,
       extensionDir,
       markerPath,
-      detail: `${extensionDir} exists but is not Clawd-managed`,
+      standaloneBridge,
+      detail: standaloneBridge
+        ? `${extensionDir} is not Clawd-managed and ${standaloneBridge} also exists; OMP may report duplicate events`
+        : `${extensionDir} exists but is not Clawd-managed`,
     });
   }
 
@@ -2362,7 +2754,7 @@ function checkPiExtensionMode(descriptor, options) {
       corePath,
       extensionFileExists,
       coreFileExists,
-      detail: "Pi extension files are missing or incomplete",
+      detail: `${agentName} extension files are missing or incomplete`,
     });
   }
 
@@ -2379,6 +2771,139 @@ function checkPiExtensionMode(descriptor, options) {
     coreFileExists,
     detail: `${extensionDir} extension verified`,
   });
+}
+
+// DeepSeek Harness has two independent carriers (web profile and desktop app)
+// that share one Doctor row. Each side gets its own status from the static
+// target; the row takes the worst side, and the Fix button is decided
+// separately so a fixable side is still repairable when the other is foreign.
+const DSH_DOCTOR_SIDES = Object.freeze(["web", "desktop"]);
+const DSH_DOCTOR_STATUS_RANK = Object.freeze({
+  "needs-review": 3,
+  "broken-path": 2,
+  "not-connected": 1,
+  ok: 0,
+});
+const DSH_DOCTOR_REVIEW_DETAILS = Object.freeze({
+  "foreign-package": "A foreign or conflicting DeepSeek Harness plugin uses the Clawd bridge package name; Clawd will not replace it",
+  "profile-entry-foreign-or-conflicting": "A foreign or conflicting DeepSeek Harness plugin uses the Clawd bridge package name; Clawd will not replace it",
+  "integrity-failed": "The managed DeepSeek Harness bridge bytes no longer match their ownership marker; inspect them manually",
+  "generation-integrity-failed": "The managed DeepSeek Harness bridge bytes no longer match their ownership marker; inspect them manually",
+  "source-unavailable": "Clawd's packaged DeepSeek Harness bridge source is unavailable; repair the Clawd installation",
+  "profile-corrupt": "The DeepSeek Harness {profile} profile manifest is unreadable; Clawd will not rewrite it automatically",
+  "carrier-unavailable": "The DeepSeek Harness desktop app was not found, but its profile still has a Clawd registration; install or locate the app and Repair",
+  "desktop-unverifiable": "Clawd could not verify whether the DeepSeek Harness desktop app is installed; manual inspection is required",
+  "multiple-desktop-installs": "More than one DeepSeek Harness desktop app was found; Clawd will not guess which one to use",
+});
+const DSH_DOCTOR_NOT_APPLICABLE_DETAILS = Object.freeze({
+  "web-not-used": "not used",
+  "desktop-not-installed": "desktop app not installed",
+  "desktop-profile-uninitialized": "open the DeepSeek Harness desktop app once to initialize its profile",
+});
+
+// A side is shown from its on-disk health when it may be attempted: a mutable
+// target, or web's manual fallback (macOS app PATH often cannot see a login
+// shell dsh, so a healthy web is still reported from disk). Any other diagnose
+// reason is a review finding.
+function dshSideCanAttemptFix(target) {
+  return target.role === "mutable" || (target.profile === "web" && target.manualFallback === true);
+}
+
+function dshSideStatus(target) {
+  if (target.role === "not-applicable") return null;
+  if (!dshSideCanAttemptFix(target)) return "needs-review";
+  const status = target.health && target.health.status;
+  if (status === "healthy") return "ok";
+  if (status === "absent" || status === "profile-missing") return "not-connected";
+  return "broken-path";
+}
+
+function dshSideDetail(target, status) {
+  if (status === null) {
+    return DSH_DOCTOR_NOT_APPLICABLE_DETAILS[target.reason] || "not used";
+  }
+  if (status === "ok") {
+    return target.profile === "web"
+      ? "managed bridge verified on disk; restart any running dsh web process to load a new plugin generation"
+      : "managed bridge verified on disk";
+  }
+  if (status === "not-connected" || status === "broken-path") {
+    return `managed bridge is ${target.health && target.health.status}`;
+  }
+  if (target.reason === "version-unsupported") {
+    const detected = (target.health && target.health.detectedDshVersion)
+      || (target.discovery && target.discovery.staticVersion)
+      || "or its bridge marker";
+    const range = (target.health && target.health.supportedDshRange) || "the supported range";
+    return `DeepSeek Harness ${detected} is outside ${range}; Clawd will not activate it automatically`;
+  }
+  const template = DSH_DOCTOR_REVIEW_DETAILS[target.reason];
+  if (template) return template.replace("{profile}", target.profile);
+  return `needs manual attention (${target.reason || "unknown"})`;
+}
+
+function dshRowStatus(sides) {
+  const counted = sides.filter((side) => side.status !== null);
+  if (!counted.length) return "not-connected";
+  return counted.reduce(
+    (worst, side) => (DSH_DOCTOR_STATUS_RANK[side.status] > DSH_DOCTOR_STATUS_RANK[worst] ? side.status : worst),
+    "ok"
+  );
+}
+
+function checkDshPluginMode(descriptor, options, prefs) {
+  const targets = inspectDshTargetsSync({
+    fs: options.fs,
+    dshHome: descriptor.parentDir,
+    managedRoot: options.dshManagedRoot,
+    dshInstallRoot: options.dshInstallRoot,
+    homeDir: options.homeDir,
+    env: options.env,
+    platform: options.platform,
+    desktopDiscovery: options.dshDesktopDiscovery,
+    windowsRegistrySnapshot: options.windowsRegistrySnapshot,
+  }, { operation: "doctor" });
+  const sides = DSH_DOCTOR_SIDES.map((profile) => {
+    const target = targets[profile];
+    return { profile, target, status: dshSideStatus(target) };
+  });
+  const byProfile = Object.fromEntries(sides.map((side) => [side.profile, side]));
+  const rowStatus = dshRowStatus(sides);
+  const counted = sides.filter((side) => side.status !== null);
+  // `sides` keeps web first, so the reduce tie-break prefers web as required.
+  const deciding = counted.length
+    ? counted.reduce((worst, side) => (
+      DSH_DOCTOR_STATUS_RANK[side.status] > DSH_DOCTOR_STATUS_RANK[worst.status] ? side : worst
+    ))
+    : byProfile.web;
+  const fields = {
+    level: rowStatus === "ok" ? null : "warning",
+    detail: sides.map((side) => `${side.profile}: ${dshSideDetail(side.target, side.status)}`).join("; "),
+    bridgeHealth: deciding.target.health ? deciding.target.health.status : null,
+    configPath: deciding.target.profileDir,
+  };
+  if (rowStatus === "ok") {
+    const pluginSide = byProfile.web.status !== null ? byProfile.web : byProfile.desktop;
+    const resolved = pluginSide.target.health && pluginSide.target.health.resolved;
+    if (resolved && resolved.packageDir) fields.pluginPath = resolved.packageDir;
+  }
+  fields.dshTargets = Object.fromEntries(sides.map((side) => [side.profile, {
+    role: side.target.role,
+    reason: side.target.reason,
+    status: side.status,
+  }]));
+  const detail = makeDetail(descriptor, rowStatus, fields);
+  // Fix eligibility is decided from the sides, not from the row status: a
+  // foreign side pushes the row to needs-review while the other side is still
+  // repairable, so the button must stay even though "needs-review" is not in
+  // REPAIRABLE_AGENT_STATUSES.
+  const fixable = !!descriptor.autoInstall && sides.some((side) => (
+    dshSideCanAttemptFix(side.target) && side.status !== null && side.status !== "ok"
+  ));
+  const withFix = fixable
+    ? { ...detail, fixAction: { type: "agent-integration", agentId: descriptor.agentId } }
+    : detail;
+  return withAgentBubbleNote(withFix, prefs, descriptor.agentId);
 }
 
 function checkAgent(descriptor, options) {
@@ -2414,56 +2939,15 @@ function checkAgent(descriptor, options) {
   }
 
   if (descriptor.configMode === "dsh-plugin") {
-    const health = inspectDeepSeekHarnessDiskSync({
-      fs: options.fs,
-      dshHome: descriptor.parentDir,
-      dshInstallRoot: options.dshInstallRoot,
-      managedRoot: options.dshManagedRoot,
-      homeDir: options.homeDir,
-      env: options.env,
-      platform: options.platform,
-    });
-    let detail;
-    if (health.status === "healthy") {
-      detail = makeDetail(descriptor, "ok", {
-        level: null,
-        detail: `${health.profileDir} managed bridge verified on disk; restart any running dsh web process to load this plugin generation`,
-        configPath: health.profileDir,
-        pluginPath: health.resolved && health.resolved.packageDir,
-        bridgeHealth: health.status,
-      });
-    } else if (
-      health.status === "profile-entry-foreign-or-conflicting"
-      || health.status === "version-unsupported"
-      || health.status === "host-version-unsupported"
-      || health.status === "generation-integrity-failed"
-      || health.status === "source-unavailable"
-      || health.status === "profile-corrupt"
-    ) {
-      detail = makeDetail(descriptor, "needs-review", {
-        level: "warning",
-        detail: health.status === "version-unsupported" || health.status === "host-version-unsupported"
-          ? `DeepSeek Harness ${health.detectedDshVersion || "or its bridge marker"} is outside ${health.supportedDshRange || "the supported range"}; Clawd will not activate it automatically`
-          : (health.status === "generation-integrity-failed"
-            ? "The managed DeepSeek Harness bridge bytes no longer match their ownership marker; inspect them manually"
-            : (health.status === "source-unavailable"
-              ? "Clawd's packaged DeepSeek Harness bridge source is unavailable; repair the Clawd installation"
-              : (health.status === "profile-corrupt"
-                ? "The DeepSeek Harness web profile manifest is unreadable; Clawd will not rewrite it automatically"
-                : "A foreign or conflicting DeepSeek Harness plugin uses the Clawd bridge package name; Clawd will not replace it"))),
-        configPath: health.profileDir,
-        bridgeHealth: health.status,
-      });
-    } else {
-      const broken = health.status !== "absent" && health.status !== "profile-missing";
-      detail = makeDetail(descriptor, broken ? "broken-path" : "not-connected", {
-        level: "warning",
-        detail: `DeepSeek Harness managed bridge is ${health.status}`,
-        configPath: health.profileDir,
-        bridgeHealth: health.status,
-      });
-    }
-    return withAgentFixAction(withAgentBubbleNote(detail, prefs, descriptor.agentId), descriptor);
+    return checkDshPluginMode(descriptor, options, prefs);
+  }
+
+  if (descriptor.configMode === "grok-hooks") {
+    // Dynamic GROK_HOME path + structured ownership are resolved by the shared
+    // inspector, so this branch must not rely on the static descriptor path or
+    // the generic parent-dir check below.
+    const grokDetail = checkGrokHooksMode(descriptor, options);
+    return withAgentFixAction(withAgentBubbleNote(grokDetail, prefs, descriptor.agentId), descriptor);
   }
 
   // Multi-home agents declare ordered configTargets. Most use the first
@@ -2510,12 +2994,14 @@ function checkAgent(descriptor, options) {
     detail = checkCodewhaleHooksTomlMode(descriptor, options);
   } else if (descriptor.configMode === "dir") {
     detail = checkKiroDirMode(descriptor, options);
-  } else if (descriptor.configMode === "pi-extension") {
-    detail = checkPiExtensionMode(descriptor, options);
+  } else if (isExtensionConfigMode(descriptor.configMode)) {
+    detail = checkExtensionMode(descriptor, options);
   } else if (descriptor.configMode === "openclaw-plugin") {
     detail = checkOpenClawPluginMode(descriptor, options);
   } else if (descriptor.configMode === "plugin-dir") {
     detail = checkPluginDirMode(descriptor, options);
+  } else if (descriptor.configMode === "minimax-plugin") {
+    detail = checkMinimaxPluginMode(descriptor, options);
   } else if (descriptor.configMode === "antigravity-hooks") {
     detail = checkAntigravityHooksMode(descriptor, options);
   } else {
@@ -2528,8 +3014,12 @@ function checkAgent(descriptor, options) {
   if (descriptor.agentId === "kimi-cli") {
     detail = withKimiLegacyPermissionModeSupplement(detail, descriptor, options);
   }
+  if (descriptor.agentId === "omp") {
+    detail = withOmpProfileNotice(detail, options);
+  }
   detail = withClaudeHookGuardNotice(detail, descriptor, options);
   detail = withTraeCodeEnableNotice(detail, descriptor);
+  detail = withMinimaxEnableNotice(detail, descriptor);
   return withAgentFixAction(withAgentBubbleNote(detail, prefs, descriptor.agentId), descriptor);
 }
 
@@ -2601,6 +3091,29 @@ function withKimiLegacyPermissionModeSupplement(detail, descriptor, options) {
   };
 }
 
+// Clawd installs into the ONE OMP agent directory it resolves for its own
+// environment. A machine that also runs OMP under another profile (including
+// the default profile) therefore has sessions that load nothing from it — the
+// extension directory is per-profile.
+// Reporting a bare "verified" there is a claim Clawd cannot make, so the note
+// names the unmanaged profiles (setting OMP_PROFILE for Clawd, or re-running
+// the installer from that profile's shell, is the fix). Never masks a finding.
+function withOmpProfileNotice(detail, options) {
+  if (detail.status !== "ok" && detail.status !== "manual-managed") return detail;
+  const unmanaged = listOtherOmpProfileAgentDirs({
+    env: options.env,
+    homeDir: options.homeDir,
+    fs: options.fs,
+  });
+  if (!unmanaged.length) return detail;
+  const names = unmanaged.map((entry) => entry.profile).join(", ");
+  return {
+    ...detail,
+    detail: `${detail.detail}; ${unmanaged.length} other OMP profile(s) are not managed here (${names}) — Clawd resolves one OMP agent directory per environment`,
+    unmanagedOmpProfiles: unmanaged.map((entry) => entry.profile),
+  };
+}
+
 function summarize(details) {
   const counts = {};
   for (const detail of details) {
@@ -2633,7 +3146,14 @@ function checkAgentIntegrations(options = {}) {
     validateTarget: options.validateTarget || validateHookTarget,
     dshInstallRoot: options.dshInstallRoot,
     dshManagedRoot: options.dshManagedRoot,
+    // Static desktop discovery for tests; production reads the Windows registry
+    // cache that the Doctor preheat fills.
+    dshDesktopDiscovery: options.dshDesktopDiscovery,
+    windowsRegistrySnapshot: options.windowsRegistrySnapshot,
     homeDir: options.homeDir,
+    // opencode v2 host verdict for the managed inspector (upstream PR #1045
+    // review); undefined in production → the inspector probes the real binary.
+    v2Host: options.v2Host,
   };
   const descriptors = options.descriptors || getAgentDescriptors();
   const details = descriptors.map((descriptor) => checkAgent(descriptor, detectorOptions));
@@ -2655,7 +3175,7 @@ module.exports = {
     checkFileMode,
     checkKiroDirMode,
     checkOpenClawPluginMode,
-    checkPiExtensionMode,
+    checkExtensionMode,
     checkPluginDirMode,
     checkAntigravityHooksMode,
     findAntigravityHookCommandsForEvent,
