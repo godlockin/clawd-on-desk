@@ -128,6 +128,7 @@ function createDisplayedVisualProjection(options = {}) {
         file: input.file,
         hitBox: input.hitBox || null,
         source: input.source,
+        restartAnimation: input.restartAnimation === true,
         deliver: input.deliver,
         onLogicalSettlement: typeof input.onLogicalSettlement === "function"
           ? input.onLogicalSettlement
@@ -142,6 +143,7 @@ function createDisplayedVisualProjection(options = {}) {
       file: tuple.file,
       source: tuple.source,
       visualGeneration,
+      ...(input.restartAnimation === true ? { restartAnimation: true } : {}),
     });
     let delivered = false;
     try {

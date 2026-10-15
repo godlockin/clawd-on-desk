@@ -138,6 +138,8 @@ function normalizeApprovalPayload(payload) {
     summary: String((payload && payload.summary) || "").trim(),
     suggestions,
     canOfferSessionTrust: payload && payload.canOfferSessionTrust === true,
+    // Absent means the agent has a native terminal surface to fall back to.
+    canOfferTerminal: !payload || payload.canOfferTerminal !== false,
   };
 }
 
@@ -422,7 +424,9 @@ function buildApprovalCard(payload, options = {}, context = {}) {
   ];
   // DSH web has no originating terminal surface. Its no-decision path returns
   // to the browser answerer, so a remote "Go to terminal" action is misleading.
-  if (normalized.agentId !== "deepseek-harness") {
+  // The canOfferTerminal flag carries that over the real (non-structured)
+  // payload; the agentId check still covers callers that send a structured one.
+  if (normalized.canOfferTerminal !== false && normalized.agentId !== "deepseek-harness") {
     actions.push(button(ctx.t("feishuCardButtonTerminal"), { requestId, decision: "terminal" }, "default"));
   }
   actions.push(...normalized.suggestions.map((entry) => (

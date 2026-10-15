@@ -1,6 +1,6 @@
 "use strict";
 
-const { createRecapAggregate } = require("./recap-aggregate");
+const { createRecapAggregate, createRecapDayProjection } = require("./recap-aggregate");
 const { createRecapCoverage } = require("./recap-coverage");
 const { createCanonicalRecapEvent } = require("./recap-event");
 const { createRecapJournal } = require("./recap-journal");
@@ -19,7 +19,6 @@ const {
 const PERIODS = new Set(["today", "week", "month", "year"]);
 const MAX_FUTURE_SKEW_MS = 5 * 60000;
 const MAX_HYDRATION_BUFFER = 4096;
-const HYDRATION_APPLY_BATCH_SIZE = 250;
 const STORAGE_RETRY_DELAYS_MS = Object.freeze([100, 250, 500, 1000, 2000, 5000, 10000, 30000]);
 
 function rangeForPeriod(period, anchorDate) {
@@ -95,12 +94,6 @@ function createRecapRuntime(options = {}) {
     logWarn,
   });
   const powerMonitor = options.powerMonitor || null;
-  const hydrationApplyBatchSize = Number.isSafeInteger(options.hydrationApplyBatchSize)
-    && options.hydrationApplyBatchSize > 0
-    ? options.hydrationApplyBatchSize
-    : HYDRATION_APPLY_BATCH_SIZE;
-  const yieldHydrationApply = options.yieldHydrationApply
-    || (() => new Promise((resolve) => setImmediate(resolve)));
   let initialized = false;
   let started = false;
   let enabled = false;
@@ -116,8 +109,6 @@ function createRecapRuntime(options = {}) {
   let hydrationPromise = Promise.resolve();
   let hydrationBuffer = [];
   let hydrationOverflow = false;
-  let hydrationRebuilding = false;
-  let hydrationLiveDedupeKeys = new Set();
   let hydrationToken = 0;
   let lifecycleWired = false;
   let storageRetryTimer = null;
@@ -223,23 +214,35 @@ function createRecapRuntime(options = {}) {
     hydrating = true;
     hydrationBuffer = [];
     hydrationOverflow = false;
-    hydrationLiveDedupeKeys = new Set();
     const token = ++hydrationToken;
     const anchorDate = currentLocalDate();
-    // loadRetainedAsync snapshots retained file sizes before its first await.
-    // Call it directly so events accepted after start() are always beyond that
-    // snapshot and can be replayed exactly once from hydrationBuffer.
-    hydrationPromise = journal.loadRetainedAsync(anchorDate)
-      .then(async ({ dates, records, truncated }) => {
+    // Build a fresh in-memory projection for each attempt. The reader snapshots
+    // retained file sizes before its first await, so events accepted after
+    // start() are always beyond that snapshot and can be replayed exactly once
+    // from hydrationBuffer.
+    const projection = createRecapDayProjection();
+    hydrationPromise = journal
+      .forEachRetainedAsync(anchorDate, (record) => projection.apply(record))
+      .then(({ dates, truncated, restoredDedupeKeys }) => {
         if (token !== hydrationToken || !initialized || unavailable) return;
-        if (hydrationOverflow) {
+        // Retry when this attempt can no longer publish a complete window:
+        // - the live buffer overflowed while reading, or
+        // - the local date moved forward (midnight, or a timezone change to a
+        //   day ahead). The replacement only covers the dates captured at
+        //   start, but events accepted during the read may belong to a newer
+        //   day; publishing would then count a keyed replay on both days. A
+        //   fresh attempt snapshots the new window, and disk dedupe drops the
+        //   copy a restart would drop too.
+        // A backward date move does not retry: the original window still
+        // replaces the original day, while a retry would shrink the window
+        // and leave that day's already published copy outside it.
+        if (hydrationOverflow || compareLocalDates(currentLocalDate(), anchorDate) > 0) {
           hydrating = false;
           return beginHydration();
         }
         if (truncated) {
           hydrating = false;
           hydrationBuffer = [];
-          hydrationLiveDedupeKeys = new Set();
           try { aggregate.flush(); } catch (err) {
             warn("Clawd: recap aggregate privacy migration flush failed", err && err.code ? err.code : "storage-error");
           }
@@ -247,74 +250,56 @@ function createRecapRuntime(options = {}) {
           return;
         }
 
-        // Events accepted before this replacement were applied to the old
-        // monthly cache and are about to be wiped. Replay that exact prefix;
-        // events accepted after replacement apply directly to the new cache.
+        // Swap the projection in and replay the buffered live prefix in one
+        // synchronous block. No await may appear here: it keeps a live event
+        // from landing between taking the buffer and publishing the
+        // projection, where it would be neither buffered nor applied.
         const bufferedBeforeReplace = hydrationBuffer;
         hydrationBuffer = [];
-        hydrationRebuilding = true;
-        aggregate.beginBatch();
-        aggregate.replaceDates(dates, []);
-
-        const applyBatched = async (recordValues, skipLiveDedupe) => {
-          for (let index = 0; index < recordValues.length; index += 1) {
-            if (token !== hydrationToken || !initialized || unavailable || hydrationOverflow) return false;
-            const recordValue = recordValues[index];
-            if (!(
-              skipLiveDedupe
-              && recordValue.dedupeKeyHash
-              && hydrationLiveDedupeKeys.has(recordValue.dedupeKeyHash)
-            )) aggregate.apply(recordValue);
-            if ((index + 1) % hydrationApplyBatchSize === 0 && index + 1 < recordValues.length) {
-              await yieldHydrationApply();
-            }
-          }
-          return token === hydrationToken && initialized && !unavailable && !hydrationOverflow;
-        };
-
-        if (!await applyBatched(records, true) || !await applyBatched(bufferedBeforeReplace, false)) {
-          if (token !== hydrationToken || !initialized || unavailable) return;
-          aggregate.endBatch({ schedule: false });
-          // Never leave the first attempt's partial reconstruction publishable
-          // while the retry is reading. Restore the last complete monthly cache;
-          // every live event remains durable in the journal and the retry will
-          // project it again.
-          aggregate.resetMemory();
-          aggregate.load();
-          hydrationRebuilding = false;
-          hydrating = false;
-          hydrationBuffer = [];
-          hydrationLiveDedupeKeys = new Set();
-          return beginHydration();
-        }
-
-        hydrationBuffer = [];
-        hydrationLiveDedupeKeys = new Set();
         hydrating = false;
+        const retainedDateSet = new Set(dates);
         try {
-          aggregate.endBatch({ flush: true });
+          aggregate.beginBatch();
+          aggregate.replaceDays(dates, projection);
+          for (const recordValue of bufferedBeforeReplace) {
+            // Events outside this window were already applied directly, so
+            // replaying them would count them again. In the accepted
+            // timezone-flip case, a keyed replay can remain on both days
+            // until a later successful reconciliation covers both dates.
+            if (!retainedDateSet.has(recordValue.localDate)) continue;
+            // This live event replays a ticket already projected from disk, so
+            // skip it to count the event once. A restart keeps whichever copy
+            // sits in the earliest retained file: the disk copy, unless the
+            // replay is dated earlier, in which case the restart counts it on
+            // that earlier date instead. The total is the same either way, and
+            // that rare combination does not justify a retractable projection.
+            if (recordValue.dedupeKeyHash && restoredDedupeKeys.has(recordValue.dedupeKeyHash)) continue;
+            aggregate.apply(recordValue);
+          }
         } catch (err) {
-          // Reconstruction is complete in memory. Keep dirty months intact so
-          // a later lifecycle flush can retry instead of discarding the journal
-          // projection and serving an empty/stale cache until restart.
-          warn("Clawd: recap aggregate reconciliation flush failed", err && err.code ? err.code : "storage-error");
-        }
-        hydrationRebuilding = false;
-      })
-      .catch((err) => {
-        if (token !== hydrationToken) return;
-        if (hydrationRebuilding) {
+          // Never leave a half-swapped aggregate in memory or on disk.
           try { aggregate.endBatch({ schedule: false }); } catch {}
-          hydrationRebuilding = false;
           try {
             aggregate.resetMemory();
             aggregate.load();
           } catch {}
+          warn("Clawd: recap journal reconciliation failed", err && err.code ? err.code : "storage-error");
+          return;
         }
+        try {
+          aggregate.endBatch({ flush: true });
+        } catch (err) {
+          // The replacement is complete in memory. Keep dirty months intact so
+          // a later lifecycle flush can retry instead of discarding the journal
+          // projection and serving an empty/stale cache until restart.
+          warn("Clawd: recap aggregate reconciliation flush failed", err && err.code ? err.code : "storage-error");
+        }
+      })
+      .catch((err) => {
+        if (token !== hydrationToken) return;
         hydrating = false;
         hydrationBuffer = [];
         hydrationOverflow = false;
-        hydrationLiveDedupeKeys = new Set();
         try { aggregate.flush(); } catch (flushErr) {
           warn("Clawd: recap aggregate privacy migration flush failed", flushErr && flushErr.code ? flushErr.code : "storage-error");
         }
@@ -428,7 +413,6 @@ function createRecapRuntime(options = {}) {
     if (hydrating) {
       if (hydrationBuffer.length < MAX_HYDRATION_BUFFER) hydrationBuffer.push(recordValue);
       else hydrationOverflow = true;
-      if (recordValue.dedupeKeyHash) hydrationLiveDedupeKeys.add(recordValue.dedupeKeyHash);
     }
     notifyChanged();
     return true;
@@ -544,19 +528,13 @@ function createRecapRuntime(options = {}) {
     recordingToken = Object.freeze({});
     // Clear is an explicit user recovery action and is allowed to reset an
     // unavailable/corrupt recap generation. No other path rotates its salt.
-    // Invalidate async hydration before touching memory. The generation is
-    // about to be deleted, so writing coverage or an aggregate first has no
-    // value and could publish a partially rebuilt cache if deletion then fails.
+    // Invalidate async hydration before touching memory so a reader cannot
+    // swap its projection in after the generation has been deleted.
     hydrationToken += 1;
     cancelStorageRetry();
     hydrating = false;
     hydrationBuffer = [];
     hydrationOverflow = false;
-    hydrationLiveDedupeKeys = new Set();
-    if (hydrationRebuilding) {
-      try { aggregate.endBatch({ schedule: false }); } catch {}
-      hydrationRebuilding = false;
-    }
     try { coverage.resetMemory(); } catch {}
     try { aggregate.resetMemory(); } catch {}
     try { journal.resetMemory(); } catch {}
@@ -584,12 +562,11 @@ function createRecapRuntime(options = {}) {
   function flush() {
     if (!initialized || unavailable) return;
     if (started && enabled && !suspended) coverage.tick(now());
-    if (!hydrationRebuilding) aggregate.flush();
+    aggregate.flush();
   }
 
   function dispose() {
     recordingToken = Object.freeze({});
-    const discardHydrationRebuild = hydrationRebuilding;
     cancelStorageRetry();
     if (midnightTimer) clearTimer(midnightTimer);
     midnightTimer = null;
@@ -603,17 +580,11 @@ function createRecapRuntime(options = {}) {
     hydrating = false;
     hydrationBuffer = [];
     hydrationOverflow = false;
-    hydrationLiveDedupeKeys = new Set();
-    if (hydrationRebuilding) {
-      try { aggregate.endBatch({ schedule: false }); } catch {}
-      hydrationRebuilding = false;
-    }
     try { journal.resetMemory(); } catch {}
     if (initialized) {
       try {
         if (started && enabled && !suspended) coverage.stop(now());
-        if (discardHydrationRebuild) aggregate.resetMemory();
-        else aggregate.flush();
+        aggregate.flush();
       } catch (err) {
         warn("Clawd: local recap shutdown flush failed", err && err.code ? err.code : "storage-error");
       }
@@ -637,7 +608,6 @@ function createRecapRuntime(options = {}) {
 }
 
 module.exports = {
-  HYDRATION_APPLY_BATCH_SIZE,
   MAX_FUTURE_SKEW_MS,
   MAX_HYDRATION_BUFFER,
   PERIODS,
