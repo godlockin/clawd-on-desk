@@ -21,6 +21,7 @@ const CLIENT_TIMEOUT_MS = 90000;
 const RATE_WINDOW_MS = 60000;
 const RATE_MAX = 60;
 const MAX_CLIENTS = 10;
+const SHUTDOWN_FORCE_CLOSE_MS = 250;
 const GRACE_PERIOD_MS = 5 * 60 * 1000;          // 5 minutes
 const ROTATION_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -101,6 +102,8 @@ function initMobilePreviewServer(ctx) {
     ? ctx.writeTokenState
     : atomicWrite;
   const tokenState = loadOrCreateTokenState(tokenPath, now, writeTokenState);
+  const permissionObservation = ctx && ctx.permissionObservation;
+  const log = ctx && typeof ctx.log === "function" ? ctx.log : console.log;
   const clients = new Set();
   const clientMeta = new Map();
   let sessionCache = new Map();
@@ -109,9 +112,103 @@ function initMobilePreviewServer(ctx) {
   let activePort = null;
   let heartbeatTimer = null;
   let rotationTimer = null;
+  let observationUnsubscribe = null;
   let startPromise = null;
   let cancelPendingStart = null;
-  let closed = false;
+  let closed = true;
+
+  function readPermissionObservationSnapshot() {
+    if (!permissionObservation || typeof permissionObservation.snapshot !== "function") {
+      return Object.freeze({
+        feature: Object.freeze({ supported: false, enabled: false }),
+        records: Object.freeze([]),
+      });
+    }
+    try {
+      const snapshot = permissionObservation.snapshot() || {};
+      const feature = snapshot.feature || {};
+      return {
+        feature: {
+          supported: feature.supported === true,
+          enabled: feature.enabled === true,
+        },
+        records: Array.isArray(snapshot.records) ? snapshot.records : [],
+      };
+    } catch (err) {
+      console.warn("[mobile-preview] permission observation snapshot failed:", err && err.message);
+      return { feature: { supported: true, enabled: false }, records: [] };
+    }
+  }
+
+  function buildPermissionFeature(snapshot = readPermissionObservationSnapshot()) {
+    return {
+      supported: snapshot.feature.supported === true,
+      enabled: snapshot.feature.enabled === true,
+    };
+  }
+
+  function buildPermissionSnapshotPayload(snapshot = readPermissionObservationSnapshot()) {
+    return {
+      feature: buildPermissionFeature(snapshot),
+      permissions: snapshot.records,
+    };
+  }
+
+  function logPermissionFanout(type, delivered, details = {}) {
+    try {
+      log(`[mobile-preview] permission fanout type=${type}`
+        + `${details.requestId ? ` requestId=${details.requestId}` : ""}`
+        + `${details.source ? ` source=${details.source}` : ""}`
+        + `${details.reason ? ` reason=${details.reason}` : ""}`
+        + `${typeof details.decided === "boolean" ? ` decided=${details.decided}` : ""}`
+        + ` clients=${delivered}`);
+    } catch {}
+  }
+
+  function onPermissionObservationEvent(event) {
+    if (closed || !event || typeof event !== "object") return;
+    if (event.type === "replace") {
+      const delivered = broadcast(buildMessage("permission_snapshot", {
+        feature: {
+          supported: event.feature && event.feature.supported === true,
+          enabled: event.feature && event.feature.enabled === true,
+        },
+        permissions: Array.isArray(event.records) ? event.records : [],
+      }));
+      logPermissionFanout("permission_snapshot", delivered, { source: "replace" });
+      return;
+    }
+    if (event.type === "upsert" && event.record) {
+      const delivered = broadcast(buildMessage("permission_request", { permission: event.record }));
+      logPermissionFanout("permission_request", delivered, { requestId: event.record.requestId });
+      return;
+    }
+    if (event.type === "retract" && typeof event.requestId === "string") {
+      const delivered = broadcast(buildMessage("permission_dismissed", {
+        requestId: event.requestId,
+        reason: event.reason,
+        decided: event.decided === true,
+      }));
+      logPermissionFanout("permission_dismissed", delivered, {
+        requestId: event.requestId,
+        reason: event.reason,
+        decided: event.decided === true,
+      });
+    }
+  }
+
+  function attachPermissionObservation() {
+    if (observationUnsubscribe || !permissionObservation
+        || typeof permissionObservation.subscribe !== "function") return;
+    observationUnsubscribe = permissionObservation.subscribe(onPermissionObservationEvent);
+  }
+
+  function detachPermissionObservation() {
+    if (typeof observationUnsubscribe === "function") {
+      try { observationUnsubscribe(); } catch {}
+    }
+    observationUnsubscribe = null;
+  }
 
   // ── Token rotation ──
 
@@ -183,7 +280,7 @@ function initMobilePreviewServer(ctx) {
     }, msUntilRotate);
   }
 
-  function regenerateToken() {
+  function regenerateToken(closeReason = "Token regenerated") {
     const newToken = crypto.randomBytes(16).toString("hex");
     const nextState = {
       ...tokenState,
@@ -198,7 +295,7 @@ function initMobilePreviewServer(ctx) {
     }
     // Kick all connected clients (they have stale tokens)
     for (const c of clients) {
-      try { c.close(1008, "Token regenerated"); } catch {}
+      try { c.close(1008, closeReason); } catch {}
     }
     clients.clear();
     clientMeta.clear();
@@ -210,7 +307,16 @@ function initMobilePreviewServer(ctx) {
   // in Slice 2+ (device-list semantics). regenerateToken() only rotates the
   // token and kicks connected clients, but does not clear the device roster.
   function resetMobileAccess() {
-    return regenerateToken();
+    return regenerateToken("access-reset");
+  }
+
+  function disconnectClients({ code = 1001, reason = "Reconnecting" } = {}) {
+    for (const client of clients) {
+      try { client.close(code, reason); } catch {}
+    }
+    clients.clear();
+    clientMeta.clear();
+    stopHeartbeat();
   }
 
   // ── HTTP server (serves PWA + WebSocket upgrade) ──
@@ -279,10 +385,15 @@ function initMobilePreviewServer(ctx) {
   // retry loop, that forwarded event had no server-level listener and crashed
   // the process before start() could advance from 23334 to the next candidate.
   function attachWebSocketServer(server) {
-    const WebSocketServer = ctx && ctx.WebSocketServer
-      ? ctx.WebSocketServer
-      : WebSocket.Server;
-    const socketServer = new WebSocketServer({ server, path: "/ws" });
+    let socketServer;
+    if (ctx && typeof ctx.createWebSocketServer === "function") {
+      socketServer = ctx.createWebSocketServer({ server, path: "/ws" });
+    } else {
+      const WebSocketServer = ctx && ctx.WebSocketServer
+        ? ctx.WebSocketServer
+        : WebSocket.Server;
+      socketServer = new WebSocketServer({ server, path: "/ws" });
+    }
     wss = socketServer;
     // A post-listen server error is still surfaced by ws. Keep it observable
     // without letting an EventEmitter `error` event terminate the desktop app.
@@ -334,12 +445,28 @@ function initMobilePreviewServer(ctx) {
         }
       }
 
-      // Send snapshot on connect
+      // Add the client, then synchronously send both authoritative snapshots.
+      // Do not introduce an await here: this single event-loop turn preserves
+      // snapshot-before-delta ordering for the observation subscriber.
+      let permissionSnapshotSent = false;
       try {
         const snapshot = {};
         for (const [sid, data] of sessionCache) snapshot[sid] = data;
-        ws.send(buildMessage("snapshot", { sessions: snapshot }));
+        const permissionSnapshot = readPermissionObservationSnapshot();
+        const permissionFeature = buildPermissionFeature(permissionSnapshot);
+        ws.send(buildMessage("snapshot", {
+          features: { permissionPreview: permissionFeature },
+          sessions: snapshot,
+        }));
+        ws.send(buildMessage(
+          "permission_snapshot",
+          buildPermissionSnapshotPayload(permissionSnapshot)
+        ));
+        permissionSnapshotSent = true;
       } catch {}
+      if (permissionSnapshotSent) {
+        logPermissionFanout("permission_snapshot", 1, { source: "connect" });
+      }
 
       startHeartbeat();
 
@@ -431,11 +558,16 @@ function initMobilePreviewServer(ctx) {
   }
 
   function broadcast(message) {
+    let delivered = 0;
     for (const c of clients) {
       if (c.readyState === WebSocket.OPEN) {
-        try { c.send(message); } catch {}
+        try {
+          c.send(message);
+          delivered++;
+        } catch {}
       }
     }
+    return delivered;
   }
 
   // ── Session data ──
@@ -479,7 +611,11 @@ function initMobilePreviewServer(ctx) {
       }
       const snapshot = {};
       for (const [sid, data] of sessionCache) snapshot[sid] = data;
-      broadcast(buildMessage("snapshot", { sessions: snapshot }));
+      const permissionSnapshot = readPermissionObservationSnapshot();
+      broadcast(buildMessage("snapshot", {
+        features: { permissionPreview: buildPermissionFeature(permissionSnapshot) },
+        sessions: snapshot,
+      }));
       return;
     }
 
@@ -512,12 +648,14 @@ function initMobilePreviewServer(ctx) {
     if (startPromise) return startPromise;
 
     closed = false;
+    attachPermissionObservation();
     let server;
     try {
       server = createHttpServer();
       httpServer = server;
     } catch (err) {
       closed = true;
+      detachPermissionObservation();
       return Promise.reject(err);
     }
     const ports = [];
@@ -546,9 +684,18 @@ function initMobilePreviewServer(ctx) {
       const failStart = (err) => {
         if (settled) return;
         settled = true;
+        // Only the generation that still owns the runtime tears down shared
+        // state; a cancelled one was already torn down by cleanup().
+        const ownsRuntime = httpServer === server;
         detachStartListeners();
         closeAttempt();
         closed = true;
+        if (ownsRuntime) {
+          detachPermissionObservation();
+          sessionCache.clear();
+          stopHeartbeat();
+          if (rotationTimer) { clearTimeout(rotationTimer); rotationTimer = null; }
+        }
         reject(err);
       };
       const onError = (err) => {
@@ -633,17 +780,50 @@ function initMobilePreviewServer(ctx) {
     // A same-tick disable → enable transition must create a fresh listener,
     // not inherit the cancelled promise until its rejection microtask runs.
     startPromise = null;
+    detachPermissionObservation();
     sessionCache.clear();
     stopHeartbeat();
     if (rotationTimer) { clearTimeout(rotationTimer); rotationTimer = null; }
-    for (const c of clients) { try { c.close(1001, "Server shutting down"); } catch {} }
+    const closingClients = Array.from(clients);
+    for (const c of closingClients) { try { c.close(1001, "Server shutting down"); } catch {} }
     clients.clear();
     clientMeta.clear();
-    if (wss) { try { wss.close(); } catch {} }
-    if (httpServer) { try { httpServer.close(); } catch {} }
+    const closingWss = wss;
+    const closingHttpServer = httpServer;
     wss = null;
     httpServer = null;
     activePort = null;
+
+    // Teardown above is synchronous so a same-tick re-enable starts fresh.
+    // The returned promise additionally lets callers (the settings reconcile
+    // queue) wait until the old listener is actually gone, force-closing
+    // clients that ignore the close handshake.
+    const waits = [];
+    if (closingWss) {
+      waits.push(new Promise((resolve) => {
+        try { closingWss.close(() => resolve()); } catch { resolve(); }
+      }));
+    }
+    if (closingHttpServer) {
+      waits.push(new Promise((resolve) => {
+        try { closingHttpServer.close(() => resolve()); } catch { resolve(); }
+      }));
+    }
+    let forceCloseTimer = null;
+    const forceClose = new Promise((resolve) => {
+      forceCloseTimer = setTimeout(() => {
+        for (const client of closingClients) {
+          try { client.terminate(); } catch {}
+        }
+        try { closingHttpServer?.closeAllConnections?.(); } catch {}
+        resolve();
+      }, SHUTDOWN_FORCE_CLOSE_MS);
+    });
+    return Promise.race([Promise.all(waits), forceClose])
+      .then(() => undefined)
+      .finally(() => {
+        if (forceCloseTimer) clearTimeout(forceCloseTimer);
+      });
   }
 
   function onSnapshot() {
@@ -659,6 +839,8 @@ function initMobilePreviewServer(ctx) {
     getToken: () => tokenState.token,
     regenerateToken,
     resetMobileAccess,
+    disconnectClients,
+    isStarted: () => !closed && Number.isInteger(activePort) && activePort > 0,
     PROTOCOL_VERSION,
   };
 }
