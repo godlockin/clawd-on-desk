@@ -56,10 +56,13 @@ describe("mobile preview lifecycle", () => {
     assert.equal(result, null);
   });
 
-  it("wires both main-process start sites through the safe helper", () => {
+  it("wires the main-process reconcile start through the safe helper", () => {
     const mainSource = fs.readFileSync(path.join(__dirname, "..", "src", "main.js"), "utf8");
-    const helperCalls = mainSource.match(/startMobilePreviewServerSafely\(_lanWss,/g) || [];
-    assert.equal(helperCalls.length, 2);
+    // Startup and settings changes both go through enqueueMobilePreviewReconcile,
+    // which is the only place the server is started.
+    const helperCalls = mainSource.match(/startMobilePreviewServerSafely\(server,/g) || [];
+    assert.equal(helperCalls.length, 1);
     assert.doesNotMatch(mainSource, /_lanWss\.start\(\)/);
+    assert.doesNotMatch(mainSource, /await server\.start\(\)/);
   });
 });

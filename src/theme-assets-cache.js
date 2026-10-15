@@ -27,20 +27,25 @@ function externalAssetsSourceDir(themeDir) {
   return path.join(themeDir, "assets");
 }
 
+// Bump when sanitizeSvg's output changes so cached SVGs are written again.
+// v3: the XML declaration keeps its closing "?" (v2 caches wrote `<?xml ...>`).
+const CACHE_META_VERSION = 3;
+
 function emptyCacheMeta() {
-  return { version: 2, svgs: {}, rasters: {} };
+  return { version: CACHE_META_VERSION, svgs: {}, rasters: {} };
 }
 
 function normalizeCacheMeta(value) {
-  if (value && value.version === 2) {
+  if (value && (value.version === CACHE_META_VERSION || value.version === 2)) {
+    const stale = value.version !== CACHE_META_VERSION;
     return {
       meta: {
-        version: 2,
+        version: CACHE_META_VERSION,
         svgs: isPlainObject(value.svgs) ? value.svgs : {},
         rasters: isPlainObject(value.rasters) ? value.rasters : {},
       },
-      changed: false,
-      invalidateSvgs: false,
+      changed: stale,
+      invalidateSvgs: stale,
     };
   }
   if (isPlainObject(value)) {
@@ -50,7 +55,7 @@ function normalizeCacheMeta(value) {
       if (!isPlainObject(entry)) continue;
       svgs[file] = entry;
     }
-    return { meta: { version: 2, svgs, rasters: {} }, changed: true, invalidateSvgs: true };
+    return { meta: { version: CACHE_META_VERSION, svgs, rasters: {} }, changed: true, invalidateSvgs: true };
   }
   return { meta: emptyCacheMeta(), changed: true, invalidateSvgs: true };
 }

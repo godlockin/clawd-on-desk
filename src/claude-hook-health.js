@@ -16,6 +16,7 @@ const {
   commandMatchesMarker,
   findManagedClaudeEnvNodeBinCandidates,
   parseClaudeEnvStateHookCommand,
+  stripUtf8Bom,
 } = require("../hooks/json-utils");
 
 // Deliberately NOT imported from ./claude-settings-watcher: that module will
@@ -55,6 +56,7 @@ const REPAIR_CLASS_BY_CODE = Object.freeze({
   "missing-managed-core-hooks": "managed-hooks",
   "script-path-missing": "core-script-path",
   "stale-script-path": "core-script-path",
+  "target-generation-missing": "target-generation",
   "permission-url-mismatch": "permission-url",
   "auto-start-path-missing": "auto-start-path",
   "auto-start-stale-path": "auto-start-path",
@@ -140,20 +142,52 @@ function findManagedStateCommandRecords(settings, eventName) {
   return { managed, unverified };
 }
 
-function findUsableEnvNodeCandidate(settings, validateOptions) {
+function findUsableEnvNodeCandidate(settings, validateOptions, resolveTrustedNodeCandidate) {
   const fsImpl = validateOptions.fs || nodeFs;
   const platform = validateOptions.platform || process.platform;
-  for (const candidate of findManagedClaudeEnvNodeBinCandidates(settings)) {
+  const isUsable = (candidate) => {
+    if (typeof candidate !== "string" || !candidate) return false;
     try {
-      if (platform === "win32") {
-        if (fsImpl.existsSync(candidate)) return candidate;
-        continue;
-      }
+      if (platform === "win32") return fsImpl.existsSync(candidate);
       fsImpl.accessSync(candidate, nodeFs.constants.X_OK);
-      return candidate;
-    } catch {}
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // First prefer a Node the env-owned commands/settings already evidence.
+  for (const candidate of findManagedClaudeEnvNodeBinCandidates(settings)) {
+    if (isUsable(candidate)) return candidate;
+  }
+  // #874: when env evidence names no usable Node (CLAWD_NODE_BIN missing, bare
+  // `node`, or stale) but the host's normal resolver can still find a usable
+  // Node, treat the hook as migratable rather than stuck. The resolved path is
+  // only used to CLASSIFY migratable here — it is never serialized; the installer
+  // re-resolves and writes the absolute value during the actual repair. Require
+  // an absolute path so this verdict matches what the installer can migrate: a
+  // relative/bare value cannot canonicalize the env command (hooks/install.js).
+  if (typeof resolveTrustedNodeCandidate === "function") {
+    let trusted = null;
+    try {
+      trusted = resolveTrustedNodeCandidate();
+    } catch {
+      trusted = null;
+    }
+    if (isAbsoluteNodePath(trusted, platform) && isUsable(trusted)) return trusted;
   }
   return null;
+}
+
+// Platform-aware absolute-path test. On Windows a usable Node is either a
+// drive-letter path (C:\…, C:/…) or a UNC share (\\host\share); everything else
+// (bare `node`, `./node`, a relative fragment) cannot be migrated into a hook
+// command, so it must not count as a migratable candidate.
+function isAbsoluteNodePath(candidate, platform) {
+  if (typeof candidate !== "string" || !candidate) return false;
+  if (platform === "win32") {
+    return /^[a-zA-Z]:[\\/]/.test(candidate) || /^\\\\/.test(candidate);
+  }
+  return candidate.startsWith("/");
 }
 
 function pushIssue(issues, issue) {
@@ -204,6 +238,18 @@ function inspectEventCommands(commands, event, marker, expectedScriptPath, valid
         automaticRepairable: true,
       });
     } else if (result.issue === "scriptPath-missing") {
+      // When the whole persistent generation is known to be missing/corrupt,
+      // every command pointing at its (expected) target is a consequence of
+      // that one fault. Suppressing the per-command path-missing issue keeps
+      // the repair signature stable between "generation dir deleted" and
+      // "generation present but corrupt", so the 3-strike counter does not
+      // reset just because the same repair deletes then recreates files.
+      if (
+        validateOptions.suppressTargetGenerationConsequences === true
+        && scriptPathMatchesExpected(result.scriptPath, expectedScriptPath, validateOptions.platform)
+      ) {
+        continue;
+      }
       pushIssue(issues, {
         code: issueCodes.missing,
         event,
@@ -233,12 +279,26 @@ function inspectEventCommands(commands, event, marker, expectedScriptPath, valid
  * @param {string} rawSettings
  * @param {object} options
  * @param {string} [options.expectedPermissionUrl]
- * @param {string} [options.expectedHookScriptPath]
- * @param {string} [options.expectedAutoStartScriptPath]
+ * @param {string} [options.expectedHookScriptPath] — persistent command target
+ *   (AppImage generation in AppImage mode; source script in direct mode)
+ * @param {string} [options.expectedAutoStartScriptPath] — persistent command
+ *   target for the auto-start entry
+ * @param {string} [options.sourceHookScriptPath] — packaged source script that
+ *   a repair could rebuild from. Defaults to expectedHookScriptPath.
+ * @param {string} [options.sourceAutoStartScriptPath] — packaged source
+ *   auto-start script. Defaults to expectedAutoStartScriptPath.
+ * @param {{ ok: boolean }} [options.targetGeneration] — byte-verified
+ *   completeness of the persistent generation. `ok:false` is a repairable
+ *   target-generation-missing issue even when the entry files still exist.
  * @param {boolean} [options.requireAutoStart]
  * @param {string[]} [options.coreEvents]
  * @param {string} [options.platform]
  * @param {object} [options.fs] — injected fs (existsSync at minimum)
+ * @param {() => (string|null)} [options.resolveTrustedNodeCandidate] — returns a
+ *   host-resolved absolute Node path (or null) used ONLY to classify an
+ *   env-indirected hook as migratable when env evidence names no usable Node.
+ *   This getter must be synchronous and spawn-free — it only reads a value the
+ *   caller resolved out-of-band (see claude-settings-watcher's cached candidate).
  */
 function inspectClaudeHookHealth(rawSettings, options = {}) {
   const platform = options.platform || process.platform;
@@ -247,8 +307,18 @@ function inspectClaudeHookHealth(rawSettings, options = {}) {
   const expectedPermissionUrl = options.expectedPermissionUrl || null;
   const expectedHookScriptPath = options.expectedHookScriptPath || null;
   const expectedAutoStartScriptPath = options.expectedAutoStartScriptPath || null;
+  // Source is what a repair would rebuild FROM; target is what settings should
+  // point AT. They differ only in AppImage mode. Callers that don't split them
+  // keep the historical behavior (source === target).
+  const sourceHookScriptPath = options.sourceHookScriptPath || expectedHookScriptPath;
+  const sourceAutoStartScriptPath = options.sourceAutoStartScriptPath || expectedAutoStartScriptPath;
+  const targetGeneration = options.targetGeneration || null;
   const requireAutoStart = !!options.requireAutoStart;
-  const validateOptions = { platform, fs: fsImpl };
+  const validateOptions = {
+    platform,
+    fs: fsImpl,
+    suppressTargetGenerationConsequences: !!(targetGeneration && targetGeneration.ok === false),
+  };
 
   const unreadable = () => ({
     status: "unreadable",
@@ -263,25 +333,21 @@ function inspectClaudeHookHealth(rawSettings, options = {}) {
 
   let parsed;
   try {
-    parsed = JSON.parse(rawSettings);
+    parsed = JSON.parse(stripUtf8Bom(rawSettings));
   } catch {
     return unreadable();
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return unreadable();
 
-  // The currently-installed source script is a hard precondition for every
-  // repair this module can suggest: reconciling settings.json only rewrites
-  // commands to point at expectedHookScriptPath, which is useless if that
-  // file itself does not exist (a broken/partial install). Check this before
-  // anything else so callers never attempt a reconcile that cannot succeed.
+  // The currently-installed SOURCE script is a hard precondition for every
+  // repair this module can suggest. In AppImage mode the persistent target
+  // generation can be rebuilt from this source; if the source itself is gone
+  // (broken/partial install, mount vanished) no repair can succeed, so this
+  // stays an unrepairable source-script-missing. Target-generation loss is a
+  // separate, repairable signal below.
   // When auto-start is required, its own source script is an equally hard
-  // precondition — otherwise a repair would "fix" things by writing a
-  // SessionStart command that points at a script that isn't there either,
-  // and since that write only happens while requireAutoStart is true, a
-  // caller who later disables auto-start would never see the resulting
-  // broken command flagged again (requireAutoStart:false skips the check
-  // entirely) — it would sit as undetected garbage in settings.json.
-  if (fsImpl && expectedHookScriptPath && !fsImpl.existsSync(expectedHookScriptPath)) {
+  // precondition.
+  if (fsImpl && sourceHookScriptPath && !fsImpl.existsSync(sourceHookScriptPath)) {
     return {
       status: "source-script-missing",
       repairable: false,
@@ -291,7 +357,7 @@ function inspectClaudeHookHealth(rawSettings, options = {}) {
       snapshot: null,
     };
   }
-  if (fsImpl && requireAutoStart && expectedAutoStartScriptPath && !fsImpl.existsSync(expectedAutoStartScriptPath)) {
+  if (fsImpl && requireAutoStart && sourceAutoStartScriptPath && !fsImpl.existsSync(sourceAutoStartScriptPath)) {
     return {
       status: "source-script-missing",
       repairable: false,
@@ -320,7 +386,23 @@ function inspectClaudeHookHealth(rawSettings, options = {}) {
   let managedCoreEventCount = 0;
   const missingEvents = [];
   let hasUnverifiedEnvIndirection = false;
-  const usableEnvNodeCandidate = findUsableEnvNodeCandidate(parsed, validateOptions);
+  // Resolved lazily and memoized within this inspection: only an actual
+  // ownership-proven env-indirected hook (the branch below) needs to consult the
+  // injected trusted-Node getter, and memoizing keeps that getter to one call per
+  // inspection. A config with no env hook never reads it at all.
+  let envNodeCandidateResolved = false;
+  let envNodeCandidate = null;
+  const getUsableEnvNodeCandidate = () => {
+    if (!envNodeCandidateResolved) {
+      envNodeCandidateResolved = true;
+      envNodeCandidate = findUsableEnvNodeCandidate(
+        parsed,
+        validateOptions,
+        options.resolveTrustedNodeCandidate
+      );
+    }
+    return envNodeCandidate;
+  };
 
   for (const event of coreEvents) {
     const records = findManagedStateCommandRecords(parsed, event);
@@ -362,7 +444,7 @@ function inspectClaudeHookHealth(rawSettings, options = {}) {
         );
         continue;
       }
-      const migratable = !!usableEnvNodeCandidate;
+      const migratable = !!getUsableEnvNodeCandidate();
       pushIssue(issues, {
         code: migratable ? "env-hook-migratable" : "env-hook-node-unresolved",
         event,
@@ -406,6 +488,20 @@ function inspectClaudeHookHealth(rawSettings, options = {}) {
         AUTO_START_COMMAND_ISSUE_CODES
       );
     }
+  }
+
+  // Byte-verified completeness of the persistent target generation. A
+  // generation whose entry files exist but are truncated / wrong-content /
+  // marker-mismatched passes every command check above, so this is the only
+  // signal that the artifact itself needs rebuilding. Repairable: the watcher
+  // re-runs the installer, which rematerializes from the still-present source.
+  if (targetGeneration && targetGeneration.ok === false) {
+    pushIssue(issues, {
+      code: "target-generation-missing",
+      marker: HOOK_MARKER,
+      generationDir: targetGeneration.dir || null,
+      automaticRepairable: true,
+    });
   }
 
   const snapshot = { keyCount: Object.keys(parsed).length, hookCount: commandCount };
