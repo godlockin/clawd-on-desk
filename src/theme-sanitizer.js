@@ -96,7 +96,19 @@ function sanitizeSvg(svgContent) {
 
   const doc = parseDocument(svgContent, { xmlMode: true });
   sanitizeNode(doc);
+  restoreProcessingInstructionEnds(doc);
   return render.default(doc, { xmlMode: true });
+}
+
+// htmlparser2 12 drops the closing "?" from processing-instruction data
+// ("?xml version=\"1.0\"" instead of "?xml version=\"1.0\"?"), and
+// dom-serializer writes the data back verbatim, so `<?xml ...?>` came out as
+// `<?xml ...>` and Chromium refused to parse the cached SVG.
+function restoreProcessingInstructionEnds(doc) {
+  for (const child of doc.children || []) {
+    if (child.type !== "directive" || typeof child.data !== "string") continue;
+    if (child.data.startsWith("?") && !child.data.endsWith("?")) child.data += "?";
+  }
 }
 
 function collectSafeRasterRefs(svgContent, sourceAssetsDir) {

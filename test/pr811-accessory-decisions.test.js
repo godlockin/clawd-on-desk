@@ -38,6 +38,8 @@ const HIDDEN_MOUTH_FILES = Object.freeze([
   "clawd-working-sweeping.svg",
   "clawd-error.svg",
   "clawd-happy.svg",
+  "clawd-designing.svg",
+  "clawd-heart-eyes.svg",
   "clawd-working-building.svg",
   "clawd-idle-bubble.svg",
   "clawd-working-debugger.svg",
@@ -67,7 +69,7 @@ const OPTIONAL_LIBRARY_FILES = Object.freeze([
   "clawd-working-wizard.svg",
 ]);
 
-test("PR #811 mouth policy covers the approved 36 stock sprites exactly", () => {
+test("mouth policy covers the approved 38 stock sprites exactly", () => {
   const theme = themeLoader.loadTheme("clawd", { strict: true });
   const files = theme.customization.mouthAccessories.files;
   const stockFiles = Object.fromEntries(
@@ -81,7 +83,7 @@ test("PR #811 mouth policy covers the approved 36 stock sprites exactly", () => 
     new Set(Object.keys(stockFiles)),
     new Set([...VISIBLE_MOUTH_FILES, ...HIDDEN_MOUTH_FILES])
   );
-  assert.strictEqual(Object.keys(stockFiles).length, 36);
+  assert.strictEqual(Object.keys(stockFiles).length, 38);
   assert.deepStrictEqual(files["clawd-outlaw-bender.svg"], { visibility: "hidden" });
   assert.deepStrictEqual(
     files["clawd-working-typing-boss.svg"],
@@ -268,6 +270,23 @@ test("every visible animated cigarette has a measured or authored hit envelope",
   );
 });
 
+test("Clawd lists bender, both sleep poses and thinking as object-channel SVGs", () => {
+  const theme = themeLoader.loadTheme("clawd", { strict: true });
+  assert.deepStrictEqual(theme.rendering.objectChannelFiles, [
+    "clawd-outlaw-bender.svg",
+    "clawd-collapse-sleep.svg",
+    "clawd-sleeping.svg",
+    "clawd-working-thinking.svg",
+  ]);
+});
+
+test("Clawd caps its thinking object-channel animation to 24 discrete steps per second", () => {
+  const theme = themeLoader.loadTheme("clawd", { strict: true });
+  assert.deepStrictEqual(theme.rendering.discreteSampling, {
+    "clawd-working-thinking.svg": 24,
+  });
+});
+
 test("bender uses the one-unit anti-crop viewBox and its measured face-plant hitbox", () => {
   const theme = themeLoader.loadTheme("clawd", { strict: true });
   assert.deepStrictEqual(theme.idleEasterEggs, [{
@@ -277,7 +296,6 @@ test("bender uses the one-unit anti-crop viewBox and its measured face-plant hit
     cooldownMs: 1800000,
     requiresAccessories: { head: "western-cowboy-hat", mouth: "cigarette" },
   }]);
-  assert.deepStrictEqual(theme.rendering.objectChannelFiles, ["clawd-outlaw-bender.svg"]);
   assert.deepStrictEqual(theme.fileViewBoxes["clawd-outlaw-bender.svg"], {
     x: -15,
     y: -25,

@@ -19,5 +19,8 @@ if (process.argv[2] === "attempt") {
     appData: process.env.APPDATA,
     codexHome: process.env.CODEX_HOME || null,
     nodeOptions: process.env.NODE_OPTIONS || null,
+    claudeConfigDir: process.env.CLAUDE_CONFIG_DIR || null,
+    grokHookEvent: process.env.GROK_HOOK_EVENT || null,
+    orcaPaneKey: process.env.ORCA_PANE_KEY || null,
   }));
 }

@@ -30,6 +30,8 @@ function makeConfig(tmpDir) {
 
 const TEST_FILENAME = "rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl";
 const EXPECTED_SID = "codex:019d23d4-f1a9-7633-b9c7-758327137228";
+const DESKTOP_TURN_FILENAME = "rollout-2026-09-01T09-35-17-01a04e10-d510-7be1-9577-ba8145e64c2c_01a05a9b-3a56-7af3-b0c3-d599832f7b06.jsonl";
+const EXPECTED_DESKTOP_TURN_SID = "codex:01a04e10-d510-7be1-9577-ba8145e64c2c";
 
 function uniqueRolloutName(index) {
   return `rollout-2026-03-25T15-10-51-${String(index).padStart(8, "0")}-f1a9-7633-b9c7-758327137228.jsonl`;
@@ -60,6 +62,26 @@ describe("CodexLogMonitor", () => {
       done();
     });
     monitor.start();
+  });
+
+  it("extracts the parent thread from a Codex Desktop turn-suffixed rollout filename", () => {
+    const testFile = path.join(dateDir, DESKTOP_TURN_FILENAME);
+    fs.writeFileSync(testFile, JSON.stringify({
+      type: "session_meta",
+      payload: {
+        session_id: "01a04e10-d510-7be1-9577-ba8145e64c2c",
+        cwd: "C:\\GitRepos\\clawd-on-desk",
+        originator: "Codex Desktop",
+        source: "vscode",
+      },
+    }) + "\n");
+
+    const config = makeConfig(tmpDir);
+    const events = [];
+    monitor = new CodexLogMonitor(config, (sid, state) => events.push({ sid, state }));
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.deepStrictEqual(events, [{ sid: EXPECTED_DESKTOP_TURN_SID, state: "idle" }]);
   });
 
   it("should map session_meta to idle", (_, done) => {
@@ -1860,6 +1882,125 @@ describe("CodexLogMonitor", () => {
       }
     });
     monitor.start();
+  });
+
+  for (const [format, payload] of Object.entries({
+    legacy: { type: "context_compacted" },
+    "item-completed": { type: "item_completed", item: { type: "ContextCompaction", id: "compaction-1" } },
+  })) {
+    it(`emits live ${format} compaction without ending the turn or resolving a question`, () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      fs.writeFileSync(testFile, [
+        { type: "session_meta", payload: { cwd: "/projects/compaction" } },
+        { type: "event_msg", payload: { type: "task_started", turn_id: "turn-compaction" } },
+        { type: "response_item", payload: { type: "function_call", name: "shell_command" } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+      const events = [];
+      const resolved = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event, extra) => {
+        events.push({ sid, state, event, extra });
+      }, { onUserInputResolved: (...args) => resolved.push(args) });
+      monitor._findCodexWriterPid = () => null;
+      monitor._pollFile(testFile, TEST_FILENAME);
+      assert.strictEqual(events.at(-1).state, "working");
+      const tracked = monitor._tracked.get(testFile);
+      tracked.pendingUserInputs.set("call_question", { callId: "call_question" });
+      events.length = 0;
+
+      const timestamp = new Date().toISOString();
+      fs.appendFileSync(testFile, JSON.stringify({ type: "event_msg", timestamp, payload }) + "\n");
+      monitor._pollFile(testFile, TEST_FILENAME);
+
+      assert.deepStrictEqual(events.map(({ state, event }) => ({ state, event })), [
+        { state: "sweeping", event: "event_msg:context_compacted" },
+      ]);
+      assert.strictEqual(events[0].sid, EXPECTED_SID);
+      assert.strictEqual(events[0].extra.turnId, "turn-compaction");
+      assert.strictEqual(events[0].extra.recapOccurredAt, Date.parse(timestamp));
+      assert.strictEqual(tracked.activeTurnId, "turn-compaction");
+      assert.strictEqual(tracked.turnBoundaryOpen, true);
+      assert.strictEqual(tracked.hadToolUse, true);
+      assert.strictEqual(tracked.pendingUserInputs.has("call_question"), true);
+      assert.deepStrictEqual(resolved, []);
+
+      fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_complete"}}\n');
+      monitor._pollFile(testFile, TEST_FILENAME);
+      assert.strictEqual(events.at(-1).state, "attention");
+      assert.strictEqual(events.at(-1).event, "event_msg:task_complete");
+      assert.strictEqual(tracked.activeTurnId, null);
+      assert.strictEqual(tracked.pendingUserInputs.size, 0);
+      assert.strictEqual(resolved.length, 1);
+    });
+
+    it(`does not replay ${format} compaction from an old timestamp in a fresh rollout`, () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      const events = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+        events.push({ state, event });
+      });
+      monitor._findCodexWriterPid = () => null;
+      fs.writeFileSync(testFile, JSON.stringify({
+        type: "event_msg", payload,
+        timestamp: new Date(monitor._startedAtMs - 60_000).toISOString(),
+      }) + "\n");
+      monitor._pollFile(testFile, TEST_FILENAME);
+      assert.deepStrictEqual(events, []);
+
+      fs.appendFileSync(testFile, JSON.stringify({ type: "event_msg", payload }) + "\n");
+      monitor._pollFile(testFile, TEST_FILENAME);
+      assert.deepStrictEqual(events, [{ state: "sweeping", event: "event_msg:context_compacted" }]);
+    });
+
+    it(`backfills ${format} compaction silently, then accepts a live append`, () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      fs.writeFileSync(testFile, [
+        { type: "session_meta", payload: { cwd: "/projects/compaction" } },
+        { type: "event_msg", payload: { type: "task_started" } },
+        { type: "response_item", payload: { type: "function_call" } },
+        { type: "event_msg", payload },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+      const oldTime = new Date(Date.now() - 10_000);
+      fs.utimesSync(testFile, oldTime, oldTime);
+      const events = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+        events.push({ state, event });
+      });
+      monitor._findCodexWriterPid = () => null;
+      monitor._pollFile(testFile, TEST_FILENAME);
+      assert.deepStrictEqual(events, [], "history must not restore working or replay sweeping");
+
+      fs.appendFileSync(testFile, JSON.stringify({ type: "event_msg", payload }) + "\n");
+      monitor._pollFile(testFile, TEST_FILENAME);
+      assert.deepStrictEqual(events, [{ state: "sweeping", event: "event_msg:context_compacted" }]);
+    });
+  }
+
+  it("does not treat checkpoints or unrelated item events as live compaction", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, '{"type":"response_item","payload":{"type":"function_call"}}\n');
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ state, event });
+    });
+    monitor._findCodexWriterPid = () => null;
+    monitor._pollFile(testFile, TEST_FILENAME);
+    assert.strictEqual(events.at(-1).state, "working");
+    events.length = 0;
+
+    for (const record of [
+      { type: "compacted", payload: {} },
+      { type: "response_item", payload: { type: "compaction" } },
+      { type: "event_msg", payload: { type: "item_started", item: { type: "ContextCompaction" } } },
+      { type: "response_item", payload: { type: "item_completed", item: { type: "ContextCompaction" } } },
+      { type: "event_msg", payload: { type: "item_completed", item: { type: "AgentMessage" } } },
+      { type: "event_msg", payload: { type: "item_completed", item: null } },
+      { type: "event_msg", payload: { type: "item_completed" } },
+    ]) {
+      fs.appendFileSync(testFile, JSON.stringify(record) + "\n");
+      monitor._pollFile(testFile, TEST_FILENAME);
+      assert.deepStrictEqual(events, [], JSON.stringify(record));
+      assert.strictEqual(monitor._tracked.get(testFile).lastState, "working");
+    }
   });
 
   it("normalizes, inherits, and clears JSONL turn identity around terminal emission", () => {
@@ -4227,7 +4368,7 @@ describe("CodexLogMonitor", () => {
         payload: {
           type: "function_call",
           name: "web_search",
-          arguments: JSON.stringify({ query: "test" }),
+          arguments: JSON.stringify({ query: "private-query-marker" }),
         },
       }),
     ].join("\n") + "\n");
@@ -4244,7 +4385,7 @@ describe("CodexLogMonitor", () => {
       assert.deepStrictEqual(observed.map((entry) => entry.state), ["idle", "working"]);
       assert.strictEqual(observed[1].event, "response_item:function_call");
       assert.strictEqual(observed[1].extra.recapIsWebSearch, true);
-      assert.strictEqual(JSON.stringify(observed[1].extra).includes("test"), false);
+      assert.strictEqual(JSON.stringify(observed[1].extra).includes("private-query-marker"), false);
       assert.strictEqual(JSON.stringify(observed[1].extra).includes("web_search"), false);
       done();
     }, 100);
@@ -4340,6 +4481,157 @@ describe("CodexLogMonitor", () => {
         }
       });
       monitor.start();
+    });
+
+    it("issue #1103: re-sends a restored index title after another title source displaced it", () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      fs.writeFileSync(testFile, JSON.stringify({
+        type: "session_meta", payload: { cwd: "/projects/title-fixture" },
+      }) + "\n");
+      const events = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (...args) => events.push(args), { codexDir: tmpDir });
+      monitor._poll();
+      const tracked = monitor._tracked.get(testFile);
+      let before = { state: tracked.lastState, at: tracked.lastEventTime, offset: tracked.offset };
+      events.length = 0;
+      fs.writeFileSync(path.join(tmpDir, "session_index.jsonl"), JSON.stringify({
+        id: EXPECTED_SID.slice("codex:".length), thread_name: "A",
+      }) + "\n");
+      monitor._poll();
+      assert.deepStrictEqual(events, [[EXPECTED_SID, null, "session_index:title", { sessionTitle: "A" }]]);
+      assert.deepStrictEqual({ state: tracked.lastState, at: tracked.lastEventTime, offset: tracked.offset }, before);
+      assert.strictEqual(tracked.sessionTitle, "A");
+      events.length = 0;
+      monitor._poll();
+      assert.strictEqual(events.length, 0, "unchanged title must not emit again");
+      fs.unlinkSync(path.join(tmpDir, "session_index.jsonl"));
+      monitor._poll();
+      assert.strictEqual(events.length, 0, "missing index must not erase a known title");
+      assert.strictEqual(tracked.sessionTitle, "A");
+      // _extractSessionTitle() displaces via summary; adjust if that source is removed.
+      fs.appendFileSync(testFile, [
+        { type: "turn_context", payload: { summary: "detailed" } },
+        { type: "event_msg", payload: { type: "task_started" } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+      monitor._poll();
+      before = { state: tracked.lastState, at: tracked.lastEventTime, offset: tracked.offset };
+      events.length = 0;
+      fs.writeFileSync(path.join(tmpDir, "session_index.jsonl"), JSON.stringify({
+        id: EXPECTED_SID.slice("codex:".length), thread_name: "A",
+      }) + "\n");
+      monitor._poll();
+      assert.deepStrictEqual(events, [[EXPECTED_SID, null, "session_index:title", { sessionTitle: "A" }]]);
+      assert.deepStrictEqual({ state: tracked.lastState, at: tracked.lastEventTime, offset: tracked.offset }, before);
+      events.length = 0;
+      monitor._poll();
+      assert.deepStrictEqual(events, []);
+      fs.writeFileSync(path.join(tmpDir, "session_index.jsonl"), JSON.stringify({
+        id: EXPECTED_SID.slice("codex:".length), thread_name: "Renamed title",
+      }) + "\n");
+      monitor._poll();
+      assert.strictEqual(events.length, 1);
+      assert.strictEqual(events[0][3].sessionTitle, "Renamed title");
+    });
+
+    it("issue #1103: does not repeat an index title after tracker retirement and reattachment", () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      fs.writeFileSync(testFile, JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/title-fixture" } }) + "\n");
+      fs.writeFileSync(path.join(tmpDir, "session_index.jsonl"), JSON.stringify({
+        id: EXPECTED_SID.slice("codex:".length), thread_name: "A",
+      }) + "\n");
+      const events = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (...args) => events.push(args), { codexDir: tmpDir });
+      monitor._findCodexWriterPid = () => null;
+      monitor._poll();
+      assert.deepStrictEqual(events.filter((entry) => entry[2] === "session_index:title"), [
+        [EXPECTED_SID, null, "session_index:title", { sessionTitle: "A" }],
+      ]);
+      monitor._retireTrackedFile(testFile, monitor._tracked.get(testFile));
+      assert.strictEqual(monitor._tracked.has(testFile), false);
+      events.length = 0;
+      monitor._poll();
+      assert.strictEqual(monitor._tracked.has(testFile), true);
+      assert.strictEqual(monitor._retiredTracked.has(testFile), false, "ordinary reattachment must consume the retired record");
+      assert.deepStrictEqual(events, [], "an unchanged title must remain delivered after reattachment");
+    });
+
+    it("issue #1103: prefers the active tracker when startup recovery leaves a retired copy", () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      const indexFile = path.join(tmpDir, "session_index.jsonl");
+      const writeTitle = (title) => fs.writeFileSync(indexFile, JSON.stringify({
+        id: EXPECTED_SID.slice("codex:".length), thread_name: title,
+      }) + "\n");
+      fs.writeFileSync(testFile, JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/title-fixture" } }) + "\n");
+      writeTitle("A");
+      const events = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (...args) => events.push(args), { codexDir: tmpDir });
+      monitor._findCodexWriterPid = () => null;
+      monitor._poll();
+      const active = monitor._tracked.get(testFile);
+      // Startup recovery can leave an older retired copy beside the active tracker.
+      const retired = { ...active };
+      monitor._retiredTracked.set(testFile, retired);
+      events.length = 0;
+      writeTitle("B");
+      monitor._poll();
+      assert.deepStrictEqual(events, [[EXPECTED_SID, null, "session_index:title", { sessionTitle: "B" }]]);
+      assert.strictEqual(active.sessionTitle, "B");
+      assert.strictEqual(active.reportedIndexTitle, "B");
+      assert.strictEqual(retired.sessionTitle, "A");
+      assert.strictEqual(retired.reportedIndexTitle, "A");
+      events.length = 0;
+      monitor._poll();
+      assert.deepStrictEqual(events, []);
+      assert.strictEqual(monitor._retiredTracked.get(testFile), retired);
+    });
+
+    it("issue #1103: refreshes an observed retired tracker title without reattachment", () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      const indexFile = path.join(tmpDir, "session_index.jsonl");
+      const writeTitle = (title) => fs.writeFileSync(indexFile, JSON.stringify({
+        id: EXPECTED_SID.slice("codex:".length), thread_name: title,
+      }) + "\n");
+      fs.writeFileSync(testFile, JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/title-fixture" } }) + "\n");
+      writeTitle("A");
+      const events = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (...args) => events.push(args), { codexDir: tmpDir });
+      monitor._findCodexWriterPid = () => null;
+      monitor._poll();
+      monitor._retireTrackedFile(testFile, monitor._tracked.get(testFile));
+      const retired = monitor._retiredTracked.get(testFile);
+      // Keep the real retired record outside the rollout discovery set.
+      fs.renameSync(testFile, `${testFile}.parked`);
+      events.length = 0;
+      writeTitle("B");
+      monitor._poll();
+      assert.strictEqual(monitor._tracked.has(testFile), false);
+      assert.deepStrictEqual(events, [[EXPECTED_SID, null, "session_index:title", { sessionTitle: "B" }]]);
+      assert.strictEqual(retired.sessionTitle, "B");
+      assert.strictEqual(retired.reportedIndexTitle, "B");
+      events.length = 0;
+      monitor._poll();
+      assert.deepStrictEqual(events, []);
+    });
+
+    it("issue #1103: separately delivers an index title read by a lifecycle event in the same poll", () => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      const indexFile = path.join(tmpDir, "session_index.jsonl");
+      fs.writeFileSync(testFile, JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/title-fixture" } }) + "\n");
+      fs.writeFileSync(indexFile, JSON.stringify({ id: EXPECTED_SID.slice("codex:".length), thread_name: "A" }) + "\n");
+      const events = [];
+      monitor = new CodexLogMonitor(makeConfig(tmpDir), (...args) => events.push(args), { codexDir: tmpDir });
+      monitor._findCodexWriterPid = () => null;
+      monitor._poll();
+      events.length = 0;
+      fs.writeFileSync(indexFile, JSON.stringify({ id: EXPECTED_SID.slice("codex:".length), thread_name: "B" }) + "\n");
+      fs.appendFileSync(testFile, JSON.stringify({ type: "event_msg", payload: { type: "task_started" } }) + "\n");
+      monitor._poll();
+      const lifecycle = events.filter((entry) => entry[2] === "event_msg:task_started");
+      assert.strictEqual(lifecycle.length, 1);
+      assert.strictEqual(lifecycle[0][3].sessionTitle, "B");
+      assert.deepStrictEqual(events.filter((entry) => entry[2] === "session_index:title"), [
+        [EXPECTED_SID, null, "session_index:title", { sessionTitle: "B" }],
+      ]);
     });
 
     it("uses Codex /rename thread_name from session_index.jsonl", (_, done) => {
