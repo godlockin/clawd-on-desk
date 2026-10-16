@@ -6,7 +6,7 @@ const { getDefaultShortcuts } = require("./shortcut-actions");
 const { keepOutOfTaskbar } = require("./taskbar");
 const { clampTextScale, scaleWidth, scaleHeight, applyZoomToWindow } = require("./text-scale");
 const { createTranslator } = require("./i18n");
-const { firstStringValue, formatDetail, truncate, parseMcpToolName } = require("./bubble-format");
+const { firstStringValue, formatDetail, formatReminderReason, truncate, parseMcpToolName } = require("./bubble-format");
 const {
   getPermissionSessionKey,
   groupPermissionEntries,
@@ -16,13 +16,17 @@ const { MAC_TOPMOST_LEVEL } = require("./topmost-runtime");
 const { redactSecrets } = require("./secret-redact");
 const path = require("path");
 const http = require("http");
-const { timingSafeEqual } = require("crypto");
+const crypto = require("crypto");
+const { timingSafeEqual } = crypto;
 const {
   CLAWD_SERVER_HEADER,
   CLAWD_SERVER_ID,
 } = require("../hooks/server-config");
 const { isOpencodeFamilyEntry, getFamilyConfig } = require("../agents/opencode-family");
+const { getAgent } = require("../agents/registry");
 const { isPassiveNotifyEntry } = require("./passive-notify-entry");
+const { validateQuestionAnswers } = require("./agent-question-wire");
+const { reminderHolds } = require("./permission-reminder");
 const {
   normalizeOpencodeFamilyBridgeUrl,
   isValidOpencodeFamilyBridgeToken,
@@ -728,6 +732,9 @@ function buildPermissionFocusEntry(perm) {
   if (perm.model) focusEntry.model = perm.model;
   if (perm.codexOriginator) focusEntry.codexOriginator = perm.codexOriginator;
   if (perm.codexSource) focusEntry.codexSource = perm.codexSource;
+  // An approval can arrive before the session lifecycle event, so the fallback
+  // entry needs the carrier to remain jumpable to the desktop app window.
+  if (perm.dshCarrier) focusEntry.dshCarrier = perm.dshCarrier;
   return focusEntry;
 }
 
@@ -783,6 +790,23 @@ function computeQueueCommitDeadline(existingDeadline, now, timeoutMs = QUEUE_COM
   return startedAt + timeout;
 }
 
+// Only the permission queue payload (buildQueuePayload) uses this to label a
+// session; it lives at module scope so the __test export can reach it.
+function queueAgentLabel(entry) {
+  const id = String((entry && entry.agentId) || "claude-code");
+  const labels = {
+    "claude-code": "Claude Code",
+    codebuddy: "CodeBuddy",
+    codex: "Codex",
+    "qwen-code": "Qwen Code",
+    zcode: "ZCode",
+    "copilot-cli": "Copilot CLI",
+    hermes: "Hermes",
+    "deepseek-harness": "DeepSeek Harness",
+  };
+  return labels[id] || id;
+}
+
 module.exports = function initPermission(ctx) {
 
 // Bound to ctx.lang (a live getter), so a runtime language switch is picked up
@@ -792,10 +816,21 @@ const t = createTranslator(() => ctx.lang);
 // Each entry: { res, abortHandler, suggestions, sessionId, bubble, hideTimer, toolName, toolInput, resolvedSuggestion, createdAt, measuredHeight }
 const pendingPermissions = [];
 let expandedPermissionEntry = null;
+// Presentation/projection state is owned beside pendingPermissions. Raw
+// permission entries never cross this boundary: consumers receive only frozen,
+// scalar-only records from permissionObservation below.
+const presentationByEntry = new WeakMap();
+const mobilePermissionProjection = new Map();
+const mobilePermissionSubscribers = new Set();
+let mobilePermissionObservationEnabled = false;
 // Keep windows independently of pendingPermissions so Orbit continues avoiding
 // a bubble during its 250ms fade-out after the request has already been removed
 // from the pending list.
 const permissionBubbleWindows = new Set();
+// A hidden BrowserWindow starts at a provisional origin. Only a successful
+// presentation bounds write makes it eligible to show, including the
+// transactional first-show retry below.
+const positionedPermissionWindows = new WeakSet();
 const overflowPresentation = {
   mode: "normal",
   revision: 0,
@@ -878,6 +913,190 @@ function isHotkeyActionablePermission(permission) {
     )
     && !isDecisionInteraction(permission.interaction)
   );
+}
+
+function isActionablePermissionEntry(entry) {
+  return !isPassiveNotifyEntry(entry)
+    && isValidInteraction(entry && entry.interaction)
+    && entry.interaction.capabilities.allowDeny === true
+    && !isDecisionInteraction(entry.interaction);
+}
+
+function frozenMobilePermissionFeature() {
+  return Object.freeze({
+    supported: true,
+    enabled: mobilePermissionObservationEnabled,
+  });
+}
+
+function frozenProjectionRecords() {
+  const records = [...mobilePermissionProjection.values()];
+  records.sort((left, right) => (
+    left.presentedAt - right.presentedAt
+    || left.requestId.localeCompare(right.requestId)
+  ));
+  return Object.freeze(records);
+}
+
+function mobilePermissionLog(message) {
+  try {
+    permLog(message);
+  } catch {
+    // Observation diagnostics must not affect permission decision/fallback
+    // semantics, even if the optional rotating debug log is unavailable.
+  }
+}
+
+function emitMobilePermissionObservation(event) {
+  const frozenEvent = Object.freeze(event);
+  for (const listener of [...mobilePermissionSubscribers]) {
+    try {
+      listener(frozenEvent);
+    } catch {
+      mobilePermissionLog(`mobile permission observer callback failed type=${event.type}`);
+    }
+  }
+}
+
+function isCurrentMobilePresentation(entry, marker = presentationByEntry.get(entry)) {
+  if (!entry || !marker || !pendingPermissions.includes(entry)) return false;
+  if (!isActionablePermissionEntry(entry)) return false;
+  if (entry.remoteOnly === true || entry._delayedResolve === true) return false;
+  if (isPermissionEntryHeadless(entry)) return false;
+  const agent = getAgent(typeof entry.agentId === "string" ? entry.agentId : "");
+  if (!agent || agent.capabilities.mobilePermissionObservation !== true) return false;
+  if (!entry.bubble || marker.bubble !== entry.bubble) return false;
+  try {
+    if (typeof marker.bubble.isDestroyed === "function" && marker.bubble.isDestroyed()) return false;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function buildMobilePermissionRecord(entry, marker) {
+  const session = ctx.sessions && typeof ctx.sessions.get === "function"
+    ? ctx.sessions.get(entry.sessionId)
+    : null;
+  return Object.freeze({
+    requestId: marker.requestId,
+    agentId: compactRemoteApprovalText(entry.agentId || "", 80),
+    toolName: compactRemoteApprovalText(entry.toolName || t("approvalUnknownTool"), 80),
+    summary: buildRemoteApprovalSummary(entry),
+    folder: compactRemoteApprovalText(
+      basenameForDisplay((session && session.cwd) || entry.cwd || ""),
+      80
+    ),
+    presentedAt: marker.presentedAt,
+  });
+}
+
+function publishMobilePermissionEntry(entry, { emit = true } = {}) {
+  if (!mobilePermissionObservationEnabled) return null;
+  const marker = presentationByEntry.get(entry);
+  if (!isCurrentMobilePresentation(entry, marker)) return null;
+  if (mobilePermissionProjection.has(marker.requestId)) {
+    return mobilePermissionProjection.get(marker.requestId);
+  }
+  let record;
+  try {
+    record = buildMobilePermissionRecord(entry, marker);
+  } catch {
+    mobilePermissionLog(`mobile permission publish failed requestId=${marker.requestId}`);
+    return null;
+  }
+  mobilePermissionProjection.set(marker.requestId, record);
+  mobilePermissionLog(`mobile permission publish requestId=${record.requestId} agent=${record.agentId} tool=${record.toolName}`);
+  if (emit) emitMobilePermissionObservation({ type: "upsert", record });
+  return record;
+}
+
+function markMobilePermissionPresented(entry, bubble) {
+  try {
+    let marker = presentationByEntry.get(entry);
+    if (!marker) {
+      marker = Object.freeze({
+        bubble,
+        requestId: crypto.randomBytes(16).toString("hex"),
+        presentedAt: Date.now(),
+      });
+      presentationByEntry.set(entry, marker);
+    }
+    publishMobilePermissionEntry(entry);
+    return marker;
+  } catch {
+    // Observation is strictly advisory. Marker generation/projection failures
+    // must never affect the blocking permission request or its fallback path.
+    mobilePermissionLog("mobile permission presentation marker failed");
+    return null;
+  }
+}
+
+function replaceMobilePermissionProjection(enabled) {
+  mobilePermissionProjection.clear();
+  if (enabled) {
+    for (const entry of pendingPermissions) publishMobilePermissionEntry(entry, { emit: false });
+  }
+  const feature = frozenMobilePermissionFeature();
+  const records = frozenProjectionRecords();
+  mobilePermissionLog(`mobile permission replace enabled=${feature.enabled} count=${records.length}`);
+  emitMobilePermissionObservation({ type: "replace", feature, records });
+}
+
+const permissionObservation = Object.freeze({
+  setEnabled(enabled) {
+    const next = enabled === true;
+    if (next === mobilePermissionObservationEnabled) return;
+    mobilePermissionObservationEnabled = next;
+    replaceMobilePermissionProjection(next);
+  },
+  snapshot() {
+    return Object.freeze({
+      feature: frozenMobilePermissionFeature(),
+      records: frozenProjectionRecords(),
+    });
+  },
+  subscribe(listener) {
+    if (typeof listener !== "function") throw new TypeError("permissionObservation.subscribe requires a listener");
+    mobilePermissionSubscribers.add(listener);
+    return () => mobilePermissionSubscribers.delete(listener);
+  },
+});
+
+function observationDisposition(reason, decided, changeReason) {
+  return Object.freeze({ reason, decided: decided === true, changeReason });
+}
+
+function resolutionOptions(reason, decided) {
+  return Object.freeze({
+    disposition: Object.freeze({ reason, decided: decided === true }),
+  });
+}
+
+function retractMobilePermissionEntry(entry, disposition) {
+  const marker = presentationByEntry.get(entry);
+  if (!marker || !mobilePermissionProjection.delete(marker.requestId)) return;
+  const reason = disposition && disposition.reason ? disposition.reason : "cancelled";
+  const decided = !!(disposition && disposition.decided === true);
+  mobilePermissionLog(`mobile permission retract requestId=${marker.requestId} reason=${reason} decided=${decided}`);
+  emitMobilePermissionObservation({
+    type: "retract",
+    requestId: marker.requestId,
+    reason,
+    decided,
+  });
+}
+
+function detachPendingPermission(entry, disposition) {
+  const idx = pendingPermissions.indexOf(entry);
+  if (idx === -1) return false;
+  pendingPermissions.splice(idx, 1);
+  retractMobilePermissionEntry(entry, disposition);
+
+  notifyPermissionsChanged(
+    disposition && disposition.changeReason ? disposition.changeReason : "removed"
+  );
+  return true;
 }
 
 function getActionablePermissions() {
@@ -1093,7 +1312,7 @@ function hotkeyResolve(behavior, message) {
   const perm = getHotkeyTargetPermission();
   if (!perm) return;
   captureFrontApp((appName) => {
-    resolvePermissionEntry(perm, behavior, message);
+    resolvePermissionEntry(perm, behavior, message, resolutionOptions("resolved", true));
     if (appName) {
       setTimeout(() => restoreFrontApp(appName), RESTORE_FOCUS_DELAY_MS);
     }
@@ -1252,7 +1471,9 @@ function getLocalPresentationEntries() {
 function createPresentationGeometry() {
   if (!ctx.win || ctx.win.isDestroyed()) return null;
   const petBounds = ctx.getPetWindowBounds();
+  if (!isUsableRect(petBounds)) return null;
   const workArea = getAnchorWorkArea(petBounds);
+  if (!isUsableRect(workArea)) return null;
   const scale = getTextScale(workArea);
   const margin = Math.round(8 * scale);
   const gap = Math.round(6 * scale);
@@ -1500,21 +1721,6 @@ function queueSessionLabel(entry) {
   return id ? `#${id.slice(-3)}` : "";
 }
 
-function queueAgentLabel(entry) {
-  const id = String((entry && entry.agentId) || "claude-code");
-  const labels = {
-    "claude-code": "Claude Code",
-    codebuddy: "CodeBuddy",
-    codex: "Codex",
-    "qwen-code": "Qwen Code",
-    zcode: "ZCode",
-    "copilot-cli": "Copilot CLI",
-    hermes: "Hermes",
-    dsh: "DeepSeek Harness",
-  };
-  return labels[id] || id;
-}
-
 function isSwitchingLocked() {
   return pendingPermissions.some((entry) => entry && entry.compositionActive === true);
 }
@@ -1583,10 +1789,24 @@ function setRequestWindowVisible(entry, visible, bounds, geometry) {
   const bubble = entry && entry.bubble;
   if (!isLiveBrowserWindow(bubble)) return;
   if (visible) {
-    try { applyZoomToWindow(bubble, geometry.scale); } catch {}
-    if (bounds && !bubble.__clawdMacImeEditing) {
-      try { bubble.setBounds(bounds); } catch {}
+    if (!bubble.__clawdMacImeEditing) {
+      positionedPermissionWindows.delete(bubble);
+      if (!geometry || !isUsableRect(bounds)) return;
+      try {
+        bubble.setBounds(bounds);
+        positionedPermissionWindows.add(bubble);
+      } catch {
+        // Keep the request pending. A later owner/display/measurement reflow
+        // retries placement; showing now would expose the provisional origin
+        // or bounds from a previous presentation.
+        return;
+      }
+    } else if (!positionedPermissionWindows.has(bubble)) {
+      // An editing card may preserve valid prior bounds, but an unpositioned
+      // window cannot use the IME freeze to bypass its first placement.
+      return;
     }
+    try { applyZoomToWindow(bubble, geometry.scale); } catch {}
     try {
       if (isWin) bubble.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
       if (isMac && !bubble.__clawdMacImeEditing) bubble.setAlwaysOnTop(true, MAC_TOPMOST_LEVEL);
@@ -1656,7 +1876,7 @@ function requestSlackRemeasureForNewlyVisible(candidates) {
 
 function showQueueWindow(bounds, geometry, options = {}) {
   const queueWindow = overflowPresentation.queueWindow;
-  if (!isLiveBrowserWindow(queueWindow) || !bounds) return false;
+  if (!isLiveBrowserWindow(queueWindow) || !geometry || !isUsableRect(bounds)) return false;
   try { applyZoomToWindow(queueWindow, geometry.scale); } catch {}
   try {
     queueWindow.setBounds(bounds);
@@ -2162,6 +2382,125 @@ function isPermissionEntryHeadless(permEntry) {
     && !isInteractiveCodexSubagentEntry(permEntry));
 }
 
+// Destructive-action reminder (opt-in, off by default).
+//
+// Reads the stamp the route put on the entry instead of re-deriving anything
+// from entry.toolInput: that field is the display copy and has already been
+// through truncateDeep(), so a command whose destructive part sits past
+// PREVIEW_MAX would not be in it.
+//
+// If the setting cannot be read at all, an unmatched request keeps today's
+// behavior and a matched one ends at the human. A settings read that throws is
+// already a broken state, and the direction that costs an extra card is
+// preferable to the one that silently disarms a guard the user switched on.
+//
+// #1021 review (5), TOCTOU: the match stamp (hold/tag) is computed once, at
+// accept time, by permission-reminder.js -- a module with no ctx, so it
+// cannot read this setting at all. Whether that stamp actually holds used to
+// re-read the LIVE setting on every call, including from
+// canAutoResolvePendingPermission()/sweep(), which can run much later than
+// accept time (a session grant can arrive after the request has already been
+// sitting, displayed, for a while). That let a request already shown to a
+// human as held become sweep-resolvable the moment the setting was turned
+// off, with no human action and no re-render of the already-shown card --
+// and the reverse (turning it on) could newly hold a request that automation
+// had already committed to resolving through a path that does not re-check
+// this predicate. Freezing the decision the first time it is asked answers
+// both directions the same way a snapshot answers a race: whichever value
+// was true when this request first became eligible for automation is the
+// value it keeps for its whole pending lifetime, so the display (whenever it
+// last rendered) and the decision can never silently diverge on a request
+// that neither the human nor policy has touched.
+function permissionReminderHolds(permEntry) {
+  // Scoped to the same branch the policy scopes it to. Elicitation and plan
+  // entries are answered or reviewed on their own paths, and a question card
+  // must never show a reminder reason just because the safety net in the route
+  // stamped one.
+  if (!isValidInteraction(permEntry && permEntry.interaction)) return false;
+  const intent = permEntry.interaction.intent;
+  if (intent !== INTERACTION_INTENT.TOOL_APPROVAL && intent !== INTERACTION_INTENT.UNKNOWN) {
+    return false;
+  }
+  if (typeof permEntry._reminderHoldAtAccept === "boolean") {
+    return permEntry._reminderHoldAtAccept;
+  }
+  const stampHolds = reminderHolds(permEntry.permissionReminder);
+  let result;
+  if (typeof ctx.isDestructiveReminderEnabled !== "function") {
+    result = false;
+  } else {
+    try {
+      result = ctx.isDestructiveReminderEnabled() === true ? stampHolds : false;
+    } catch (err) {
+      permLog(`destructive reminder: setting read failed (${err && err.message ? err.message : err}); falling back to the match`);
+      result = stampHolds;
+    }
+  }
+  permEntry._reminderHoldAtAccept = result;
+  return result;
+}
+
+// Whether the reminder is the reason this request is in front of a human.
+//
+// permissionReminderHolds() answers "should automation stop here"; this answers
+// "did stopping here change anything". They differ whenever the request was going
+// to reach a human regardless -- automation off, an ineligible agent, a session
+// with no grant -- and in that case the card must not claim Clawd intervened.
+// The card still shows the ordinary destructive-action hint there, as before.
+//
+// #1021 review (3): this used to re-evaluate automation policy with its own
+// partial copy of canAutoResolvePendingPermission()'s gates, which skipped the
+// entry-level ones entirely (agent/subagent enabled, headless, Codex permission
+// intercept, session-automation eligibility, live-response, DND). Reachable
+// miss: a remote-only entry with an existing session grant, where Codex
+// permission intercept or the subagent automation gate is off -- sweep()
+// would never have resolved that entry (canAutoResolvePendingPermission
+// returns false), yet this function said the reminder was why it was
+// pending, so the card rendered Tier 1 ("Automatic approval paused") when the
+// request needed a human regardless (Tier 2 is correct).
+//
+// Fix: derive from canAutoResolvePendingPermission() itself -- the same
+// predicate sweep()/session-grant flows use -- instead of keeping a second
+// copy of its gates, but ONLY in the exact circumstance where that predicate
+// is actually consulted for real auto-resolution: a session-automation
+// override exists, or this is an interactive Codex subagent entry
+// (maybeAutoApprovePermission's own `needsLiveGate` condition, unchanged
+// here). An ordinary global-automation request is never routed through
+// canAutoResolvePendingPermission()'s entry-level gates either -- see
+// maybeAutoApprovePermission(), which auto-allows it directly once
+// evaluatePermissionAutomation() says AUTO_ALLOW -- so asking this predicate
+// to apply those gates there would claim a stronger check happened than the
+// one that actually resolves the request, which would then wrongly downgrade
+// an otherwise-correct Tier 1 card (e.g. an opencode-family session under
+// plain global automation) to Tier 2.
+function reminderIsWhyThisIsPending(permEntry) {
+  if (!permissionReminderHolds(permEntry)) return false;
+  let mode;
+  if (typeof ctx.getEffectivePermissionAutomationMode === "function") {
+    mode = ctx.getEffectivePermissionAutomationMode(permEntry, {
+      sessionOnly: permEntry.remoteOnly === true,
+    });
+  } else if (typeof ctx.getPermissionAutomationMode === "function") {
+    mode = ctx.getPermissionAutomationMode();
+  } else {
+    mode = PERMISSION_AUTOMATION_MODE.OFF;
+  }
+  const wouldAutoAllow = evaluatePermissionAutomation({
+    mode,
+    interaction: permEntry.interaction,
+    entry: permEntry,
+    reminderHold: false,
+  }) === AUTOMATION_ACTION.AUTO_ALLOW;
+  if (!wouldAutoAllow) return false;
+
+  const hasSessionOverride = typeof ctx.hasSessionAutomationOverride === "function"
+    && ctx.hasSessionAutomationOverride(permEntry);
+  const needsLiveGate = hasSessionOverride || isInteractiveCodexSubagentEntry(permEntry);
+  if (!needsLiveGate) return true;
+
+  return canAutoResolvePendingPermission(permEntry, { mode, ignoreReminderHold: true }) === true;
+}
+
 function canAutoResolvePendingPermission(permEntry, options = {}) {
   if (!isPermissionEntryLive(permEntry)) return false;
   if (ctx.doNotDisturb) return false;
@@ -2193,6 +2532,9 @@ function canAutoResolvePendingPermission(permEntry, options = {}) {
 
   if (
     permEntry.isCodex
+    && !(permEntry.codexAutoManual === true
+      && typeof ctx.getCodexPermissionMode === "function"
+      && ctx.getCodexPermissionMode() === "auto")
     && (
       typeof ctx.isCodexPermissionInterceptEnabled !== "function"
       || !ctx.isCodexPermissionInterceptEnabled()
@@ -2215,10 +2557,18 @@ function canAutoResolvePendingPermission(permEntry, options = {}) {
         );
   }
 
+  // ignoreReminderHold lets reminderIsWhyThisIsPending() ask "would every
+  // OTHER gate have let this through" without re-implementing them: it is
+  // the neutralize-only-the-reminder-hold view onto this exact predicate.
+  const reminderHold = options.ignoreReminderHold === true
+    ? false
+    : permissionReminderHolds(permEntry);
+
   return evaluatePermissionAutomation({
     mode,
     interaction: permEntry.interaction,
     entry: permEntry,
+    reminderHold,
   }) === AUTOMATION_ACTION.AUTO_ALLOW;
 }
 
@@ -2242,6 +2592,32 @@ function buildAutoApproveElicitationAnswers(toolInput) {
   return answers;
 }
 
+// Codex Auto routing hands remote/WSL requests back to Codex because their
+// transcript is not readable here. A user who turned on global automation
+// still expects Clawd to allow those tool requests, as Intercept did before
+// Auto (#1186). The route asks this
+// before claiming such a request: only an immediate global auto-allow
+// qualifies. Session overrides and interactive subagents need the live gate
+// on a real pending entry, and a held or deferred request must stay with
+// Codex rather than open a bubble Auto promised not to show.
+function wouldAutoAllowPermission(permEntry) {
+  if (!permEntry || isPassiveNotifyEntry(permEntry)) return false;
+  if (typeof ctx.getEffectivePermissionAutomationMode !== "function"
+    && typeof ctx.getPermissionAutomationMode !== "function") return false;
+  if (typeof ctx.hasSessionAutomationOverride === "function"
+    && ctx.hasSessionAutomationOverride(permEntry)) return false;
+  if (isInteractiveCodexSubagentEntry(permEntry)) return false;
+  const mode = typeof ctx.getEffectivePermissionAutomationMode === "function"
+    ? ctx.getEffectivePermissionAutomationMode(permEntry, { sessionOnly: false })
+    : ctx.getPermissionAutomationMode();
+  return evaluatePermissionAutomation({
+    mode,
+    interaction: permEntry.interaction,
+    entry: permEntry,
+    reminderHold: permissionReminderHolds(permEntry),
+  }) === AUTOMATION_ACTION.AUTO_ALLOW;
+}
+
 function maybeAutoApprovePermission(permEntry) {
   if (!permEntry) return false;
   if (isPassiveNotifyEntry(permEntry)) return false;
@@ -2252,13 +2628,17 @@ function maybeAutoApprovePermission(permEntry) {
           ? ctx.getPermissionAutomationMode()
           : PERMISSION_AUTOMATION_MODE.OFF
       );
+  const reminderHold = permissionReminderHolds(permEntry);
   const action = evaluatePermissionAutomation({
     mode,
     interaction: permEntry.interaction,
     entry: permEntry,
+    reminderHold,
   });
   if (action === AUTOMATION_ACTION.DEFER) {
-    if (!isValidInteraction(permEntry.interaction)) {
+    if (reminderHold) {
+      permLog(`destructive reminder: holding for a human mode=${mode} reason=${permEntry.permissionReminder.tag} tool=${permEntry.toolName || "(missing)"} session=${permEntry.sessionId} agent=${permEntry.agentId || "unknown"}`);
+    } else if (!isValidInteraction(permEntry.interaction)) {
       permLog(`automation defer: invalid interaction tool=${permEntry.toolName} session=${permEntry.sessionId} agent=${permEntry.agentId || "unknown"}`);
     } else if (
       mode !== PERMISSION_AUTOMATION_MODE.OFF
@@ -2293,7 +2673,12 @@ function maybeAutoApprovePermission(permEntry) {
   }
 
   permLog(`permission automation: mode=${mode} action=${action} intent=${permEntry.interaction.intent} tool=${permEntry.toolName} session=${permEntry.sessionId} agent=${permEntry.agentId || "claude-code"}`);
-  resolvePermissionEntry(permEntry, "allow");
+  resolvePermissionEntry(
+    permEntry,
+    "allow",
+    undefined,
+    resolutionOptions("resolved", true)
+  );
   return true;
 }
 
@@ -2309,23 +2694,42 @@ function handlePermissionBubbleFailure(permEntry, reason) {
     return true;
   }
   permLog(`permission bubble failed; returning no-decision: ${reason} tool=${permEntry.toolName} session=${permEntry.sessionId} agent=${permEntry.agentId || "unknown"}`);
-  resolvePermissionEntry(permEntry, "no-decision", reason);
+  resolvePermissionEntry(
+    permEntry,
+    "no-decision",
+    reason,
+    resolutionOptions("cancelled", false)
+  );
   return true;
 }
 
 function showPermissionBubble(permEntry) {
   // Auto-pilot: if enabled, approve immediately and never render a bubble.
   if (maybeAutoApprovePermission(permEntry)) return;
+  // Claimed only for automation (see wouldAutoAllowPermission). If settings
+  // changed since the route asked, give the request back to Codex.
+  if (permEntry.codexAutomationClaim === true) {
+    permLog(`codex automation claim no longer applies -> no decision, native prompt fallback (tool=${permEntry.toolName})`);
+    resolvePermissionEntry(
+      permEntry,
+      "no-decision",
+      "Automation no longer applies",
+      resolutionOptions("cancelled", false)
+    );
+    return;
+  }
   ensureBubblePresentationState(permEntry);
   ensurePermissionUiIdentity(permEntry);
 
   const canOfferSessionTrust = typeof ctx.canOfferSessionTrust === "function"
     && ctx.canOfferSessionTrust(permEntry) === true;
   const sugCount = (permEntry.suggestions || []).length + (canOfferSessionTrust ? 1 : 0);
-  const wa = getAnchorWorkArea();
-  const scale = getTextScale(wa);
-  const bh = clampBubbleHeight(scaleHeight(estimateBubbleHeight(sugCount), scale), wa.height);
-  // Temporary position — repositionBubbles() will finalize after renderer reports real height
+  const initialGeometry = createPresentationGeometry();
+  const wa = initialGeometry && initialGeometry.workArea;
+  const scale = initialGeometry ? initialGeometry.scale : getTextScale();
+  const bh = clampBubbleHeight(scaleHeight(estimateBubbleHeight(sugCount), scale), wa && wa.height);
+  // Provisional bounds stay hidden until presentation applies a valid layout.
+  // Renderer measurements refine that first layout afterwards.
   const pos = { x: 0, y: 0, width: getBubbleWidth(scale, wa), height: bh };
 
   // Bubbles that host a text input (elicitation "Other", ExitPlanMode
@@ -2391,8 +2795,20 @@ function showPermissionBubble(permEntry) {
       permEntry.bubbleReady = true;
       // Explicit even though same-origin propagation usually covers it — a
       // stale partition-persisted factor must never win over prefs.
-      applyZoomToWindow(bub, getTextScale(getAnchorWorkArea()));
-      syncPermissionBubbleContent(permEntry);
+      const geometry = createPresentationGeometry();
+      if (geometry) applyZoomToWindow(bub, geometry.scale);
+      let contentSent = false;
+      try {
+        contentSent = syncPermissionBubbleContent(permEntry) === true;
+      } catch {
+        // Observation must never turn a renderer-send failure into a permission
+        // decision or fallback. The existing request remains pending.
+        mobilePermissionLog("mobile permission presentation sync failed");
+      }
+      if (contentSent) markMobilePermissionPresented(permEntry, bub);
+      // Loading provides another natural placement attempt if the owner or a
+      // native bounds write was temporarily unavailable during creation.
+      reconcilePermissionPresentation("bubble-ready");
       // Arrival never steals focus. Eligible Ask cards may already be visually
       // expanded, but controls receive focus only after an explicit local or
       // queue action.
@@ -2402,19 +2818,32 @@ function showPermissionBubble(permEntry) {
       permissionBubbleWindows.delete(bub);
       const idx = pendingPermissions.indexOf(permEntry);
       if (idx !== -1) {
-        // Qwen + Copilot + ZCode + DSH can hand no-decision back to their native
-        // flow. Hermes has no native permission UI, so its opt-in plugin gate
-        // treats this as a retryable block. In every case we avoid fabricating a
-        // user denial. CC/CodeBuddy still get an explicit deny for this
-        // user-close action.
+        // Codex + Qwen + Copilot + ZCode + DSH can hand no-decision back to
+        // their native flow. opencode-family entries do the same: OpenCode v2
+        // answers 204 on its blocking evaluate hook so the native ask UI takes
+        // over, while OpenCode v1 / MiMo silently drop the request so their
+        // built-in terminal or Desktop prompt wins. Hermes has no native
+        // permission UI, so its opt-in plugin gate treats this as a retryable
+        // block. In every case we avoid fabricating a user denial.
+        // Claude Code / CodeBuddy still get an explicit deny for this user-close
+        // action.
         const behavior = (
-          permEntry.isQwenCode
+          permEntry.isCodex
+          || permEntry.isQwenCode
           || permEntry.isCopilotCli
           || permEntry.isHermes
           || permEntry.isZcode
           || permEntry.isDsh
+          || isOpencodeFamilyEntry(permEntry)
         ) ? "no-decision" : "deny";
-        resolvePermissionEntry(permEntry, behavior, "Bubble window closed by user");
+        resolvePermissionEntry(
+          permEntry,
+          behavior,
+          "Bubble window closed by user",
+          behavior === "deny"
+            ? resolutionOptions("resolved", true)
+            : resolutionOptions("handed_to_terminal", false)
+        );
       }
       repositionDependentBubbles();
     });
@@ -2493,6 +2922,7 @@ function showPermissionBubble(permEntry) {
     if (
       !queueAlreadyRepresentsPending
       && !isEntryCutOffByPet(permEntry)
+      && positionedPermissionWindows.has(bub)
       && (typeof bub.isVisible !== "function" || !bub.isVisible())
       && typeof bub.showInactive === "function"
     ) {
@@ -2556,7 +2986,12 @@ function dismissPermissionWithoutDecision(permEntry, message) {
   const idx = pendingPermissions.indexOf(permEntry);
   if (idx === -1) return;
   permLog(`auto-close dismiss: tool=${permEntry.toolName} session=${permEntry.sessionId} agent=${permEntry.agentId || "claude-code"}`);
-  resolvePermissionEntry(permEntry, "no-decision", message || "Auto-closed");
+  resolvePermissionEntry(
+    permEntry,
+    "no-decision",
+    message || "Auto-closed",
+    resolutionOptions("timeout", false)
+  );
 }
 
 function notifyPermissionsChanged(reason) {
@@ -2616,11 +3051,10 @@ function addPendingPermission(permEntry, reason = "added") {
 }
 
 function removePendingPermission(permEntry, reason = "removed") {
-  const idx = pendingPermissions.indexOf(permEntry);
-  if (idx === -1) return false;
-  pendingPermissions.splice(idx, 1);
-  notifyPermissionsChanged(reason);
-  return true;
+  return detachPendingPermission(
+    permEntry,
+    observationDisposition("cancelled", false, reason)
+  );
 }
 
 // Called by settings-effect-router after permissionBubbleAutoCloseSeconds
@@ -2643,6 +3077,13 @@ function buildPermissionBubblePayload(permEntry) {
   return {
     toolName: permEntry.toolName,
     toolInput: permEntry.toolInput,
+    // Why this card exists, when it exists because the reminder held it. Null
+    // for every other card -- including one whose command the display hint
+    // badges anyway. The badge says "this looks destructive"; this says
+    // "automation would have allowed this and Clawd stopped for you".
+    reminderTag: reminderIsWhyThisIsPending(permEntry)
+      ? permEntry.permissionReminder.tag
+      : null,
     detailText: typeof permEntry.detailText === "string"
       ? permEntry.detailText
       : null,
@@ -2661,6 +3102,9 @@ function buildPermissionBubblePayload(permEntry) {
     lang: ctx.lang,
     interaction: isValidInteraction(permEntry.interaction) ? permEntry.interaction : null,
     isElicitation: permEntry.isElicitation || false,
+    isFamilyQuestion: permEntry.isFamilyQuestion === true,
+    questionAwaitingDelivery: permEntry.questionAwaitingDelivery === true,
+    questionDeliveryUnconfirmed: permEntry.questionDeliveryUnconfirmed === true,
     // opencode-family provenance for the renderer, which has no registry
     // access: presence of familyAgentId selects the family render branch;
     // familyDisplayName templates the blanket-always tooltip (plan §3.5).
@@ -2668,6 +3112,10 @@ function buildPermissionBubblePayload(permEntry) {
     familyDisplayName: isOpencodeFamilyEntry(permEntry)
       ? ((getFamilyConfig(permEntry.agentId) || {}).displayName || permEntry.agentId)
       : null,
+    // v2 family entries keep their "always" rule inside the host's background
+    // service (plugin memory), not the CLI process, so the blanket-always
+    // tooltip must not tell the user a terminal restart revokes it.
+    familyV2: permEntry.isOpencodeV2 === true,
     isAntigravity: permEntry.isAntigravity || false,
     // Provenance for the renderer: lets the bubble relabel Codex MCP tool calls
     // (issue #445) without touching approval semantics. Mirrors the flags above.
@@ -2983,17 +3431,48 @@ function buildRemoteApprovalPayload(permEntry) {
   );
   // Label this value "Folder" (not "Session"): it is only the cwd basename,
   // never a session id or full local path.
+  // The same reason the local card shows, so a remote-only operator is not told
+  // less about why the request stopped than someone sitting at the desk.
+  //
+  // Two tiers, mirroring bubble-renderer.js's badge exactly, because the local
+  // card degrades to a weaker line where this used to degrade to silence:
+  //   held BY the reminder        -> "Automatic approval paused: X"
+  //   destructive but pending anyway -> "Potentially destructive action: X"
+  // The second tier is the case the old single-tier code dropped. It is the
+  // ONLY tier a remote-only operator can ever see: bubbles are off, so the
+  // local irreversible badge that carries this hint is not on their screen at
+  // all. Dropping it left exactly one configuration -- the one named in the
+  // comment above -- told nothing, which is the opposite of what it promises.
+  // Tier 2 must NOT reuse the tier-1 wording: the request was reaching a human
+  // regardless, so claiming Clawd stopped it would be false.
+  // One extraction, not three: reminderHolds() already rejects a null stamp, a
+  // malformed one, and an empty tag (test/permission-reminder lanes pin all
+  // four shapes), so a true from either predicate GUARANTEES an object with a
+  // truthy tag. Two cross-family reviewers independently read the old shape as
+  // a null-dereference plus an empty-tag asymmetry; both were refuted at the
+  // source, and the per-branch guards that invited the reading are gone with
+  // them rather than being left as dead code that documents a fear.
+  const reminderTag = permissionReminderHolds(permEntry)
+    ? permEntry.permissionReminder.tag
+    : null;
+  const reminderLine = !reminderTag
+    ? null
+    : (reminderIsWhyThisIsPending(permEntry)
+      ? interpolate(t("approvalDetailReminderValue"), "{reason}", formatReminderReason(reminderTag, ctx.lang))
+      : interpolate(t("approvalDetailIrreversibleValue"), "{reason}", formatReminderReason(reminderTag, ctx.lang)));
   const detail = [
     `${t("approvalDetailAgent")}: ${agentId}`,
     `${t("approvalDetailTool")}: ${toolName}`,
     sessionFolder ? `${t("approvalDetailFolder")}: ${sessionFolder}` : null,
     `${t("approvalDetailSummary")}: ${summary}`,
+    reminderLine ? `${t("approvalDetailReminder")}: ${reminderLine}` : null,
   ].filter(Boolean).join("\n");
   const fields = [
     { label: t("approvalDetailAgent"), value: agentId },
     { label: t("approvalDetailTool"), value: toolName },
     sessionFolder ? { label: t("approvalDetailFolder"), value: sessionFolder } : null,
     { label: t("approvalDetailSummary"), value: summary },
+    reminderLine ? { label: t("approvalDetailReminder"), value: reminderLine } : null,
   ].filter(Boolean);
   const suggestionButtons = buildRemoteSuggestionButtons(permEntry);
   const payload = {
@@ -3001,6 +3480,11 @@ function buildRemoteApprovalPayload(permEntry) {
     detail,
     fields,
   };
+  // A capability flag, not an identity: the Feishu card switches to its
+  // structured layout as soon as it sees a top-level agentId, which would drop
+  // this payload's detail and reminder lines for every agent. This flag only
+  // removes an action DSH has no native terminal for.
+  if (agentId === "deepseek-harness") payload.canOfferTerminal = false;
   if (suggestionButtons.length > 0) payload.suggestions = suggestionButtons;
   return payload;
 }
@@ -3234,7 +3718,12 @@ function hidePermissionBubbleSafely(permEntry) {
 function dismissPermissionForTerminal(perm) {
   if (!perm) return;
   if (perm.remoteOnly) {
-    resolvePermissionEntry(perm, "no-decision", "Go to terminal from remote approval");
+    resolvePermissionEntry(
+      perm,
+      "no-decision",
+      "Go to terminal from remote approval",
+      resolutionOptions("handed_to_terminal", false)
+    );
     ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     return;
   }
@@ -3249,10 +3738,10 @@ function dismissPermissionForTerminal(perm) {
     outcome: remoteOutcome,
     skipClientName: perm.remoteApprovalSkipClientName,
   });
-  const idx = pendingPermissions.indexOf(perm);
-  if (idx !== -1) {
-    pendingPermissions.splice(idx, 1);
-    notifyPermissionsChanged("deny-and-focus");
+  if (detachPendingPermission(
+    perm,
+    observationDisposition("handed_to_terminal", false, "deny-and-focus")
+  )) {
     notifyPermissionResolved(perm, "deny-and-focus");
   }
   const { res, abortHandler } = perm;
@@ -3312,7 +3801,12 @@ function maybeStartRemoteApproval(permEntry) {
     if (settledWithoutDecision < remoteRequests.length) return;
     if (pendingPermissions.indexOf(permEntry) === -1) return;
     permLog(`remote-only approval: all remote requests settled without a decision, falling back (tool=${permEntry.toolName} session=${permEntry.sessionId})`);
-    resolvePermissionEntry(permEntry, "no-decision", "Remote approval unavailable; no client returned a decision");
+    resolvePermissionEntry(
+      permEntry,
+      "no-decision",
+      "Remote approval unavailable; no client returned a decision",
+      resolutionOptions("cancelled", false)
+    );
   }
 
   for (const { name, client } of clients) {
@@ -3519,15 +4013,30 @@ function handleRemoteApprovalDecision(
         // Hermes treats an explicit deny as "clarification cancelled"; only a
         // no-decision (204) falls back to its native terminal prompt, which is
         // what "go to terminal" means here.
-        resolvePermissionEntry(permEntry, "no-decision", "Go to terminal from remote approval");
+        resolvePermissionEntry(
+          permEntry,
+          "no-decision",
+          "Go to terminal from remote approval",
+          resolutionOptions("handed_to_terminal", false)
+        );
         ctx.focusTerminalForSession(permEntry.sessionId, { fallbackEntry: buildPermissionFocusEntry(permEntry) });
         return true;
       }
-      resolvePermissionEntry(permEntry, "deny", "User answered in terminal");
+      resolvePermissionEntry(
+        permEntry,
+        "deny",
+        "User answered in terminal",
+        resolutionOptions("handed_to_terminal", false)
+      );
       return true;
     }
     if (permEntry.isCodex || permEntry.isQwenCode || permEntry.isAntigravity || permEntry.isZcode || permEntry.isDsh) {
-      resolvePermissionEntry(permEntry, "no-decision", "Go to terminal from remote approval");
+      resolvePermissionEntry(
+        permEntry,
+        "no-decision",
+        "Go to terminal from remote approval",
+        resolutionOptions("handed_to_terminal", false)
+      );
       ctx.focusTerminalForSession(permEntry.sessionId, { fallbackEntry: buildPermissionFocusEntry(permEntry) });
     } else {
       dismissPermissionForTerminal(permEntry);
@@ -3561,7 +4070,12 @@ function handleRemoteApprovalDecision(
       actionLabel: "提交输入",
       source,
     }, sourceName);
-    resolvePermissionEntry(permEntry, "allow");
+    resolvePermissionEntry(
+      permEntry,
+      "allow",
+      undefined,
+      resolutionOptions("resolved", true)
+    );
     return true;
   }
 
@@ -3576,7 +4090,12 @@ function handleRemoteApprovalDecision(
       actionLabel: label,
       source,
     }, sourceName);
-    resolvePermissionEntry(permEntry, "allow");
+    resolvePermissionEntry(
+      permEntry,
+      "allow",
+      undefined,
+      resolutionOptions("resolved", true)
+    );
     return true;
   }
 
@@ -3585,7 +4104,12 @@ function handleRemoteApprovalDecision(
     actionLabel: remoteApprovalDecisionLabel(decision),
     source,
   }, sourceName);
-  resolvePermissionEntry(permEntry, decision);
+  resolvePermissionEntry(
+    permEntry,
+    decision,
+    undefined,
+    resolutionOptions("resolved", true)
+  );
   return true;
 }
 
@@ -3633,7 +4157,7 @@ function applyPermissionSuggestion(perm, index, options = {}) {
   return resolved || !options.requireResolved;
 }
 
-  function resolvePermissionEntry(permEntry, behavior, message) {
+  function resolvePermissionEntry(permEntry, behavior, message, options = {}) {
     // Codex notify bubbles have no HTTP connection — route to dedicated cleanup
     if (isPassiveNotifyEntry(permEntry)) {
       dismissPassiveNotify(permEntry, `resolve:${behavior || "unknown"}`);
@@ -3678,12 +4202,20 @@ function applyPermissionSuggestion(perm, index, options = {}) {
   const isAutoResolve = message === "Client disconnected";
   if (isAutoResolve && permEntry.bubble && age < MIN_BUBBLE_DISPLAY_MS && !permEntry._delayedResolve) {
     permEntry._delayedResolve = true;
-    permEntry._delayTimer = setTimeout(() => resolvePermissionEntry(permEntry, behavior, message), MIN_BUBBLE_DISPLAY_MS - age);
+    permEntry._delayTimer = setTimeout(
+      () => resolvePermissionEntry(permEntry, behavior, message, options),
+      MIN_BUBBLE_DISPLAY_MS - age
+    );
     return;
   }
 
-  pendingPermissions.splice(idx, 1);
-  notifyPermissionsChanged("resolved");
+  const disposition = options && options.disposition && typeof options.disposition === "object"
+    ? options.disposition
+    : { reason: "cancelled", decided: false };
+  if (!detachPendingPermission(
+    permEntry,
+    observationDisposition(disposition.reason, disposition.decided, "resolved")
+  )) return;
   notifyPermissionResolved(permEntry, "resolved");
 
   if (permEntry.autoCloseTimer) {
@@ -3706,6 +4238,25 @@ function applyPermissionSuggestion(perm, index, options = {}) {
   // (Bun.serve or node:http on a random localhost port). The plugin then calls
   // the host's in-process Hono route. Plugin sent us a fire-and-forget POST — no HTTP
   // response to complete on this connection.
+  if (permEntry.isFamilyQuestion) {
+    if (!res || res.writableEnded || res.destroyed) return;
+    sendNoDecisionResponse(res, "question native fallback", "question");
+    return;
+  }
+  if (permEntry.isOpencodeV2) {
+    // opencode v2 (issue #1039): the plugin's evaluate hook is BLOCKING on
+    // this very HTTP response — the decision is the response body. 204 keeps
+    // the effect untouched so the native ask UI takes over.
+    if (behavior === "no-decision") {
+      sendOpencodeV2NoDecisionResponse(res, message || "no-decision");
+      return;
+    }
+    const decision = behavior === "deny"
+      ? "deny"
+      : (permEntry.familyAlwaysPicked ? "always" : "allow");
+    sendOpencodeV2Response(res, decision, message);
+    return;
+  }
   if (isOpencodeFamilyEntry(permEntry)) {
     // Autoclose: silent drop — same DND semantics. The host falls back to its
     // built-in terminal or Desktop prompt so the user can answer natively.
@@ -3869,12 +4420,16 @@ function permLog(msg) {
   rotatedAppend(ctx.permDebugLog, `[${new Date().toISOString()}] ${msg}\n`);
 }
 
-// Fire-and-forget POST to the family plugin's reverse bridge. The plugin runs
-// inside the host and does NOT expose the host's own permission route
-// externally — TUI mode has no TCP listener at all (see Phase 2 Spike in
-// docs/plans/plan-opencode-integration.md). Instead the plugin starts a tiny
+// Fire-and-forget POST to the family plugin's reverse bridge. The default TUI
+// has no TCP listener at all (see Phase 2 Spike in
+// docs/plans/plan-opencode-integration.md), so the plugin starts a tiny
 // Bun.serve (CLI/TUI) or node:http (Desktop) listener on a random port and
-// forwards our decision to the host's in-process Hono router via ctx.client._client.post().
+// forwards our decision to the host's router. Under `opencode serve` / `web`
+// the host does listen, but ctx.client targets that listening address; a
+// wildcard address (0.0.0.0 / [::]) is a listen address rather than a
+// destination, and the host process's Bun fetch would hand it to HTTP_PROXY, so
+// the plugin rewrites those hosts to loopback per call (#1065). This side always
+// talks to the plugin's own 127.0.0.1 bridge.
 //
 // Shape: POST http://127.0.0.1:<plugin-port>/reply
 //   Authorization: Bearer <hex token>
@@ -3986,6 +4541,27 @@ function sendCodexPermissionResponse(res, decisionOrBehavior, message) {
 
 function sendQwenCodeNoDecisionResponse(res, reason = "") {
   return sendNoDecisionResponse(res, reason, "qwen-code");
+}
+
+// opencode v2 (issue #1039): the plugin's evaluate hook awaits this response.
+// 200 + JSON { decision: "allow" | "always" | "deny", message? } resolves the
+// await; 204 means "no decision" and leaves the hook's effect untouched so the
+// native prompt wins. Any non-2xx/identity-less answer is treated the same by
+// the plugin.
+function sendOpencodeV2Response(res, decision, message) {
+  if (!res || res.writableEnded || res.destroyed || res.headersSent) return false;
+  const responseBody = JSON.stringify(message ? { decision, message } : { decision });
+  permLog(`opencode-v2 response: ${responseBody}`);
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID,
+  });
+  res.end(responseBody);
+  return true;
+}
+
+function sendOpencodeV2NoDecisionResponse(res, reason = "") {
+  return sendNoDecisionResponse(res, reason, "opencode-v2");
 }
 
 function sendQwenCodePermissionResponse(res, decisionOrBehavior, message) {
@@ -4466,11 +5042,27 @@ function handleDecide(event, behavior) {
   const perm = pendingPermissions.find(p => p.bubble === senderWin);
   permLog(`IPC permission-decide: behavior=${behavior} matched=${!!perm}`);
   if (!perm) return;
+  const resolvedDecisionOptions = resolutionOptions("resolved", true);
+  const unsupportedActionOptions = behavior === "deny-and-focus"
+    ? resolutionOptions("handed_to_terminal", false)
+    : resolutionOptions("cancelled", false);
   if (perm.isCodexUserInputNotify) {
     dismissPassiveNotify(perm, "ipc-decide");
     if (behavior === "codex-user-input-focus" && !perm.host) {
       ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     }
+    return;
+  }
+  if (perm.isFamilyQuestion) {
+    if (perm.questionAwaitingDelivery && behavior !== "deny-and-focus") return;
+    const answers = !perm.questionDeliveryUnconfirmed && behavior && behavior.type === "elicitation-submit"
+      ? validateQuestionAnswers(perm.familyQuestionWire, behavior.answers) : null;
+    if (answers && typeof perm.submitQuestionAnswers === "function") {
+      perm.submitQuestionAnswers(answers);
+      return;
+    }
+    resolvePermissionEntry(perm, "no-decision", "Question native fallback");
+    if (behavior === "deny-and-focus") ctx.focusTerminalForSession(perm.sessionId);
     return;
   }
   if (perm.isCodexNotify || perm.isKimiNotify) {
@@ -4499,13 +5091,18 @@ function handleDecide(event, behavior) {
   }
   if (perm.isCodex) {
     if (behavior === "allow" || behavior === "deny") {
-      resolvePermissionEntry(perm, behavior);
+      resolvePermissionEntry(perm, behavior, undefined, resolvedDecisionOptions);
       return;
     }
     // Codex is blocking on the hook socket. UI actions that mean "handle it
     // elsewhere" must answer no-decision immediately instead of leaving the
     // hook parked until its long timeout.
-    resolvePermissionEntry(perm, "no-decision", `Unsupported Codex bubble action: ${String(behavior)}`);
+    resolvePermissionEntry(
+      perm,
+      "no-decision",
+      `Unsupported Codex bubble action: ${String(behavior)}`,
+      unsupportedActionOptions
+    );
     if (behavior === "deny-and-focus") {
       ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     }
@@ -4513,10 +5110,15 @@ function handleDecide(event, behavior) {
   }
   if (perm.isQwenCode) {
     if (behavior === "allow" || behavior === "deny") {
-      resolvePermissionEntry(perm, behavior);
+      resolvePermissionEntry(perm, behavior, undefined, resolvedDecisionOptions);
       return;
     }
-    resolvePermissionEntry(perm, "no-decision", `Unsupported Qwen bubble action: ${String(behavior)}`);
+    resolvePermissionEntry(
+      perm,
+      "no-decision",
+      `Unsupported Qwen bubble action: ${String(behavior)}`,
+      unsupportedActionOptions
+    );
     if (behavior === "deny-and-focus") {
       ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     }
@@ -4535,7 +5137,7 @@ function handleDecide(event, behavior) {
   }
   if (perm.isCopilotCli) {
     if (behavior === "allow" || behavior === "deny") {
-      resolvePermissionEntry(perm, behavior);
+      resolvePermissionEntry(perm, behavior, undefined, resolvedDecisionOptions);
       return;
     }
     // Mirror Codex/Qwen: any non-allow/deny UI action (deny-and-focus,
@@ -4543,14 +5145,24 @@ function handleDecide(event, behavior) {
     // simple {behavior, message} wire format. Resolve as no-decision so
     // the hook returns empty stdout and Copilot's native menu owns the
     // call rather than the bubble parking until timeout.
-    resolvePermissionEntry(perm, "no-decision", `Unsupported Copilot bubble action: ${String(behavior)}`);
+    resolvePermissionEntry(
+      perm,
+      "no-decision",
+      `Unsupported Copilot bubble action: ${String(behavior)}`,
+      unsupportedActionOptions
+    );
     if (behavior === "deny-and-focus") {
       ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     }
     return;
   }
   if (perm.isAntigravity && behavior !== "allow" && behavior !== "deny") {
-    resolvePermissionEntry(perm, "no-decision", `Unsupported Antigravity bubble action: ${String(behavior)}`);
+    resolvePermissionEntry(
+      perm,
+      "no-decision",
+      `Unsupported Antigravity bubble action: ${String(behavior)}`,
+      unsupportedActionOptions
+    );
     if (behavior === "deny-and-focus") {
       ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     }
@@ -4558,15 +5170,20 @@ function handleDecide(event, behavior) {
   }
   if (perm.isDsh) {
     if (behavior === "allow" || behavior === "deny") {
-      resolvePermissionEntry(perm, behavior);
+      resolvePermissionEntry(perm, behavior, undefined, resolvedDecisionOptions);
       return;
     }
-    resolvePermissionEntry(perm, "no-decision", `Unsupported DSH bubble action: ${String(behavior)}`);
+    resolvePermissionEntry(
+      perm,
+      "no-decision",
+      `Unsupported DSH bubble action: ${String(behavior)}`,
+      unsupportedActionOptions
+    );
     return;
   }
   if (perm.isHermes) {
     if (behavior === "allow" || behavior === "deny") {
-      resolvePermissionEntry(perm, behavior);
+      resolvePermissionEntry(perm, behavior, undefined, resolvedDecisionOptions);
       return;
     }
     if (
@@ -4584,21 +5201,31 @@ function handleDecide(event, behavior) {
       );
       if (!validatedAnswers.ok) {
         permLog(`desktop Hermes elicitation rejected: ${validatedAnswers.reason}`);
-        resolvePermissionEntry(perm, "no-decision", validatedAnswers.reason);
+        resolvePermissionEntry(
+          perm,
+          "no-decision",
+          validatedAnswers.reason,
+          resolutionOptions("cancelled", false)
+        );
         return;
       }
       perm.resolvedUpdatedInput = buildElicitationUpdatedInput(
         wireInput,
         validatedAnswers.answers
       );
-      resolvePermissionEntry(perm, "allow");
+      resolvePermissionEntry(perm, "allow", undefined, resolvedDecisionOptions);
       return;
     }
     // Hermes' opt-in permission gate has no native approval prompt. The plugin
     // maps no-decision to a retryable block, while clarify elicitation maps it
     // to Hermes' native clarification UI. This branch backstops unknown/legacy
     // actions without fabricating allow or deny.
-    resolvePermissionEntry(perm, "no-decision", `Unsupported Hermes bubble action: ${String(behavior)}`);
+    resolvePermissionEntry(
+      perm,
+      "no-decision",
+      `Unsupported Hermes bubble action: ${String(behavior)}`,
+      unsupportedActionOptions
+    );
     if (behavior === "deny-and-focus") {
       ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     }
@@ -4619,14 +5246,19 @@ function handleDecide(event, behavior) {
     );
     if (!validatedAnswers.ok) {
       permLog(`desktop elicitation rejected: ${validatedAnswers.reason}`);
-      resolvePermissionEntry(perm, "no-decision", validatedAnswers.reason);
+      resolvePermissionEntry(
+        perm,
+        "no-decision",
+        validatedAnswers.reason,
+        resolutionOptions("cancelled", false)
+      );
       return;
     }
     perm.resolvedUpdatedInput = buildElicitationUpdatedInput(
       wireInput,
       validatedAnswers.answers
     );
-    resolvePermissionEntry(perm, "allow");
+    resolvePermissionEntry(perm, "allow", undefined, resolvedDecisionOptions);
     return;
   }
   // Plan feedback: "Tell Claude what to change" textarea submitted from the
@@ -4650,27 +5282,45 @@ function handleDecide(event, behavior) {
     }
     if (feedback.length > PLAN_FEEDBACK_MAX_LENGTH) {
       permLog(`desktop plan feedback rejected: exceeds ${PLAN_FEEDBACK_MAX_LENGTH} characters`);
-      resolvePermissionEntry(perm, "no-decision", "Plan feedback is too long");
+      resolvePermissionEntry(
+        perm,
+        "no-decision",
+        "Plan feedback is too long",
+        resolutionOptions("cancelled", false)
+      );
       return;
     }
-    resolvePermissionEntry(perm, "deny", feedback);
+    resolvePermissionEntry(perm, "deny", feedback, resolvedDecisionOptions);
     return;
   }
   // opencode-family "Always" button — map to reply="always" via resolvePermissionEntry
   if (behavior === "family-always") {
     perm.familyAlwaysPicked = true;
-    resolvePermissionEntry(perm, "allow");
+    resolvePermissionEntry(perm, "allow", undefined, resolvedDecisionOptions);
     return;
   }
   // "suggestion:N" — user picked a permission suggestion
   if (typeof behavior === "string" && behavior.startsWith("suggestion:")) {
     const idx = parseInt(behavior.split(":")[1], 10);
-    if (!applyPermissionSuggestion(perm, idx)) { resolvePermissionEntry(perm, "deny", "Invalid suggestion index"); return; }
-    resolvePermissionEntry(perm, "allow");
+    if (!applyPermissionSuggestion(perm, idx)) {
+      resolvePermissionEntry(
+        perm,
+        "deny",
+        "Invalid suggestion index",
+        resolutionOptions("resolved", true)
+      );
+      return;
+    }
+    resolvePermissionEntry(perm, "allow", undefined, resolvedDecisionOptions);
   } else if (behavior === "deny-and-focus") {
     dismissPermissionForTerminal(perm);
   } else {
-    resolvePermissionEntry(perm, behavior === "allow" ? "allow" : "deny");
+    resolvePermissionEntry(
+      perm,
+      behavior === "allow" ? "allow" : "deny",
+      undefined,
+      resolvedDecisionOptions
+    );
   }
 }
 
@@ -4864,13 +5514,14 @@ function findKimiNotifyEntryBySession(sessionId) {
 }
 
 function dismissPassiveNotify(permEntry, reason = "unknown") {
-  const idx = pendingPermissions.indexOf(permEntry);
-  if (idx === -1) return;
+  if (!pendingPermissions.includes(permEntry)) return;
   permLog(
     `passive notify dismiss: agent=${getPassiveNotifyAgentId(permEntry)} session=${permEntry.sessionId || "(none)"} reason=${reason}`
   );
-  pendingPermissions.splice(idx, 1);
-  notifyPermissionsChanged("passive-dismissed");
+  detachPendingPermission(
+    permEntry,
+    observationDisposition("cancelled", false, "passive-dismissed")
+  );
   if (permEntry.autoExpireTimer) clearTimeout(permEntry.autoExpireTimer);
   if (permEntry.hideTimer) clearTimeout(permEntry.hideTimer);
   hidePermissionBubbleSafely(permEntry);
@@ -4921,11 +5572,10 @@ function refreshPassiveNotifyAutoClose() {
 }
 
 function dismissInteractivePermissionWithoutDecision(perm, reason) {
-  const idx = pendingPermissions.indexOf(perm);
-  if (idx !== -1) {
-    pendingPermissions.splice(idx, 1);
-    notifyPermissionsChanged("dismissed");
-  }
+  detachPendingPermission(
+    perm,
+    observationDisposition("suppressed", false, "dismissed")
+  );
   cancelRemoteApproval(perm);
   if (perm._delayTimer) { clearTimeout(perm._delayTimer); perm._delayTimer = null; }
   if (perm.autoCloseTimer) { clearTimeout(perm.autoCloseTimer); perm.autoCloseTimer = null; }
@@ -4936,10 +5586,16 @@ function dismissInteractivePermissionWithoutDecision(perm, reason) {
   // Do not answer approval requests on the user's behalf. Dropping the UI
   // means Codex/Antigravity receive no decision, CC/CodeBuddy fall back
   // via socket close, and opencode falls back by receiving no bridge reply.
-  if (perm.isCodex) {
+  if (perm.isFamilyQuestion) {
+    sendNoDecisionResponse(perm.res, reason || "question-dismissed", "question");
+  } else if (perm.isCodex) {
     sendCodexNoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isQwenCode) {
     sendQwenCodeNoDecisionResponse(perm.res, reason || "permission-dismissed");
+  } else if (perm.isOpencodeV2) {
+    // v2 blocks on this connection: release the await explicitly instead of
+    // relying on socket close (same contract as codex/qwen above).
+    sendOpencodeV2NoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isZcode) {
     sendZcodeNoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isCopilotCli) {
@@ -5022,9 +5678,12 @@ function dismissOpencodeFamilyPermissionResolvedExternally(identity) {
   // Establish non-liveness first for every exact duplicate. A late click,
   // hotkey, automation callback, or timer will now fail its pending-membership
   // guard before any slower renderer/notification teardown runs.
+  const externalDisposition = observationDisposition("handed_to_terminal", true, "resolved-externally");
   for (const entry of matches) {
     const index = pendingPermissions.indexOf(entry);
-    if (index !== -1) pendingPermissions.splice(index, 1);
+    if (index === -1) continue;
+    pendingPermissions.splice(index, 1);
+    retractMobilePermissionEntry(entry, externalDisposition);
   }
   notifyPermissionsChanged("resolved-externally");
 
@@ -5072,6 +5731,29 @@ function dismissPermissionsByAgent(agentId, options = {}) {
   repositionDependentBubbles();
   syncPermissionShortcuts();
   permLog(`dismissPermissionsByAgent(${agentId}${subagentOnly ? ", subagent-only" : ""}): cleared ${toDismiss.length}`);
+  return toDismiss.length;
+}
+
+// Session-scoped retirement used by Codex archive lifecycle (#655). Drops only
+// the surfaces owned by this session: passive notify/user-input cards are
+// cleared, and any interactive prompt is handed back with the normal
+// no-decision semantics — never an allow/deny on the user's behalf.
+function dismissPermissionsForSession(sessionId, reason = "session-dismissed") {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return 0;
+  const toDismiss = pendingPermissions.filter((p) => p && p.sessionId === id);
+  if (toDismiss.length === 0) return 0;
+  for (const perm of toDismiss) {
+    if (isPassiveNotifyEntry(perm)) {
+      dismissPassiveNotify(perm, reason);
+      continue;
+    }
+    dismissInteractivePermissionWithoutDecision(perm, reason);
+  }
+  repositionBubbles();
+  repositionDependentBubbles();
+  syncPermissionShortcuts();
+  permLog(`dismissPermissionsForSession(${id}): cleared ${toDismiss.length}`);
   return toDismiss.length;
 }
 
@@ -5162,6 +5844,7 @@ function cleanup() {
 
 return {
   showPermissionBubble, resolvePermissionEntry,
+  permissionObservation,
   sendPermissionResponse, repositionBubbles, permLog,
   pendingPermissions, PASSTHROUGH_TOOLS,
   getVisibleBubbleBounds,
@@ -5173,6 +5856,7 @@ return {
   reconcilePermissionPresentation,
   addPendingPermission, removePendingPermission,
   isPermissionEntryLive, canAutoResolvePendingPermission,
+  wouldAutoAllowPermission,
   beginSessionTrustConfirmation, endSessionTrustConfirmation,
   syncPermissionBubbleContent,
   maybeStartRemoteApproval,
@@ -5190,10 +5874,13 @@ return {
   refreshPassiveNotifyAutoClose,
   refreshPermissionAutoCloseForPolicy,
   dismissPermissionsByAgent, dismissInteractivePermissionBubbles,
+  dismissPermissionsForSession,
   dismissPermissionsForDnd,
   dismissOpencodeFamilyPermissionResolvedExternally,
   syncPermissionShortcuts,
   replyOpencodeFamilyPermission,
+  sendOpencodeV2Response,
+  sendOpencodeV2NoDecisionResponse,
   // Exposed for the payload↔renderer contract test (plan §3.5/§9): the
   // builder closes over ctx, so it can only be reached through an instance.
   buildPermissionBubblePayload,
@@ -5224,4 +5911,6 @@ module.exports.__test = {
   areBubbleBoundsSafe,
   stackHeightForSizes,
   computeQueueCommitDeadline,
+  queueAgentLabel,
+  buildPermissionFocusEntry,
 };

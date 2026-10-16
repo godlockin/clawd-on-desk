@@ -6,7 +6,7 @@ const DEFAULT_MAX_SESSIONS = 200;
 const DEFAULT_MAX_CLOSED_TURNS = 512;
 
 const START_EVENTS = new Set(["UserPromptSubmit", "event_msg:task_started"]);
-const TERMINAL_EVENTS = new Set(["Stop", "event_msg:task_complete", "event_msg:turn_aborted"]);
+const TERMINAL_EVENTS = new Set(["Stop", "Interrupt", "event_msg:task_complete", "event_msg:turn_aborted"]);
 const WORKING_STATES = new Set(["thinking", "working", "juggling", "sweeping"]);
 
 function createCodexTurnFence(options = {}) {
@@ -104,6 +104,26 @@ function createCodexTurnFence(options = {}) {
       sessionId,
       turnId: normalizeCodexTurnId(rawInput.turnId),
     };
+    // Only compaction cue events take this housekeeping branch. Manual
+    // compaction is valid while no turn is open. It is presentation
+    // housekeeping, not work that can reopen a completed turn. JSONL replay
+    // and timestamp guards run at ingestion before this fence.
+    if (input.state === "sweeping"
+      && (input.event === "PreCompact" || input.event === "PostCompact"
+        || input.event === "event_msg:context_compacted")) {
+      const owner = records.get(sessionId);
+      // A post-turn/manual compact may finish after its old turn closed, but
+      // must not overwrite another turn that has since started. With an open
+      // id-less turn, an identified completion is not proven to belong to it.
+      if (owner && !owner.terminalLatch && input.turnId
+        && input.turnId !== owner.currentTurnId) {
+        const reason = owner.closedTurnIds.has(input.turnId)
+          ? "closed-turn-id" : "unexpected-distinct-work";
+        logDecision("drop", input, reason);
+        return { accept: false, reason };
+      }
+      return { accept: true, reason: "housekeeping" };
+    }
     const syntheticOpenStart = input.syntheticBackfill === true
       && input.turnBoundaryOpen === true
       && !!input.turnId;
@@ -172,6 +192,27 @@ function createCodexTurnFence(options = {}) {
     closedLru.clear();
   }
 
+  // Narrow per-session reset used when a session is retired (archived). Global
+  // `clear()` would drop unrelated live sessions' fences.
+  function clearSession(sessionId) {
+    const id = typeof sessionId === "string" ? sessionId : "";
+    if (!id) return false;
+    const record = records.get(id);
+    const had = !!record;
+    deleteRecord(id, null);
+    if (had) return true;
+    // A session with only tombstoned turns but no live record still owns
+    // closedLru entries that must not leak into a recreated session.
+    let removed = false;
+    for (const [key, entry] of [...closedLru]) {
+      if (entry && entry.sessionId === id) {
+        closedLru.delete(key);
+        removed = true;
+      }
+    }
+    return removed;
+  }
+
   function getSnapshot(sessionId) {
     const record = records.get(sessionId);
     if (!record) return null;
@@ -186,6 +227,7 @@ function createCodexTurnFence(options = {}) {
   return {
     observe,
     clear,
+    clearSession,
     getSnapshot,
     get size() { return records.size; },
     get closedSize() { return closedLru.size; },

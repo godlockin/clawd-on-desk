@@ -16,8 +16,13 @@ const {
 const { EVENT_RETENTION_DAYS } = require("./recap-store");
 
 const MAX_PERSISTED_RECORD_BYTES = 2048;
-const MAX_RETAINED_RESTORE_BYTES = 64 * 1024 * 1024;
-const MAX_RETAINED_RESTORE_RECORDS = 100000;
+// Bounds on one startup reconciliation. The async reader hands each accepted
+// record to its caller instead of collecting them, so these cap the read and
+// compute work and the size of the dedupe key tables. The record cap is the
+// only guard against floods of blank or corrupt lines, which are short enough
+// to fit many more under the byte cap.
+const MAX_RETAINED_RESTORE_BYTES = 256 * 1024 * 1024;
+const MAX_RETAINED_RESTORE_RECORDS = 1000000;
 const RESTORE_READ_CHUNK_BYTES = 64 * 1024;
 const HASH_PATTERN = /^hmac:[A-Za-z0-9_-]{40,64}$/;
 
@@ -206,16 +211,22 @@ function createRecapJournal(options = {}) {
       throw err;
     }
     const records = [];
-    const dedupeKeys = new Set();
+    const dedupeKeys = new Map();
     let warnedInvalid = false;
     for (const line of contents.split("\n")) {
-      const result = normalizeLine(line, localDate, records, dedupeKeys, !warnedInvalid);
+      const result = normalizeLine(
+        line,
+        localDate,
+        (record) => records.push(record),
+        dedupeKeys,
+        !warnedInvalid
+      );
       if (result === "invalid") warnedInvalid = true;
     }
     return records;
   }
 
-  function normalizeLine(line, localDate, records, dedupeKeys = null, warnInvalid = true) {
+  function normalizeLine(line, localDate, accept, dedupeKeys = null, warnInvalid = true) {
     if (!line.trim()) return "blank";
     if (Buffer.byteLength(line, "utf8") > MAX_PERSISTED_RECORD_BYTES) {
       if (warnInvalid) warn("Clawd: ignored oversized recap journal line");
@@ -233,9 +244,9 @@ function createRecapJournal(options = {}) {
     }
     if (normalized.dedupeKeyHash && dedupeKeys) {
       if (dedupeKeys.has(normalized.dedupeKeyHash)) return "duplicate";
-      dedupeKeys.add(normalized.dedupeKeyHash);
+      dedupeKeys.set(normalized.dedupeKeyHash, normalized.localDate);
     }
-    records.push(normalized);
+    accept(normalized);
     return "accepted";
   }
 
@@ -255,10 +266,10 @@ function createRecapJournal(options = {}) {
     return records;
   }
 
-  async function loadRetainedAsync(
-    anchorDate = freezeLocalTime(now(), getTimeZone()).localDate,
-    optionsValue = {}
-  ) {
+  async function forEachRetainedAsync(anchorDate, onRecord, optionsValue = {}) {
+    if (typeof onRecord !== "function") {
+      throw new TypeError("forEachRetainedAsync requires an onRecord callback");
+    }
     const dates = retainedDates(anchorDate);
     const snapshots = [];
     const generation = ++memoryGeneration;
@@ -285,10 +296,12 @@ function createRecapJournal(options = {}) {
       }
     }
 
-    if (totalBytes > maxBytes) return { dates, records: [], truncated: true };
+    if (totalBytes > maxBytes) return { dates, truncated: true };
 
-    const records = [];
-    const retainedDedupeKeys = new Set();
+    // Hash -> local date of the first accepted occurrence. Reads run from the
+    // earliest date forward, so this is the disk copy a restart keeps. The
+    // caller uses it to skip live replays of tickets already projected here.
+    const restoredDedupeKeys = new Map();
     const yieldEvery = Number.isSafeInteger(optionsValue.yieldEvery) && optionsValue.yieldEvery > 0
       ? optionsValue.yieldEvery
       : 250;
@@ -303,7 +316,7 @@ function createRecapJournal(options = {}) {
       const decoder = new StringDecoder("utf8");
       while (position < snapshot.size) {
         if (generation !== memoryGeneration) {
-          return { dates, records: [], truncated: false, aborted: true };
+          return { dates, truncated: false, aborted: true };
         }
         const requested = Math.min(RESTORE_READ_CHUNK_BYTES, snapshot.size - position);
         const buffer = Buffer.allocUnsafe(requested);
@@ -322,7 +335,7 @@ function createRecapJournal(options = {}) {
           if (newline === -1) {
             await yieldToMain();
             if (generation !== memoryGeneration) {
-              return { dates, records: [], truncated: false, aborted: true };
+              return { dates, truncated: false, aborted: true };
             }
             continue;
           }
@@ -335,14 +348,14 @@ function createRecapJournal(options = {}) {
         for (const line of lines) {
           processed += 1;
           if (processed > maxRecords) {
-            return { dates, records: [], truncated: true };
+            return { dates, truncated: true };
           }
           if (line.trim()) {
             const result = normalizeLine(
               line,
               snapshot.localDate,
-              records,
-              retainedDedupeKeys,
+              onRecord,
+              restoredDedupeKeys,
               !warnedInvalid
             );
             if (result === "invalid") warnedInvalid = true;
@@ -350,13 +363,13 @@ function createRecapJournal(options = {}) {
           if (processed % yieldEvery === 0) {
             await yieldToMain();
             if (generation !== memoryGeneration) {
-              return { dates, records: [], truncated: false, aborted: true };
+              return { dates, truncated: false, aborted: true };
             }
           }
         }
         if (Buffer.byteLength(pending, "utf8") > MAX_PERSISTED_RECORD_BYTES) {
           processed += 1;
-          if (processed > maxRecords) return { dates, records: [], truncated: true };
+          if (processed > maxRecords) return { dates, truncated: true };
           if (!warnedInvalid) warn("Clawd: ignored oversized recap journal line");
           warnedInvalid = true;
           pending = "";
@@ -366,33 +379,33 @@ function createRecapJournal(options = {}) {
         // events directory on Windows and resetMemory can abort promptly.
         await yieldToMain();
         if (generation !== memoryGeneration) {
-          return { dates, records: [], truncated: false, aborted: true };
+          return { dates, truncated: false, aborted: true };
         }
       }
       pending += decoder.end();
       if (!discardingOversizedLine && pending.trim()) {
         processed += 1;
-        if (processed > maxRecords) return { dates, records: [], truncated: true };
+        if (processed > maxRecords) return { dates, truncated: true };
         const result = normalizeLine(
           pending,
           snapshot.localDate,
-          records,
-          retainedDedupeKeys,
+          onRecord,
+          restoredDedupeKeys,
           !warnedInvalid
         );
         if (result === "invalid") warnedInvalid = true;
       }
       await yieldToMain();
       if (generation !== memoryGeneration) {
-        return { dates, records: [], truncated: false, aborted: true };
+        return { dates, truncated: false, aborted: true };
       }
     }
     if (generation === memoryGeneration) {
-      for (const record of records) {
-        rememberDedupe(record.dedupeKeyHash, record.localDate);
+      for (const [hash, localDate] of restoredDedupeKeys) {
+        rememberDedupe(hash, localDate);
       }
     }
-    return { dates, records, truncated: false };
+    return { dates, truncated: false, restoredDedupeKeys };
   }
 
   function resetMemory() {
@@ -425,8 +438,8 @@ function createRecapJournal(options = {}) {
     append,
     buildRecord,
     eventPath,
+    forEachRetainedAsync,
     loadRetained,
-    loadRetainedAsync,
     prune,
     readDate,
     resetMemory,
