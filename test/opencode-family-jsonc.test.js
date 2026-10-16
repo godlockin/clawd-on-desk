@@ -622,7 +622,7 @@ describe("opencode JSONC installer — merged config semantics (#825)", () => {
     assert.deepStrictEqual(parseJsonc(fs.readFileSync(jsonPath, "utf8")).plugin, ["@vendor/keep"]);
   });
 
-  it("uninstall now claims what install claims — stale absolute paths by basename, never npm specifiers", () => {
+  it("uninstall removes the exact owned path but preserves unproven basename matches and npm specifiers", () => {
     const dir = ocDir();
     const jsonPath = inDir(
       dir,
@@ -630,11 +630,11 @@ describe("opencode JSONC installer — merged config semantics (#825)", () => {
       `{\n  "plugin": ["${OC_PLUGIN_DIR}", "/old/install/opencode-plugin", "opencode-wakatime", "@scope/opencode-plugin"]\n}`
     );
     const res = unregisterOpencodePlugin({ silent: true, configPath: defaultConfigPath(dir), pluginDir: OC_PLUGIN_DIR });
-    assert.strictEqual(res.removed, 2);
+    assert.strictEqual(res.removed, 1);
     assert.deepStrictEqual(
       parseJsonc(fs.readFileSync(jsonPath, "utf8")).plugin,
-      ["opencode-wakatime", "@scope/opencode-plugin"],
-      "package specifiers are not absolute paths and must survive"
+      ["/old/install/opencode-plugin", "opencode-wakatime", "@scope/opencode-plugin"],
+      "basename-only absolute paths and package specifiers must survive"
     );
   });
 

@@ -36,6 +36,7 @@ const {
   REQUIRED_STATES,
   FULL_SLEEP_REQUIRED_STATES,
   MINI_REQUIRED_STATES,
+  MINI_OPTIONAL_PEEK_STATES,
   VISUAL_FALLBACK_STATES,
   isPlainObject,
   hasNonEmptyArray,
@@ -309,7 +310,14 @@ const assetsDir = assetsOverride ? path.resolve(assetsOverride) : path.join(reso
 const assetsDirExists = fs.existsSync(assetsDir);
 check(assetsDirExists, `assets/ directory exists`);
 
-const referencedFiles = new Set(themeSchema.collectRequiredAssetFiles(raw));
+// Selectable-only idle visuals are optional at runtime. Check them below as
+// warnings, not as missing required visual assets.
+const referencedFiles = new Set(themeSchema.collectRequiredAssetFiles({
+  ...raw, idleVisualOptions: undefined,
+}));
+const idleVisualOptions = Object.prototype.hasOwnProperty.call(raw, "idleVisualOptions")
+  ? themeSchema.normalizeIdleVisualOptions(raw.idleVisualOptions, (message) => warn(false, message))
+  : [];
 let missingCount = 0;
 let presentCount = 0;
 
@@ -328,6 +336,14 @@ if (assetsDirExists) {
     console.log(`  ${PASS} All ${presentCount} referenced assets exist`);
   } else {
     console.log(`  ${FAIL} ${missingCount}/${referencedFiles.size} assets missing`);
+  }
+
+  for (const entry of idleVisualOptions) {
+    const file = entry.file;
+    let exists = false;
+    try { exists = fs.statSync(path.join(assetsDir, file)).isFile(); } catch {}
+    if (exists) referencedFiles.add(file);
+    else warn(false, `idleVisualOptions entry dropped: missing asset ${file}`);
   }
 
   // Check for orphan files (in assets/ but not referenced)
@@ -428,6 +444,22 @@ if (raw.hitBoxes) {
   warn(false, "hitBoxes not specified (will use defaults)");
 }
 
+// workingTiers / jugglingTiers: optional per-tier `files` pool
+const tierFileErrors = themeSchema.validateTierFiles(raw);
+for (const message of tierFileErrors) check(false, message);
+for (const groupName of ["workingTiers", "jugglingTiers"]) {
+  if (!Array.isArray(raw[groupName])) continue;
+  raw[groupName].forEach((tier, index) => {
+    if (!isPlainObject(tier) || tierFileErrors.length > 0) return;
+    if (Array.isArray(tier.files) && typeof tier.file === "string" && tier.file) {
+      warn(
+        tier.files.includes(tier.file),
+        `${groupName}[${index}]: "file" is ignored next to "files" (only older Clawd builds read it); list it in "files" too`
+      );
+    }
+  });
+}
+
 // workingTiers sort order
 if (raw.workingTiers && raw.workingTiers.length > 1) {
   const sorted = [...raw.workingTiers].sort((a, b) => b.minSessions - a.minSessions);
@@ -443,6 +475,14 @@ if (isPlainObject(raw.miniMode) && raw.miniMode.supported !== false) {
     check(
       raw.miniMode.states && Array.isArray(raw.miniMode.states[s]) && raw.miniMode.states[s].length > 0,
       `miniMode.supported=true requires miniMode.states.${s}`
+    );
+  }
+  for (const s of MINI_OPTIONAL_PEEK_STATES) {
+    if (!Object.prototype.hasOwnProperty.call(raw.miniMode.states || {}, s)) continue;
+    check(
+      Array.isArray(raw.miniMode.states[s]) && raw.miniMode.states[s].length > 0
+        && raw.miniMode.states[s].every((file) => typeof file === "string" && !!file),
+      `miniMode.states.${s} is a non-empty file array when declared`
     );
   }
 }
@@ -516,11 +556,16 @@ function collectVariantAssetFiles(variantSpec) {
   const files = new Set();
   if (!variantSpec || typeof variantSpec !== "object") return files;
   if (typeof variantSpec.preview === "string") files.add(variantSpec.preview);
-  for (const field of ["workingTiers", "jugglingTiers", "idleAnimations"]) {
+  for (const field of ["workingTiers", "jugglingTiers"]) {
     if (Array.isArray(variantSpec[field])) {
       for (const entry of variantSpec[field]) {
-        if (entry && typeof entry.file === "string") files.add(entry.file);
+        for (const file of themeSchema.getTierFiles(entry)) files.add(file);
       }
+    }
+  }
+  if (Array.isArray(variantSpec.idleAnimations)) {
+    for (const entry of variantSpec.idleAnimations) {
+      if (entry && typeof entry.file === "string") files.add(entry.file);
     }
   }
   for (const field of ["wideHitboxFiles", "sleepingHitboxFiles"]) {
@@ -542,11 +587,16 @@ function collectVariantAssetFiles(variantSpec) {
 // that the allow-list governs — used for rule 4 "new asset must have objectScale entry".
 function collectBaseAssetFiles(base) {
   const files = new Set();
-  for (const field of ["workingTiers", "jugglingTiers", "idleAnimations"]) {
+  for (const field of ["workingTiers", "jugglingTiers"]) {
     if (Array.isArray(base[field])) {
       for (const entry of base[field]) {
-        if (entry && typeof entry.file === "string") files.add(entry.file);
+        for (const file of themeSchema.getTierFiles(entry)) files.add(file);
       }
+    }
+  }
+  if (Array.isArray(base.idleAnimations)) {
+    for (const entry of base.idleAnimations) {
+      if (entry && typeof entry.file === "string") files.add(entry.file);
     }
   }
   if (base.states) {
@@ -608,9 +658,21 @@ if (raw.variants !== undefined) {
         }
       }
 
+      for (const message of themeSchema.validateTierFiles(variantSpec)) {
+        check(false, `variant "${variantId}": ${message}`);
+      }
+
       // Rule 3: asset existence (format-agnostic: svg/apng/gif)
       const variantAssets = collectVariantAssetFiles(variantSpec);
+      const variantIdleOptions = Object.prototype.hasOwnProperty.call(variantSpec, "idleVisualOptions")
+        ? themeSchema.normalizeIdleVisualOptions(variantSpec.idleVisualOptions, (message) => warn(false, `variant "${variantId}": ${message}`))
+        : [];
       if (assetsDirExists) {
+        for (const entry of variantIdleOptions) {
+          let exists = false;
+          try { exists = fs.statSync(path.join(assetsDir, entry.file)).isFile(); } catch {}
+          if (!exists) warn(false, `variant "${variantId}" idleVisualOptions entry dropped: missing asset ${entry.file}`);
+        }
         for (const file of variantAssets) {
           const basename = path.basename(file);
           const filePath = path.join(assetsDir, basename);
@@ -653,7 +715,7 @@ if (raw.variants !== undefined) {
       if (variantSpec.workingTiers && !variantSpec.displayHintMap) {
         const newTierFiles = new Set();
         for (const entry of variantSpec.workingTiers) {
-          if (entry && typeof entry.file === "string") newTierFiles.add(path.basename(entry.file));
+          for (const file of themeSchema.getTierFiles(entry)) newTierFiles.add(path.basename(file));
         }
         const hintOverlap = [];
         for (const [hintKey, hintValue] of Object.entries(baseDisplayHintMap)) {

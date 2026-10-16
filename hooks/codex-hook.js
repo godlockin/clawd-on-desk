@@ -25,10 +25,12 @@ const {
   readStdinJson,
   getPlatformConfig,
   applyOrcaPaneKey,
+  herdrPaneFromEnv,
   processAlive,
 } = require("./shared-process");
 const {
   ROLE_UNKNOWN,
+  ROLE_SUBAGENT,
   classifyHookPayload,
   classifySessionMeta,
 } = require("./codex-subagent-fields");
@@ -37,6 +39,13 @@ const {
 } = require("./codex-assistant-output");
 const { readCodexThreadName } = require("./codex-session-index");
 const {
+  CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+  isCodexAmbientSuggestionPrompt,
+  isCodexClientEphemeralPayload,
+  isCodexMemoryWorkerPayload,
+} = require("./codex-internal-worker");
+const {
+  CODEX_DEFAULT_SESSION_ID,
   isCodexCliOriginator,
   isCodexDesktopOriginator,
 } = require("./codex-originator");
@@ -134,9 +143,16 @@ const EVENT_TO_STATE = {
   UserPromptSubmit: "thinking",
   PreToolUse: "working",
   PostToolUse: "working",
+  PreCompact: "sweeping",
+  PostCompact: "sweeping",
+  Interrupt: "idle",
   // Placeholder: server.js resolves official Codex Stop to attention/idle
   // using the per-turn tool-use map it owns.
   Stop: "idle",
+  // Thread teardown (archive / delete / idle unload / shutdown). The server
+  // retires a local Codex row on this unless it still holds a replyable
+  // completion mapping.
+  SessionEnd: "sleeping",
 };
 
 function getCodexPermissionTimeoutMs() {
@@ -148,8 +164,9 @@ function getCodexPermissionTimeoutMs() {
 function extractCodexSessionIdFromTranscriptPath(transcriptPath) {
   if (typeof transcriptPath !== "string" || !transcriptPath.trim()) return null;
   const fileName = path.basename(transcriptPath.replace(/\\/g, "/"));
+  const uuid = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})";
   const match = fileName.match(
-    /^rollout-.+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
+    new RegExp(`^rollout-.+-${uuid}(?:_${uuid})?\\.jsonl$`, "i")
   );
   return match ? match[1] : null;
 }
@@ -157,7 +174,7 @@ function extractCodexSessionIdFromTranscriptPath(transcriptPath) {
 function normalizeCodexSessionId(value, transcriptPath = "") {
   const transcriptSessionId = extractCodexSessionIdFromTranscriptPath(transcriptPath);
   const raw = transcriptSessionId
-    || (typeof value === "string" && value.trim() ? value.trim() : "default");
+    || (typeof value === "string" && value.trim() ? value.trim() : CODEX_DEFAULT_SESSION_ID);
   return raw.startsWith("codex:") ? raw : `codex:${raw}`;
 }
 
@@ -275,11 +292,48 @@ function firstString(...values) {
   return "";
 }
 
-function applyCodexSessionMetaFields(body, payload, sessionMeta) {
+function isCodexSessionStartLifecycleSource(payload) {
+  // Official SessionStart.source describes the lifecycle cause, not the
+  // session_meta source (CLI, exec, internal, or structured child provenance).
+  return payload.hook_event_name === "SessionStart"
+    && ["startup", "resume", "clear", "compact", "fork"].includes(payload.source);
+}
+
+function resolveCodexOriginator(payload, sessionMeta, options = {}) {
   const source = payload && typeof payload === "object" ? payload : {};
   const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
-  const originator = firstString(meta.originator, source.originator);
-  let codexSource = firstString(meta.source, source.source);
+  const explicit = firstString(meta.originator, source.originator);
+  if (explicit) return explicit;
+  // Desktop ephemeral hooks have no rollout/session_meta. Only an audited
+  // Desktop env value can supply their missing originator; an arbitrary client
+  // override must not change PID selection or server-side Desktop routing.
+  const env = options.env || process.env;
+  const inherited = firstString(env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE);
+  // Missing/blank string fields permit inheritance; a present malformed or
+  // structured value is declared provenance and must not become Desktop.
+  const hasDeclaredProvenance = [meta, source].some((record, index) =>
+    ["originator", "source"].some((key) => Object.prototype.hasOwnProperty.call(record, key)
+      && !(index === 1 && key === "source" && isCodexSessionStartLifecycleSource(source))
+      && (typeof record[key] !== "string" || record[key].trim() !== "")));
+  return (options.platform || process.platform) === "win32"
+    && options.allowDesktopEnvOriginator !== false
+    && !env.CLAWD_REMOTE && !env.CLAWD_WSL_DISTRO
+    && source.headless !== true && meta.headless !== true
+    && !hasDeclaredProvenance
+    && classifyHookPayload(source) !== ROLE_SUBAGENT
+    && classifySessionMeta(meta) !== ROLE_SUBAGENT
+    && isCodexClientEphemeralPayload(source, { env })
+    && isCodexDesktopOriginator(inherited)
+    ? inherited : "";
+}
+
+function applyCodexSessionMetaFields(body, payload, sessionMeta, options = {}) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
+  const originator = resolveCodexOriginator(payload, sessionMeta, options);
+  // Keep the event's lifecycle cause separate from outgoing session provenance.
+  let codexSource = firstString(meta.source,
+    isCodexSessionStartLifecycleSource(source) ? "" : source.source);
   const metaSubagent = meta.source && typeof meta.source === "object"
     ? meta.source.subagent
     : null;
@@ -321,10 +375,15 @@ function applyCodexSessionMetaFields(body, payload, sessionMeta) {
   if (parentThreadId) body.codex_parent_thread_id = parentThreadId.slice(0, 200);
 }
 
-function isCodexDesktopSession(payload, sessionMeta) {
-  const source = payload && typeof payload === "object" ? payload : {};
-  const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
-  return isCodexDesktopOriginator(firstString(meta.originator, source.originator));
+function isCodexDesktopSession(payload, sessionMeta, options = {}) {
+  return isCodexDesktopOriginator(resolveCodexOriginator(payload, sessionMeta, options));
+}
+
+function shouldPreferCodexAgentPid(payload, sessionMeta, options) {
+  return options.allowDesktopPidPreference !== false
+    && payload.headless !== true
+    && !["exec", "internal"].includes(firstString(sessionMeta && sessionMeta.source, payload.source))
+    && isCodexDesktopSession(payload, sessionMeta, options);
 }
 
 function shouldReportForegroundWtHwnd(event) {
@@ -333,13 +392,14 @@ function shouldReportForegroundWtHwnd(event) {
 
 function applyLocalProcessFields(body, resolve, options = {}) {
   // #634: cross-process pid cache via the shared resolver. Lifecycle keys off
-  // the state event (permission bodies carry no event → "event"); codex has no
-  // SessionEnd hook and Stop is deliberately NOT "end" (turn completion). The
-  // cacheable guard compares against the exact normalizeCodexSessionId
-  // fallback, so an id-less payload (raw "default", cf. #583) never keys a
-  // shared cache entry.
+  // the state event (permission bodies carry no event → "event"); SessionEnd is
+  // "end" so a Windows pid cache entry is cleared with the session, while Stop
+  // is deliberately NOT "end" (turn completion, not teardown). The cacheable
+  // guard compares against the exact normalizeCodexSessionId fallback, so an
+  // id-less payload (raw "default", cf. #583) never keys a shared cache entry.
   const lifecycle = options.event === "SessionStart" ? "start"
     : options.event === "UserPromptSubmit" ? "prompt"
+    : options.event === "SessionEnd" ? "end"
     : "event";
   const metadata = resolve({
     namespace: "codex",
@@ -347,9 +407,16 @@ function applyLocalProcessFields(body, resolve, options = {}) {
     cacheCwd: body.cwd || "",
     lifecycle,
     cacheable: body.session_id !== "codex:default" && !!body.cwd,
+    ...(options.preferAgentPid ? { preferAgentPid: true } : {}),
   });
   const { stablePid, agentPid, detectedEditor, pidChain, foregroundWtHwnd, tmuxSocket, tmuxClient, headless } = metadata;
-  const sourcePid = options.preferAgentPid && agentPid ? agentPid : stablePid;
+  // Desktop's app-server hosts its threads, so its sessions point at the agent.
+  // Inside a herdr pane (#1139) the same originator only means the codex
+  // inherited CODEX_INTERNAL_ORIGINATOR_OVERRIDE from a Codex Desktop shell that
+  // started the herdr server: the process is a terminal codex, and the window to
+  // raise is the terminal hosting the herdr client, like any other CLI session.
+  const preferAgentPid = options.preferAgentPid === true && !herdrPaneFromEnv();
+  const sourcePid = preferAgentPid && agentPid ? agentPid : stablePid;
   body.source_pid = sourcePid;
   if (detectedEditor) body.editor = detectedEditor;
   if (agentPid) body.agent_pid = agentPid;
@@ -455,7 +522,7 @@ function buildPermissionBody(payload, resolve, options = {}) {
   // fail-closes subagents whose originator is not an audited interactive client.
   const codexRole = resolveCodexSessionRole(payload, sessionMeta);
   if (codexRole !== ROLE_UNKNOWN) body.codex_session_role = codexRole;
-  applyCodexSessionMetaFields(body, payload, sessionMeta);
+  applyCodexSessionMetaFields(body, payload, sessionMeta, options);
 
   const toolUseId = normalizeToolUseId(payload.tool_use_id ?? payload.toolUseId ?? payload.toolUseID);
   const toolInputFingerprint = buildToolInputFingerprint(rawToolInput);
@@ -472,7 +539,7 @@ function buildPermissionBody(payload, resolve, options = {}) {
       applyOrcaPaneKey(body);
     } else {
       const metadata = applyLocalProcessFields(body, resolve, {
-        preferAgentPid: isCodexDesktopSession(payload, sessionMeta),
+        preferAgentPid: shouldPreferCodexAgentPid(payload, sessionMeta, options),
         event,
       });
       if (typeof options.onProcessMetadata === "function") options.onProcessMetadata(metadata);
@@ -498,6 +565,7 @@ function buildStateBody(payload, resolve, options = {}) {
     agent_id: "codex",
     hook_source: "codex-official",
   };
+  if (options.codexInternalThread) body.codex_internal_thread = options.codexInternalThread;
 
   const cwd = typeof payload.cwd === "string" ? payload.cwd : "";
   if (cwd) body.cwd = cwd;
@@ -525,7 +593,7 @@ function buildStateBody(payload, resolve, options = {}) {
   if (threadName) body.session_title = threadName;
   const codexRole = resolveCodexSessionRole(payload, sessionMeta);
   if (codexRole !== ROLE_UNKNOWN) body.codex_session_role = codexRole;
-  applyCodexSessionMetaFields(body, payload, sessionMeta);
+  applyCodexSessionMetaFields(body, payload, sessionMeta, options);
   applyCodexUpstreamFields(body, payload, sessionMeta);
 
   const toolName = typeof payload.tool_name === "string" && payload.tool_name ? payload.tool_name : null;
@@ -546,7 +614,7 @@ function buildStateBody(payload, resolve, options = {}) {
       applyOrcaPaneKey(body);
     } else {
       const metadata = applyLocalProcessFields(body, resolve, {
-        preferAgentPid: isCodexDesktopSession(payload, sessionMeta),
+        preferAgentPid: shouldPreferCodexAgentPid(payload, sessionMeta, options),
         event,
       });
       if (typeof options.onProcessMetadata === "function") options.onProcessMetadata(metadata);
@@ -641,11 +709,11 @@ async function runCodexHook(payload, options = {}) {
     const resolveHookWslDistro = options.resolveWslDistro || resolveWslDistro;
     wslDistro = resolveHookWslDistro();
   } catch {}
-  const mayUseWindowsProcessChain = platform === "win32"
-    && !env.CLAWD_REMOTE
+  const mayUseLocalProcess = !env.CLAWD_REMOTE
     && !env.CLAWD_WSL_DISTRO
     && !wslInterop
     && !wslDistro;
+  const mayUseWindowsProcessChain = platform === "win32" && mayUseLocalProcess;
   const readHookContext = options.readWindowsProcessChainHookContext
     || readWindowsProcessChainHookContext;
   const isAlive = options.processAlive || processAlive;
@@ -681,6 +749,9 @@ async function runCodexHook(payload, options = {}) {
     const resolverOptions = {
       agentNames: { win: new Set(["codex.exe"]), mac: new Set(["codex"]), linux: new Set(["codex"]) },
       platformConfig: config,
+      // Interrupt's upstream outer timeout remains three seconds.
+      windowsSnapshotTimeoutMs: payload && payload.hook_event_name === "Interrupt" ? 3000 : 5000,
+      env,
       readRuntimeIdentity() {
         if (processChainAttempt && processChainAttempt.context) {
           return processChainAttempt.context.identity;
@@ -704,6 +775,10 @@ async function runCodexHook(payload, options = {}) {
     const permissionAttempt = createAttemptResolver(options.preferredPort || null, processChainAttempt);
     let legacyCacheSource = "none";
     const permissionBody = buildPermissionBody(payload, permissionAttempt.resolve, {
+      env,
+      platform,
+      allowDesktopEnvOriginator: mayUseWindowsProcessChain,
+      allowDesktopPidPreference: mayUseLocalProcess,
       authoritativeProcessChain: processChainAttempt.authoritative,
       onProcessMetadata: (metadata) => { legacyCacheSource = metadata && metadata.cacheSource || "none"; },
     });
@@ -725,12 +800,50 @@ async function runCodexHook(payload, options = {}) {
     });
   }
 
+  // Codex memory consolidation runs as an internal, ephemeral thread whose
+  // cwd is <CODEX_HOME>/memories(_v2). It has no transcript and upstream
+  // (openai/codex#40587) stops forwarding its Stop to user hooks, so a state
+  // event from it would open a "memories" ghost session that never ends. The
+  // payload carries no thread/session source, so cwd plus an empty transcript
+  // is the only identity available. Drop these state events entirely — no
+  // POST, no auto-start gate, no cold start. PermissionRequest is handled
+  // above and is deliberately not filtered: the worker's approval policy is
+  // Never, and a permission request must never be silently swallowed here.
+  if (isCodexMemoryWorkerPayload(payload, { env, platform })) {
+    return { body: null, posted: false, stdout: "" };
+  }
+
+  // Codex Desktop runs ephemeral threads under its app-server: the hidden
+  // ambient-suggestion / safety-review workers and the user-visible side chat.
+  // They share every field, so treat only two fixed prompts as hidden work:
+  //   - SessionStart is not shown (a thread should appear only once it acts),
+  //     but still runs process resolution to prewarm the pid cache — see below.
+  //   - an ambient-suggestion UserPromptSubmit is tagged and posted; the server
+  //     then suppresses the whole sid.
+  //   - every other state event (tools, PreCompact, Stop, SessionEnd) posts as
+  //     usual, so the side chat still shows.
+  // If upstream rewrites the prompts, recognition stops and the hidden thread
+  // merely lingers briefly before SessionEnd retires it — never hides a chat.
+  const clientEphemeral = isCodexClientEphemeralPayload(payload, { env });
+  const isClientEphemeralSessionStart = !!(clientEphemeral
+    && payload.hook_event_name === "SessionStart");
+  const codexInternalThread = clientEphemeral
+    && payload.hook_event_name === "UserPromptSubmit"
+    && isCodexAmbientSuggestionPrompt(payload.prompt)
+    ? CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS
+    : null;
+
   const postState = options.postState || postStateToRunningServer;
   const buildStateAttempt = (preferredPort = null, processChainAttempt = observeAttempt()) => {
     const attempt = createAttemptResolver(preferredPort, processChainAttempt);
     let legacyCacheSource = "none";
     const body = buildStateBody(payload || {}, attempt.resolve, {
+      env,
+      platform,
+      allowDesktopEnvOriginator: mayUseWindowsProcessChain,
+      allowDesktopPidPreference: mayUseLocalProcess,
       authoritativeProcessChain: processChainAttempt.authoritative,
+      codexInternalThread,
       onProcessMetadata: (metadata) => { legacyCacheSource = metadata && metadata.cacheSource || "none"; },
     });
     if (!body) return null;
@@ -749,6 +862,17 @@ async function runCodexHook(payload, options = {}) {
       } : null,
     };
   };
+
+  // A client ephemeral SessionStart is never delivered, but its process
+  // resolution still runs under lifecycle "start" so Windows' cache-only prompt
+  // lifecycle can find the thread's pid on its first real action instead of
+  // starting the turn with no jump target. It must not POST, read the
+  // auto-start gate, or cold-start. Authoritative process-chain mode skips the
+  // legacy resolver here exactly like a normal SessionStart.
+  if (isClientEphemeralSessionStart) {
+    buildStateAttempt(options.preferredPort || null);
+    return { body: null, posted: false, stdout: "" };
+  }
   const postAttempt = (attempt) => new Promise((resolveRun) => {
     const requestOptions = { timeoutMs: 100 };
     if (attempt.preferredPort) {

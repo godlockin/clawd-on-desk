@@ -2,7 +2,7 @@
 
 [Back to README](../../README.md) · [简体中文](copilot-setup.zh-CN.md)
 
-> **Copilot CLI is installed on demand.** On fresh installs, open **Settings → Agents** and click **Install** for Copilot CLI before using local Copilot tracking. After it is installed and enabled, Clawd writes `copilot-hook.js` into `<COPILOT_HOME or ~/.copilot>/hooks/hooks.json` on launch using marker-based merge that preserves your other hook entries.
+> **Copilot CLI is installed on demand.** On fresh installs, open **Settings → AI Coding Tools** and click **Install** for Copilot CLI before using local Copilot tracking. After it is installed and enabled, Clawd writes `copilot-hook.js` into `<COPILOT_HOME or ~/.copilot>/hooks/hooks.json` on launch using marker-based merge that preserves your other hook entries.
 >
 > This document is kept as the **advanced / manual fallback**: useful for debugging, customizing the event subset, working offline, or testing Clawd's behavior.
 

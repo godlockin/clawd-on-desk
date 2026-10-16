@@ -5,6 +5,7 @@ const { EventEmitter } = require("node:events");
 const { describe, it } = require("node:test");
 
 const initServer = require("../src/server");
+const { buildPermissionBody } = require("../hooks/codex-hook");
 const { makeSessionKey } = require("../src/session-key");
 
 const localSessionKey = (rawSessionId) => makeSessionKey({
@@ -28,6 +29,7 @@ function makeReq(body) {
   const req = new EventEmitter();
   req.method = "POST";
   req.url = "/permission";
+  req.headers = { host: "127.0.0.1:23333", "content-type": "application/json" };
   setImmediate(() => {
     req.emit("data", Buffer.from(JSON.stringify(body)));
     req.emit("end");
@@ -95,6 +97,7 @@ function startServer(overrides = {}) {
     getBubblePolicy: () => ({ enabled: true, autoCloseMs: null }),
     isAgentEnabled: () => true,
     isAgentPermissionsEnabled: () => true,
+    isCodexPermissionInterceptEnabled: () => true,
     updateSession: (...args) => updates.push(args),
     showPermissionBubble: (entry) => shown.push(entry),
     resolvePermissionEntry: (entry) => {
@@ -116,6 +119,73 @@ function startServer(overrides = {}) {
 }
 
 describe("Codex official /permission path", () => {
+  it("Auto delegates unknown and MCP requests before bubble or automation creation", async () => {
+    const { handler, pendingPermissions, shown } = startServer({
+      getCodexPermissionMode: () => "auto",
+      getPermissionAutomationMode: () => "unattended",
+    });
+    const res = await callPermission(handler, {
+      agent_id: "codex", hook_source: "codex-official",
+      session_id: "codex:01a119d3-1893-7f42-aadc-fa33ca4166a8",
+      tool_name: "mcp__github__get_issue", tool_input: { number: 199 },
+    });
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(res.body, "");
+    assert.strictEqual(pendingPermissions.length, 0);
+    assert.strictEqual(shown.length, 0);
+  });
+
+
+  it("returns no-decision for an archived local task before any bubble, state or automation", async () => {
+    const { handler, pendingPermissions, updates, shown } = startServer({
+      shouldSuppressCodexArchive: (raw) => raw === "codex:archived",
+    });
+
+    const res = await callPermission(handler, {
+      agent_id: "codex",
+      session_id: "codex:archived",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      hook_source: "codex-official",
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(res.body, "");
+    assert.strictEqual(pendingPermissions.length, 0);
+    assert.strictEqual(updates.length, 0, "no session/card is created");
+    // Codex automation is evaluated inside showPermissionBubble. The separate
+    // maybeAutoResolveSessionPermission callback belongs to other adapters.
+    assert.strictEqual(shown.length, 0, "Codex bubble/automation entry is not reached");
+  });
+
+  it("only gates the archived task on the exact local codex boundary", async () => {
+    const predicate = (raw, opts) =>
+      raw === "codex:archived" && opts.profileId === "local" && !opts.host && !opts.wslDistro;
+
+    const remote = startServer({ shouldSuppressCodexArchive: predicate });
+    remote.handler(makeReq({
+      agent_id: "codex",
+      session_id: "codex:archived",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      host: "remote-box",
+    }), makeRes());
+    for (let i = 0; i < 20 && remote.pendingPermissions.length === 0; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.strictEqual(remote.pendingPermissions.length, 1, "a remote session still prompts normally");
+
+    const local = startServer({ shouldSuppressCodexArchive: predicate });
+    const res = await callPermission(local.handler, {
+      agent_id: "codex",
+      session_id: "codex:archived",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+    });
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(local.pendingPermissions.length, 0);
+  });
+
   it("returns no-decision on DND instead of denying", async () => {
     const { handler, pendingPermissions } = startServer({ doNotDisturb: true });
 
@@ -148,7 +218,7 @@ describe("Codex official /permission path", () => {
     assert.strictEqual(pendingPermissions.length, 0);
   });
 
-  it("defaults Codex PermissionRequest to a real approval bubble", async () => {
+  it("preserves the explicit Intercept approval bubble", async () => {
     const { handler, pendingPermissions, updates, shown } = startServer();
     const req = makeReq({
       agent_id: "codex",
@@ -431,6 +501,40 @@ describe("Codex official /permission path", () => {
       assert.strictEqual(pendingPermissions.length, 0, String(originator));
       assert.strictEqual(shown.length, 0, String(originator));
       assert.deepStrictEqual(updates, [], String(originator));
+    }
+  });
+
+  it("keeps headless, exec and unaudited children on native fallback despite a Desktop env", async () => {
+    const payloads = [
+      { headless: true },
+      { source: "exec", codex_session_role: "subagent" },
+      { originator: "codex_exec", codex_session_role: "subagent" },
+      { originator: "unknown-client", codex_session_role: "subagent" },
+      { source: { subagent: { thread_spawn: { parent_thread_id: "parent" } } } },
+      { codex_session_role: "subagent" },
+      { originator: 123, codex_session_role: "subagent" },
+      { originator: null, codex_session_role: "subagent" },
+      { source: { type: "exec" }, codex_session_role: "subagent" },
+      { source: { role: "unknown" }, codex_session_role: "subagent" },
+      ...["startup", "resume", "clear", "compact", "fork"].map((source) => ({ source, codex_session_role: "subagent" })),
+    ];
+    for (const payload of payloads) {
+      const { handler, pendingPermissions, updates, shown } = startServer({
+        isCodexPermissionInterceptEnabled: () => true,
+      });
+      const body = buildPermissionBody({
+        hook_event_name: "PermissionRequest", session_id: "env-child", tool_name: "Bash",
+        tool_input: { command: "npm test" }, ...payload,
+      }, () => ({ stablePid: null, agentPid: null }), {
+        platform: "win32", env: { CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "Codex Desktop" },
+      });
+      assert.strictEqual(body.codex_originator, typeof payload.originator === "string" ? payload.originator : undefined);
+      const res = await callPermission(handler, body);
+      assert.strictEqual(res.statusCode, 204, JSON.stringify(payload));
+      assert.strictEqual(res.body, "");
+      assert.strictEqual(pendingPermissions.length, 0);
+      assert.strictEqual(shown.length, 0);
+      assert.deepStrictEqual(updates, []);
     }
   });
 });
