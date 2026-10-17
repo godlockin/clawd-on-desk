@@ -9,6 +9,17 @@ const {
   collectSafeRasterRefs,
 } = require("../src/theme-sanitizer");
 
+test("sanitizeSvg keeps the XML declaration well formed", () => {
+  const sanitized = sanitizeSvg(
+    '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'
+  );
+
+  assert.ok(
+    sanitized.startsWith('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n<svg'),
+    sanitized
+  );
+});
+
 test("sanitizeSvg strips unsafe script, href, and CSS URL surfaces", () => {
   const svg = [
     "<svg xmlns=\"http://www.w3.org/2000/svg\">",

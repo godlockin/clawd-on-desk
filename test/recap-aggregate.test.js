@@ -8,6 +8,7 @@ const path = require("node:path");
 const {
   MAX_AGGREGATE_ROWS_PER_DAY,
   createRecapAggregate,
+  createRecapDayProjection,
   normalizeDay,
 } = require("../src/recap-aggregate");
 const { createRecapJournal } = require("../src/recap-journal");
@@ -202,4 +203,65 @@ test("aggregate rejects bounded-size schema fan-out before normalizing rows", (t
   assert.ok(performance.now() - started < 500);
   assert.equal(fs.existsSync(filePath), false);
   assert.ok(fs.readdirSync(store.childPath("quarantine")).some((name) => name.startsWith("daily-2026-08.json.")));
+});
+
+function onDate(journal, localDate, hour, agentId, metrics, identity = {}) {
+  const [year, month, day] = localDate.split("-").map(Number);
+  return journal.buildRecord({
+    occurredAt: Date.UTC(year, month - 1, day, hour),
+    agentId,
+    scope: identity.scope || "local",
+    metrics,
+  }, identity);
+}
+
+test("issue #1141: projection plus replaceDays matches a direct record replay", (t) => {
+  const first = fixture(t);
+  const second = fixture(t);
+  const dates = ["2026-08-29", "2026-08-30", "2026-08-31"];
+
+  const records = [
+    onDate(first.journal, "2026-08-30", 8, "codex", ["activity", "tool-call"]),
+    onDate(first.journal, "2026-08-30", 9, "codex", ["activity", "turn-complete", "session-start"], {
+      scope: "remote",
+      scopeId: "server-one",
+    }),
+    onDate(first.journal, "2026-08-30", 10, "claude-code", ["activity"], {
+      sessionId: "default",
+      sessionStartPartial: true,
+    }),
+    onDate(first.journal, "2026-08-30", 11, "antigravity-cli", ["activity", "tool-call"]),
+    onDate(first.journal, "2026-08-31", 0, "codex", ["activity"]),
+  ];
+  // A historical ticket can freeze tool support that current policy rejects.
+  records[3].support.toolCalls = true;
+
+  // Seed the same pre-existing shape on both sides: the projected day 08-29 has
+  // no input record and must end up deleted; 09-01 is outside dates and stays.
+  for (const f of [first, second]) {
+    f.aggregate.replaceDates(["2026-08-29"], [
+      onDate(f.journal, "2026-08-29", 2, "codex", ["activity", "tool-call"]),
+      onDate(f.journal, "2026-08-29", 5, "claude-code", ["activity"], { sessionId: "seeded" }),
+    ]);
+    f.aggregate.replaceDates(["2026-09-01"], [
+      onDate(f.journal, "2026-09-01", 7, "codex", ["activity", "turn-complete"]),
+    ]);
+  }
+
+  first.aggregate.replaceDates(dates, records);
+
+  const projection = createRecapDayProjection();
+  for (const value of records) projection.apply(value);
+  second.aggregate.replaceDays(dates, projection);
+
+  assert.deepStrictEqual(
+    first.aggregate.query("2026-08-25", "2026-09-05"),
+    second.aggregate.query("2026-08-25", "2026-09-05")
+  );
+  // Guard the two behaviors this comparison is meant to cover.
+  const projected = second.aggregate.query("2026-08-25", "2026-09-05");
+  const day29 = projected.find((day) => day.localDate === "2026-08-29");
+  const day01 = projected.find((day) => day.localDate === "2026-09-01");
+  assert.equal(day29.rows.length, 0);
+  assert.equal(day01.rows.length, 1);
 });

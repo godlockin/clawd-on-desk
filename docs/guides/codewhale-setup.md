@@ -53,7 +53,7 @@
 
 ### 2.2 按需安装与同步
 
-- 全新安装默认不会写入 CodeWhale hooks；需要本机 CodeWhale 追踪时，先到 **Settings → Agents → CodeWhale → Install** 安装并启用集成
+- 全新安装默认不会写入 CodeWhale hooks；需要本机 CodeWhale 追踪时，先到 **Settings → AI 编程工具 → CodeWhale → Install** 安装并启用集成
 - 安装且启用后，Clawd 启动时会继续同步 7 个 hooks 条目到 `~/.codewhale/config.toml`
 - Settings / Doctor 的 Fix / Repair 会手动重新同步；`npm run install:codewhale-hooks` 仍可用于调试或预注册
 - 卸载支持（`npm run uninstall:codewhale-hooks`）
@@ -387,7 +387,7 @@ CodeWhale 有两个独立的 hook/事件系统：
 ### 8.1 螃蟹不动
 
 1. 确认 Clawd 在运行：`curl http://127.0.0.1:23333/state` 返回 `{"ok":true}`
-2. 确认已在 **Settings → Agents → CodeWhale → Install** 安装并启用集成
+2. 确认已在 **Settings → AI 编程工具 → CodeWhale → Install** 安装并启用集成
 3. 确认 hooks 已注册：`grep "codewhale-hook" ~/.codewhale/config.toml` 应有 7 个条目
 4. 确认 hooks 用的是 `node` 而非 `electron`：同上
 5. 手动模拟测试：
@@ -409,7 +409,7 @@ CodeWhale 有两个独立的 hook/事件系统：
 ### 8.4 Hook 命令用了 electron 而非 node
 
 如果已安装且启用的 CodeWhale 集成在 Clawd 启动同步时覆盖了 hooks：
-1. 从 **Settings → Agents → CodeWhale → Fix / Repair** 重新同步，或调试时手动运行 `npm run install:codewhale-hooks`
+1. 从 **Settings → AI 编程工具 → CodeWhale → Fix / Repair** 重新同步，或调试时手动运行 `npm run install:codewhale-hooks`
 2. 确认 `codewhale-install.js` 使用 `resolveNodeBin()`，不会在 Electron 启动路径里固定写入裸 `node`
 
 ### 8.5 安装脚本失败
@@ -436,7 +436,7 @@ sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
 npm start
 ```
 
-启动后打开 **Settings → Agents → CodeWhale → Install**。安装且启用后，Clawd 会在后续启动时继续同步 CodeWhale hooks。
+启动后打开 **Settings → AI 编程工具 → CodeWhale → Install**。安装且启用后，Clawd 会在后续启动时继续同步 CodeWhale hooks。
 
 如需在启动桌宠前调试 installer，也可以手动执行：
 
