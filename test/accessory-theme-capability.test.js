@@ -71,8 +71,8 @@ describe("built-in accessory capability contracts", () => {
     const usages = projectThemeVisualUsages(raw);
     const files = collectRequiredAssetFiles(raw);
 
-    assert.strictEqual(usages.length, 50);
-    assert.strictEqual(files.length, 48);
+    assert.strictEqual(usages.length, 52);
+    assert.strictEqual(files.length, 50);
     assert.deepStrictEqual(
       new Set(files),
       new Set(fs.readdirSync(path.join(ROOT, "assets", "svg")).filter((file) => file.endsWith(".svg"))),
@@ -82,6 +82,11 @@ describe("built-in accessory capability contracts", () => {
     assert.ok(files.includes("clawd-working-typing-boss.svg"));
     assert.ok(!usages.some((usage) => usage.file === "clawd-working-typing-boss.svg"));
     assert.ok(!usages.some((usage) => usage.source === "rendering.objectChannelFiles"));
+    assert.ok(!usages.some((usage) => usage.source === "rendering.discreteSampling"));
+    assert.ok(
+      files.includes("clawd-working-thinking.svg"),
+      "a sampled file is also a required asset, like any object-channel file"
+    );
     assert.strictEqual(normalized._capabilities.accessories, true);
     assertDeclaredTargetsExist("clawd", raw);
 

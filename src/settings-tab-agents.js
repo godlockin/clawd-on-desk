@@ -11,7 +11,7 @@
   let helpers = null;
   let ops = null;
   const CODEX_PERMISSION_MODE_OPTIONS = [
-    { id: "native", labelKey: "codexPermissionModeNative" },
+    { id: "auto", labelKey: "codexPermissionModeAuto" },
     { id: "intercept", labelKey: "codexPermissionModeIntercept" },
   ];
   const INSTALL_HINT_CONFIDENCES = new Set(["high", "medium"]);
@@ -20,6 +20,10 @@
   let agentInstallHintResetPending = false;
   let agentCleanupHintResetPending = false;
   let codexHookHealthRequestSeq = 0;
+  const permissionModePending = new Set();
+  let claudeHookHealthRequestSeq = 0;
+  let dshNoticesRequestSeq = 0;
+  const dshNoticeContainers = new Set();
 
   function t(key) {
     return helpers.t(key);
@@ -48,7 +52,10 @@
     const categorized = categorizeAgentsForSections(agents);
     const subtab = resolveAgentsSubtab(categorized);
 
-    parent.appendChild(buildAgentSubtabRow(subtab, categorized));
+    const switcher = buildAgentSubtabRow(subtab, categorized);
+    parent.appendChild(switcher.row);
+    for (const panel of switcher.control.panels.values()) parent.appendChild(panel);
+    parent = switcher.control.panels.get(subtab);
 
     // Each banner lives in the subtab it acts on: "install what we detected"
     // is what the discover subtab is for, and "your integration outlived its
@@ -134,19 +141,17 @@
       count.textContent = String(shown);
     }
 
-    const search = document.createElement("input");
-    search.type = "search";
-    search.className = "agent-section-search";
-    search.placeholder = t("agentSearchPlaceholder");
-    search.value = runtime.agentsUnavailableQuery || "";
-    // The input sits inside the collapsible header, whose click and Enter/Space
-    // handlers would otherwise toggle the group out from under the typist.
-    const stopHeaderToggle = (event) => {
-      if (event && typeof event.stopPropagation === "function") event.stopPropagation();
-    };
-    search.addEventListener("click", stopHeaderToggle);
-    search.addEventListener("keydown", stopHeaderToggle);
-
+    const search = helpers.buildTextInput({
+      type: "search",
+      size: "compact",
+      className: "agent-section-search",
+      placeholder: t("agentSearchPlaceholder"),
+      ariaLabel: t("agentSearchPlaceholder"),
+      value: runtime.agentsUnavailableQuery || "",
+      stopPropagation: true,
+    });
+    // The input sits inside the collapsible header, so the shared primitive
+    // stops click/keydown propagation before the header can toggle.
     function commitQuery(event) {
       runtime.agentsUnavailableQuery = (event && event.target && event.target.value) || "";
       applyFilter();
@@ -298,6 +303,12 @@
     return entries.find((entry) => entry && entry.agentId === agentId) || null;
   }
 
+  function getCustomAgentUnavailableLabelKey(hint) {
+    if (hint && hint.reason === "not-executable") return "customToolDetectionNotExecutable";
+    if (hint && hint.reason === "not-file") return "customToolDetectionNotFile";
+    return "customToolDetectionMissing";
+  }
+
   function buildAgentRows(agents) {
     return agents.map((agent) => buildAgentGroup(agent));
   }
@@ -309,36 +320,32 @@
     const row = document.createElement("div");
     row.className = "agents-subtabs";
 
-    const group = document.createElement("div");
-    group.className = "segmented";
-    group.setAttribute("role", "tablist");
     const entries = [
       { key: "connected", label: t("agentsSubtabConnected"), count: 0 },
       // Counts what the user can act on right now, so the badge stays a
       // to-do marker: agents detected locally but not connected yet.
       { key: "discover", label: t("agentsSubtabDiscover"), count: categorized.recommended.length },
     ];
-    for (const entry of entries) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = entry.label;
-      btn.setAttribute("role", "tab");
-      btn.setAttribute("aria-selected", entry.key === current ? "true" : "false");
-      if (entry.key === current) btn.classList.add("active");
-      if (entry.count > 0) {
-        const badge = document.createElement("span");
-        badge.className = "agents-subtab-count";
-        badge.textContent = String(entry.count);
-        btn.appendChild(badge);
-      }
-      btn.addEventListener("click", () => {
-        if (runtime.agentsSubtab === entry.key) return;
-        runtime.agentsSubtab = entry.key;
+    const control = helpers.buildTabs({
+      id: "settings-agents",
+      ariaLabel: t("agentsTitle"),
+      value: current,
+      options: entries.map((entry) => ({ ...entry, value: entry.key })),
+      renderLabel(btn, entry) {
+        if (entry.count > 0) {
+          const badge = document.createElement("span");
+          badge.className = "agents-subtab-count";
+          badge.textContent = String(entry.count);
+          btn.appendChild(badge);
+        }
+      },
+      onChange(value) {
+        runtime.agentsSubtab = value;
         ops.requestRender({ content: true });
-      });
-      group.appendChild(btn);
-    }
-    row.appendChild(group);
+      },
+    });
+    helpers.registerMountedDisposable(control);
+    row.appendChild(control.element);
 
     // WSL rescan belongs to the connected subtab: it re-detects built-in
     // agents installed inside distros, and its results render as instance rows
@@ -347,7 +354,7 @@
       const wslScanControl = buildWslScanControl();
       if (wslScanControl) row.appendChild(wslScanControl);
     }
-    return row;
+    return { row, control };
   }
 
   function buildCustomToolsSection() {
@@ -371,19 +378,22 @@
 
     const control = document.createElement("div");
     control.className = "custom-tool-discovery-control custom-tool-discovery-actions";
-    const addButton = document.createElement("button");
-    addButton.type = "button";
-    addButton.className = "soft-btn accent custom-tool-path-picker";
-    addButton.textContent = t("customToolManualAdd");
+    const addButton = helpers.buildButton({
+      labelKey: "customToolManualAdd",
+      tone: "accent",
+      size: "compact",
+      className: "custom-tool-path-picker",
+    });
     addButton.addEventListener("click", () => addPickedCustomDiscoveryPath(addButton));
     control.appendChild(addButton);
-    const scanButton = document.createElement("button");
-    scanButton.type = "button";
-    scanButton.className = "soft-btn custom-tool-scan";
-    scanButton.textContent = t("customToolRescan");
+    const scanButton = helpers.buildButton({
+      labelKey: "customToolRescan",
+      size: "compact",
+      className: "custom-tool-scan",
+    });
     scanButton.addEventListener("click", async () => {
       const scanStartedAt = Date.now();
-      scanButton.disabled = true;
+      helpers.setButtonState(scanButton, { pending: true });
       scanStatus.classList.remove("failed");
       scanStatus.classList.add("pending");
       scanStatus.textContent = t("customToolScanStatusScanning");
@@ -401,7 +411,7 @@
         scanStatus.textContent = t("customToolScanStatusFailed");
       } finally {
         scanStatus.classList.remove("pending");
-        scanButton.disabled = false;
+        helpers.setButtonState(scanButton, { pending: false });
       }
     });
     control.appendChild(scanButton);
@@ -422,14 +432,17 @@
 
     const control = document.createElement("div");
     control.className = "custom-tool-wsl-scan";
-    const scanButton = document.createElement("button");
-    scanButton.type = "button";
-    scanButton.className = "soft-btn agent-instance-scan-btn";
-    scanButton.textContent = t("agentInstanceScanWsl");
-    scanButton.title = t("agentInstanceScanWslDesc");
+    const scanButton = helpers.buildButton({
+      labelKey: "agentInstanceScanWsl",
+      size: "compact",
+      className: "agent-instance-scan-btn",
+      title: t("agentInstanceScanWslDesc"),
+    });
     scanButton.addEventListener("click", async () => {
-      scanButton.disabled = true;
-      scanButton.textContent = t("agentInstanceScanning");
+      helpers.setButtonState(scanButton, {
+        pending: true,
+        labelKey: "agentInstanceScanning",
+      });
       try {
         if (ops && typeof ops.fetchAgentInstallationHints === "function") {
           await ops.fetchAgentInstallationHints({ refreshWsl: true });
@@ -438,8 +451,10 @@
       } catch (err) {
         console.warn("WSL scan failed:", err && err.message);
       } finally {
-        scanButton.disabled = false;
-        scanButton.textContent = t("agentInstanceScanWsl");
+        helpers.setButtonState(scanButton, {
+          pending: false,
+          labelKey: "agentInstanceScanWsl",
+        });
       }
     });
     control.appendChild(scanButton);
@@ -476,9 +491,12 @@
       ops.showToast(t("toastSaveFailed") + "settings API unavailable", { error: true });
       return;
     }
-    const originalLabel = button.textContent;
-    button.disabled = true;
-    button.textContent = t("customToolScanStatusScanning");
+    const labelElement = button.querySelector(".settings-button-label");
+    const originalLabel = labelElement ? labelElement.textContent : "";
+    helpers.setButtonState(button, {
+      pending: true,
+      labelKey: "customToolScanStatusScanning",
+    });
     try {
       const result = await window.settingsAPI.pickAgentDiscoveryPath("directory");
       if (!result || result.status === "cancel") return;
@@ -502,8 +520,10 @@
     } catch (err) {
       ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
     } finally {
-      button.disabled = false;
-      button.textContent = originalLabel;
+      helpers.setButtonState(button, {
+        pending: false,
+        label: originalLabel,
+      });
     }
   }
 
@@ -560,22 +580,29 @@
     row.appendChild(text);
 
     if (result.application) {
-      const status = document.createElement(result.application.added ? "span" : "button");
-      status.className = result.application.added
-        ? "custom-tool-result-status"
-        : "soft-btn accent custom-tool-add";
-      status.textContent = result.application.added ? t("customToolAdded") : t("customToolAdd");
-      if (!result.application.added) {
-        status.type = "button";
+      const status = result.application.added
+        ? document.createElement("span")
+        : helpers.buildButton({
+          labelKey: "customToolAdd",
+          tone: "accent",
+          size: "compact",
+          className: "custom-tool-add",
+        });
+      if (result.application.added) {
+        status.className = "custom-tool-result-status";
+        status.textContent = t("customToolAdded");
+      } else {
         status.addEventListener("click", () => addCustomApplication(result, status));
       }
       row.appendChild(status);
     }
     if (result.path) {
-      const removePathButton = document.createElement("button");
-      removePathButton.type = "button";
-      removePathButton.className = "soft-btn danger custom-tool-remove-path";
-      removePathButton.textContent = t("customToolRemovePath");
+      const removePathButton = helpers.buildButton({
+        labelKey: "customToolRemovePath",
+        tone: "danger",
+        size: "compact",
+        className: "custom-tool-remove-path",
+      });
       removePathButton.addEventListener("click", () => removeCustomDiscoveryPath(result.path, removePathButton));
       row.appendChild(removePathButton);
     }
@@ -584,7 +611,7 @@
 
   async function removeCustomDiscoveryPath(pathToRemove, button) {
     if (!window.settingsAPI || typeof window.settingsAPI.command !== "function") return;
-    button.disabled = true;
+    helpers.setButtonState(button, { pending: true });
     try {
       const paths = readers.readAgentCustomDiscoveryPaths("custom")
         .filter((entry) => entry !== pathToRemove);
@@ -600,7 +627,7 @@
       }
       ops.requestRender({ content: true });
     } catch (err) {
-      button.disabled = false;
+      helpers.setButtonState(button, { pending: false });
       ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
     }
   }
@@ -618,7 +645,7 @@
   }
 
   async function addCustomApplication(result, button) {
-    button.disabled = true;
+    helpers.setButtonState(button, { pending: true });
     try {
       const response = await window.settingsAPI.command("addCustomApplication", { path: result.path });
       if (!response || response.status !== "ok") throw new Error((response && response.message) || "add failed");
@@ -629,7 +656,7 @@
       await refreshCustomAgentUi();
     } catch (err) {
       ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
-      button.disabled = false;
+      helpers.setButtonState(button, { pending: false });
     }
   }
 
@@ -708,20 +735,24 @@
 
     const actions = document.createElement("div");
     actions.className = "agent-hint-actions agent-install-hint-actions";
-    const installBtn = document.createElement("button");
-    installBtn.type = "button";
-    installBtn.className = "soft-btn accent agent-install-hint-install";
-    installBtn.textContent = agentHintActionPending
-      ? t("agentIntegrationWorking")
-      : t("agentInstallHintInstallRecommended");
-    installBtn.disabled = !!agentHintActionPending;
+    const installBtn = helpers.buildButton({
+      labelKey: agentHintActionPending
+        ? "agentIntegrationWorking"
+        : "agentInstallHintInstallRecommended",
+      tone: "accent",
+      size: "compact",
+      className: "agent-install-hint-install",
+      disabled: !!agentHintActionPending,
+      pending: !!agentHintActionPending,
+    });
     installBtn.addEventListener("click", () => installRecommendedHints(agentIds));
 
-    const dismissBtn = document.createElement("button");
-    dismissBtn.type = "button";
-    dismissBtn.className = "soft-btn agent-install-hint-dismiss";
-    dismissBtn.textContent = t("agentInstallHintDismiss");
-    dismissBtn.disabled = !!agentHintActionPending;
+    const dismissBtn = helpers.buildButton({
+      labelKey: "agentInstallHintDismiss",
+      size: "compact",
+      className: "agent-install-hint-dismiss",
+      disabled: !!agentHintActionPending,
+    });
     dismissBtn.addEventListener("click", () => dismissInstallHints(agentIds));
 
     actions.appendChild(installBtn);
@@ -749,20 +780,22 @@
 
     const actions = document.createElement("div");
     actions.className = "agent-hint-actions agent-cleanup-hint-actions";
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className = "soft-btn accent agent-cleanup-hint-remove";
-    removeBtn.textContent = agentHintActionPending
-      ? t("agentIntegrationWorking")
-      : t("agentCleanupHintRemove");
-    removeBtn.disabled = !!agentHintActionPending;
+    const removeBtn = helpers.buildButton({
+      labelKey: agentHintActionPending ? "agentIntegrationWorking" : "agentCleanupHintRemove",
+      tone: "accent",
+      size: "compact",
+      className: "agent-cleanup-hint-remove",
+      disabled: !!agentHintActionPending,
+      pending: !!agentHintActionPending,
+    });
     removeBtn.addEventListener("click", () => removeCleanupHints(agentIds));
 
-    const dismissBtn = document.createElement("button");
-    dismissBtn.type = "button";
-    dismissBtn.className = "soft-btn agent-cleanup-hint-dismiss";
-    dismissBtn.textContent = t("agentCleanupHintDismiss");
-    dismissBtn.disabled = !!agentHintActionPending;
+    const dismissBtn = helpers.buildButton({
+      labelKey: "agentCleanupHintDismiss",
+      size: "compact",
+      className: "agent-cleanup-hint-dismiss",
+      disabled: !!agentHintActionPending,
+    });
     dismissBtn.addEventListener("click", () => dismissCleanupHints(agentIds));
 
     actions.appendChild(removeBtn);
@@ -1006,6 +1039,156 @@
     });
   }
 
+  // Failure reasons a Repair run can actually resolve; anything else needs
+  // manual inspection, so promising a Fix would be misleading.
+  const DSH_REPAIRABLE_FAILURE_REASONS = new Set([
+    "plugin-disabled-in-dsh",
+    "repair-pending",
+    "inspection-required",
+  ]);
+
+  function dshNoticeProfileLabel(profile) {
+    return t(profile === "desktop" ? "dshNoticeProfileDesktop" : "dshNoticeProfileWeb");
+  }
+
+  function dshNoticeBody(notice) {
+    switch (notice.kind) {
+      case "restart-required":
+        return t("dshNoticeRestartRequired");
+      case "first-install":
+        return t("dshNoticeFirstInstall");
+      case "manual-command":
+        return t("dshNoticeManualCommand");
+      case "failed-target": {
+        if (notice.reason === "generation-conflict") return t("dshNoticeGenerationConflict");
+        const message = notice.message == null ? "" : String(notice.message);
+        const key = notice.operation === "uninstall" ? "dshNoticeUninstallFailed" : "dshNoticeInstallFailed";
+        let body = t(key).replace("{message}", message);
+        if (DSH_REPAIRABLE_FAILURE_REASONS.has(notice.reason)) {
+          body = `${body} ${t("dshNoticeOpenDoctor").replace("{fix}", t("doctorFix"))}`;
+        }
+        return body;
+      }
+      default:
+        return "";
+    }
+  }
+
+  function buildDshNoticeActions(container, notice) {
+    const actions = document.createElement("div");
+    actions.className = "agent-dsh-notice-actions";
+    if (notice.kind === "manual-command") {
+      const copy = helpers.buildButton({
+        labelKey: "dshNoticeCopy",
+        size: "compact",
+        className: "agent-dsh-notice-copy",
+      });
+      copy.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        copyDshNoticeCommands(notice, copy);
+      });
+      actions.appendChild(copy);
+    }
+    const ack = helpers.buildButton({
+      labelKey: "dshNoticeAcknowledge",
+      size: "compact",
+      className: "agent-dsh-notice-ack",
+    });
+    ack.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      acknowledgeDshNoticeRow(container, notice, ack);
+    });
+    actions.appendChild(ack);
+    return actions;
+  }
+
+  function buildDshNoticeRow(container, notice) {
+    const row = document.createElement("div");
+    row.className = "agent-dsh-notice";
+    row.setAttribute("data-kind", notice.kind);
+    row.setAttribute("data-profile", notice.profile);
+    const line = document.createElement("div");
+    line.className = "agent-dsh-notice-line";
+    line.textContent = t("dshNoticeLine")
+      .replace("{profile}", dshNoticeProfileLabel(notice.profile))
+      .replace("{text}", dshNoticeBody(notice));
+    row.appendChild(line);
+    if (notice.kind === "manual-command") {
+      const commands = document.createElement("pre");
+      commands.className = "agent-dsh-notice-commands";
+      commands.textContent = (notice.commands || []).join("\n");
+      row.appendChild(commands);
+    }
+    row.appendChild(buildDshNoticeActions(container, notice));
+    container.appendChild(row);
+  }
+
+  // Copy-only by design: the command mutates the user's DSH install, so Clawd
+  // hands it over instead of running it.
+  async function copyDshNoticeCommands(notice, button) {
+    helpers.setButtonState(button, { pending: true });
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText((notice.commands || []).join("\n"));
+      ops.showToast(t("dshNoticeCopied"));
+    } catch (err) {
+      ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+    } finally {
+      helpers.setButtonState(button, { pending: false });
+    }
+  }
+
+  async function acknowledgeDshNoticeRow(container, notice, button) {
+    helpers.setButtonState(button, { pending: true });
+    try {
+      const result = await window.settingsAPI.acknowledgeDshNotice(notice.profile, notice.id);
+      if (!result || result.status !== "ok") throw new Error((result && result.message) || "acknowledge failed");
+      await refreshDshNotices(container);
+    } catch (err) {
+      ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+      helpers.setButtonState(button, { pending: false });
+    }
+  }
+
+  async function refreshDshNotices(container) {
+    // The initial fetch starts while the row is still detached, so only the
+    // response is gated on the container still being on the page.
+    if (!container) return;
+    const seq = String(++dshNoticesRequestSeq);
+    container.dataset.dshNoticeSeq = seq;
+    try {
+      const result = await window.settingsAPI.getDshNotices();
+      if (container.isConnected === false) return;
+      if (container.dataset.dshNoticeSeq !== seq) return;
+      const notices = result && Array.isArray(result.notices) ? result.notices : [];
+      container.textContent = "";
+      for (const notice of notices) buildDshNoticeRow(container, notice);
+    } catch {
+      // Keep whatever is already shown; a transient IPC failure is not a row.
+    }
+  }
+
+  function refreshMountedDshNotices() {
+    for (const container of [...dshNoticeContainers]) {
+      if (container.isConnected === false) {
+        dshNoticeContainers.delete(container);
+        continue;
+      }
+      refreshDshNotices(container);
+    }
+  }
+
+  function buildDshNotices(agent, text) {
+    if (agent.custom || agent.id !== "deepseek-harness") return;
+    const container = document.createElement("div");
+    container.className = "agent-dsh-notices";
+    text.appendChild(container);
+    dshNoticeContainers.add(container);
+    refreshDshNotices(container);
+  }
+
   function buildAgentMasterRow(agent) {
     let integrationBadge = null;
     return buildAgentSwitchRow({
@@ -1042,7 +1225,7 @@
           if (customHint && customHint.detectedInstalled === false) {
             const missingBadge = document.createElement("span");
             missingBadge.className = "agent-badge custom-missing";
-            missingBadge.textContent = t("customToolDetectionMissing");
+            missingBadge.textContent = t(getCustomAgentUnavailableLabelKey(customHint));
             badges.appendChild(missingBadge);
           }
         } else {
@@ -1067,22 +1250,33 @@
           hint.textContent = t("traecodeEnableHint");
           text.appendChild(hint);
         }
+        // MiniMax Code has the same manual-enable gap: the plugin directory
+        // is on disk but the app decides whether hooks fire.
+        if (!agent.custom && agent.id === "minimax" && readers.readAgentIntegrationInstalled(agent.id)) {
+          const hint = document.createElement("div");
+          hint.className = "row-desc agent-minimax-hint";
+          hint.textContent = t("minimaxEnableHint");
+          text.appendChild(hint);
+        }
+        buildDshNotices(agent, text);
       },
       buildExtraControls: (ctrl) => {
         if (agent.custom) {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "soft-btn danger custom-agent-remove";
-          button.textContent = t("customToolRemove");
+          const button = helpers.buildButton({
+            labelKey: "customToolRemove",
+            tone: "danger",
+            size: "compact",
+            className: "custom-agent-remove",
+          });
           button.addEventListener("click", async () => {
-            button.disabled = true;
+            helpers.setButtonState(button, { pending: true });
             try {
               const result = await window.settingsAPI.command("removeCustomApplication", { id: agent.id });
               if (!result || result.status !== "ok") throw new Error((result && result.message) || "remove failed");
               await refreshCustomAgentUi();
             } catch (err) {
               ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
-              button.disabled = false;
+              helpers.setButtonState(button, { pending: false });
             }
           });
           ctrl.appendChild(button);
@@ -1141,10 +1335,11 @@
         text.appendChild(desc);
         row.appendChild(text);
         if (["customToolAgentId", "customAgentStateEndpoint", "customAgentPayloadExample"].includes(labelKey)) {
-          const copyButton = document.createElement("button");
-          copyButton.type = "button";
-          copyButton.className = "soft-btn custom-agent-copy";
-          copyButton.textContent = t("customAgentCopy");
+          const copyButton = helpers.buildButton({
+            labelKey: "customAgentCopy",
+            size: "compact",
+            className: "custom-agent-copy",
+          });
           copyButton.addEventListener("click", async () => {
             try {
               if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
@@ -1328,24 +1523,27 @@
     statusLine.textContent = t("kimiQuotaStatusLoading");
     card.appendChild(statusLine);
 
-    function makePasswordInput() {
-      const input = document.createElement("input");
-      input.type = "password";
-      input.className = "kimi-quota-key-input";
-      input.placeholder = t("kimiQuotaApiKeyPlaceholder");
-      input.autocomplete = "new-password";
-      input.spellcheck = false;
-      input.setAttribute("aria-label", t("kimiQuotaApiKeyPlaceholder"));
-      input.addEventListener("click", (event) => event.stopPropagation());
-      input.addEventListener("keydown", (event) => event.stopPropagation());
-      return input;
+    function makePasswordInput(onEnter) {
+      return helpers.buildTextInput({
+        type: "password",
+        className: "kimi-quota-key-input",
+        placeholder: t("kimiQuotaApiKeyPlaceholder"),
+        autocomplete: "new-password",
+        spellcheck: false,
+        ariaLabel: t("kimiQuotaApiKeyPlaceholder"),
+        stopPropagation: true,
+        onEnter,
+        onInput: (event) => helpers.setTextInputState(event.currentTarget, { invalid: false }),
+      });
     }
 
     function makeConsoleLink() {
-      const link = document.createElement("button");
-      link.type = "button";
-      link.className = "soft-btn quiet kimi-quota-console-link";
-      link.textContent = t("kimiQuotaOpenConsole");
+      const link = helpers.buildButton({
+        labelKey: "kimiQuotaOpenConsole",
+        tone: "quiet",
+        size: "compact",
+        className: "kimi-quota-console-link",
+      });
       link.addEventListener("click", (event) => {
         event.stopPropagation();
         if (window.settingsAPI && typeof window.settingsAPI.openExternal === "function") {
@@ -1363,11 +1561,14 @@
     connectSection.hidden = true;
     const connectRow = document.createElement("div");
     connectRow.className = "kimi-quota-connect-row";
-    const connectInput = makePasswordInput();
-    const connectButton = document.createElement("button");
-    connectButton.type = "button";
-    connectButton.className = "soft-btn accent settings-button kimi-quota-primary";
-    connectButton.textContent = t("kimiQuotaConnect");
+    const connectInput = makePasswordInput((_event, input) => {
+      submitKey(input, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
+    });
+    const connectButton = helpers.buildButton({
+      labelKey: "kimiQuotaConnect",
+      tone: "accent",
+      className: "kimi-quota-primary",
+    });
     connectRow.appendChild(connectInput);
     connectRow.appendChild(connectButton);
     connectSection.appendChild(connectRow);
@@ -1407,13 +1608,16 @@
 
     const primaryRow = document.createElement("div");
     primaryRow.className = "kimi-quota-primary-row";
-    const refreshButton = document.createElement("button");
-    refreshButton.type = "button";
-    refreshButton.className = "soft-btn accent settings-button kimi-quota-primary";
-    const replaceToggle = document.createElement("button");
-    replaceToggle.type = "button";
-    replaceToggle.className = "soft-btn quiet";
-    replaceToggle.textContent = t("kimiQuotaReplace");
+    const refreshButton = helpers.buildButton({
+      tone: "accent",
+      className: "kimi-quota-primary",
+    });
+    const replaceToggle = helpers.buildButton({
+      labelKey: "kimiQuotaReplace",
+      tone: "quiet",
+      size: "compact",
+      ariaPressed: false,
+    });
     primaryRow.appendChild(refreshButton);
     primaryRow.appendChild(replaceToggle);
     manageSection.appendChild(primaryRow);
@@ -1421,18 +1625,22 @@
     const replacePanel = document.createElement("div");
     replacePanel.className = "kimi-quota-replace";
     replacePanel.hidden = true;
-    const replaceInput = makePasswordInput();
+    const replaceInput = makePasswordInput((_event, input) => {
+      submitKey(input, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
+    });
     replacePanel.appendChild(replaceInput);
     const replaceActions = document.createElement("div");
     replaceActions.className = "kimi-quota-replace-actions";
-    const replaceConfirm = document.createElement("button");
-    replaceConfirm.type = "button";
-    replaceConfirm.className = "soft-btn accent";
-    replaceConfirm.textContent = t("kimiQuotaReplaceConfirm");
-    const replaceCancel = document.createElement("button");
-    replaceCancel.type = "button";
-    replaceCancel.className = "soft-btn quiet";
-    replaceCancel.textContent = t("kimiQuotaCancel");
+    const replaceConfirm = helpers.buildButton({
+      labelKey: "kimiQuotaReplaceConfirm",
+      tone: "accent",
+      size: "compact",
+    });
+    const replaceCancel = helpers.buildButton({
+      labelKey: "kimiQuotaCancel",
+      tone: "quiet",
+      size: "compact",
+    });
     replaceActions.appendChild(replaceConfirm);
     replaceActions.appendChild(replaceCancel);
     replacePanel.appendChild(replaceActions);
@@ -1442,10 +1650,10 @@
     dangerZone.className = "kimi-quota-danger";
     const disconnectRow = document.createElement("div");
     disconnectRow.className = "kimi-quota-danger-row";
-    const disconnectButton = document.createElement("button");
-    disconnectButton.type = "button";
-    disconnectButton.className = "soft-btn";
-    disconnectButton.textContent = t("kimiQuotaDisconnect");
+    const disconnectButton = helpers.buildButton({
+      labelKey: "kimiQuotaDisconnect",
+      size: "compact",
+    });
     const disconnectDesc = document.createElement("span");
     disconnectDesc.className = "row-desc kimi-quota-danger-desc";
     disconnectDesc.textContent = t("kimiQuotaDisconnectDesc");
@@ -1454,10 +1662,11 @@
     dangerZone.appendChild(disconnectRow);
     const forgetRow = document.createElement("div");
     forgetRow.className = "kimi-quota-danger-row";
-    const forgetButton = document.createElement("button");
-    forgetButton.type = "button";
-    forgetButton.className = "soft-btn danger";
-    forgetButton.textContent = t("kimiQuotaForgetLocal");
+    const forgetButton = helpers.buildButton({
+      labelKey: "kimiQuotaForgetLocal",
+      tone: "danger",
+      size: "compact",
+    });
     const forgetDesc = document.createElement("span");
     forgetDesc.className = "row-desc kimi-quota-danger-desc";
     forgetDesc.textContent = t("kimiQuotaForgetDesc");
@@ -1479,11 +1688,15 @@
     let statusLoaded = false;
     let busy = false;
     let replaceOpen = false;
+    let pendingButton = null;
 
     function setReplaceOpen(open) {
       replaceOpen = open;
       replacePanel.hidden = !open;
-      replaceToggle.disabled = busy || open;
+      helpers.setButtonState(replaceToggle, {
+        disabled: busy || open,
+        ariaPressed: open,
+      });
       if (!open) replaceInput.value = "";
     }
 
@@ -1502,20 +1715,38 @@
       // The single primary action: Refresh while connected, Reconnect with
       // the stored key while disconnected. Reconnect/Refresh both stay
       // manual-only user actions, exactly like Connect.
-      refreshButton.textContent = t(collectionEnabled ? "kimiQuotaRefresh" : "kimiQuotaReconnect");
-      refreshButton.disabled = busy || !decryptable || (collectionEnabled && !agentEnabled);
-      connectButton.disabled = busy;
-      connectInput.disabled = busy;
-      replaceInput.disabled = busy;
-      replaceConfirm.disabled = busy;
-      replaceCancel.disabled = busy;
-      replaceToggle.disabled = busy || replaceOpen;
+      helpers.setButtonState(refreshButton, {
+        labelKey: collectionEnabled ? "kimiQuotaRefresh" : "kimiQuotaReconnect",
+        disabled: busy || !decryptable || (collectionEnabled && !agentEnabled),
+        pending: pendingButton === refreshButton,
+      });
+      helpers.setButtonState(connectButton, {
+        disabled: busy,
+        pending: pendingButton === connectButton,
+      });
+      helpers.setTextInputState(connectInput, { pending: busy });
+      helpers.setTextInputState(replaceInput, { pending: busy });
+      helpers.setButtonState(replaceConfirm, {
+        disabled: busy,
+        pending: pendingButton === replaceConfirm,
+      });
+      helpers.setButtonState(replaceCancel, { disabled: busy });
+      helpers.setButtonState(replaceToggle, {
+        disabled: busy || replaceOpen,
+        ariaPressed: replaceOpen,
+      });
       replacePanel.hidden = !replaceOpen;
       disconnectRow.hidden = !collectionEnabled;
-      disconnectButton.disabled = busy;
+      helpers.setButtonState(disconnectButton, {
+        disabled: busy,
+        pending: pendingButton === disconnectButton,
+      });
       // Forget is only legal once collection is off (the runtime enforces
       // "disconnect-required"); the disabled state plus its desc says so.
-      forgetButton.disabled = busy || collectionEnabled;
+      helpers.setButtonState(forgetButton, {
+        disabled: busy || collectionEnabled,
+        pending: pendingButton === forgetButton,
+      });
       statusLine.textContent = busy
         ? t("kimiQuotaStatusRefreshing")
         : kimiQuotaStatusText(currentStatus);
@@ -1533,15 +1764,17 @@
       syncControls();
     }
 
-    async function runAction(invoke) {
+    async function runAction(invoke, sourceButton) {
       if (busy) return;
       busy = true;
+      pendingButton = sourceButton || null;
       setReplaceOpen(false);
       syncControls();
       let result;
       try { result = await invoke(); }
       catch { result = { status: "error", reason: "runtime-unavailable" }; }
       busy = false;
+      pendingButton = null;
       await reloadStatus();
       if (!result || result.status !== "ok") {
         const reason = (result && (result.reason || result.message)) || "unknown-error";
@@ -1554,10 +1787,12 @@
       const apiKey = input.value;
       input.value = "";
       if (!apiKey) {
+        helpers.setTextInputState(input, { invalid: true });
+        input.focus();
         ops.showToast(t("kimiQuotaKeyRequired"), { error: true });
         return;
       }
-      runAction(() => invoke(apiKey));
+      runAction(() => invoke(apiKey), input === connectInput ? connectButton : replaceConfirm);
     }
 
     connectButton.addEventListener("click", (event) => {
@@ -1569,7 +1804,7 @@
       const collectionEnabled = !!(currentStatus && currentStatus.collectionEnabled);
       runAction(() => (collectionEnabled
         ? window.settingsAPI.refreshKimiQuota()
-        : window.settingsAPI.reconnectKimiQuota()));
+        : window.settingsAPI.reconnectKimiQuota()), refreshButton);
     });
     replaceToggle.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -1585,20 +1820,13 @@
     });
     disconnectButton.addEventListener("click", (event) => {
       event.stopPropagation();
-      runAction(() => window.settingsAPI.disconnectKimiQuota());
+      runAction(() => window.settingsAPI.disconnectKimiQuota(), disconnectButton);
     });
     forgetButton.addEventListener("click", (event) => {
       event.stopPropagation();
       if (typeof window.confirm === "function" && !window.confirm(t("kimiQuotaForgetConfirm"))) return;
-      runAction(() => window.settingsAPI.forgetKimiQuotaCredential());
+      runAction(() => window.settingsAPI.forgetKimiQuotaCredential(), forgetButton);
     });
-    connectInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") submitKey(connectInput, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
-    });
-    replaceInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") submitKey(replaceInput, (apiKey) => window.settingsAPI.connectKimiQuota(apiKey));
-    });
-
     syncControls();
     void reloadStatus();
     return card;
@@ -1718,13 +1946,17 @@
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
 
-    const button = document.createElement("button");
-    button.className = "soft-btn agent-instance-action";
-    button.textContent = t("agentInstancePair");
-    button.title = `WSL: ${wslEntry.distro}`;
+    const button = helpers.buildButton({
+      labelKey: "agentInstancePair",
+      size: "compact",
+      className: "agent-instance-action",
+      title: `WSL: ${wslEntry.distro}`,
+    });
     button.addEventListener("click", async () => {
-      button.disabled = true;
-      button.textContent = t("agentInstancePairing");
+      helpers.setButtonState(button, {
+        pending: true,
+        labelKey: "agentInstancePairing",
+      });
       try {
         if (window.settingsAPI && typeof window.settingsAPI.command === "function") {
           const result = await window.settingsAPI.command("deployToWsl", {
@@ -1758,8 +1990,10 @@
         // Refresh after both success and failure: an installer can leave
         // managed files that the user must be able to Unpair/repair.
         refreshWslHints();
-        button.disabled = false;
-        button.textContent = t("agentInstancePair");
+        helpers.setButtonState(button, {
+          pending: false,
+          labelKey: "agentInstancePair",
+        });
       }
     });
     ctrl.appendChild(button);
@@ -1772,13 +2006,17 @@
       ? wslEntry.integrationFilesPresent === true
       : wslEntry.hooksFilesPresent === true;
     if (canUnpair) {
-      const unpairBtn = document.createElement("button");
-      unpairBtn.className = "soft-btn agent-instance-action";
-      unpairBtn.textContent = t("agentInstanceUnpair");
-      unpairBtn.title = `WSL: ${wslEntry.distro}`;
+      const unpairBtn = helpers.buildButton({
+        labelKey: "agentInstanceUnpair",
+        size: "compact",
+        className: "agent-instance-action",
+        title: `WSL: ${wslEntry.distro}`,
+      });
       unpairBtn.addEventListener("click", async () => {
-        unpairBtn.disabled = true;
-        unpairBtn.textContent = t("agentInstanceUnpairing");
+        helpers.setButtonState(unpairBtn, {
+          pending: true,
+          labelKey: "agentInstanceUnpairing",
+        });
         try {
           if (window.settingsAPI && typeof window.settingsAPI.command === "function") {
             const result = await window.settingsAPI.command("removeFromWsl", {
@@ -1798,8 +2036,10 @@
           ops.showToast(String(err && err.message ? err.message : err), { error: true });
         } finally {
           refreshWslHints();
-          unpairBtn.disabled = false;
-          unpairBtn.textContent = t("agentInstanceUnpair");
+          helpers.setButtonState(unpairBtn, {
+            pending: false,
+            labelKey: "agentInstanceUnpair",
+          });
         }
       });
       ctrl.appendChild(unpairBtn);
@@ -1814,11 +2054,8 @@
     if (flag === "enabled") return false;
     const masterOn = readers.readAgentFlagValue(agentId, "enabled");
     if (!masterOn) return true;
-    if (agentId === "codex" && flag === "permissionsEnabled") {
-      return readers.readAgentPermissionMode(agentId) !== "intercept";
-    }
     if (agentId === "codex" && flag === "nativeNotificationSoundEnabled") {
-      return readers.readAgentPermissionMode(agentId) !== "native";
+      return readers.readAgentPermissionMode(agentId) !== "auto";
     }
     // Subagent sub-gate sits under the permission switch: pointless to toggle
     // while the parent permission gate already suppresses every CC bubble.
@@ -1846,70 +2083,48 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const segmented = document.createElement("div");
-    segmented.className = "segmented codex-permission-mode-segmented";
-    segmented.setAttribute("role", "tablist");
-    const current = readers.readAgentPermissionMode(agent.id);
-    segmented.style.setProperty("--codex-permission-mode-active-index", String(getCodexPermissionModeIndex(current)));
-    for (const mode of CODEX_PERMISSION_MODE_OPTIONS) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.dataset.mode = mode.id;
-      btn.textContent = t(mode.labelKey);
-      btn.classList.toggle("active", current === mode.id);
-      btn.disabled = !!disabled;
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        if (btn.disabled || btn.classList.contains("active")) return;
-        window.settingsAPI.command("setAgentPermissionMode", {
-          agentId: agent.id,
-          mode: mode.id,
-        }).then((result) => {
-          if (!result || result.status !== "ok") {
-            const msg = (result && result.message) || "unknown error";
-            ops.showToast(t("toastSaveFailed") + msg, { error: true });
-          }
-        }).catch((err) => {
+    const control = helpers.buildSegmentedRadio({
+      id: "codex-permission-mode",
+      ariaLabel: t("rowCodexPermissionMode"),
+      className: "codex-permission-mode-segmented",
+      stopPropagation: true,
+      value: readers.readAgentPermissionMode(agent.id),
+      disabled: !!disabled,
+      pending: permissionModePending.has(agent.id),
+      options: CODEX_PERMISSION_MODE_OPTIONS.map((mode) => ({
+        value: mode.id, label: t(mode.labelKey), dataset: { mode: mode.id },
+      })),
+      onValueSync(value, element) {
+        element.style.setProperty("--codex-permission-mode-active-index", String(getCodexPermissionModeIndex(value)));
+      },
+      async onChange(mode) {
+        if (permissionModePending.has(agent.id)) return false;
+        permissionModePending.add(agent.id);
+        try {
+          const result = await window.settingsAPI.command("setAgentPermissionMode", { agentId: agent.id, mode });
+          if (result && result.status === "ok") return true;
+          ops.showToast(t("toastSaveFailed") + ((result && result.message) || "unknown error"), { error: true });
+        } catch (err) {
           ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
-        });
-      });
-      segmented.appendChild(btn);
-    }
-    ctrl.appendChild(segmented);
+        } finally {
+          permissionModePending.delete(agent.id);
+          state.mountedControls.agentPermissionModes.get(agent.id)?.control.setPending(false);
+        }
+        return false;
+      },
+    });
+    ctrl.appendChild(control.element);
     row.appendChild(ctrl);
     state.mountedControls.agentPermissionModes.set(agent.id, {
       row,
+      control,
       agentId: agent.id,
-      syncFromSnapshot: () => syncCodexPermissionModeRow(row, agent.id),
+      syncFromSnapshot() {
+        control.setValue(readers.readAgentPermissionMode(agent.id));
+        control.setDisabled(!readers.readAgentFlagValue(agent.id, "enabled"));
+      },
     });
     return row;
-  }
-
-  function syncCodexPermissionModeRow(row, agentId) {
-    const disabled = !readers.readAgentFlagValue(agentId, "enabled");
-    const current = readers.readAgentPermissionMode(agentId);
-    const segmented = row.querySelector(".codex-permission-mode-segmented");
-    const currentIndex = getCodexPermissionModeIndex(current);
-    const previousActive = segmented && [...segmented.querySelectorAll("button")]
-      .find((btn) => btn.classList.contains("active"));
-    const previousIndex = previousActive
-      ? getCodexPermissionModeIndex(previousActive.dataset.mode)
-      : currentIndex;
-    if (segmented) {
-      segmented.style.setProperty("--codex-permission-mode-active-index", String(previousIndex));
-    }
-    for (const btn of row.querySelectorAll("button")) {
-      btn.classList.toggle("active", btn.dataset.mode === current);
-      btn.disabled = !!disabled;
-    }
-    if (segmented && previousIndex !== currentIndex) {
-      requestAnimationFrame(() => {
-        segmented.getBoundingClientRect();
-        segmented.style.setProperty("--codex-permission-mode-active-index", String(currentIndex));
-      });
-    } else if (segmented) {
-      segmented.style.setProperty("--codex-permission-mode-active-index", String(currentIndex));
-    }
   }
 
   function getCodexPermissionModeIndex(mode) {
@@ -1918,10 +2133,7 @@
 
   function syncAgentSwitchDisabledState(meta, disabled) {
     meta.disabled = !!disabled;
-    const sw = meta.element;
-    sw.classList.toggle("disabled", !!disabled);
-    sw.setAttribute("aria-disabled", disabled ? "true" : "false");
-    sw.setAttribute("tabindex", disabled ? "-1" : "0");
+    meta.control.setState({ disabled: !!disabled });
   }
 
   function syncAgentIntegrationBadge(badge, agentId) {
@@ -1930,6 +2142,7 @@
     badge.classList.toggle("not-installed", !installed);
     badge.textContent = t(installed ? "agentIntegrationInstalled" : "agentIntegrationNotInstalled");
     if (agentId === "codex") annotateCodexHookHealth(badge, installed);
+    if (agentId === "claude-code") annotateClaudeHookHealth(badge, installed);
   }
 
   // Codex approval awareness now depends ENTIRELY on the official PermissionRequest
@@ -1957,12 +2170,39 @@
     }).catch(() => {});
   }
 
+  // Claude counterpart of annotateCodexHookHealth. When the managed hook is no
+  // longer being kept healthy (auto-repair exhausted, paused by the suspicious-
+  // shrink guard, or the source script is missing), the prefs "Installed" flag
+  // is stale — Claude isn't actually driving the pet. Overlay the same amber
+  // warning, sourced from the live watcher status the Doctor reads, with the
+  // specific reason in the tooltip. Async + best-effort: an unavailable or
+  // healthy probe keeps the badge's base "Installed" state.
+  function annotateClaudeHookHealth(badge, installed) {
+    if (!badge) return;
+    const seq = String(++claudeHookHealthRequestSeq);
+    if (badge.dataset) badge.dataset.claudeHookHealthSeq = seq;
+    badge.classList.remove("hook-warning");
+    badge.removeAttribute("title");
+    if (!installed || !window.doctor || typeof window.doctor.claudeHookHealth !== "function") return;
+    window.doctor.claudeHookHealth().then((health) => {
+      if (badge.isConnected === false) return;
+      if (badge.dataset && badge.dataset.claudeHookHealthSeq !== seq) return;
+      if (!health || health.healthy || !health.signature) return;
+      if (!readers.readAgentIntegrationInstalled("claude-code")) return;
+      badge.classList.add("hook-warning");
+      badge.textContent = t("agentClaudeHookNeedsAttention");
+      if (health.reasonKey) badge.title = t(health.reasonKey);
+    }).catch(() => {});
+  }
+
   function syncAgentIntegrationAction(meta) {
     if (!meta || !meta.button) return;
     const installed = readers.readAgentIntegrationInstalled(meta.agentId);
-    meta.button.disabled = false;
-    meta.button.classList.remove("pending");
-    meta.button.textContent = t(installed ? "agentIntegrationUninstall" : "agentIntegrationInstall");
+    helpers.setButtonState(meta.button, {
+      disabled: false,
+      pending: false,
+      labelKey: installed ? "agentIntegrationUninstall" : "agentIntegrationInstall",
+    });
     meta.button.setAttribute(
       "aria-label",
       t(installed ? "agentIntegrationUninstall" : "agentIntegrationInstall")
@@ -1971,9 +2211,10 @@
   }
 
   function buildAgentIntegrationActionButton(agent) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "soft-btn agent-integration-action";
+    const button = helpers.buildButton({
+      size: "compact",
+      className: "agent-integration-action",
+    });
     const meta = {
       button,
       agentId: agent.id,
@@ -1989,9 +2230,10 @@
       if (installed && typeof window.confirm === "function" && !window.confirm(t("agentIntegrationUninstallConfirm"))) {
         return;
       }
-      button.disabled = true;
-      button.classList.add("pending");
-      button.textContent = t("agentIntegrationWorking");
+      helpers.setButtonState(button, {
+        pending: true,
+        labelKey: "agentIntegrationWorking",
+      });
       window.settingsAPI.command(command, { agentId: agent.id }).then((result) => {
         if (result && result.status === "skipped") {
           ops.showToast(formatHintResult(t("agentIntegrationInstallSkipped"), {
@@ -2014,6 +2256,9 @@
         ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
       }).finally(() => {
         syncAgentIntegrationAction(meta);
+        // Install/uninstall rewrites the notices; refresh the DSH row whether
+        // the command succeeded or failed.
+        if (agent.id === "deepseek-harness") refreshMountedDshNotices();
       });
     });
     state.mountedControls.agentIntegrationActions.set(agent.id, meta);
@@ -2034,24 +2279,25 @@
     if (typeof buildExtraControls === "function") {
       buildExtraControls(ctrl);
     }
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", disabled ? "-1" : "0");
-    sw.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-    });
-    sw.addEventListener("keydown", (ev) => {
-      ev.stopPropagation();
-    });
     const stateId = readers.agentSwitchStateId(agent.id, flag);
     const override = state.transientUiState.agentSwitches.get(stateId);
     const committedVisual = readers.readAgentFlagValue(agent.id, flag);
-    helpers.setSwitchVisual(sw, override ? override.visualOn : committedVisual, {
+    const label = text.querySelector(".row-label");
+    const desc = text.querySelector(".row-desc");
+    const controlId = `settings-agent-${agent.id}-${flag}`;
+    if (label) label.id = `${controlId}-label`;
+    if (desc) desc.id = `${controlId}-description`;
+    const switchControl = helpers.buildSwitch({
+      checked: override ? override.visualOn : committedVisual,
       pending: override ? override.pending : false,
+      disabled,
+      ariaLabelledBy: label ? label.id : null,
+      ariaDescribedBy: desc ? desc.id : null,
+      stopPropagation: true,
     });
     const meta = {
-      element: sw,
+      control: switchControl,
+      element: switchControl.element,
       agentId: agent.id,
       flag,
       disabled,
@@ -2059,7 +2305,7 @@
     };
     state.mountedControls.agentSwitches.set(stateId, meta);
     syncAgentSwitchDisabledState(meta, disabled);
-    helpers.attachAnimatedSwitch(sw, {
+    helpers.attachOptimisticSwitch(switchControl, {
       getCommittedVisual: () => readers.readAgentFlagValue(agent.id, flag),
       getTransientState: () => state.transientUiState.agentSwitches.get(stateId) || null,
       setTransientState: (value) => state.transientUiState.agentSwitches.set(stateId, value),
@@ -2075,7 +2321,7 @@
           value: !readers.readAgentFlagValue(agent.id, flag),
         }),
     });
-    ctrl.appendChild(sw);
+    ctrl.appendChild(switchControl.element);
     row.appendChild(ctrl);
     return row;
   }
@@ -2088,38 +2334,29 @@
     placeholderKey,
     value,
   }) {
-    const row = document.createElement("div");
-    row.className = "row row-sub agent-text-input-row";
-
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = t(labelKey);
-    text.appendChild(label);
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.textContent = t(descKey);
-    text.appendChild(desc);
-    row.appendChild(text);
-
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control agent-text-input-control";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.value = typeof value === "function" ? value() : "";
-    input.placeholder = t(placeholderKey);
-    input.spellcheck = false;
-    input.addEventListener("click", (ev) => ev.stopPropagation());
-    input.addEventListener("keydown", (ev) => {
-      ev.stopPropagation();
-      if (ev.key === "Enter") input.blur();
+    const rowParts = helpers.buildSettingRow({
+      labelKey,
+      descriptionKey: descKey,
+      className: "row-sub agent-text-input-row",
+      controlClassName: "agent-text-input-control",
+    });
+    const row = rowParts.element;
+    const ctrl = rowParts.controlElement;
+    const input = helpers.buildTextInput({
+      type: "text",
+      value: typeof value === "function" ? value() : "",
+      placeholder: t(placeholderKey),
+      spellcheck: false,
+      labelledBy: rowParts.labelElement.id,
+      describedBy: rowParts.descriptionElement ? rowParts.descriptionElement.id : null,
+      stopPropagation: true,
+      onEnter: () => input.blur(),
+      onInput: (event) => helpers.setTextInputState(event.currentTarget, { invalid: false }),
     });
     input.addEventListener("change", () => {
       saveAgentTextInput(input, { agentId, command });
     });
     ctrl.appendChild(input);
-    row.appendChild(ctrl);
     row._settingsInput = input;
     row._settingsControl = ctrl;
     return row;
@@ -2131,7 +2368,7 @@
       return { status: "error", message: "settings API unavailable" };
     }
     const nextValue = input.value;
-    input.disabled = true;
+    helpers.setTextInputState(input, { pending: true });
     try {
       const result = await window.settingsAPI.command(command, {
         agentId,
@@ -2139,19 +2376,25 @@
       });
       if (!result || result.status !== "ok") {
         const msg = (result && result.message) || "unknown error";
+        // A pending field is disabled and cannot take focus; clear it first.
+        helpers.setTextInputState(input, { pending: false, invalid: true });
+        input.focus();
         ops.showToast(t("toastSaveFailed") + msg, { error: true });
         return result || { status: "error", message: msg };
       }
+      helpers.setTextInputState(input, { invalid: false });
       ops.showToast(t("toastAgentCustomSaved"));
       if (command === "setAgentCustomDiscoveryPaths" && typeof ops.fetchAgentInstallationHints === "function") {
         await ops.fetchAgentInstallationHints({ force: true });
       }
       return result;
     } catch (err) {
+      helpers.setTextInputState(input, { pending: false, invalid: true });
+      input.focus();
       ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
       return { status: "error", message: err && err.message };
     } finally {
-      input.disabled = false;
+      helpers.setTextInputState(input, { pending: false });
     }
   }
 
@@ -2173,7 +2416,10 @@
       if (meta.flag !== "enabled") {
         meta.syncDisabledState(computeAgentSubSwitchDisabled(meta.agentId, meta.flag));
       }
-      helpers.setSwitchVisual(meta.element, readers.readAgentFlagValue(meta.agentId, meta.flag), { pending: false });
+      meta.control.setState({
+        checked: readers.readAgentFlagValue(meta.agentId, meta.flag),
+        pending: false,
+      });
     }
     for (const [, meta] of state.mountedControls.agentPermissionModes) {
       meta.syncFromSnapshot();
@@ -2190,6 +2436,11 @@
     readers = core.readers;
     helpers = core.helpers;
     ops = core.ops;
+    // Startup sync and Doctor repairs write notices while the window is open;
+    // refetching on focus is how those surface without a live push channel.
+    if (typeof window !== "undefined" && window && typeof window.addEventListener === "function") {
+      window.addEventListener("focus", () => refreshMountedDshNotices());
+    }
     core.tabs.agents = {
       render,
       patchInPlace,

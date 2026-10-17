@@ -33,12 +33,18 @@ const AGENT_METRIC_POLICIES = Object.freeze({
   "qwen-code": policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   zcode: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   codewhale: policy(null, null, STANDARD_TOOL_START),
-  // OpenCode-family plugins dedupe and compact repeated visual states. A
-  // second PreToolUse inside the same working run may never reach /state, so
-  // claiming per-tool counts would turn a deterministic undercount into 0.
-  opencode: policy(null, STANDARD_COMPLETION, null),
-  mimocode: policy(null, STANDARD_COMPLETION, null),
+  // OpenCode-family tool lifecycle events are delivered per call: the family
+  // plugin exempts them from visual-state dedup/compaction so every
+  // PreToolUse reaches /state (hooks/opencode-family-plugin/core.mjs). Only a
+  // transport overflow that drops the oldest queued snapshot can undercount,
+  // and only during extreme delivery stalls.
+  opencode: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
+  mimocode: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   pi: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
+  // OMP records a main-session completion candidate at session_stop and emits
+  // Stop only after the following agent_end proves willContinue !== true, so
+  // accepted Stop remains a completed-turn boundary here.
+  omp: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   openclaw: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   // Hermes normalizes both post_llm_call and on_session_end to Stop. The first
   // can be an intermediate model boundary before a tool call, so Stop is not a
@@ -50,6 +56,21 @@ const AGENT_METRIC_POLICIES = Object.freeze({
   qwenwork: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   workbuddy: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
   traecode: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
+  // MiniMax Code maps SessionStart→Stop turn boundaries exactly like the
+  // Claude-compatible adapters; PreToolUse/PostToolUse bracket tool calls.
+  minimax: policy(null, STANDARD_COMPLETION, STANDARD_TOOL_START),
+  "grok-build": policy(null, null, STANDARD_TOOL_START),
+  // KiroCrew is a state-only bridge over the gateway's chat lifecycle hooks.
+  // It opts out of every proven-boundary metric rather than guessing one:
+  //  - sessionStart: AgentSpawn is not a fresh-start source and carries no
+  //    startup/clear origin, so it cannot prove a session-start.
+  //  - turnComplete: Stop marks the end of a turn, not a completed task — it
+  //    also fires on user cancel and before a hook-requested continuation —
+  //    so it is not a safe completed-turn boundary.
+  //  - toolCall: PreToolUse is intentionally NOT installed (its non-zero exit
+  //    denies tools on KiroCrew's approval path), and PostToolUse is a plain
+  //    state ping, not a proven per-call tool boundary.
+  kirocrew: policy(null, null, null),
 });
 
 function policy(sessionStart, turnCompleteEvents, toolCallEvents) {

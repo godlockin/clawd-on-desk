@@ -87,6 +87,18 @@ describe("doctor hook activity connection test", () => {
     assert.doesNotMatch(result.detail, /HTTP works|likely/i);
   });
 
+  it("points to optional Codex hook review before blaming the HTTP path", () => {
+    const result = evaluateConnectionTest({
+      fileActivity: [{ agentId: "codex", source: "file-mtime", count: 1 }],
+      codexHookHealth: { signature: "needs-review-optional", status: "needs-review" },
+    });
+
+    assert.strictEqual(result.status, "hooks-need-review");
+    assert.strictEqual(result.level, "warning");
+    assert.match(result.detail, /\/hooks/);
+    assert.doesNotMatch(result.detail, /HTTP works|likely/i);
+  });
+
   it("keeps observed HTTP outcomes ahead of Codex hook review state", () => {
     const shared = {
       fileActivity: [{ agentId: "codex", source: "file-mtime", count: 1 }],
