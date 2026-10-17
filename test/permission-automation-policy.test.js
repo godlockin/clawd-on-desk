@@ -16,6 +16,20 @@ function evaluate(mode, interaction) {
   return evaluatePermissionAutomation({ mode, interaction });
 }
 
+describe("native question protocol capability", () => {
+  it("grants only explicit family question ingress and never approval automation", () => {
+    for (const agentId of ["opencode", "mimocode"]) {
+      const native = classifyPermissionInteraction({ agentId, eventKind: "question", toolName: "AskUserQuestion" });
+      assert.strictEqual(native.capabilities.answerQuestions, true);
+      assert.strictEqual(native.capabilities.allowDeny, false);
+      assert.strictEqual(native.automationEligibility.autoTools, false);
+      assert.strictEqual(native.automationEligibility.unattended, false);
+      const permission = classifyPermissionInteraction({ agentId, eventKind: "permission", toolName: "AskUserQuestion" });
+      assert.strictEqual(permission.capabilities.answerQuestions, false);
+    }
+  });
+});
+
 describe("permission automation interaction classifier", () => {
   it("classifies Claude tool, question, and plan interactions", () => {
     const tool = classifyPermissionInteraction({
@@ -431,6 +445,17 @@ describe("evaluatePermissionAutomation", () => {
         evaluate(PERMISSION_AUTOMATION_MODE.OFF, interaction),
         AUTOMATION_ACTION.DEFER
       );
+    }
+  });
+
+  it("defers every Grok Build interaction in auto-tools and unattended", () => {
+    // Grok Build is state-only (Phase 1) and never registers /permission, so no
+    // interaction may ever be automated for it.
+    for (const toolName of ["Bash", "AskUserQuestion", "ExitPlanMode"]) {
+      const interaction = classifyPermissionInteraction({ agentId: "grok-build", toolName });
+      assert.strictEqual(evaluate(PERMISSION_AUTOMATION_MODE.AUTO_TOOLS, interaction), AUTOMATION_ACTION.DEFER);
+      assert.strictEqual(evaluate(PERMISSION_AUTOMATION_MODE.UNATTENDED, interaction), AUTOMATION_ACTION.DEFER);
+      assert.strictEqual(evaluate(PERMISSION_AUTOMATION_MODE.OFF, interaction), AUTOMATION_ACTION.DEFER);
     }
   });
 
