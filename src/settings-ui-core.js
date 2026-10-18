@@ -45,6 +45,15 @@
   // startsWith("Mac") not /\bMac\b/ — "MacIntel" has \w after "c", fails \b (regression #135).
   const IS_MAC = (navigator.platform || "").startsWith("Mac");
   const IS_WIN = (navigator.platform || "").startsWith("Win");
+  // Renderers have no `process`, so platform-gated shortcut rows resolve their
+  // support from the same navigator probe. Anything we cannot positively
+  // identify as darwin/win32 is treated as unsupported, which is the safe
+  // direction for a gate that must stay closed on Linux.
+  const SHORTCUT_PLATFORM = IS_MAC ? "darwin" : (IS_WIN ? "win32" : "linux");
+  const isShortcutActionSupported = shortcutApi.isShortcutActionSupported
+    || (() => true);
+  const SUPPORTED_SHORTCUT_ACTION_IDS = SHORTCUT_ACTION_IDS.filter((actionId) =>
+    isShortcutActionSupported(actionId, SHORTCUT_PLATFORM));
   const COLLAPSED_GROUPS_STORAGE_KEY = "clawd.settings.collapsedGroups.v1";
   const NAVIGATION_STORAGE_KEY = "clawd.settings.navigation.v1";
   const MAX_PERSISTED_SCROLL_TOP = 10_000_000;
@@ -78,17 +87,16 @@
       animMapReset: null,
       animOverrideTimingSliders: new Map(),
       idleVisualPicker: null,
-      bubblePolicySummary: null,
-      sessionHudSummary: null,
       size: null,
-      soundSummary: null,
       soundVolume: null,
       textScale: null,
       roamMovementStyle: null,
       bubblePlacement: null,
+      quotaAlertThresholds: null,
       roamArea: null,
       settingsSelects: new Set(),
       segmentedRadios: new Set(),
+      formFields: new Set(),
       disposableScopes: new Map(),
       quotaRingDisplayMode: null,
       permissionAutomationMode: null,
@@ -101,6 +109,12 @@
     nextTransientUiSeq: 1,
   };
 
+  // Native `disabled` cannot distinguish a business rule from a temporary
+  // pending lock. Keep those axes separate so async actions can recover
+  // without accidentally enabling a button that should remain unavailable.
+  const settingsButtonStates = new WeakMap();
+  let nextSettingsSwitchId = 1;
+
   const runtime = {
     agentMetadata: null,
     agentInstallationHints: null,
@@ -108,6 +122,24 @@
     agentInstallationHintsFetched: false,
     agentInstallationHintsPromise: null,
     themeList: null,
+    themeListPromise: null,
+    officialThemeList: null,
+    officialThemePromise: null,
+    officialThemeListFetched: false,
+    officialThemeCatalogStatus: null,
+    officialThemeCatalogVersion: null,
+    officialThemeCatalogRetrying: false,
+    officialThemeOperation: null,
+    officialThemePendingThemeId: null,
+    // Bumped every time an operation end is observed, and mirrored onto a list
+    // read that actually replaced the official list. When the two differ, the
+    // cached per-card progress snapshots predate the observed end and must not
+    // be trusted as "an install is still running".
+    officialThemeEndCount: 0,
+    officialThemeListEndCount: 0,
+    // De-dupes the post-operation list refresh so the two back-to-back idle
+    // events share one read and one completion render.
+    officialThemeEndRefresh: null,
     codexPetsRefreshPending: false,
     codexPetZipImportPending: false,
     userThemeZipImportPending: false,
@@ -195,7 +227,7 @@
   function readAgentPermissionMode(agentId) {
     const entry = state.snapshot && state.snapshot.agents && state.snapshot.agents[agentId];
     if (agentId === "codex" && entry && entry.permissionMode === "intercept") return "intercept";
-    return "native";
+    return "auto";
   }
 
   function readAgentCustomPermissionUrl(agentId) {
@@ -301,27 +333,122 @@
     }, ttl);
   }
 
-  function setSwitchVisual(sw, visualOn, { pending = false } = {}) {
-    sw.classList.toggle("on", !!visualOn);
-    sw.classList.toggle("pending", !!pending);
-    sw.setAttribute("aria-checked", visualOn ? "true" : "false");
+  function buildSwitch(config = {}) {
+    const element = config.element || document.createElement("button");
+    const visualElement = config.visualElement || element;
+    const isButton = String(element.tagName || "").toLowerCase() === "button";
+    if (isButton) element.type = "button";
+    element.setAttribute("role", "switch");
+    visualElement.classList.add("switch");
+    for (const name of String(config.className || "").split(/\s+/).filter(Boolean)) {
+      visualElement.classList.add(name);
+    }
+
+    let checked = config.checked === true;
+    let disabled = config.disabled === true;
+    let pending = config.pending === true;
+    let disposed = false;
+    let onToggle = typeof config.onToggle === "function" ? config.onToggle : null;
+    const enabledTabIndex = Number.isInteger(config.tabIndex) ? config.tabIndex : 0;
+    const stopPropagation = config.stopPropagation === true;
+
+    function syncAccessibleName(patch) {
+      if (Object.prototype.hasOwnProperty.call(patch, "ariaLabel")) {
+        const value = patch.ariaLabel == null ? "" : String(patch.ariaLabel);
+        if (value) element.setAttribute("aria-label", value);
+        else element.removeAttribute("aria-label");
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "ariaLabelledBy")) {
+        const value = patch.ariaLabelledBy == null ? "" : String(patch.ariaLabelledBy);
+        if (value) element.setAttribute("aria-labelledby", value);
+        else element.removeAttribute("aria-labelledby");
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "ariaDescribedBy")) {
+        const value = patch.ariaDescribedBy == null ? "" : String(patch.ariaDescribedBy);
+        if (value) element.setAttribute("aria-describedby", value);
+        else element.removeAttribute("aria-describedby");
+      }
+    }
+
+    function syncState() {
+      visualElement.classList.toggle("on", checked);
+      visualElement.classList.toggle("pending", pending);
+      visualElement.classList.toggle("disabled", disabled);
+      element.setAttribute("aria-checked", checked ? "true" : "false");
+      element.setAttribute("aria-disabled", disabled ? "true" : "false");
+      element.setAttribute("aria-busy", pending ? "true" : "false");
+      element.tabIndex = disabled ? -1 : enabledTabIndex;
+      element.setAttribute("tabindex", String(element.tabIndex));
+      if (isButton) element.disabled = disabled;
+    }
+
+    function requestToggle(event) {
+      if (stopPropagation && event && typeof event.stopPropagation === "function") {
+        event.stopPropagation();
+      }
+      if (disposed || disabled || pending || typeof onToggle !== "function") return;
+      onToggle({ checked, nextChecked: !checked, event, control });
+    }
+
+    function onClick(event) {
+      requestToggle(event);
+    }
+
+    function onKeyDown(event) {
+      if (!event || (event.key !== " " && event.key !== "Enter")) return;
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      requestToggle(event);
+    }
+
+    const control = {
+      element,
+      visualElement,
+      getChecked: () => checked,
+      setState(patch = {}) {
+        if (disposed) return control;
+        if (Object.prototype.hasOwnProperty.call(patch, "checked")) checked = patch.checked === true;
+        if (Object.prototype.hasOwnProperty.call(patch, "disabled")) disabled = patch.disabled === true;
+        if (Object.prototype.hasOwnProperty.call(patch, "pending")) pending = patch.pending === true;
+        syncAccessibleName(patch);
+        syncState();
+        return control;
+      },
+      setOnToggle(handler) {
+        onToggle = typeof handler === "function" ? handler : null;
+        return control;
+      },
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        onToggle = null;
+        element.removeEventListener("click", onClick);
+        element.removeEventListener("keydown", onKeyDown);
+      },
+    };
+
+    syncAccessibleName(config);
+    if (!element.getAttribute("aria-label") && !element.getAttribute("aria-labelledby")) {
+      throw new TypeError("buildSwitch requires ariaLabel or ariaLabelledBy");
+    }
+    syncState();
+    element.addEventListener("click", onClick);
+    element.addEventListener("keydown", onKeyDown);
+    return registerMountedDisposable(control);
   }
 
-  function attachAnimatedSwitch(sw, {
+  function attachOptimisticSwitch(control, {
     getCommittedVisual,
     getTransientState,
     setTransientState,
     clearTransientState,
     invoke,
   }) {
-    const run = () => {
-      if (sw.classList.contains("disabled") || sw.getAttribute("aria-disabled") === "true") return;
-      if (sw.classList.contains("pending")) return;
+    control.setOnToggle(() => {
       const currentVisual = getCommittedVisual();
       const nextVisual = !currentVisual;
       const seq = state.nextTransientUiSeq++;
       setTransientState({ visualOn: nextVisual, pending: true, seq });
-      setSwitchVisual(sw, nextVisual, { pending: true });
+      control.setState({ checked: nextVisual, pending: true });
       Promise.resolve()
         .then(invoke)
         .then((result) => {
@@ -329,30 +456,24 @@
           if (!current || current.seq !== seq) return;
           if (!result || result.status !== "ok" || result.noop) {
             clearTransientState(seq);
-            setSwitchVisual(sw, getCommittedVisual(), { pending: false });
-            if (result && result.noop) return;
+            control.setState({ checked: getCommittedVisual(), pending: false });
+            if (result && (result.noop || result.cancelled)) return;
             const msg = (result && result.message) || "unknown error";
             showToast(t("toastSaveFailed") + msg, { error: true });
             return;
           }
           clearTransientState(seq);
-          setSwitchVisual(sw, nextVisual, { pending: false });
+          control.setState({ checked: nextVisual, pending: false });
         })
         .catch((err) => {
           const current = getTransientState();
           if (!current || current.seq !== seq) return;
           clearTransientState(seq);
-          setSwitchVisual(sw, getCommittedVisual(), { pending: false });
+          control.setState({ checked: getCommittedVisual(), pending: false });
           showToast(t("toastSaveFailed") + (err && err.message), { error: true });
         });
-    };
-    sw.addEventListener("click", run);
-    sw.addEventListener("keydown", (ev) => {
-      if (ev.key === " " || ev.key === "Enter") {
-        ev.preventDefault();
-        run();
-      }
     });
+    return control;
   }
 
   function buildSection(title, rows) {
@@ -371,9 +492,62 @@
     return section;
   }
 
-  // Shared Settings button primitive. Feature tabs keep ownership of business
-  // behavior while tone, sizing and pending/accessibility semantics stay
-  // consistent across the Settings window.
+  function resolveButtonLabel(config = {}) {
+    if (Object.prototype.hasOwnProperty.call(config, "label")) {
+      return config.label == null ? "" : String(config.label);
+    }
+    return config.labelKey ? t(String(config.labelKey)) : "";
+  }
+
+  function isDomNode(value) {
+    if (!value || typeof value !== "object") return false;
+    const NodeCtor = typeof globalThis !== "undefined" ? globalThis.Node : null;
+    if (typeof NodeCtor === "function") return value instanceof NodeCtor;
+    return typeof value.tagName === "string" && typeof value.appendChild === "function";
+  }
+
+  function applyButtonState(button, buttonState) {
+    buttonState.labelElement.textContent = buttonState.label;
+    button.disabled = buttonState.disabled || buttonState.pending;
+    button.classList.toggle("pending", buttonState.pending);
+    button.setAttribute("aria-busy", buttonState.pending ? "true" : "false");
+    if (typeof buttonState.ariaPressed === "boolean") {
+      button.setAttribute("aria-pressed", buttonState.ariaPressed ? "true" : "false");
+    } else {
+      button.removeAttribute("aria-pressed");
+    }
+  }
+
+  // Shared Settings button primitive. Feature tabs keep ownership of commands,
+  // confirmation, persistence and rollback while this layer owns structure and
+  // presentation state. Updating the label never replaces an optional icon.
+  function setButtonState(button, patch = {}) {
+    if (!button || typeof button !== "object") return button;
+    const current = settingsButtonStates.get(button);
+    if (!current) {
+      throw new TypeError("setButtonState requires a button built by buildButton");
+    }
+    const next = { ...current };
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "label")
+      || Object.prototype.hasOwnProperty.call(patch, "labelKey")
+    ) {
+      next.label = resolveButtonLabel(patch);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "disabled")) {
+      next.disabled = patch.disabled === true;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "pending")) {
+      next.pending = patch.pending === true;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "ariaPressed")) {
+      next.ariaPressed = typeof patch.ariaPressed === "boolean" ? patch.ariaPressed : null;
+    }
+    settingsButtonStates.set(button, next);
+    applyButtonState(button, next);
+    return button;
+  }
+
   function buildButton(config = {}) {
     const button = document.createElement("button");
     const tone = ["neutral", "accent", "danger", "quiet"].includes(config.tone)
@@ -390,16 +564,305 @@
       tone === "neutral" ? "" : tone,
       config.className || "",
     ].filter(Boolean).join(" ");
-    button.textContent = config.label != null
-      ? String(config.label)
-      : (config.labelKey ? t(config.labelKey) : "");
+
+    if (config.icon != null) {
+      if (!isDomNode(config.icon)) {
+        throw new TypeError("buildButton icon must be a DOM Node");
+      }
+      const iconElement = document.createElement("span");
+      iconElement.className = "settings-button-icon";
+      iconElement.setAttribute("aria-hidden", "true");
+      iconElement.appendChild(config.icon);
+      button.appendChild(iconElement);
+    }
+    const labelElement = document.createElement("span");
+    labelElement.className = "settings-button-label";
+    button.appendChild(labelElement);
+    const buttonState = {
+      labelElement,
+      label: resolveButtonLabel(config),
+      disabled: config.disabled === true,
+      pending: config.pending === true,
+      ariaPressed: typeof config.ariaPressed === "boolean" ? config.ariaPressed : null,
+    };
+    settingsButtonStates.set(button, buttonState);
     if (config.ariaLabel) button.setAttribute("aria-label", String(config.ariaLabel));
     if (config.title) button.title = String(config.title);
-    if (config.disabled === true || config.pending === true) button.disabled = true;
-    button.classList.toggle("pending", config.pending === true);
-    button.setAttribute("aria-busy", config.pending === true ? "true" : "false");
     if (typeof config.onClick === "function") button.addEventListener("click", config.onClick);
+    applyButtonState(button, buttonState);
     return button;
+  }
+
+  let nextSettingsDomId = 1;
+  function createSettingsDomId(suffix) {
+    const id = nextSettingsDomId++;
+    return `settings-${suffix}-${id}`;
+  }
+
+  function resolveCanonicalOrAlias(config, canonicalKey, aliasKey) {
+    if (Object.prototype.hasOwnProperty.call(config, canonicalKey)) {
+      return config[canonicalKey];
+    }
+    if (Object.prototype.hasOwnProperty.call(config, aliasKey)) {
+      return config[aliasKey];
+    }
+    return undefined;
+  }
+
+  // Shared layout primitive for ordinary Settings rows. It deliberately owns
+  // only structure and accessible relationships; feature tabs still own the
+  // contents placed into the text and control slots.
+  function buildSettingRow(config = {}) {
+    const element = document.createElement("div");
+    element.className = ["row", config.className || ""].filter(Boolean).join(" ");
+
+    const textElement = document.createElement("div");
+    textElement.className = "row-text";
+    const labelElement = document.createElement("span");
+    labelElement.className = "row-label";
+    labelElement.id = createSettingsDomId("row-label");
+    labelElement.textContent = config.label != null
+      ? String(config.label)
+      : (config.labelKey ? t(config.labelKey) : "");
+    textElement.appendChild(labelElement);
+
+    let descriptionElement = null;
+    const description = config.description != null
+      ? String(config.description)
+      : (config.descriptionKey ? t(config.descriptionKey) : "");
+    if (description) {
+      descriptionElement = document.createElement("span");
+      descriptionElement.className = "row-desc";
+      descriptionElement.id = createSettingsDomId("row-description");
+      descriptionElement.textContent = description;
+      textElement.appendChild(descriptionElement);
+    }
+
+    const controlElement = document.createElement("div");
+    controlElement.className = ["row-control", config.controlClassName || ""]
+      .filter(Boolean).join(" ");
+    element.appendChild(textElement);
+    element.appendChild(controlElement);
+    return { element, textElement, labelElement, descriptionElement, controlElement };
+  }
+
+  function buildFormField(config = {}) {
+    const supportedTypes = new Set(["text", "password", "number", "search"]);
+    const type = config.type || "text";
+    if (!supportedTypes.has(type)) throw new Error(`Unsupported Settings form field type: ${type}`);
+    const ariaLabel = config.ariaLabel != null ? String(config.ariaLabel) : "";
+    const ariaLabelledBy = resolveCanonicalOrAlias(config, "ariaLabelledBy", "labelledBy");
+    if (!ariaLabel && !ariaLabelledBy) {
+      throw new Error("Settings form fields require ariaLabel or ariaLabelledBy");
+    }
+    const ariaDescribedBy = resolveCanonicalOrAlias(config, "ariaDescribedBy", "describedBy");
+
+    const element = document.createElement("input");
+    const size = config.size === "compact" ? "compact" : "regular";
+    element.type = type;
+    element.className = [
+      "settings-form-field",
+      "settings-text-input",
+      `settings-text-input-${size}`,
+      config.className || "",
+    ].filter(Boolean).join(" ");
+    if (config.placeholder != null) element.placeholder = String(config.placeholder);
+    if (config.autocomplete != null) element.autocomplete = String(config.autocomplete);
+    if (config.spellcheck != null) element.spellcheck = config.spellcheck === true;
+    if (config.inputMode != null) element.inputMode = String(config.inputMode);
+    if (config.maxLength != null) element.maxLength = Number(config.maxLength);
+    if (config.pattern != null) element.pattern = String(config.pattern);
+    for (const key of ["min", "max", "step"]) {
+      if (config[key] != null) element[key] = String(config[key]);
+    }
+
+    const validationElement = document.createElement("span");
+    validationElement.id = createSettingsDomId("field-validation");
+    validationElement.className = "settings-form-field-validation";
+    validationElement.hidden = true;
+    document.body.appendChild(validationElement);
+
+    let disposed = false;
+    const listeners = [];
+    const fieldState = {
+      disabled: false,
+      pending: false,
+      invalid: false,
+      ariaLabel,
+      ariaLabelledBy: ariaLabelledBy ? String(ariaLabelledBy) : "",
+      ariaDescribedBy: ariaDescribedBy == null ? "" : String(ariaDescribedBy),
+      validationMessage: "",
+    };
+
+    function addListener(typeName, listener) {
+      if (typeof listener !== "function") return;
+      element.addEventListener(typeName, listener);
+      listeners.push([typeName, listener]);
+    }
+
+    function syncAccessibleDescription() {
+      const ids = String(fieldState.ariaDescribedBy || "").split(/\s+/).filter(Boolean);
+      if (fieldState.validationMessage) ids.push(validationElement.id);
+      const describedBy = [...new Set(ids)].join(" ");
+      if (describedBy) element.setAttribute("aria-describedby", describedBy);
+      else element.removeAttribute("aria-describedby");
+    }
+
+    const control = {
+      element,
+      validationElement,
+      getValue() {
+        return element.value;
+      },
+      setState(patch = {}) {
+        if (disposed) return control;
+        if (Object.prototype.hasOwnProperty.call(patch, "value")) {
+          const nextValue = patch.value == null ? "" : String(patch.value);
+          if (element.value !== nextValue) element.value = nextValue;
+        }
+        for (const key of ["disabled", "pending", "invalid"]) {
+          if (Object.prototype.hasOwnProperty.call(patch, key)) fieldState[key] = patch[key] === true;
+        }
+        for (const key of ["ariaLabel", "ariaLabelledBy", "ariaDescribedBy", "validationMessage"]) {
+          if (Object.prototype.hasOwnProperty.call(patch, key)) {
+            fieldState[key] = patch[key] == null ? "" : String(patch[key]);
+          }
+        }
+        element.disabled = fieldState.disabled;
+        element.classList.toggle("disabled", fieldState.disabled);
+        element.classList.toggle("pending", fieldState.pending);
+        element.classList.toggle("invalid", fieldState.invalid);
+        element.setAttribute("aria-disabled", fieldState.disabled ? "true" : "false");
+        element.setAttribute("aria-busy", fieldState.pending ? "true" : "false");
+        element.setAttribute("aria-invalid", fieldState.invalid ? "true" : "false");
+        if (fieldState.ariaLabel) element.setAttribute("aria-label", fieldState.ariaLabel);
+        else element.removeAttribute("aria-label");
+        if (fieldState.ariaLabelledBy) element.setAttribute("aria-labelledby", fieldState.ariaLabelledBy);
+        else element.removeAttribute("aria-labelledby");
+        validationElement.textContent = fieldState.validationMessage;
+        validationElement.hidden = !fieldState.validationMessage;
+        syncAccessibleDescription();
+        return control;
+      },
+      focus() {
+        if (!disposed) element.focus();
+      },
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        for (const [typeName, listener] of listeners) element.removeEventListener(typeName, listener);
+        listeners.length = 0;
+        validationElement.remove();
+        state.mountedControls.formFields.delete(control);
+      },
+    };
+
+    const callbackFor = (name) => (event) => {
+      if (!disposed && typeof config[name] === "function") {
+        config[name]({ value: element.value, event, control });
+      }
+    };
+    addListener("input", callbackFor("onInput"));
+    addListener("change", callbackFor("onChange"));
+    addListener("focus", callbackFor("onFocus"));
+    addListener("blur", callbackFor("onBlur"));
+    addListener("click", (event) => {
+      if (config.stopPropagation === true) event.stopPropagation();
+    });
+    addListener("keydown", (event) => {
+      if (config.stopPropagation === true) event.stopPropagation();
+      if (typeof config.onKeyDown === "function") {
+        config.onKeyDown({ value: element.value, event, control });
+      }
+    });
+
+    element._settingsFormFieldControl = control;
+    control.setState({
+      value: config.value,
+      disabled: config.disabled,
+      pending: config.pending,
+      invalid: config.invalid,
+      ariaLabel,
+      ariaLabelledBy,
+      ariaDescribedBy,
+      validationMessage: config.validationMessage,
+    });
+    state.mountedControls.formFields.add(control);
+    return control;
+  }
+
+  function setTextInputState(input, nextState = {}) {
+    if (!input) return input;
+    const previous = input._settingsTextInputState || {
+      disabled: false,
+      pending: false,
+      invalid: false,
+      lockWhilePending: true,
+    };
+    const state = { ...previous };
+    for (const key of ["disabled", "pending", "invalid"]) {
+      if (Object.prototype.hasOwnProperty.call(nextState, key)) state[key] = nextState[key] === true;
+    }
+    if (Object.prototype.hasOwnProperty.call(nextState, "lockWhilePending")) {
+      state.lockWhilePending = nextState.lockWhilePending !== false;
+    }
+    input._settingsTextInputState = state;
+    const control = input._settingsFormFieldControl;
+    if (control && typeof control.setState === "function") {
+      const patch = {
+        disabled: state.disabled || (state.pending && state.lockWhilePending),
+        pending: state.pending,
+        invalid: state.invalid,
+      };
+      if (Object.prototype.hasOwnProperty.call(nextState, "describedBy")) {
+        patch.ariaDescribedBy = nextState.describedBy;
+      }
+      control.setState(patch);
+    }
+    return input;
+  }
+
+  function buildTextInput(config = {}) {
+    const control = buildFormField({
+      ...config,
+      onInput: config.onInput
+        ? ({ event }) => config.onInput(event)
+        : null,
+      onChange: config.onChange
+        ? ({ event }) => config.onChange(event)
+        : null,
+      onFocus: config.onFocus
+        ? ({ event }) => config.onFocus(event)
+        : null,
+      onBlur: config.onBlur
+        ? ({ event }) => config.onBlur(event)
+        : null,
+      onKeyDown: ({ event }) => {
+        if (typeof config.onKeyDown === "function") config.onKeyDown(event);
+        if (
+          event.key !== "Enter"
+          || typeof config.onEnter !== "function"
+          || event.isComposing === true
+          || event.keyCode === 229
+        ) return;
+        event.preventDefault();
+        config.onEnter(event, control.element);
+      },
+    });
+    const input = control.element;
+    const textState = {
+      disabled: config.disabled,
+      pending: config.pending,
+      invalid: config.invalid,
+      lockWhilePending: config.lockWhilePending,
+    };
+    if (Object.prototype.hasOwnProperty.call(config, "ariaDescribedBy")) {
+      textState.describedBy = config.ariaDescribedBy;
+    } else if (Object.prototype.hasOwnProperty.call(config, "describedBy")) {
+      textState.describedBy = config.describedBy;
+    }
+    setTextInputState(input, textState);
+    return input;
   }
 
   function buildSettingsSelect(config = {}) {
@@ -417,6 +880,144 @@
     return control;
   }
 
+  // Selection controls own semantics and input; pages own rendering and commands.
+  function buildTabs(config = {}) {
+    if (!config.id || (!config.ariaLabel && !config.labelledBy)) {
+      throw new TypeError("Tabs require a stable id and accessible name");
+    }
+    const options = config.options || [];
+    const values = options.map((option) => String(option.value));
+    if (new Set(values).size !== values.length) throw new TypeError("Duplicate tab value");
+    let value = values.includes(String(config.value)) ? String(config.value) : (values[0] || "");
+    let focused = value;
+    let disabled = config.disabled === true;
+    let disposed = false;
+    const vertical = config.orientation === "vertical";
+    const element = document.createElement("div");
+    element.className = config.className || "segmented settings-tabs";
+    element.setAttribute("role", "tablist");
+    element.setAttribute("aria-orientation", vertical ? "vertical" : "horizontal");
+    if (config.labelledBy) element.setAttribute("aria-labelledby", config.labelledBy);
+    else element.setAttribute("aria-label", config.ariaLabel);
+    const panels = new Map();
+    const buttons = options.map((option, index) => {
+      const key = values[index];
+      const id = `${config.id}-${encodeURIComponent(key)}`;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = config.buttonClassName || "";
+      button.id = `${id}-tab`;
+      button.dataset.value = key;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-controls", `${id}-panel`);
+      button.setAttribute("data-settings-focus-key", `${id}-tab`);
+      button.setAttribute("data-settings-choice-group", config.id);
+      button.textContent = option.label;
+      if (typeof config.renderLabel === "function") config.renderLabel(button, option);
+      const panel = config.panels?.get(key) || document.createElement("div");
+      panel.id = `${id}-panel`;
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", button.id);
+      panel.tabIndex = 0;
+      panels.set(key, panel);
+      element.appendChild(button);
+      return button;
+    });
+    const available = () => buttons.filter((button, index) => !disabled && !options[index].disabled);
+    function sync() {
+      const enabled = available();
+      if (!enabled.some((button) => button.dataset.value === focused)) {
+        focused = (enabled.find((button) => button.dataset.value === value) || enabled[0])?.dataset.value || "";
+      }
+      buttons.forEach((button, index) => {
+        const selected = button.dataset.value === value;
+        button.disabled = disabled || options[index].disabled === true;
+        button.classList.toggle("disabled", button.disabled);
+        button.classList.toggle("active", selected);
+        button.setAttribute("aria-selected", String(selected));
+        button.tabIndex = !button.disabled && button.dataset.value === focused ? 0 : -1;
+        panels.get(button.dataset.value).hidden = !selected;
+      });
+    }
+    function focus(next = value) {
+      if (disposed) return;
+      const button = available().find((item) => item.dataset.value === String(next)) || available()[0];
+      if (!button) return;
+      focused = button.dataset.value;
+      sync();
+      button.focus({ preventScroll: true });
+    }
+    function activate(button) {
+      if (disposed || button.disabled || button.dataset.value === value) return;
+      const previous = value;
+      if (typeof config.onBeforeChange === "function") config.onBeforeChange(button.dataset.value, previous);
+      value = button.dataset.value;
+      focused = value;
+      sync();
+      if (typeof config.onChange === "function" && config.onChange(value) === false && !disposed) {
+        value = previous;
+        sync();
+      }
+    }
+    function onClick(event) {
+      if (config.stopPropagation === true) event.stopPropagation();
+      if (disposed || event.currentTarget.disabled) return;
+      focus(event.currentTarget.dataset.value);
+      activate(event.currentTarget);
+    }
+    function onFocus(event) {
+      focused = event.currentTarget.dataset.value;
+      sync();
+    }
+    function onBlur(event) {
+      if (buttons.includes(event.relatedTarget)) return;
+      focused = value;
+      sync();
+    }
+    function onKeyDown(event) {
+      if (disposed || event.currentTarget.disabled) return;
+      const enabled = available();
+      const index = enabled.indexOf(event.currentTarget);
+      let target;
+      if (event.key === (vertical ? "ArrowDown" : "ArrowRight")) target = enabled[(index + 1) % enabled.length];
+      else if (event.key === (vertical ? "ArrowUp" : "ArrowLeft")) target = enabled[(index - 1 + enabled.length) % enabled.length];
+      else if (event.key === "Home") target = enabled[0];
+      else if (event.key === "End") target = enabled[enabled.length - 1];
+      else if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        if (!event.repeat) activate(event.currentTarget);
+        return;
+      } else return;
+      event.preventDefault();
+      if (target) focus(target.dataset.value);
+    }
+    const listeners = { click: onClick, keydown: onKeyDown, focus: onFocus, blur: onBlur };
+    for (const button of buttons) {
+      for (const [event, listener] of Object.entries(listeners)) button.addEventListener(event, listener);
+    }
+    sync();
+    return {
+      element, panels,
+      getValue: () => value,
+      setValue(next) {
+        if (disposed || !values.includes(String(next))) return false;
+        value = String(next);
+        if (!buttons.includes(document.activeElement)) focused = value;
+        sync();
+        return true;
+      },
+      setDisabled(next) { if (!disposed) { disabled = next === true; sync(); } },
+      focus,
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        for (const button of buttons) {
+          for (const [event, listener] of Object.entries(listeners)) button.removeEventListener(event, listener);
+        }
+      },
+    };
+  }
+
   function buildSegmentedRadio(config = {}) {
     const options = Array.isArray(config.options)
       ? config.options.filter((option) => option && option.value != null)
@@ -426,7 +1027,10 @@
       ? String(config.value)
       : (values[0] || "");
     let disabled = config.disabled === true;
-    let pending = false;
+    let pending = config.pending === true;
+    let inFlight = false;
+    let operation = 0;
+    let version = 0;
     let disposed = false;
 
     const element = document.createElement("div");
@@ -434,13 +1038,20 @@
       .filter(Boolean)
       .join(" ");
     element.setAttribute("role", "radiogroup");
-    if (config.ariaLabel) element.setAttribute("aria-label", config.ariaLabel);
+    if (config.labelledBy) element.setAttribute("aria-labelledby", config.labelledBy);
+    else if (config.ariaLabel) element.setAttribute("aria-label", config.ariaLabel);
+    else throw new TypeError("Segmented radio requires an accessible name");
 
     const buttons = options.map((option) => {
       const button = document.createElement("button");
       button.type = "button";
       button.setAttribute("role", "radio");
       button.dataset.value = String(option.value);
+      if (config.id) {
+        button.setAttribute("data-settings-focus-key", `${config.id}-${encodeURIComponent(option.value)}`);
+        button.setAttribute("data-settings-choice-group", config.id);
+      }
+      if (option.dataset) Object.assign(button.dataset, option.dataset);
 
       const label = document.createElement("span");
       label.className = "settings-segmented-radio-label";
@@ -458,73 +1069,92 @@
     });
 
     function syncVisualState() {
-      element.classList.toggle("pending", pending);
+      const busy = pending || inFlight;
+      element.classList.toggle("pending", busy);
       element.classList.toggle("disabled", disabled);
-      element.setAttribute("aria-busy", pending ? "true" : "false");
-      for (const button of buttons) {
+      element.setAttribute("aria-busy", busy ? "true" : "false");
+      const entry = buttons.find((button, index) => button.dataset.value === currentValue && !options[index].disabled)
+        || buttons.find((button, index) => !options[index].disabled);
+      for (const [index, button] of buttons.entries()) {
         const selected = button.dataset.value === currentValue;
         button.classList.toggle("active", selected);
         button.setAttribute("aria-checked", selected ? "true" : "false");
-        button.tabIndex = selected ? 0 : -1;
-        button.disabled = disabled || pending;
+        button.tabIndex = !disabled && button === entry ? 0 : -1;
+        // Pending blocks activation without dropping keyboard focus.
+        button.disabled = disabled || options[index].disabled === true;
+        button.setAttribute("aria-disabled", String(button.disabled || busy));
       }
+      if (typeof config.onValueSync === "function") config.onValueSync(currentValue, element);
     }
 
-    async function selectValue(nextValue) {
+    function selectValue(nextValue) {
       const next = String(nextValue);
-      if (disposed || disabled || pending || !values.includes(next)) return false;
+      if (disposed || disabled || pending || inFlight || !values.includes(next)
+        || options[values.indexOf(next)].disabled) return false;
       if (next === currentValue) return true;
       const previous = currentValue;
+      const request = ++operation;
+      const revision = version;
       const focusTarget = buttons.includes(document.activeElement) ? document.activeElement : null;
       currentValue = next;
-      let accepted = true;
-      try {
-        if (typeof config.onChange === "function") {
-          const result = config.onChange(next);
-          pending = true;
-          syncVisualState();
-          accepted = (await Promise.resolve(result)) !== false;
-        } else {
-          pending = true;
-          syncVisualState();
-        }
-      } catch (_) {
-        accepted = false;
-      }
-      if (!accepted) currentValue = previous;
-      pending = false;
+      inFlight = true;
       syncVisualState();
-      if (focusTarget && focusTarget.isConnected !== false && typeof focusTarget.focus === "function") {
-        const active = document.activeElement;
-        if (!active || active === document.body || active === focusTarget || active.isConnected === false) {
-          try { focusTarget.focus({ preventScroll: true }); } catch (_) { focusTarget.focus(); }
+      function finish(accepted) {
+        if (disposed || request !== operation) return accepted;
+        if (!accepted && version === revision) currentValue = previous;
+        inFlight = false;
+        syncVisualState();
+        if (focusTarget && focusTarget.isConnected !== false && typeof focusTarget.focus === "function") {
+          const active = document.activeElement;
+          if (!active || active === document.body || active === focusTarget || active.isConnected === false) {
+            try { focusTarget.focus({ preventScroll: true }); } catch (_) { focusTarget.focus(); }
+          }
         }
+        return accepted;
       }
-      return accepted;
+      try {
+        const result = typeof config.onChange === "function" ? config.onChange(next) : true;
+        if (result && typeof result.then === "function") {
+          return Promise.resolve(result).then((value) => finish(value !== false), () => finish(false));
+        }
+        return finish(result !== false);
+      } catch (_) {
+        return finish(false);
+      }
     }
 
     function onClick(event) {
+      // Opt-in only: a document-level click listener (e.g. the dropdown
+      // picker's outside-click close) must still see ordinary choice clicks.
+      if (config.stopPropagation === true) event.stopPropagation();
       const button = event && event.currentTarget;
       if (button) void selectValue(button.dataset.value);
     }
 
     function onKeyDown(event) {
-      if (disabled || pending || buttons.length === 0) return;
-      const currentIndex = Math.max(0, buttons.indexOf(event.currentTarget));
+      if (disposed || disabled || pending || inFlight || event.currentTarget.disabled) {
+        // Suppress Space's deferred native click even if the save finishes
+        // between keydown and keyup.
+        if (event.key === " " || event.key === "Enter") event.preventDefault();
+        return;
+      }
+      const enabled = buttons.filter((button) => !button.disabled);
+      if (!enabled.length) return;
+      const currentIndex = Math.max(0, enabled.indexOf(event.currentTarget));
       let nextIndex = currentIndex;
       if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-        nextIndex = (currentIndex + 1) % buttons.length;
+        nextIndex = (currentIndex + 1) % enabled.length;
       } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-        nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+        nextIndex = (currentIndex - 1 + enabled.length) % enabled.length;
       } else if (event.key === "Home") {
         nextIndex = 0;
       } else if (event.key === "End") {
-        nextIndex = buttons.length - 1;
+        nextIndex = enabled.length - 1;
       } else if (event.key !== "Enter" && event.key !== " ") {
         return;
       }
       event.preventDefault();
-      const target = buttons[nextIndex];
+      const target = enabled[nextIndex];
       if (target && typeof target.focus === "function") target.focus();
       void selectValue(target.dataset.value);
     }
@@ -540,18 +1170,27 @@
       getValue: () => currentValue,
       setValue(value) {
         const next = String(value);
-        if (!values.includes(next)) return false;
+        if (disposed || !values.includes(next)) return false;
+        version++;
         currentValue = next;
         syncVisualState();
         return true;
       },
       setDisabled(value) {
+        if (disposed) return;
         disabled = value === true;
+        syncVisualState();
+      },
+      setPending(value) {
+        if (disposed) return;
+        pending = value === true;
         syncVisualState();
       },
       dispose() {
         if (disposed) return;
         disposed = true;
+        operation++;
+        state.mountedControls.segmentedRadios.delete(control);
         for (const button of buttons) {
           button.removeEventListener("click", onClick);
           button.removeEventListener("keydown", onKeyDown);
@@ -1013,13 +1652,18 @@
         `<span class="row-label"></span>` +
         `<span class="row-desc"></span>` +
       `</div>` +
-      `<div class="row-control"><div class="switch" role="switch" tabindex="0"></div></div>`;
+      `<div class="row-control"></div>`;
     const labelEl = row.querySelector(".row-label");
     labelEl.textContent = t(labelKey);
+    const controlId = nextSettingsSwitchId++;
+    labelEl.id = `settings-switch-${controlId}-label`;
     if (danger) labelEl.classList.add("row-label-danger");
     const text = row.querySelector(".row-text");
     const desc = row.querySelector(".row-desc");
-    if (descKey) desc.textContent = t(descKey);
+    if (descKey) {
+      desc.textContent = t(descKey);
+      desc.id = `settings-switch-${controlId}-description`;
+    }
     else desc.remove();
     let extraElement = null;
     if (descExtraKey) {
@@ -1029,23 +1673,31 @@
       text.appendChild(extra);
       extraElement = extra;
     }
-    const sw = row.querySelector(".switch");
-    const control = row.querySelector(".row-control");
+    const rowControl = row.querySelector(".row-control");
     const override = state.transientUiState.generalSwitches.get(key);
     const visualOn = override ? override.visualOn : readGeneralSwitchVisual(key, invert);
-    setSwitchVisual(sw, visualOn, { pending: override ? override.pending : false });
-    state.mountedControls.generalSwitches.set(key, { element: sw, invert, row, text, extraElement });
+    const switchControl = buildSwitch({
+      checked: visualOn,
+      pending: override ? override.pending : false,
+      disabled,
+      ariaLabelledBy: labelEl.id,
+      ariaDescribedBy: descKey ? desc.id : null,
+    });
+    rowControl.appendChild(switchControl.element);
+    state.mountedControls.generalSwitches.set(key, {
+      control: switchControl,
+      element: switchControl.element,
+      invert,
+      row,
+      text,
+      extraElement,
+    });
     if (actionButton) {
       const btn = buildButton({ labelKey: actionButton.labelKey, tone: "accent" });
-      control.insertBefore(btn, sw);
+      rowControl.insertBefore(btn, switchControl.element);
       attachActivation(btn, actionButton.invoke);
     }
-    if (disabled) {
-      sw.classList.add("disabled");
-      sw.setAttribute("aria-disabled", "true");
-      sw.tabIndex = -1;
-    }
-    attachAnimatedSwitch(sw, {
+    attachOptimisticSwitch(switchControl, {
       getCommittedVisual: () => readGeneralSwitchVisual(key, invert),
       getTransientState: () => state.transientUiState.generalSwitches.get(key) || null,
       setTransientState: (value) => state.transientUiState.generalSwitches.set(key, value),
@@ -1099,26 +1751,35 @@
     zeroLabelKey = null,
     debounceMs = NUMBER_INPUT_COMMIT_DELAY_MS,
   }) {
-    const row = document.createElement("div");
-    row.className = "row session-cleanup-row";
-    row.innerHTML =
-      `<div class="row-text">` +
-        `<span class="row-label"></span>` +
-        `<span class="row-desc"></span>` +
-      `</div>` +
-      `<div class="row-control session-cleanup-control">` +
-        `<input type="text" class="bubble-policy-seconds session-cleanup-input" inputmode="numeric" />` +
-        `<span class="bubble-policy-unit session-cleanup-unit"></span>` +
-      `</div>`;
-    row.querySelector(".row-label").textContent = t(labelKey);
-    const descNode = row.querySelector(".row-desc");
-    if (descKey) descNode.textContent = t(descKey);
-    else descNode.remove();
-    const input = row.querySelector(".session-cleanup-input");
-    const unit = row.querySelector(".session-cleanup-unit");
-    if (unitKey) unit.textContent = t(unitKey);
-    else unit.remove();
-    input.maxLength = String(max).length + 1;
+    const rowParts = buildSettingRow({
+      labelKey,
+      descriptionKey: descKey,
+      className: "session-cleanup-row",
+      controlClassName: "session-cleanup-control",
+    });
+    const row = rowParts.element;
+    const control = rowParts.controlElement;
+    const input = buildTextInput({
+      type: "text",
+      size: "compact",
+      className: "bubble-policy-seconds session-cleanup-input",
+      inputMode: "numeric",
+      maxLength: String(max).length + 1,
+      labelledBy: rowParts.labelElement.id,
+      describedBy: rowParts.descriptionElement ? rowParts.descriptionElement.id : null,
+      onEnter: () => {
+        clearCommitTimer();
+        commitFromInput();
+        input.blur();
+      },
+    });
+    control.appendChild(input);
+    const unit = document.createElement("span");
+    unit.className = "bubble-policy-unit session-cleanup-unit";
+    if (unitKey) {
+      unit.textContent = t(unitKey);
+      control.appendChild(unit);
+    }
 
     function currentStored() {
       const stored = state.snapshot && state.snapshot[key];
@@ -1219,12 +1880,7 @@
       commitFromInput();
     });
     input.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") {
-        ev.preventDefault();
-        clearCommitTimer();
-        commitFromInput();
-        input.blur();
-      } else if (ev.key === "Escape") {
+      if (ev.key === "Escape") {
         ev.preventDefault();
         clearCommitTimer();
         revert();
@@ -1273,6 +1929,10 @@
       if (control && typeof control.dispose === "function") control.dispose();
     }
     state.mountedControls.segmentedRadios.clear();
+    for (const control of [...state.mountedControls.formFields]) {
+      if (control && typeof control.dispose === "function") control.dispose();
+    }
+    state.mountedControls.formFields.clear();
     disposeMountedDisposables();
     state.mountedControls.generalSwitches.clear();
     state.mountedControls.bubblePolicyControls.clear();
@@ -1283,16 +1943,14 @@
     state.mountedControls.animMapSwitches.clear();
     state.mountedControls.animMapReset = null;
     state.mountedControls.animOverrideTimingSliders.clear();
-    state.mountedControls.bubblePolicySummary = null;
-    state.mountedControls.sessionHudSummary = null;
     state.mountedControls.idleVisualPicker = null;
     state.mountedControls.size = null;
-    state.mountedControls.soundSummary = null;
     state.mountedControls.soundVolume = null;
     state.mountedControls.textScale = null;
     state.mountedControls.roamMovementStyle = null;
     state.mountedControls.bubblePlacement = null;
     state.mountedControls.quotaRingDisplayMode = null;
+    state.mountedControls.quotaAlertThresholds = null;
     state.mountedControls.permissionAutomationMode = null;
     state.mountedControls.roamArea = null;
     state.mountedControls.aboutAutoUpdate = null;
@@ -1328,6 +1986,7 @@
     const focusKey = String(active.getAttribute("data-settings-focus-key") || "").trim();
     return {
       focusKey,
+      group: active.getAttribute("data-settings-choice-group") || "",
       fallbackKey: focusKey
         ? String(active.getAttribute("data-settings-focus-fallback-key") || "").trim()
         : "",
@@ -1346,12 +2005,60 @@
     return null;
   }
 
-  function restoreSettingsFocus(rootNode, focusKey) {
+  function focusSettingsTarget(rootNode, focusKey, { onlyIfFocusLost = false } = {}) {
     const target = findSettingsFocusTarget(rootNode, focusKey);
     if (!target || target.disabled === true || typeof target.focus !== "function") return;
-    const active = document.activeElement;
-    if (active && active !== document.body && active.isConnected !== false) return;
+    if (onlyIfFocusLost) {
+      const active = document.activeElement;
+      if (active && active !== document.body && active.isConnected !== false) return;
+    }
     try { target.focus({ preventScroll: true }); } catch (_) { target.focus(); }
+  }
+
+  // Page chrome belongs to the page; only the active body belongs to this host.
+  // Callers keep business state and async request fencing in their own modules.
+  function createSubpageHost({ disposeBody = () => {} } = {}) {
+    let mountedPanel = null;
+    let disposed = false;
+    let revision = 0;
+    return {
+      render(panel, renderBody, { scrollTop } = {}) {
+        if (disposed || !panel) return false;
+        const currentRevision = ++revision;
+        const focusState = getActiveSettingsFocusState();
+        const scroller = document.getElementById("content");
+        const savedScroll = scrollTop ?? scroller?.scrollTop;
+        if (mountedPanel) {
+          disposeBody();
+          mountedPanel.innerHTML = "";
+        }
+        mountedPanel = panel;
+        panel.innerHTML = "";
+        renderBody(panel);
+        if (focusState.focusKey) {
+          const exact = findSettingsFocusTarget(panel, focusState.focusKey);
+          const key = exact && !exact.disabled
+            ? focusState.focusKey : focusState.fallbackKey;
+          focusSettingsTarget(scroller || panel, key, { onlyIfFocusLost: true });
+        }
+        if (scroller && Number.isFinite(savedScroll)) {
+          scroller.scrollTop = savedScroll;
+          const appliedScroll = scroller.scrollTop;
+          requestAnimationFrame(() => {
+            if (disposed || revision !== currentRevision || !panel.isConnected
+              || document.getElementById("content") !== scroller) return;
+            // Do not undo scrolling that happened after this replacement.
+            if (scroller.scrollTop === appliedScroll) scroller.scrollTop = savedScroll;
+          });
+        }
+        return true;
+      },
+      dispose() {
+        disposed = true;
+        revision += 1;
+        mountedPanel = null;
+      },
+    };
   }
 
   function requestRender({
@@ -1360,25 +2067,15 @@
     modal = false,
     preserveScroll = false,
   } = {}) {
+    const focusState = getActiveSettingsFocusState();
     if (sidebar && typeof renderHooks.sidebar === "function") renderHooks.sidebar();
     if (content && typeof renderHooks.content === "function") {
-      const { focusKey, fallbackKey } = getActiveSettingsFocusState();
       const contentRoot = document.getElementById("content");
       const scrollTop = preserveScroll && contentRoot
         ? normalizePersistedScrollTop(Number(contentRoot.scrollTop))
         : null;
       const scrollTabId = state.activeTab;
       renderHooks.content();
-      if (focusKey) {
-        const currentContentRoot = document.getElementById("content");
-        const exactTarget = findSettingsFocusTarget(currentContentRoot, focusKey);
-        const restoreKey = exactTarget
-          && exactTarget.disabled !== true
-          && typeof exactTarget.focus === "function"
-          ? focusKey
-          : fallbackKey;
-        if (restoreKey) restoreSettingsFocus(currentContentRoot, restoreKey);
-      }
       if (scrollTop !== null
         && document.getElementById("content") === contentRoot
         && state.activeTab === scrollTabId) {
@@ -1391,6 +2088,28 @@
       }
     }
     if (modal && typeof renderHooks.modal === "function") renderHooks.modal();
+    if ((sidebar || content) && focusState.focusKey) {
+      const roots = [document.getElementById("sidebar"), document.getElementById("content")].filter(Boolean);
+      for (const rootNode of roots) {
+        const exact = findSettingsFocusTarget(rootNode, focusState.focusKey);
+        if (exact && !exact.disabled) {
+          focusSettingsTarget(rootNode, focusState.focusKey, { onlyIfFocusLost: true });
+          return;
+        }
+      }
+      for (const rootNode of roots) {
+        const candidates = [];
+        const visit = (node) => {
+          if (node.getAttribute?.("data-settings-choice-group") === focusState.group && !node.disabled) candidates.push(node);
+          for (const child of node.children || []) visit(child);
+        };
+        if (focusState.group) visit(rootNode);
+        const target = candidates.find((node) => node.getAttribute("aria-selected") === "true"
+          || node.getAttribute("aria-checked") === "true") || candidates[0];
+        const key = target?.getAttribute("data-settings-focus-key") || focusState.fallbackKey;
+        if (key) focusSettingsTarget(rootNode, key, { onlyIfFocusLost: true });
+      }
+    }
   }
 
   function normalizePersistedScrollTop(value) {
@@ -1618,12 +2337,26 @@
   }
 
   function fetchThemes() {
+    if (runtime.themeListPromise) return runtime.themeListPromise;
+    // Official metadata is network-backed. Start it beside the local scan, but
+    // never join it to the promise that gates the Theme tab's first paint.
+    void fetchOfficialThemes()
+      .then(() => {
+        // If the official list wins the race, the local-list completion owns
+        // the first paint. Rendering while themeList is still null would
+        // re-enter fetchThemes from renderThemeTab and can starve the pending
+        // listThemes IPC reply with an all-microtask render/fetch loop.
+        if (state.activeTab === "theme" && runtime.themeList !== null) {
+          requestRender({ content: true, preserveScroll: true });
+        }
+      })
+      .catch(() => {});
     if (!window.settingsAPI || typeof window.settingsAPI.listThemes !== "function") {
       runtime.themeList = [];
       return Promise.resolve([]);
     }
     const previousThemeList = Array.isArray(runtime.themeList) ? runtime.themeList : [];
-    return window.settingsAPI.listThemes().then((list) => {
+    const themeListPromise = window.settingsAPI.listThemes().then((list) => {
       const nextThemeList = Array.isArray(list) ? list : [];
       // Built-in themes make an empty successful list impossible in a healthy
       // install. Main also returns [] when enumeration throws, so preserve an
@@ -1638,6 +2371,48 @@
       runtime.themeList = previousThemeList;
       return previousThemeList;
     });
+    runtime.themeListPromise = themeListPromise;
+    void themeListPromise.finally(() => {
+      if (runtime.themeListPromise === themeListPromise) runtime.themeListPromise = null;
+    });
+    return themeListPromise;
+  }
+
+  // The official catalog is fetched independently from the local theme list.
+  // A failed list keeps whatever was rendered before, exactly like listThemes.
+  function fetchOfficialThemes() {
+    if (runtime.officialThemePromise) return runtime.officialThemePromise;
+    if (!window.settingsAPI || typeof window.settingsAPI.listOfficialThemes !== "function") {
+      runtime.officialThemeList = Array.isArray(runtime.officialThemeList) ? runtime.officialThemeList : [];
+      runtime.officialThemeListFetched = true;
+      return Promise.resolve(runtime.officialThemeList);
+    }
+    const previous = Array.isArray(runtime.officialThemeList) ? runtime.officialThemeList : [];
+    const endCountAtRequest = runtime.officialThemeEndCount;
+    const officialThemePromise = window.settingsAPI.listOfficialThemes().then((result) => {
+      const themes = result && Array.isArray(result.themes) ? result.themes : [];
+      const keepPrevious = themes.length === 0 && previous.length > 0 && !(result && result.status === "ok");
+      runtime.officialThemeList = keepPrevious ? previous : themes;
+      runtime.officialThemeCatalogStatus = (result && result.catalogStatus) || "offline";
+      runtime.officialThemeCatalogVersion = result ? result.catalogVersion : null;
+      runtime.officialThemeListFetched = true;
+      // Only a real replacement proves the returned snapshots are newer than the
+      // operation end observed while this read was in flight. Keeping the old
+      // list (or catching below) leaves the cached snapshots untrusted.
+      if (!keepPrevious) runtime.officialThemeListEndCount = endCountAtRequest;
+      return runtime.officialThemeList;
+    }).catch((err) => {
+      console.warn("settings: listOfficialThemes failed", err);
+      runtime.officialThemeList = previous;
+      runtime.officialThemeCatalogStatus = "offline";
+      runtime.officialThemeListFetched = true;
+      return previous;
+    });
+    runtime.officialThemePromise = officialThemePromise;
+    void officialThemePromise.finally(() => {
+      if (runtime.officialThemePromise === officialThemePromise) runtime.officialThemePromise = null;
+    });
+    return officialThemePromise;
   }
 
   function emptyAnimationOverridesData() {
@@ -1818,6 +2593,90 @@
       showToast(t("shortcutErrorRegistrationFailed"), { error: true });
     }
     if (state.activeTab === "shortcuts") requestRender({ content: true });
+  }
+
+  // A cached per-card progress snapshot can only be read as "still installing"
+  // until an operation end has been observed. A list read that replaced the
+  // official list after that end proves the snapshot is fresh (or gone); a read
+  // that merely kept the old list, or failed, does not.
+  function officialProgressSnapshotsTrusted() {
+    return runtime.officialThemeEndCount === runtime.officialThemeListEndCount;
+  }
+
+  // Post-operation refresh. The list read that is already in flight may have
+  // started before the operation ended, so it can still return a live-download
+  // snapshot; wait for the in-flight local/official reads to settle, then issue
+  // a genuinely new read. The read itself and its single completion render are
+  // shared by the duplicate idle the main process broadcasts.
+  function refreshThemesAfterOfficialOperation() {
+    if (runtime.officialThemeEndRefresh) return runtime.officialThemeEndRefresh;
+    const inFlight = [runtime.themeListPromise, runtime.officialThemePromise].filter(Boolean);
+    const refresh = Promise.allSettled(inFlight)
+      .then(() => {
+        // fetchThemes() resolves on the local scan, but the terminal state lives
+        // in the official catalog read it kicks off beside it. Wait for both so
+        // the completion render sees the post-operation list.
+        const local = fetchThemes();
+        const official = runtime.officialThemePromise;
+        const pending = official ? [local, official] : [local];
+        return Promise.allSettled(pending);
+      })
+      .then(() => {
+        // Clear before the completion render so buttons settle on the fresh
+        // list instead of still reading this refresh as an in-flight install.
+        if (runtime.officialThemeEndRefresh === refresh) runtime.officialThemeEndRefresh = null;
+        if (state.activeTab === "theme") requestRender({ content: true, preserveScroll: true });
+      })
+      .finally(() => {
+        if (runtime.officialThemeEndRefresh === refresh) runtime.officialThemeEndRefresh = null;
+      });
+    runtime.officialThemeEndRefresh = refresh;
+    return refresh;
+  }
+
+  // main owns the single official-theme operation; the renderer only mirrors
+  // its phase so a Settings reload can never restart or lose a live download.
+  function applyOfficialThemeProgress(progress) {
+    if (!progress || typeof progress !== "object") return;
+    const previousOperation = runtime.officialThemeOperation;
+    runtime.officialThemeOperation = progress.phase && progress.phase !== "idle" ? progress : null;
+    // A Settings reload mid-download loses the install promise that would
+    // otherwise refresh the list in its .finally, so the card can stay parked on
+    // a stale per-card progress snapshot after the operation ends. Observing the
+    // end marks cached snapshots untrusted and, when no in-page install owns the
+    // refresh, schedules one. The two back-to-back idle events share that
+    // refresh, and the second one no longer looks like another end.
+    const hasSnapshot = Array.isArray(runtime.officialThemeList)
+      && runtime.officialThemeList.some((theme) => theme && theme.officialThemeProgress);
+    const operationEnded = runtime.officialThemeOperation === null
+      && (
+        previousOperation !== null
+        || (officialProgressSnapshotsTrusted() && hasSnapshot)
+        // A Settings page that opened after the last progress event has no
+        // mirror and no snapshot yet, but an official read still in flight may
+        // carry a pre-idle snapshot. Treat the idle as an observed end so that
+        // read's stale snapshot is invalidated and a fresh read is scheduled.
+        // An in-flight end refresh already owns that fresh read, so its own
+        // read must not count as another end.
+        || (runtime.officialThemePromise && !runtime.officialThemeEndRefresh)
+      );
+    if (operationEnded) {
+      runtime.officialThemeEndCount += 1;
+      if (!runtime.officialThemePendingThemeId) refreshThemesAfterOfficialOperation();
+    }
+    if (state.activeTab !== "theme") return;
+    // Progress events arrive many times per download. A full content render
+    // would tear down and rebuild every theme card each time, which drops the
+    // CSS hover highlight on whatever card the cursor is over (and the
+    // scroll-into-place flicker that comes with it). Let the tab update just
+    // its progress rows when it can; fall back to the full render otherwise.
+    const activeTab = tabs[state.activeTab];
+    if (activeTab
+      && typeof activeTab.patchOfficialThemeProgress === "function"
+      && activeTab.patchOfficialThemeProgress()) {
+      return;
+    }
+    requestRender({ content: true, preserveScroll: true });
   }
 
   function clearTransientStateForChanges(changes) {
@@ -2128,15 +2987,22 @@
   core.helpers = {
     t,
     buildButton,
+    buildSettingRow,
+    buildFormField,
+    buildTextInput,
+    setTextInputState,
+    setButtonState,
     showSettingsDialog,
     showSettingsConfirmModal,
     escapeHtml,
-    setSwitchVisual,
-    attachAnimatedSwitch,
+    buildSwitch,
+    attachOptimisticSwitch,
     buildSwitchRow,
     buildSection,
     buildSettingsSelect,
     buildSegmentedRadio,
+    buildTabs,
+    createSubpageHost,
     buildCollapsibleGroup,
     attachSettingsDisclosure,
     registerMountedDisposable,
@@ -2163,6 +3029,8 @@
     IS_WIN,
     SHORTCUT_ACTIONS,
     SHORTCUT_ACTION_IDS,
+    SUPPORTED_SHORTCUT_ACTION_IDS,
+    SHORTCUT_PLATFORM,
     buildAcceleratorFromEvent,
     formatAcceleratorLabel,
     formatAcceleratorPartial,
@@ -2170,6 +3038,7 @@
 
   core.ops = {
     installRenderHooks,
+    focusSettingsTarget,
     requestRender,
     selectTab,
     persistNavigationState,
@@ -2184,8 +3053,12 @@
     finishShortcutRecording,
     handleShortcutRecordKey,
     applyShortcutFailures,
+    applyOfficialThemeProgress,
+    officialProgressSnapshotsTrusted,
+    refreshThemesAfterOfficialOperation,
     fetchAgentInstallationHints,
     fetchThemes,
+    fetchOfficialThemes,
     fetchAnimationOverridesData,
     applyAnimationPreviewPoster,
     stopAssetPickerPolling,

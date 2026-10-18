@@ -1,8 +1,26 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
-// Parse theme config from additionalArguments (synchronous, available on first load)
-const themeArg = process.argv.find(a => a.startsWith("--theme-config="));
-const themeConfig = themeArg ? JSON.parse(themeArg.slice("--theme-config=".length)) : null;
+// The config must be available synchronously before the first paint, but a
+// sandboxed preload cannot read files, and Windows caps the launch command
+// line at 32,767 characters. Ask main over sync IPC first; keep the old
+// additionalArguments path as a fallback for external launches and fixtures.
+function readThemeConfig() {
+  if (typeof ipcRenderer.sendSync === "function") {
+    try {
+      const fromMain = ipcRenderer.sendSync("renderer-config:get-pet");
+      if (fromMain != null) return fromMain;
+    } catch {}
+  }
+  const themeArg = process.argv.find(a => a.startsWith("--theme-config="));
+  if (!themeArg) return null;
+  try {
+    return JSON.parse(themeArg.slice("--theme-config=".length));
+  } catch {
+    return null;
+  }
+}
+
+const themeConfig = readThemeConfig();
 
 contextBridge.exposeInMainWorld("themeConfig", themeConfig);
 
@@ -27,6 +45,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   onEyeMove: (callback) => ipcRenderer.on("eye-move", (_, dx, dy) => callback(dx, dy)),
   onCloudlingPointer: (callback) => ipcRenderer.on("cloudling-pointer", (_, payload) => callback(payload)),
   onRoamHeading: (callback) => ipcRenderer.on("roam-heading", (_, headingLeft) => callback(headingLeft)),
+  onPetScreenSide: (callback) => ipcRenderer.on("pet-screen-side", (_, onRight) => callback(onRight)),
   onWakeFromDoze: (callback) => ipcRenderer.on("wake-from-doze", () => callback()),
   onDndChange: (callback) => ipcRenderer.on("dnd-change", (_, enabled) => callback(enabled)),
   onMiniModeChange: (cb) => ipcRenderer.on("mini-mode-change", (_, enabled, edge, options) => cb(enabled, edge, options)),
@@ -36,7 +55,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Reaction control (from main, relayed from hit window)
   onStartDragReaction: (cb) => ipcRenderer.on("start-drag-reaction", (_, requestOrDirection, legacyDirection) => cb(requestOrDirection, legacyDirection)),
   onEndDragReaction: (cb) => ipcRenderer.on("end-drag-reaction", () => cb()),
-  onPlayClickReaction: (cb) => ipcRenderer.on("play-click-reaction", (_, requestOrSvg, duration) => cb(requestOrSvg, duration)),
+  onPlayClickReaction: (cb) => ipcRenderer.on("play-click-reaction", (_, requestOrSvg, duration, options) => cb(requestOrSvg, duration, options)),
+  onCancelClickReaction: (cb) => ipcRenderer.on("cancel-click-reaction", () => cb()),
   onPlayTestReaction: (cb) => ipcRenderer.on("play-test-reaction", (_, result) => {
     if (result === "pass" || result === "fail") cb(result);
   }),

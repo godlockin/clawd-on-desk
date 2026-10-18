@@ -18,7 +18,9 @@ let idleLookReturnTimer = null;
 let idleLookVisualGeneration = null;
 let idleLookAttempt = null;
 let yawnDelayTimer = null;     // tracked setTimeout for yawn/idle-look transitions
+// Track idle visual edges separately from walks that preserve unattended timing.
 let idleWasActive = false;
+let roamWasActive = false;
 let lastEyeDx = 0, lastEyeDy = 0;
 let lastPointerBridgeKey = null;
 let lastPointerBridgePayload = null;
@@ -47,7 +49,7 @@ const REACTION_TICK_MS = 500;
 const BACKGROUND_TICK_MS = 750;
 const RECENT_MOUSE_MS = 2000;
 const POINTER_BRIDGE_STATES = new Set(["idle", "mini-idle", "mini-peek"]);
-const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
+const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing", "collapsing", "sleeping"]);
 const POINTER_BRIDGE_EPSILON = 0.001;
 
 // ── Theme-driven state (refreshed on hot theme switch) ──
@@ -218,6 +220,12 @@ function getPointerBridgeKey() {
   return `${state}|${ctx.currentSvg || ""}`;
 }
 
+function hasMiniState(state) {
+  const files = ctx.theme && ctx.theme.miniMode && ctx.theme.miniMode.states
+    && ctx.theme.miniMode.states[state];
+  return Array.isArray(files) && !!files[0];
+}
+
 function pointerBridgePayloadChanged(key, payload) {
   if (key !== lastPointerBridgeKey || !lastPointerBridgePayload) return true;
   return payload.inside !== lastPointerBridgePayload.inside
@@ -249,6 +257,20 @@ function sendPointerBridge(cursor, bounds) {
   ctx.sendToRenderer("cloudling-pointer", payload);
 }
 
+function resetIdlePeriodForMouseMove() {
+  mouseStillSince = Date.now();
+  hasTriggeredYawn = false;
+  idleLookPlayed = false;
+  if (idleLookReturnTimer) { clearTimeout(idleLookReturnTimer); idleLookReturnTimer = null; }
+  idleLookVisualGeneration = null;
+  idleLookAttempt = null;
+  if (yawnDelayTimer) { clearTimeout(yawnDelayTimer); yawnDelayTimer = null; }
+  if (isMouseIdle) {
+    isMouseIdle = false;
+    ctx.sendToRenderer("state-change", "idle", idleRestSvg());
+  }
+}
+
 function shouldSuppressPassiveIpc() {
   return !!ctx.lowPowerIdlePaused && LOW_POWER_PAUSE_STATES.has(ctx.currentState);
 }
@@ -274,27 +296,40 @@ function runMainTickOnce() {
     const roamNow = ctx.currentState === "roam" && !ctx.idlePaused;
     const nextDelay = () => getNextTickDelay(idleNow, miniIdleNow);
 
-    if (idleNow && !idleWasActive) {
+    const enteredIdle = idleNow && !idleWasActive;
+    const cameFromWalk = enteredIdle && roamWasActive;
+    if (enteredIdle) {
+      // Every idle entry starts a fresh visual, including after a walk has
+      // interrupted an idle animation, eye tracking, or cursor spin.
       isMouseIdle = false;
-      hasTriggeredYawn = false;
-      idleLookPlayed = false;
-      lastCursorX = null;
-      lastCursorY = null;
-      mouseStillSince = Date.now();
       lastEyeDx = 0;
       lastEyeDy = 0;
       lastCursorAngle = null;
       accumulatedSpin = 0;
       lastSpinTickAt = 0;
+      idleLookVisualGeneration = null;
+      idleLookAttempt = null;
       if (idleLookReturnTimer) { clearTimeout(idleLookReturnTimer); idleLookReturnTimer = null; }
       if (yawnDelayTimer) { clearTimeout(yawnDelayTimer); yawnDelayTimer = null; }
+      if (!cameFromWalk) {
+        // A completed or cancelled automatic walk is not user activity: keep
+        // its unattended clock, consumed animations, and cursor baseline.
+        hasTriggeredYawn = false;
+        idleLookPlayed = false;
+        lastCursorX = null;
+        lastCursorY = null;
+        mouseStillSince = Date.now();
+      }
     }
 
     if (!idleNow && idleWasActive) {
       if (idleLookReturnTimer) { clearTimeout(idleLookReturnTimer); idleLookReturnTimer = null; }
       if (yawnDelayTimer) { clearTimeout(yawnDelayTimer); yawnDelayTimer = null; }
+      idleLookVisualGeneration = null;
+      idleLookAttempt = null;
     }
     idleWasActive = idleNow;
+    roamWasActive = roamNow;
 
     // Skip expensive native IPC calls (getCursorScreenPoint, getBounds) when
     // cursor tracking is not needed — saves ~20 calls/sec to the OS layer.
@@ -327,20 +362,25 @@ function runMainTickOnce() {
     }
 
     // ── Mini mode peek hover ──
+    if (ctx.miniMode && (ctx.miniTransitioning || ctx.dragLocked || ctx.menuOpen)
+      && typeof ctx.cancelPendingMiniPeek === "function") ctx.cancelPendingMiniPeek(true);
     if (ctx.miniMode && !ctx.miniTransitioning && !ctx.dragLocked && !ctx.menuOpen) {
       const canPeek = ctx.currentState === "mini-idle" || ctx.currentState === "mini-peek"
-        || ctx.currentState === "mini-sleep";
+        || ctx.currentState === "mini-peek-hold" || ctx.currentState === "mini-sleep"
+        || ctx.currentState === "mini-sleep-peek";
       if (!ctx.isAnimating && canPeek) {
         if (ctx.mouseOverPet && ctx.currentState === "mini-sleep" && !ctx.miniSleepPeeked) {
-          ctx.miniPeekIn();
+          ctx.miniPeekIn("sleep");
           ctx.miniSleepPeeked = true;
-        } else if (!ctx.mouseOverPet && ctx.currentState === "mini-sleep" && ctx.miniSleepPeeked) {
+          if (hasMiniState("mini-sleep-peek")) ctx.applyState("mini-sleep-peek");
+        } else if (!ctx.mouseOverPet && (ctx.currentState === "mini-sleep" || ctx.currentState === "mini-sleep-peek") && ctx.miniSleepPeeked) {
           ctx.miniPeekOut();
           ctx.miniSleepPeeked = false;
-        } else if (ctx.mouseOverPet && ctx.currentState !== "mini-peek" && ctx.currentState !== "mini-sleep" && !ctx.miniPeeked) {
-          ctx.miniPeekIn();
+          if (ctx.currentState === "mini-sleep-peek") ctx.applyState("mini-sleep");
+        } else if (ctx.mouseOverPet && ctx.currentState === "mini-idle" && !ctx.miniPeeked) {
+          ctx.miniPeekIn("peek");
           ctx.applyState("mini-peek");
-        } else if (!ctx.mouseOverPet && (ctx.currentState === "mini-peek" || ctx.miniPeeked)) {
+        } else if (!ctx.mouseOverPet && (ctx.currentState === "mini-peek" || ctx.currentState === "mini-peek-hold" || ctx.miniPeeked)) {
           ctx.miniPeekOut();
           ctx.miniPeeked = false;
           if (ctx.currentState !== "mini-idle") ctx.applyState("mini-idle");
@@ -353,27 +393,18 @@ function runMainTickOnce() {
     if (!idleNow && !miniIdleNow && !roamNow) return nextDelay();
 
     // ── Free roam: cancel roaming when mouse moves ──
-    if (ctx.roam) {
-      if (moved && ctx.roam.enabled) {
-        ctx.roam.cancelRoam();
-      }
+    if (ctx.roam && moved && ctx.roam.enabled) {
+      // Pointer movement during an idle gap must defer the queued walk;
+      // during a walk it also ends the unattended period.
+      if (roamNow) resetIdlePeriodForMouseMove();
+      ctx.roam.cancelRoam();
     }
 
     // ── Below: idle or mini-idle logic ──
     // Normal idle: mouse idle detection + sleep sequence
     if (idleNow) {
       if (moved) {
-        mouseStillSince = Date.now();
-        hasTriggeredYawn = false;
-        idleLookPlayed = false;
-        if (idleLookReturnTimer) { clearTimeout(idleLookReturnTimer); idleLookReturnTimer = null; }
-        idleLookVisualGeneration = null;
-        idleLookAttempt = null;
-        if (yawnDelayTimer) { clearTimeout(yawnDelayTimer); yawnDelayTimer = null; }
-        if (isMouseIdle) {
-          isMouseIdle = false;
-          ctx.sendToRenderer("state-change", "idle", idleRestSvg());
-        }
+        resetIdlePeriodForMouseMove();
       }
 
       const elapsed = Date.now() - mouseStillSince;
@@ -607,6 +638,7 @@ function cleanup() {
   hasTriggeredYawn = false;
   idleLookPlayed = false;
   idleWasActive = false;
+  roamWasActive = false;
   lastEyeDx = 0;
   lastEyeDy = 0;
   lastPointerBridgeKey = null;

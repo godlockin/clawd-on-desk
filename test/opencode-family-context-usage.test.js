@@ -47,7 +47,7 @@ after(async () => {
     await Promise.all([...trackedPlugins].map((plugin) => plugin.__test.flushDebugLog()));
   } finally {
     try {
-      fs.rmSync(TMP_HOME, { recursive: true, force: true });
+      await fs.promises.rm(TMP_HOME, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     } finally {
       restoreEnv("HOME");
       restoreEnv("USERPROFILE");

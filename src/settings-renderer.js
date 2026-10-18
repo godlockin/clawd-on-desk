@@ -7,14 +7,18 @@ const core = globalThis.ClawdSettingsCore;
 // system fonts and didn't dark-mode well.
 const SIDEBAR_TABS = [
   { id: "general", labelKey: "sidebarGeneral", available: true },
-  { id: "agents", labelKey: "sidebarAgents", available: true },
-  { id: "theme", labelKey: "sidebarTheme", available: true },
+  { id: "pet", labelKey: "sidebarPet", available: true },
+  { id: "notifications", labelKey: "sidebarNotifications", available: true },
+  { id: "sessions", labelKey: "sidebarSessions", available: true },
+  { id: "permissions", labelKey: "sidebarPermissions", available: true },
+  { id: "telegram-approval", labelKey: "sidebarTelegramApproval", available: true },
+  { id: "agents", labelKey: "sidebarAgents", available: true, groupStart: true },
+  { id: "remote-ssh", labelKey: "sidebarRemoteSsh", available: true },
+  { id: "discord-presence", labelKey: "sidebarDiscordPresence", available: true },
+  { id: "theme", labelKey: "sidebarTheme", available: true, groupStart: true },
   { id: "animOverrides", labelKey: "sidebarAnimOverrides", available: true },
   { id: "shortcuts", labelKey: "sidebarShortcuts", available: true },
-  { id: "telegram-approval", labelKey: "sidebarTelegramApproval", available: true },
-  { id: "discord-presence", labelKey: "sidebarDiscordPresence", available: true },
-  { id: "remote-ssh", labelKey: "sidebarRemoteSsh", available: true },
-  { id: "recap", labelKey: "sidebarRecap", available: true },
+  { id: "recap", labelKey: "sidebarRecap", available: true, groupStart: true },
   { id: "about", labelKey: "sidebarAbout", available: true },
 ];
 
@@ -24,10 +28,14 @@ function getTabIcon(tabId) {
   return "";
 }
 
+let sidebarTabs = null;
+
 function renderSidebar() {
   document.title = core.helpers.t("settingsWindowTitle");
   const sidebar = document.getElementById("sidebar");
   if (!sidebar) return;
+  const panels = sidebarTabs?.panels;
+  if (sidebarTabs) sidebarTabs.dispose();
   sidebar.innerHTML = "";
   if (
     globalThis.ClawdSettingsDoctorModal
@@ -35,24 +43,26 @@ function renderSidebar() {
   ) {
     globalThis.ClawdSettingsDoctorModal.renderSidebarIndicator(sidebar, core);
   }
-  for (const tab of SIDEBAR_TABS) {
-    const item = document.createElement("div");
-    item.className = "sidebar-item";
-    if (!tab.available) item.classList.add("disabled");
-    if (tab.id === core.state.activeTab) item.classList.add("active");
-    // Icon HTML is trusted (it comes from our own settings-icons.js
-    // module, not user input), so we drop it in as-is.
-    item.innerHTML =
-      `<span class="sidebar-item-icon">${getTabIcon(tab.id)}</span>` +
-      `<span class="sidebar-item-label">${core.helpers.escapeHtml(core.helpers.t(tab.labelKey))}</span>` +
-      (tab.available ? "" : `<span class="sidebar-item-soon">${core.helpers.escapeHtml(core.helpers.t("sidebarSoon"))}</span>`);
-    if (tab.available) {
-      item.addEventListener("click", () => {
-        core.ops.selectTab(tab.id);
-      });
-    }
-    sidebar.appendChild(item);
-  }
+  sidebarTabs = core.helpers.buildTabs({
+    id: "settings-navigation",
+    ariaLabel: core.helpers.t("settingsWindowTitle"),
+    orientation: "vertical",
+    className: "settings-sidebar-tabs",
+    buttonClassName: "sidebar-item",
+    value: core.state.activeTab,
+    panels,
+    options: SIDEBAR_TABS.map((tab) => ({ ...tab, value: tab.id, disabled: !tab.available })),
+    onChange: (value) => core.ops.selectTab(value),
+    renderLabel(item, tab) {
+      item.classList.toggle("sidebar-item-group-start", tab.groupStart === true);
+      // Icons come from the bundled settings-icons.js, never user input.
+      item.innerHTML =
+        `<span class="sidebar-item-icon" aria-hidden="true">${getTabIcon(tab.id)}</span>` +
+        `<span class="sidebar-item-label">${core.helpers.escapeHtml(core.helpers.t(tab.labelKey))}</span>` +
+        (tab.available ? "" : `<span class="sidebar-item-soon">${core.helpers.escapeHtml(core.helpers.t("sidebarSoon"))}</span>`);
+    },
+  });
+  sidebar.appendChild(sidebarTabs.element);
 }
 
 function renderPlaceholder(parent) {
@@ -70,11 +80,18 @@ function renderContent() {
   if (!content) return;
   core.ops.clearMountedControls();
   content.innerHTML = "";
+  if (!sidebarTabs) renderSidebar();
+  sidebarTabs.setValue(core.state.activeTab);
+  for (const panel of sidebarTabs.panels.values()) {
+    panel.innerHTML = "";
+    content.appendChild(panel);
+  }
+  const panel = sidebarTabs.panels.get(core.state.activeTab);
   const tab = core.tabs[core.state.activeTab];
   if (tab && typeof tab.render === "function") {
-    tab.render(content, core);
+    tab.render(panel, core);
   } else {
-    renderPlaceholder(content);
+    renderPlaceholder(panel);
   }
 }
 
@@ -84,6 +101,10 @@ core.ops.installRenderHooks({
 });
 
 globalThis.ClawdSettingsTabGeneral.init(core);
+globalThis.ClawdSettingsTabPet.init(core);
+globalThis.ClawdSettingsTabNotifications.init(core);
+globalThis.ClawdSettingsTabSessions.init(core);
+globalThis.ClawdSettingsTabPermissions.init(core);
 globalThis.ClawdSettingsTabAgents.init(core);
 globalThis.ClawdSettingsTabTheme.init(core);
 // Not a top-level tab anymore — it provides the "on / off" subtab that
@@ -100,7 +121,9 @@ if (globalThis.ClawdSettingsTabMobile) globalThis.ClawdSettingsTabMobile.init(co
 
 core.ops.restoreNavigationState();
 function selectRequestedTab(tab) {
-  if (tab === "recap") core.ops.selectTab("recap", { persist: false });
+  if (tab === "recap" || tab === "sessions") {
+    core.ops.selectTab(tab, { persist: false });
+  }
 }
 if (window.settingsAPI && typeof window.settingsAPI.onRequestedTab === "function") {
   window.settingsAPI.onRequestedTab(selectRequestedTab);
@@ -109,7 +132,10 @@ if (window.settingsAPI && typeof window.settingsAPI.consumeRequestedTab === "fun
   selectRequestedTab(window.settingsAPI.consumeRequestedTab());
 }
 if (typeof window.addEventListener === "function") {
-  window.addEventListener("beforeunload", () => core.ops.persistNavigationState());
+  window.addEventListener("beforeunload", () => {
+    core.ops.persistNavigationState();
+    if (sidebarTabs) sidebarTabs.dispose();
+  });
 }
 
 if (window.settingsAPI && typeof window.settingsAPI.onChanged === "function") {
@@ -159,6 +185,10 @@ if (window.settingsAPI && typeof window.settingsAPI.onUpdateCheckStatus === "fun
       tab.applyUpdateCheckStatus(core.runtime.about.updateCheckSnapshot);
     }
   });
+}
+
+if (window.settingsAPI && typeof window.settingsAPI.onOfficialThemeProgress === "function") {
+  window.settingsAPI.onOfficialThemeProgress((progress) => core.ops.applyOfficialThemeProgress(progress));
 }
 
 if (window.settingsAPI && typeof window.settingsAPI.getShortcutFailures === "function") {
