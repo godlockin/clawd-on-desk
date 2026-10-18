@@ -1,5 +1,10 @@
 "use strict";
 
+// Remote approval bodies for the Permissions & approval tab: the IM channels
+// sub-page (Telegram / Feishu / Slack cards) and the LAN approval card, plus
+// their status refreshes and the Feishu lookup/draft cleanup on leave. This
+// module does not register a tab of its own; the shell resolves it at render
+// time, so load order in settings.html does not matter.
 (function initSettingsTabTelegramApproval(root) {
   const recipientApi = root.ClawdFeishuApprovalRecipient || {};
   let state = null;
@@ -334,22 +339,28 @@
     if (mounted.renderedAsLookupCancel && feishuView.networkLookupPending) return false;
     const statusCode = code || feishuView.lookupResultErrorCode;
     const message = feishuLookupPreflightMessage(statusCode);
-    mounted.saveButton.disabled = mounted.renderedAsLookupCancel
-      ? true
-      : allFeishuControlsBlocked() || !!code;
+    helpers.setButtonState(mounted.saveButton, {
+      disabled: mounted.renderedAsLookupCancel
+        ? true
+        : allFeishuControlsBlocked() || !!code,
+    });
     mounted.status.textContent = message;
     if (message) {
       if (!mounted.renderedAsLookupCancel) {
         mounted.saveButton.setAttribute("aria-describedby", mounted.status.id);
       }
-      mounted.input.setAttribute("aria-describedby", mounted.status.id);
-      mounted.input.setAttribute("aria-invalid", feishuApproverValueInvalid(statusCode) ? "true" : "false");
+      helpers.setTextInputState(mounted.input, {
+        describedBy: `${mounted.descriptionId} ${mounted.status.id}`,
+        invalid: feishuApproverValueInvalid(statusCode),
+      });
     } else {
       if (!mounted.renderedAsLookupCancel) {
         mounted.saveButton.removeAttribute("aria-describedby");
       }
-      mounted.input.removeAttribute("aria-describedby");
-      mounted.input.setAttribute("aria-invalid", "false");
+      helpers.setTextInputState(mounted.input, {
+        describedBy: mounted.descriptionId,
+        invalid: false,
+      });
     }
     return true;
   }
@@ -469,6 +480,12 @@
     }));
   }
 
+  // Status refreshes only repaint when their cards are on screen: the
+  // Permissions tab is active and the user is on the IM channels or LAN sub-page.
+  function isRemoteBodyVisible() {
+    return state.activeTab === "permissions" && coreRef.runtime.permissionsSubtab !== "local";
+  }
+
   function refreshStatus({ forceRender = false } = {}) {
     if (view.statusLoading) {
       if (forceRender) view.statusForceRenderPending = true;
@@ -487,7 +504,7 @@
       view.statusForceRenderPending = false;
       const changed = updated && statusRenderKey(previousStatus) !== statusRenderKey(nextStatus);
       if (updated) view.status = result.state || null;
-      if ((shouldForceRender || (updated && (!hadStatus || changed))) && state.activeTab === "telegram-approval") {
+      if ((shouldForceRender || (updated && (!hadStatus || changed))) && isRemoteBodyVisible()) {
         ops.requestRender({ content: true });
       }
     });
@@ -510,7 +527,7 @@
       view.tokenInfoForceRenderPending = false;
       const changed = updated && tokenInfoRenderKey(previous) !== tokenInfoRenderKey(next);
       if (updated) view.tokenInfo = next;
-      if ((shouldForceRender || (updated && changed)) && state.activeTab === "telegram-approval") {
+      if ((shouldForceRender || (updated && changed)) && isRemoteBodyVisible()) {
         ops.requestRender({ content: true });
       }
     });
@@ -537,7 +554,7 @@
       recomputeFeishuLookupPreflight();
       scheduleFeishuStatusRefresh(nextStatus);
       const initialVisibleChange = !hadStatus && feishuStatusNeedsRender(nextStatus);
-      if ((shouldForceRender || (updated && (initialVisibleChange || (hadStatus && changed)))) && state.activeTab === "telegram-approval") {
+      if ((shouldForceRender || (updated && (initialVisibleChange || (hadStatus && changed)))) && isRemoteBodyVisible()) {
         ops.requestRender({ content: true });
       }
     });
@@ -553,7 +570,7 @@
   function scheduleFeishuStatusRefresh(status) {
     clearFeishuStatusRefreshTimer();
     const s = status && typeof status === "object" ? status : {};
-    if (state.activeTab !== "telegram-approval" || s.status !== "starting" || typeof setTimeout !== "function") return;
+    if (!isRemoteBodyVisible() || s.status !== "starting" || typeof setTimeout !== "function") return;
     feishuView.refreshTimer = setTimeout(() => {
       feishuView.refreshTimer = null;
       refreshFeishuStatus({ forceRender: true });
@@ -588,7 +605,7 @@
       if (updated) feishuView.secretInfo = next;
       recomputeFeishuLookupPreflight();
       const initialVisibleChange = !previous && feishuSecretInfoNeedsRender(next);
-      if ((shouldForceRender || (updated && (initialVisibleChange || (previous && changed)))) && state.activeTab === "telegram-approval") {
+      if ((shouldForceRender || (updated && (initialVisibleChange || (previous && changed)))) && isRemoteBodyVisible()) {
         ops.requestRender({ content: true });
       }
     });
@@ -661,7 +678,7 @@
     return !!(info && info.configured);
   }
 
-  function render(parent) {
+  function renderChannelsBody(parent) {
     refreshStatus();
     refreshTokenInfo();
     refreshFeishuStatus();
@@ -673,22 +690,11 @@
     // flight.
     refreshMigrationSnapshot();
 
-    const h1 = document.createElement("h1");
-    h1.textContent = t("remoteApprovalTitle");
-    parent.appendChild(h1);
-
     const subtitle = document.createElement("p");
     subtitle.className = "subtitle";
-    subtitle.textContent = t("remoteApprovalSubtitle");
+    subtitle.textContent = t("permissionsChannelsIntro");
     parent.appendChild(subtitle);
 
-    // Two subtabs (same pattern as the anim-overrides page): IM channels vs
-    // the LAN approval bridge.
-    parent.appendChild(buildSubtabSwitcher());
-    if (coreRef.runtime.remoteApprovalSubtab === "lan") {
-      parent.appendChild(buildMobileChannelCard());
-      return;
-    }
     // Each remote approval channel renders as its own collapsible card so the
     // page can stay tidy as external approval channels grow.
     parent.appendChild(buildTelegramChannelCard());
@@ -696,32 +702,8 @@
     parent.appendChild(buildSlackChannelCard());
   }
 
-  function buildSubtabSwitcher() {
-    const wrap = document.createElement("div");
-    wrap.className = "anim-override-subtabs";
-    const group = document.createElement("div");
-    group.className = "segmented";
-    group.setAttribute("role", "tablist");
-    const current = coreRef.runtime.remoteApprovalSubtab === "lan" ? "lan" : "channels";
-    const entries = [
-      { key: "channels", label: t("remoteApprovalSubtabChannels") },
-      { key: "lan", label: t("remoteApprovalSubtabLan") },
-    ];
-    for (const entry of entries) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = entry.label;
-      if (entry.key === current) btn.classList.add("active");
-      btn.addEventListener("click", () => {
-        if (coreRef.runtime.remoteApprovalSubtab === entry.key) return;
-        if (entry.key === "lan") leaveFeishuLookupUi();
-        coreRef.runtime.remoteApprovalSubtab = entry.key;
-        coreRef.ops.requestRender({ content: true });
-      });
-      group.appendChild(btn);
-    }
-    wrap.appendChild(group);
-    return wrap;
+  function renderLanBody(parent) {
+    parent.appendChild(buildMobileChannelCard());
   }
 
   function refreshRuntimeStatus(payload) {
@@ -814,7 +796,7 @@
         const previousKey = migrationSnapshotRenderKey(migrationSnapshot);
         migrationSnapshot = res.snapshot;
         if (migrationSnapshotRenderKey(migrationSnapshot) !== previousKey
-          && state.activeTab === "telegram-approval") {
+          && isRemoteBodyVisible()) {
           ops.requestRender({ content: true });
         }
       }
@@ -902,27 +884,29 @@
 
     const actions = document.createElement("div");
     actions.className = "tg-native-migration-gate-actions";
-    const verify = document.createElement("button");
-    verify.type = "button";
-    verify.className = "soft-btn accent";
-    verify.textContent = testingFromRequired
-      ? t("telegramNativeMigrationWaiting")
-      : t("telegramNativeMigrationVerify");
-    verify.disabled = migrationPending || testingFromRequired;
+    const verify = helpers.buildButton({
+      labelKey: testingFromRequired
+        ? "telegramNativeMigrationWaiting"
+        : "telegramNativeMigrationVerify",
+      tone: "accent",
+      size: "compact",
+      disabled: migrationPending || testingFromRequired,
+      pending: testingFromRequired,
+    });
     verify.addEventListener("click", () => {
       if (verify.disabled) return;
       migrationDispatch("USER_TEST_NATIVE");
     });
-    const disable = document.createElement("button");
-    disable.type = "button";
-    disable.className = "soft-btn";
-    disable.textContent = t("telegramNativeMigrationDisable");
-    disable.disabled = migrationPending;
+    const disable = helpers.buildButton({
+      labelKey: "telegramNativeMigrationDisable",
+      size: "compact",
+      disabled: migrationPending,
+    });
     disable.addEventListener("click", () => migrationDispatch("USER_DISABLE"));
-    const guide = document.createElement("button");
-    guide.type = "button";
-    guide.className = "soft-btn";
-    guide.textContent = t("telegramNativeMigrationGuide");
+    const guide = helpers.buildButton({
+      labelKey: "telegramNativeMigrationGuide",
+      size: "compact",
+    });
     guide.addEventListener("click", () => {
       helpers.openExternalSafe(
         "https://github.com/rullerzhou-afk/clawd-on-desk/blob/main/docs/guides/telegram-approval.md"
@@ -1138,10 +1122,10 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "soft-btn";
-    btn.textContent = t("telegramApprovalReplaceToken");
+    const btn = helpers.buildButton({
+      labelKey: "telegramApprovalReplaceToken",
+      size: "compact",
+    });
     btn.addEventListener("click", () => {
       view.tokenEditing = true;
       ops.requestRender({ content: true });
@@ -1152,47 +1136,51 @@
   }
 
   function buildTokenEditRow({ configured, masked }) {
-    const row = document.createElement("div");
-    row.className = "row tg-approval-token-edit-row";
-
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = t("telegramApprovalBotToken");
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.innerHTML = configured
+    const descriptionHtml = configured
       ? escapeWithLink(t("telegramApprovalTokenReplaceHintHtml"))
       : escapeWithLink(t("telegramApprovalBotTokenHintHtml"));
-    bindExternalLinks(desc);
-    text.appendChild(label);
+    const rowParts = helpers.buildSettingRow({
+      labelKey: "telegramApprovalBotToken",
+      description: t(configured ? "telegramApprovalTokenReplaceHintHtml" : "telegramApprovalBotTokenHintHtml"),
+      className: "tg-approval-token-edit-row",
+      controlClassName: "tg-approval-input-row",
+    });
+    const row = rowParts.element;
+    const text = rowParts.textElement;
+    const ctrl = rowParts.controlElement;
+    rowParts.descriptionElement.textContent = "";
+    rowParts.descriptionElement.innerHTML = descriptionHtml;
+    bindExternalLinks(rowParts.descriptionElement);
     if (configured && masked) {
       const current = document.createElement("span");
       current.className = "tg-approval-token-current";
       current.textContent = interpolate(t("telegramApprovalTokenCurrent"), "{masked}", masked);
-      text.appendChild(current);
+      text.insertBefore(current, rowParts.descriptionElement);
     }
-    text.appendChild(desc);
-    row.appendChild(text);
+    const input = helpers.buildTextInput({
+      type: "password",
+      autocomplete: "off",
+      spellcheck: false,
+      placeholder: t("telegramApprovalBotTokenPlaceholder"),
+      className: "tg-approval-input",
+      labelledBy: rowParts.labelElement.id,
+      describedBy: rowParts.descriptionElement.id,
+      pending: view.tokenPending,
+      onEnter: () => saveBtn.click(),
+      onInput: (event) => helpers.setTextInputState(event.currentTarget, { invalid: false }),
+    });
 
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control tg-approval-input-row";
-    const input = document.createElement("input");
-    input.type = "password";
-    input.autocomplete = "off";
-    input.spellcheck = false;
-    input.placeholder = t("telegramApprovalBotTokenPlaceholder");
-    input.className = "tg-approval-input";
-
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "soft-btn accent";
-    saveBtn.textContent = view.tokenPending ? t("telegramApprovalSaving") : t("telegramApprovalSaveToken");
-    saveBtn.disabled = view.tokenPending;
+    const saveBtn = helpers.buildButton({
+      labelKey: view.tokenPending ? "telegramApprovalSaving" : "telegramApprovalSaveToken",
+      tone: "accent",
+      disabled: view.tokenPending,
+      pending: view.tokenPending,
+    });
     saveBtn.addEventListener("click", () => {
       const token = input.value.trim();
       if (!token) {
+        helpers.setTextInputState(input, { invalid: true });
+        input.focus();
         ops.showToast(t("telegramApprovalTokenEmpty"), { error: true });
         return;
       }
@@ -1219,11 +1207,11 @@
     ctrl.appendChild(saveBtn);
 
     if (configured) {
-      const cancelBtn = document.createElement("button");
-      cancelBtn.type = "button";
-      cancelBtn.className = "soft-btn";
-      cancelBtn.textContent = t("telegramApprovalCancel");
-      cancelBtn.disabled = view.tokenPending;
+      const cancelBtn = helpers.buildButton({
+        labelKey: "telegramApprovalCancel",
+        size: "compact",
+        disabled: view.tokenPending,
+      });
       cancelBtn.addEventListener("click", () => {
         view.tokenEditing = false;
         ops.requestRender({ content: true });
@@ -1231,7 +1219,6 @@
       ctrl.appendChild(cancelBtn);
     }
 
-    row.appendChild(ctrl);
     return row;
   }
 
@@ -1239,45 +1226,51 @@
 
   function buildRecipientRow() {
     const draft = getFormDraft();
-    const row = document.createElement("div");
-    row.className = "row tg-approval-recipient-row";
+    const rowParts = helpers.buildSettingRow({
+      labelKey: "telegramApprovalRecipientLabel",
+      description: t("telegramApprovalRecipientHintHtml"),
+      className: "tg-approval-recipient-row",
+      controlClassName: "tg-approval-input-row",
+    });
+    const row = rowParts.element;
+    const ctrl = rowParts.controlElement;
+    rowParts.descriptionElement.textContent = "";
+    rowParts.descriptionElement.innerHTML = escapeWithLink(t("telegramApprovalRecipientHintHtml"));
+    bindExternalLinks(rowParts.descriptionElement);
+    const input = helpers.buildTextInput({
+      type: "text",
+      inputMode: "numeric",
+      spellcheck: false,
+      placeholder: t("telegramApprovalRecipientPlaceholder"),
+      className: "tg-approval-input",
+      value: draft.allowedTgUserId || "",
+      labelledBy: rowParts.labelElement.id,
+      describedBy: rowParts.descriptionElement.id,
+      pending: view.configPending,
+      onEnter: () => saveBtn.click(),
+      onInput: () => {
+        helpers.setTextInputState(input, { pending: view.configPending, invalid: false });
+        setFormDraftValue("allowedTgUserId", input.value);
+      },
+    });
 
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = t("telegramApprovalRecipientLabel");
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.innerHTML = escapeWithLink(t("telegramApprovalRecipientHintHtml"));
-    bindExternalLinks(desc);
-    text.appendChild(label);
-    text.appendChild(desc);
-    row.appendChild(text);
-
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control tg-approval-input-row";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.inputMode = "numeric";
-    input.spellcheck = false;
-    input.placeholder = t("telegramApprovalRecipientPlaceholder");
-    input.className = "tg-approval-input";
-    input.value = draft.allowedTgUserId || "";
-    input.addEventListener("input", () => setFormDraftValue("allowedTgUserId", input.value));
-
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "soft-btn accent";
-    saveBtn.textContent = view.configPending ? t("telegramApprovalSaving") : t("telegramApprovalSaveRecipient");
-    saveBtn.disabled = view.configPending;
+    const saveBtn = helpers.buildButton({
+      labelKey: view.configPending ? "telegramApprovalSaving" : "telegramApprovalSaveRecipient",
+      tone: "accent",
+      disabled: view.configPending,
+      pending: view.configPending,
+    });
     saveBtn.addEventListener("click", () => {
       const raw = String(getFormDraft().allowedTgUserId || "").trim();
       if (!raw) {
+        helpers.setTextInputState(input, { invalid: true });
+        input.focus();
         ops.showToast(t("telegramApprovalRecipientEmpty"), { error: true });
         return;
       }
       if (!/^[1-9]\d{4,19}$/.test(raw)) {
+        helpers.setTextInputState(input, { invalid: true });
+        input.focus();
         ops.showToast(t("telegramApprovalRecipientInvalid"), { error: true });
         return;
       }
@@ -1297,7 +1290,6 @@
 
     ctrl.appendChild(input);
     ctrl.appendChild(saveBtn);
-    row.appendChild(ctrl);
     return row;
   }
 
@@ -1352,9 +1344,11 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
+    label.id = "settings-telegram-approval-enabled-label";
     label.textContent = t("telegramApprovalToggle");
     const desc = document.createElement("span");
     desc.className = "row-desc";
+    desc.id = "settings-telegram-approval-enabled-description";
     desc.textContent = t("telegramApprovalToggleDesc");
     text.appendChild(label);
     text.appendChild(desc);
@@ -1362,22 +1356,17 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", "0");
-    helpers.setSwitchVisual(sw, effectiveEnabled, { pending: view.configPending || migrationPending });
     const migrationRequired = migrationState() === "NATIVE_MIGRATION_REQUIRED";
     const canToggle = ready
-      && !migrationPending
       && !migrationRequired
       && (effectiveEnabled || migrationSnapshot);
-    if (!canToggle) {
-      sw.classList.add("disabled");
-      sw.setAttribute("aria-disabled", "true");
-      sw.removeAttribute("tabindex");
-    } else {
-      const toggle = () => {
+    const switchControl = helpers.buildSwitch({
+      checked: effectiveEnabled,
+      pending: view.configPending || migrationPending,
+      disabled: !canToggle,
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: desc.id,
+      onToggle: () => {
         const turningOff = effectiveEnabled === true;
         // Runtime ownership lives in the migration controller. OFF dispatches
         // USER_DISABLE; fresh/explicit-off users turn ON through the native
@@ -1394,16 +1383,9 @@
           migrationDispatch("USER_TEST_NATIVE");
           return;
         }
-      };
-      sw.addEventListener("click", toggle);
-      sw.addEventListener("keydown", (ev) => {
-        if (ev.key === " " || ev.key === "Enter") {
-          ev.preventDefault();
-          toggle();
-        }
-      });
-    }
-    ctrl.appendChild(sw);
+      },
+    });
+    ctrl.appendChild(switchControl.element);
     row.appendChild(ctrl);
     return row;
   }
@@ -1418,9 +1400,11 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
+    label.id = "settings-telegram-direct-send-label";
     label.textContent = t("telegramApprovalDirectSend");
     const desc = document.createElement("span");
     desc.className = "row-desc";
+    desc.id = "settings-telegram-direct-send-description";
     desc.textContent = t("telegramApprovalDirectSendDesc");
     text.appendChild(label);
     text.appendChild(desc);
@@ -1428,28 +1412,17 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", "0");
-    helpers.setSwitchVisual(sw, cfg.r3DirectSendEnabled === true, { pending: view.configPending });
-    if (!ready || view.configPending) {
-      sw.classList.add("disabled");
-      sw.setAttribute("aria-disabled", "true");
-      sw.removeAttribute("tabindex");
-    } else {
-      const toggle = () => {
+    const switchControl = helpers.buildSwitch({
+      checked: cfg.r3DirectSendEnabled === true,
+      pending: view.configPending,
+      disabled: !ready,
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: desc.id,
+      onToggle: () => {
         saveConfig({ ...cfg, r3DirectSendEnabled: cfg.r3DirectSendEnabled !== true }, { resetDraft: false });
-      };
-      sw.addEventListener("click", toggle);
-      sw.addEventListener("keydown", (ev) => {
-        if (ev.key === " " || ev.key === "Enter") {
-          ev.preventDefault();
-          toggle();
-        }
-      });
-    }
-    ctrl.appendChild(sw);
+      },
+    });
+    ctrl.appendChild(switchControl.element);
     row.appendChild(ctrl);
     return row;
   }
@@ -1477,6 +1450,7 @@
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
     const picker = helpers.buildSegmentedRadio({
+      id: "approval-completion-output",
       value: mode,
       options: ["off", "full"].map((value) => ({
         value,
@@ -1547,11 +1521,13 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "soft-btn accent";
-    btn.textContent = view.testPending ? t("telegramApprovalTesting") : t("telegramApprovalSendTest");
-    btn.disabled = testDisabled;
+    const btn = helpers.buildButton({
+      labelKey: view.testPending ? "telegramApprovalTesting" : "telegramApprovalSendTest",
+      tone: "accent",
+      size: "compact",
+      disabled: testDisabled,
+      pending: view.testPending,
+    });
     if (testDisabled && !view.testPending) {
       btn.title = (s.message && String(s.message)) || t("telegramApprovalCardMissingBoth");
     }
@@ -1602,26 +1578,22 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const segmented = document.createElement("div");
-    segmented.className = "segmented feishu-approval-platform";
-    segmented.setAttribute("role", "tablist");
-    for (const platform of FEISHU_PLATFORMS) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.dataset.platform = platform;
-      // Same source of truth as the {brand} token, so the button and the copy
-      // it controls can never drift apart.
-      btn.textContent = feishuBrand(platform);
-      btn.classList.toggle("active", cfg.platform === platform);
-      btn.disabled = allFeishuControlsBlocked();
-      btn.addEventListener("click", () => {
-        if (allFeishuControlsBlocked() || cfg.platform === platform) return;
+    const picker = helpers.buildSegmentedRadio({
+      id: "feishu-platform",
+      ariaLabel: t("feishuApprovalPlatformLabel"),
+      className: "feishu-approval-platform",
+      value: cfg.platform,
+      disabled: allFeishuControlsBlocked(),
+      options: FEISHU_PLATFORMS.map((platform) => ({
+        value: platform, label: feishuBrand(platform), dataset: { platform },
+      })),
+      onChange(platform) {
+        if (allFeishuControlsBlocked()) return false;
         clearFeishuSecretEditingState();
-        saveFeishuConfig({ platform }, { resetDraft: false });
-      });
-      segmented.appendChild(btn);
-    }
-    ctrl.appendChild(segmented);
+        return saveFeishuConfig({ platform }, { resetDraft: false });
+      },
+    });
+    ctrl.appendChild(picker.element);
     row.appendChild(ctrl);
     return row;
   }
@@ -1659,11 +1631,11 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "soft-btn";
-    btn.textContent = t("feishuApprovalReplaceSecrets");
-    btn.disabled = allFeishuControlsBlocked();
+    const btn = helpers.buildButton({
+      labelKey: "feishuApprovalReplaceSecrets",
+      size: "compact",
+      disabled: allFeishuControlsBlocked(),
+    });
     btn.addEventListener("click", () => {
       if (allFeishuControlsBlocked()) return;
       resetFeishuSecretDraft();
@@ -1676,48 +1648,48 @@
   }
 
   function buildFeishuSecretsEditRow({ configured, info }) {
-    const row = document.createElement("div");
-    row.className = "row tg-approval-token-edit-row feishu-approval-secrets-row";
-
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = tBrand("feishuApprovalSecretsLabel");
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.innerHTML = configured
+    const descriptionHtml = configured
       ? escapeWithLink(t("feishuApprovalSecretsReplaceHintHtml"))
       : escapeWithLink(tBrand("feishuApprovalSecretsHintHtml"));
-    bindExternalLinks(desc);
-    text.appendChild(label);
+    const rowParts = helpers.buildSettingRow({
+      label: tBrand("feishuApprovalSecretsLabel"),
+      description: configured
+        ? t("feishuApprovalSecretsReplaceHintHtml")
+        : tBrand("feishuApprovalSecretsHintHtml"),
+      className: "tg-approval-token-edit-row feishu-approval-secrets-row",
+      controlClassName: "tg-approval-input-row feishu-approval-secrets-grid",
+    });
+    const row = rowParts.element;
+    const text = rowParts.textElement;
+    const ctrl = rowParts.controlElement;
+    rowParts.descriptionElement.textContent = "";
+    rowParts.descriptionElement.innerHTML = descriptionHtml;
+    bindExternalLinks(rowParts.descriptionElement);
     if (configured && info) {
       const current = document.createElement("span");
       current.className = "tg-approval-token-current";
       current.textContent = t("feishuApprovalSecretsCurrent").replace("{masked}", info.appId || "");
-      text.appendChild(current);
+      text.insertBefore(current, rowParts.descriptionElement);
     }
-    text.appendChild(desc);
-    row.appendChild(text);
-
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control tg-approval-input-row feishu-approval-secrets-grid";
-    const appIdInput = buildFeishuSecretInput("feishuApprovalAppIdPlaceholder", false, "appId");
-    const appSecretInput = buildFeishuSecretInput("feishuApprovalAppSecretPlaceholder", true, "appSecret");
+    const submitSecretsOnEnter = () => saveBtn.click();
+    const appIdInput = buildFeishuSecretInput("feishuApprovalAppIdPlaceholder", false, "appId", submitSecretsOnEnter);
+    const appSecretInput = buildFeishuSecretInput("feishuApprovalAppSecretPlaceholder", true, "appSecret", submitSecretsOnEnter);
     const verificationInput = buildFeishuSecretInput(
       "feishuApprovalVerificationTokenPlaceholder",
       true,
       "verificationToken",
+      submitSecretsOnEnter,
     );
-    const encryptInput = buildFeishuSecretInput("feishuApprovalEncryptKeyPlaceholder", true, "encryptKey");
+    const encryptInput = buildFeishuSecretInput("feishuApprovalEncryptKeyPlaceholder", true, "encryptKey", submitSecretsOnEnter);
 
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "soft-btn accent";
     const credentialPersistencePending = feishuView.configPersistencePending
       && feishuView.configPersistenceKind === "credentials";
-    saveBtn.textContent = credentialPersistencePending ? t("feishuApprovalSaving") : t("feishuApprovalSaveSecrets");
-    saveBtn.disabled = allFeishuControlsBlocked();
+    const saveBtn = helpers.buildButton({
+      labelKey: credentialPersistencePending ? "feishuApprovalSaving" : "feishuApprovalSaveSecrets",
+      tone: "accent",
+      disabled: allFeishuControlsBlocked(),
+      pending: credentialPersistencePending,
+    });
     saveBtn.addEventListener("click", () => {
       if (allFeishuControlsBlocked()) return;
       const payload = {
@@ -1727,17 +1699,24 @@
         encryptKey: encryptInput.value.trim(),
       };
       if (!configured && (!payload.appId || !payload.appSecret)) {
+        helpers.setTextInputState(appIdInput, { invalid: !payload.appId });
+        helpers.setTextInputState(appSecretInput, { invalid: !payload.appSecret });
+        (!payload.appId ? appIdInput : appSecretInput).focus();
         ops.showToast(t("feishuApprovalSecretsRequired"), { error: true });
         return;
       }
       if (configured && !payload.appId && !payload.appSecret && !payload.verificationToken && !payload.encryptKey) {
+        for (const input of [appIdInput, appSecretInput, verificationInput, encryptInput]) {
+          helpers.setTextInputState(input, { invalid: true });
+        }
+        appIdInput.focus();
         ops.showToast(tBrand("feishuApprovalSecretsEmpty"), { error: true });
         return;
       }
       for (const input of [appIdInput, appSecretInput, verificationInput, encryptInput]) {
-        input.disabled = true;
+        helpers.setTextInputState(input, { pending: true });
       }
-      saveBtn.disabled = true;
+      helpers.setButtonState(saveBtn, { pending: true });
       saveFeishuCommand("feishuApproval.setSecrets", payload, {
         kind: "credentials",
         credentialPayload: payload,
@@ -1757,11 +1736,11 @@
     ctrl.appendChild(encryptInput);
     ctrl.appendChild(saveBtn);
     if (configured) {
-      const cancelBtn = document.createElement("button");
-      cancelBtn.type = "button";
-      cancelBtn.className = "soft-btn";
-      cancelBtn.textContent = t("telegramApprovalCancel");
-      cancelBtn.disabled = allFeishuControlsBlocked();
+      const cancelBtn = helpers.buildButton({
+        labelKey: "telegramApprovalCancel",
+        size: "compact",
+        disabled: allFeishuControlsBlocked(),
+      });
       cancelBtn.addEventListener("click", () => {
         if (allFeishuControlsBlocked()) return;
         clearFeishuSecretEditingState();
@@ -1769,11 +1748,11 @@
       });
       ctrl.appendChild(cancelBtn);
     } else {
-      const clearBtn = document.createElement("button");
-      clearBtn.type = "button";
-      clearBtn.className = "soft-btn";
-      clearBtn.textContent = t("feishuApprovalClearSecretsDraft");
-      clearBtn.disabled = allFeishuControlsBlocked();
+      const clearBtn = helpers.buildButton({
+        labelKey: "feishuApprovalClearSecretsDraft",
+        size: "compact",
+        disabled: allFeishuControlsBlocked(),
+      });
       clearBtn.addEventListener("click", () => {
         if (allFeishuControlsBlocked()) return;
         clearFeishuSecretEditingState();
@@ -1781,24 +1760,27 @@
       });
       ctrl.appendChild(clearBtn);
     }
-    row.appendChild(ctrl);
     return row;
   }
 
-  function buildFeishuSecretInput(placeholderKey, secret, draftKey) {
-    const input = document.createElement("input");
-    input.type = secret ? "password" : "text";
-    input.autocomplete = "off";
-    input.spellcheck = false;
-    input.placeholder = t(placeholderKey);
-    input.className = "tg-approval-input";
-    input.disabled = allFeishuControlsBlocked();
+  function buildFeishuSecretInput(placeholderKey, secret, draftKey, onEnter) {
     const draft = getFeishuSecretDraft();
-    input.value = draft[draftKey] || "";
-    input.addEventListener("input", () => {
-      if (allFeishuControlsBlocked()) return;
-      getFeishuSecretDraft()[draftKey] = input.value;
-      recomputeFeishuLookupPreflight();
+    const input = helpers.buildTextInput({
+      type: secret ? "password" : "text",
+      autocomplete: "off",
+      spellcheck: false,
+      placeholder: t(placeholderKey),
+      className: "tg-approval-input",
+      value: draft[draftKey] || "",
+      ariaLabel: t(placeholderKey),
+      disabled: allFeishuControlsBlocked(),
+      onEnter,
+      onInput: (event) => {
+        helpers.setTextInputState(event.currentTarget, { invalid: false });
+        if (allFeishuControlsBlocked()) return;
+        getFeishuSecretDraft()[draftKey] = event.currentTarget.value;
+        recomputeFeishuLookupPreflight();
+      },
     });
     return input;
   }
@@ -1843,20 +1825,18 @@
     const lookupPreflightErrorCode = feishuLookupPreflightErrorCode();
     const lookupStatusCode = lookupPreflightErrorCode || feishuView.lookupResultErrorCode;
     feishuView.lookupErrorCode = lookupPreflightErrorCode;
-    const row = document.createElement("div");
-    row.className = "row tg-approval-recipient-row feishu-approval-approver-row";
-
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = tBrand("feishuApprovalApproverLabel");
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.innerHTML = escapeWithLink(tBrand("feishuApprovalApproverHintHtml"));
-    bindExternalLinks(desc);
-    text.appendChild(label);
-    text.appendChild(desc);
+    const rowParts = helpers.buildSettingRow({
+      label: tBrand("feishuApprovalApproverLabel"),
+      description: tBrand("feishuApprovalApproverHintHtml"),
+      className: "tg-approval-recipient-row feishu-approval-approver-row",
+      controlClassName: "tg-approval-input-row",
+    });
+    const row = rowParts.element;
+    const text = rowParts.textElement;
+    const ctrl = rowParts.controlElement;
+    rowParts.descriptionElement.textContent = "";
+    rowParts.descriptionElement.innerHTML = escapeWithLink(tBrand("feishuApprovalApproverHintHtml"));
+    bindExternalLinks(rowParts.descriptionElement);
     // Only user_id costs an extra scope ("Get user user ID"). open_id (the
     // default) and union_id do not, so the note must not be shown for them —
     // over-warning pushes users to request permissions they don't need.
@@ -1883,59 +1863,53 @@
     // revealed; an empty mounted region stays inert until its text changes.
     preflightStatus.textContent = feishuLookupPreflightMessage(lookupStatusCode);
     text.appendChild(preflightStatus);
-    row.appendChild(text);
-
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control tg-approval-input-row";
-    const segmented = document.createElement("div");
-    segmented.className = "segmented feishu-approval-id-type";
-    segmented.setAttribute("role", "tablist");
-    const idTypes = [
-      { id: "open_id", label: "open_id" },
-      { id: "user_id", label: "user_id" },
-      { id: "union_id", label: "union_id" },
-    ];
-    for (const item of idTypes) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.dataset.idType = item.id;
-      btn.textContent = item.label;
-      btn.classList.toggle("active", draft.idType === item.id);
-      btn.disabled = allFeishuControlsBlocked();
-      btn.addEventListener("click", () => {
-        if (allFeishuControlsBlocked()) return;
-        setFeishuFormDraftValue("idType", item.id);
+    const picker = helpers.buildSegmentedRadio({
+      id: "feishu-id-type",
+      ariaLabel: t("feishuApprovalIdTypeLabel"),
+      className: "feishu-approval-id-type",
+      value: draft.idType,
+      disabled: allFeishuControlsBlocked(),
+      options: ["open_id", "user_id", "union_id"].map((id) => ({ value: id, label: id, dataset: { idType: id } })),
+      onChange(value) {
+        if (allFeishuControlsBlocked()) return false;
+        setFeishuFormDraftValue("idType", value);
         ops.requestRender({ content: true });
-      });
-      segmented.appendChild(btn);
-    }
+        return true;
+      },
+    });
+    const segmented = picker.element;
 
-    const input = document.createElement("input");
-    input.type = "text";
-    input.autocomplete = "off";
-    input.spellcheck = false;
-    input.placeholder = t("feishuApprovalApproverPlaceholder");
-    input.className = "tg-approval-input";
-    input.value = draft.approverId || "";
-    input.disabled = allFeishuControlsBlocked();
-    input.setAttribute("aria-invalid", feishuApproverValueInvalid(lookupStatusCode) ? "true" : "false");
-    if (lookupStatusCode) {
-      input.setAttribute("aria-describedby", preflightStatus.id);
-    }
-    input.addEventListener("input", () => setFeishuFormDraftValue("approverId", input.value));
+    const input = helpers.buildTextInput({
+      type: "text",
+      autocomplete: "off",
+      spellcheck: false,
+      placeholder: t("feishuApprovalApproverPlaceholder"),
+      className: "tg-approval-input",
+      value: draft.approverId || "",
+      labelledBy: rowParts.labelElement.id,
+      disabled: allFeishuControlsBlocked(),
+      invalid: feishuApproverValueInvalid(lookupStatusCode),
+      describedBy: [
+        rowParts.descriptionElement.id,
+        lookupStatusCode ? preflightStatus.id : "",
+      ].filter(Boolean).join(" "),
+      onEnter: () => saveBtn.click(),
+      onInput: () => setFeishuFormDraftValue("approverId", input.value),
+    });
 
-    const saveBtn = document.createElement("button");
     const renderedAsLookupCancel = feishuView.networkLookupPending;
-    saveBtn.type = "button";
-    saveBtn.className = "soft-btn accent";
-    saveBtn.textContent = renderedAsLookupCancel
-      ? feishuView.lookupCancelPending
-        ? t("feishuApprovalLookupCancelling")
-        : t("feishuApprovalLookupCancel")
-      : t("feishuApprovalSaveApprover");
-    saveBtn.disabled = renderedAsLookupCancel
-      ? feishuView.lookupCancelPending
-      : allFeishuControlsBlocked() || !!lookupPreflightErrorCode;
+    const saveBtn = helpers.buildButton({
+      labelKey: renderedAsLookupCancel
+        ? feishuView.lookupCancelPending
+          ? "feishuApprovalLookupCancelling"
+          : "feishuApprovalLookupCancel"
+        : "feishuApprovalSaveApprover",
+      tone: "accent",
+      disabled: renderedAsLookupCancel
+        ? feishuView.lookupCancelPending
+        : allFeishuControlsBlocked() || !!lookupPreflightErrorCode,
+      pending: feishuView.lookupCancelPending,
+    });
     if (preflightStatus.textContent && !renderedAsLookupCancel) {
       saveBtn.setAttribute("aria-describedby", preflightStatus.id);
     }
@@ -2045,12 +2019,12 @@
     ctrl.appendChild(segmented);
     ctrl.appendChild(input);
     ctrl.appendChild(saveBtn);
-    row.appendChild(ctrl);
     mountedFeishuApproverControl = {
       row,
       input,
       saveButton: saveBtn,
       status: preflightStatus,
+      descriptionId: rowParts.descriptionElement.id,
       renderedAsLookupCancel,
     };
     return row;
@@ -2166,7 +2140,7 @@
 
   function buildFeishuEnabledRow({ ready }) {
     const cfg = currentFeishuConfig();
-    const blocked = allFeishuControlsBlocked() || (!cfg.enabled && !ready);
+    const blocked = feishuLookupPending() || feishuView.testPending || (!cfg.enabled && !ready);
     const row = document.createElement("div");
     row.className = "row";
     if (!ready && !cfg.enabled) row.classList.add("tg-approval-row-disabled");
@@ -2175,9 +2149,11 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
+    label.id = "settings-feishu-approval-enabled-label";
     label.textContent = tBrand("feishuApprovalToggle");
     const desc = document.createElement("span");
     desc.className = "row-desc";
+    desc.id = "settings-feishu-approval-enabled-description";
     desc.textContent = tBrand("feishuApprovalToggleDesc");
     text.appendChild(label);
     text.appendChild(desc);
@@ -2185,32 +2161,21 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", "0");
-    helpers.setSwitchVisual(sw, cfg.enabled, { pending: feishuView.configPersistencePending });
-    if (blocked) {
-      sw.classList.add("disabled");
-      sw.setAttribute("aria-disabled", "true");
-      sw.removeAttribute("tabindex");
-      if (!cfg.enabled && !ready) {
-        sw.title = feishuSetupReasonMessage(feishuSetupProgress().setupReason);
-      }
-    } else {
-      const toggle = () => {
+    const switchControl = helpers.buildSwitch({
+      checked: cfg.enabled,
+      pending: feishuView.configPersistencePending,
+      disabled: blocked,
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: desc.id,
+      onToggle: () => {
         if (allFeishuControlsBlocked()) return;
         saveFeishuConfig({ enabled: !cfg.enabled }, { resetDraft: false });
-      };
-      sw.addEventListener("click", toggle);
-      sw.addEventListener("keydown", (ev) => {
-        if (ev.key === " " || ev.key === "Enter") {
-          ev.preventDefault();
-          toggle();
-        }
-      });
+      },
+    });
+    if (!cfg.enabled && !ready) {
+      switchControl.element.title = feishuSetupReasonMessage(feishuSetupProgress().setupReason);
     }
-    ctrl.appendChild(sw);
+    ctrl.appendChild(switchControl.element);
     row.appendChild(ctrl);
     return row;
   }
@@ -2287,11 +2252,13 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "soft-btn accent";
-    btn.textContent = feishuView.testPending ? t("feishuApprovalTesting") : t("feishuApprovalSendTest");
-    btn.disabled = testDisabled;
+    const btn = helpers.buildButton({
+      labelKey: feishuView.testPending ? "feishuApprovalTesting" : "feishuApprovalSendTest",
+      tone: "accent",
+      size: "compact",
+      disabled: testDisabled,
+      pending: feishuView.testPending,
+    });
     if (testDisabled && !feishuView.testPending) {
       // Prefer the translated reason the button is dead; the raw English
       // s.message is the last resort, not the first choice.
@@ -2691,7 +2658,7 @@
       const changed = updated && slackStatusRenderKey(previousStatus) !== slackStatusRenderKey(nextStatus);
       if (updated) slackView.status = result.state || null;
       const initialVisibleChange = !hadStatus && slackStatusNeedsRender(nextStatus);
-      if ((shouldForceRender || (updated && (initialVisibleChange || (hadStatus && changed)))) && state.activeTab === "telegram-approval") {
+      if ((shouldForceRender || (updated && (initialVisibleChange || (hadStatus && changed)))) && isRemoteBodyVisible()) {
         ops.requestRender({ content: true });
       }
     });
@@ -2719,7 +2686,7 @@
       const changed = updated && slackSecretInfoRenderKey(previous) !== slackSecretInfoRenderKey(next);
       if (updated) slackView.secretInfo = next;
       const initialVisibleChange = !previous && slackSecretInfoNeedsRender(next);
-      if ((shouldForceRender || (updated && (initialVisibleChange || (previous && changed)))) && state.activeTab === "telegram-approval") {
+      if ((shouldForceRender || (updated && (initialVisibleChange || (previous && changed)))) && isRemoteBodyVisible()) {
         ops.requestRender({ content: true });
       }
     });
@@ -2816,31 +2783,32 @@
     return row;
   }
 
-  function buildSlackSecretInput(placeholderKey, secret) {
-    const input = document.createElement("input");
-    input.type = secret ? "password" : "text";
-    input.autocomplete = "off";
-    input.spellcheck = false;
-    input.placeholder = t(placeholderKey);
-    input.className = "tg-approval-input";
-    return input;
+  function buildSlackSecretInput(placeholderKey, secret, onEnter) {
+    return helpers.buildTextInput({
+      type: secret ? "password" : "text",
+      autocomplete: "off",
+      spellcheck: false,
+      placeholder: t(placeholderKey),
+      className: "tg-approval-input",
+      ariaLabel: t(placeholderKey),
+      pending: slackView.secretPending,
+      lockWhilePending: false,
+      onEnter,
+    });
   }
 
   function buildSlackSecretsRow() {
     const configured = slackSecretsConfigured();
     const info = slackView.secretInfo;
-    const row = document.createElement("div");
-    row.className = "row tg-approval-token-edit-row slack-notify-secrets-row";
-
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = t("slackNotifySecretsLabel");
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.textContent = configured ? t("slackNotifySecretsReplaceHint") : t("slackNotifySecretsHint");
-    text.appendChild(label);
+    const rowParts = helpers.buildSettingRow({
+      labelKey: "slackNotifySecretsLabel",
+      descriptionKey: configured ? "slackNotifySecretsReplaceHint" : "slackNotifySecretsHint",
+      className: "tg-approval-token-edit-row slack-notify-secrets-row",
+      controlClassName: "tg-approval-input-row slack-notify-secrets-grid",
+    });
+    const row = rowParts.element;
+    const text = rowParts.textElement;
+    const ctrl = rowParts.controlElement;
     // One line per stored credential. Previously only the webhook mask showed,
     // so a bot-token-only setup looked unconfigured, and there was no way to
     // tell which of two saved credentials was actually in use.
@@ -2852,41 +2820,45 @@
       const line = document.createElement("span");
       line.className = "tg-approval-token-current";
       line.textContent = t("slackNotifySecretsCurrent").replace("{masked}", mask);
-      const clear = document.createElement("button");
-      clear.type = "button";
-      clear.className = "soft-btn";
-      clear.textContent = t("slackNotifyClear");
-      clear.disabled = slackView.secretPending;
+      const clear = helpers.buildButton({
+        labelKey: "slackNotifyClear",
+        size: "compact",
+        disabled: slackView.secretPending,
+        pending: slackView.secretPending,
+      });
       clear.addEventListener("click", () => clearSlackSecret(field, clearedKey));
       line.appendChild(document.createTextNode(" "));
       line.appendChild(clear);
-      text.appendChild(line);
+      text.insertBefore(line, rowParts.descriptionElement);
     }
     // Local removal is not revocation — say so where the button is.
     if (info && (info.webhookUrl || info.botToken)) {
       const note = document.createElement("span");
       note.className = "row-desc";
       note.textContent = t("slackNotifyRevokeNote");
-      text.appendChild(note);
+      text.insertBefore(note, rowParts.descriptionElement);
     }
-    text.appendChild(desc);
-    row.appendChild(text);
-
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control tg-approval-input-row slack-notify-secrets-grid";
-    const webhookInput = buildSlackSecretInput("slackNotifyWebhookPlaceholder", true);
-    const botTokenInput = buildSlackSecretInput("slackNotifyBotTokenPlaceholder", true);
+    const submitSecretsOnEnter = () => saveBtn.click();
+    const webhookInput = buildSlackSecretInput("slackNotifyWebhookPlaceholder", true, submitSecretsOnEnter);
+    const botTokenInput = buildSlackSecretInput("slackNotifyBotTokenPlaceholder", true, submitSecretsOnEnter);
     const draft = getSlackFormDraft();
     webhookInput.value = draft.webhookUrl;
     botTokenInput.value = draft.botToken;
-    webhookInput.addEventListener("input", () => setSlackFormDraftValue("webhookUrl", webhookInput.value));
-    botTokenInput.addEventListener("input", () => setSlackFormDraftValue("botToken", botTokenInput.value));
+    webhookInput.addEventListener("input", () => {
+      helpers.setTextInputState(webhookInput, { invalid: false });
+      setSlackFormDraftValue("webhookUrl", webhookInput.value);
+    });
+    botTokenInput.addEventListener("input", () => {
+      helpers.setTextInputState(botTokenInput, { invalid: false });
+      setSlackFormDraftValue("botToken", botTokenInput.value);
+    });
 
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "soft-btn accent";
-    saveBtn.textContent = slackView.secretPending ? t("slackNotifySaving") : t("slackNotifySaveSecrets");
-    saveBtn.disabled = slackView.secretPending;
+    const saveBtn = helpers.buildButton({
+      labelKey: slackView.secretPending ? "slackNotifySaving" : "slackNotifySaveSecrets",
+      tone: "accent",
+      disabled: slackView.secretPending,
+      pending: slackView.secretPending,
+    });
     saveBtn.addEventListener("click", () => {
       // Only send fields the user typed; blank means "keep the stored value"
       // (the writer preserves untouched keys), so saving a new webhook does not
@@ -2899,10 +2871,16 @@
       if (webhook) payload.webhookUrl = webhook;
       if (botToken) payload.botToken = botToken;
       if (!configured && !webhook && !botToken) {
+        helpers.setTextInputState(webhookInput, { invalid: true });
+        helpers.setTextInputState(botTokenInput, { invalid: true });
+        webhookInput.focus();
         ops.showToast(t("slackNotifySecretsRequired"), { error: true });
         return;
       }
       if (!webhook && !botToken) {
+        helpers.setTextInputState(webhookInput, { invalid: true });
+        helpers.setTextInputState(botTokenInput, { invalid: true });
+        webhookInput.focus();
         ops.showToast(t("slackNotifySecretsEmpty"), { error: true });
         return;
       }
@@ -2927,7 +2905,6 @@
     ctrl.appendChild(webhookInput);
     ctrl.appendChild(botTokenInput);
     ctrl.appendChild(saveBtn);
-    row.appendChild(ctrl);
     return row;
   }
 
@@ -2979,37 +2956,35 @@
 
   function buildSlackChannelIdRow() {
     const cfg = currentSlackConfig();
-    const row = document.createElement("div");
-    row.className = "row tg-approval-recipient-row slack-notify-channel-row";
+    const rowParts = helpers.buildSettingRow({
+      labelKey: "slackNotifyChannelIdLabel",
+      descriptionKey: "slackNotifyChannelIdHint",
+      className: "tg-approval-recipient-row slack-notify-channel-row",
+      controlClassName: "tg-approval-input-row",
+    });
+    const row = rowParts.element;
+    const ctrl = rowParts.controlElement;
+    const input = helpers.buildTextInput({
+      type: "text",
+      autocomplete: "off",
+      spellcheck: false,
+      placeholder: t("slackNotifyChannelIdPlaceholder"),
+      className: "tg-approval-input",
+      value: getSlackFormDraft().channelId,
+      labelledBy: rowParts.labelElement.id,
+      describedBy: rowParts.descriptionElement.id,
+      pending: slackView.configPending,
+      lockWhilePending: false,
+      onEnter: () => saveBtn.click(),
+      onInput: () => setSlackFormDraftValue("channelId", input.value),
+    });
 
-    const text = document.createElement("div");
-    text.className = "row-text";
-    const label = document.createElement("span");
-    label.className = "row-label";
-    label.textContent = t("slackNotifyChannelIdLabel");
-    const desc = document.createElement("span");
-    desc.className = "row-desc";
-    desc.textContent = t("slackNotifyChannelIdHint");
-    text.appendChild(label);
-    text.appendChild(desc);
-    row.appendChild(text);
-
-    const ctrl = document.createElement("div");
-    ctrl.className = "row-control tg-approval-input-row";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.autocomplete = "off";
-    input.spellcheck = false;
-    input.placeholder = t("slackNotifyChannelIdPlaceholder");
-    input.className = "tg-approval-input";
-    input.value = getSlackFormDraft().channelId;
-    input.addEventListener("input", () => setSlackFormDraftValue("channelId", input.value));
-
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "soft-btn accent";
-    saveBtn.textContent = slackView.configPending ? t("slackNotifySaving") : t("slackNotifySaveChannel");
-    saveBtn.disabled = slackView.configPending;
+    const saveBtn = helpers.buildButton({
+      labelKey: slackView.configPending ? "slackNotifySaving" : "slackNotifySaveChannel",
+      tone: "accent",
+      disabled: slackView.configPending,
+      pending: slackView.configPending,
+    });
     saveBtn.addEventListener("click", () => {
       const channelId = input.value.trim();
       saveSlackConfig({ ...currentSlackConfig(), channelId }).then((saved) => {
@@ -3024,7 +2999,6 @@
 
     ctrl.appendChild(input);
     ctrl.appendChild(saveBtn);
-    row.appendChild(ctrl);
     return row;
   }
 
@@ -3071,9 +3045,11 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
+    label.id = "settings-slack-notify-enabled-label";
     label.textContent = t("slackNotifyToggle");
     const desc = document.createElement("span");
     desc.className = "row-desc";
+    desc.id = "settings-slack-notify-enabled-description";
     desc.textContent = t("slackNotifyToggleDesc");
     text.appendChild(label);
     text.appendChild(desc);
@@ -3081,23 +3057,15 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", "0");
-    helpers.setSwitchVisual(sw, cfg.enabled, { pending: slackView.configPending });
-    if (!canToggle) {
-      sw.classList.add("disabled");
-      sw.setAttribute("aria-disabled", "true");
-      sw.removeAttribute("tabindex");
-    } else {
-      const toggle = () => saveSlackConfig({ ...cfg, enabled: !cfg.enabled });
-      sw.addEventListener("click", toggle);
-      sw.addEventListener("keydown", (ev) => {
-        if (ev.key === " " || ev.key === "Enter") { ev.preventDefault(); toggle(); }
-      });
-    }
-    ctrl.appendChild(sw);
+    const switchControl = helpers.buildSwitch({
+      checked: cfg.enabled,
+      pending: slackView.configPending,
+      disabled: !canToggle,
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: desc.id,
+      onToggle: () => saveSlackConfig({ ...cfg, enabled: !cfg.enabled }),
+    });
+    ctrl.appendChild(switchControl.element);
     row.appendChild(ctrl);
     return row;
   }
@@ -3109,9 +3077,11 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
+    label.id = `settings-slack-${labelKey}-label`;
     label.textContent = t(labelKey);
     const desc = document.createElement("span");
     desc.className = "row-desc";
+    desc.id = `settings-slack-${labelKey}-description`;
     desc.textContent = t(descKey);
     text.appendChild(label);
     text.appendChild(desc);
@@ -3119,17 +3089,14 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const sw = document.createElement("div");
-    sw.className = "switch";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("tabindex", "0");
-    helpers.setSwitchVisual(sw, value, { pending: slackView.configPending });
-    const toggle = () => onToggle(!value);
-    sw.addEventListener("click", toggle);
-    sw.addEventListener("keydown", (ev) => {
-      if (ev.key === " " || ev.key === "Enter") { ev.preventDefault(); toggle(); }
+    const switchControl = helpers.buildSwitch({
+      checked: value,
+      pending: slackView.configPending,
+      ariaLabelledBy: label.id,
+      ariaDescribedBy: desc.id,
+      onToggle: () => onToggle(!value),
     });
-    ctrl.appendChild(sw);
+    ctrl.appendChild(switchControl.element);
     row.appendChild(ctrl);
     return row;
   }
@@ -3157,11 +3124,13 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "soft-btn accent";
-    btn.textContent = slackView.testPending ? t("slackNotifyTesting") : t("slackNotifySendTest");
-    btn.disabled = testDisabled;
+    const btn = helpers.buildButton({
+      labelKey: slackView.testPending ? "slackNotifyTesting" : "slackNotifySendTest",
+      tone: "accent",
+      size: "compact",
+      disabled: testDisabled,
+      pending: slackView.testPending,
+    });
     if (testDisabled && !slackView.testPending) btn.title = t("slackNotifyCardMissingSecret");
     btn.addEventListener("click", () => {
       if (testDisabled) return;
@@ -3264,13 +3233,14 @@
     state = core.state;
     helpers = core.helpers;
     ops = core.ops;
-    core.tabs["telegram-approval"] = {
-      render,
-      refreshRuntimeStatus,
-      patchInPlace,
-      onExit: leaveFeishuLookupUi,
-    };
   }
 
-  root.ClawdSettingsTabTelegramApproval = { init };
+  root.ClawdSettingsTabTelegramApproval = {
+    init,
+    renderChannelsBody,
+    renderLanBody,
+    refreshRuntimeStatus,
+    patchInPlace,
+    leave: leaveFeishuLookupUi,
+  };
 })(globalThis);

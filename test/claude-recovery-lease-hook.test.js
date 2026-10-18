@@ -11,6 +11,7 @@ const {
   readLeaseFile,
   updateRecoveryLeaseFromStateBody,
 } = require("../hooks/session-recovery-lease");
+const { getHistoryFilePath, readHistoryFile } = require("../hooks/session-history");
 
 const HOOK = path.join(__dirname, "..", "hooks", "clawd-hook.js");
 
@@ -71,5 +72,57 @@ describe("Claude hook recovery lease ordering", () => {
     const lease = readLeaseFile(getLeaseFilePath("claude-code", "offline-session", { recoveryDir }));
     assert.strictEqual(lease.active, false);
     assert.strictEqual(lease.state, null);
+  });
+
+  it("does not change the Stop tombstone or ended history for a late offline batch", () => {
+    run("PreToolUse", { tool_name: "Read" });
+    run("Stop");
+    const leaseFile = getLeaseFilePath("claude-code", "offline-session", { recoveryDir });
+    const historyFile = getHistoryFilePath("claude-code", "offline-session", {
+      historyDir: path.join(home, ".clawd", "session-history-v1"),
+    });
+    const beforeLease = fs.readFileSync(leaseFile, "utf8");
+    const beforeHistory = fs.readFileSync(historyFile, "utf8");
+    const result = run("PostToolBatch", { prompt_id: "prompt-1",
+      tool_calls: [{ tool_use_id: "tool-1", tool_response: "private response" }] });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.equal(fs.readFileSync(leaseFile, "utf8"), beforeLease);
+    assert.equal(fs.readFileSync(historyFile, "utf8"), beforeHistory);
+  });
+
+  it("keeps the Stop tombstone and history ending when a trailing SubagentStop arrives (#1060)", () => {
+    const historyFile = getHistoryFilePath("claude-code", "offline-session", {
+      historyDir: path.join(home, ".clawd", "session-history-v1"),
+    });
+    run("PreToolUse", { tool_name: "Bash" });
+    run("Stop");
+    const endedAt = readHistoryFile(historyFile).endedAt;
+    assert.ok(endedAt);
+    const result = run("SubagentStop");
+    assert.strictEqual(result.status, 0, result.stderr);
+    const lease = readLeaseFile(getLeaseFilePath("claude-code", "offline-session", { recoveryDir }));
+    assert.strictEqual(lease.active, false);
+    assert.strictEqual(lease.state, null);
+    assert.strictEqual(readHistoryFile(historyFile).endedAt, endedAt);
+  });
+
+  it("persists history through the real offline hook without leaking the prompt or reply", () => {
+    const historyDir = path.join(home, ".clawd", "session-history-v1");
+    const file = getHistoryFilePath("claude-code", "offline-session", { historyDir });
+    const started = run("UserPromptSubmit", { prompt: "private prompt must stay in Claude" });
+    assert.strictEqual(started.status, 0, started.stderr);
+    assert.strictEqual(started.stdout, "");
+    const active = readHistoryFile(file);
+    assert.ok(active, "history must persist even though the HTTP receiver is offline");
+    assert.strictEqual(active.title, null);
+    assert.strictEqual(active.endedAt, null);
+    const stopped = run("Stop", { last_assistant_message: "private reply must stay in Claude" });
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    assert.strictEqual(stopped.stdout, "");
+    assert.ok(readHistoryFile(file).endedAt);
+    const disk = fs.readFileSync(file, "utf8");
+    assert.ok(!disk.includes("private prompt"));
+    assert.ok(!disk.includes("private reply"));
   });
 });

@@ -2,9 +2,31 @@
 
 [返回 README](../../README.zh-CN.md)
 
+## 源码开发前置条件
+
+安装、跑测试和本机启动请使用 Node.js 24.18.0（仓库 `.nvmrc` 指定的版本）。Electron 官方维护的安装器要求 Node.js 22.12.0 或更高。
+
+Node 24.16.x 和 24.17.x 存在一个已知的 stream 兼容性回归：只要旧的 `extract-zip` / `yauzl` 链路仍存在，它就可能静默截断 ZIP 解压结果（[nodejs/node#63487](https://github.com/nodejs/node/issues/63487)）。当前 Electron 依赖已不再使用该链路，但本仓库及其周边工具仍以 24.18.0 作为受支持的开发基线。
+
+如果 Electron 报缺少 Framework 或完整性校验失败，请删除整个包后重装；不要只创建 `path.txt`：
+
+```bash
+rm -rf node_modules/electron
+npm install
+```
+
+PowerShell 等价写法：
+
+```powershell
+Remove-Item -Recurse -Force node_modules/electron
+npm install
+```
+
+自定义开发分发时，Linux 上使用 `ELECTRON_OVERRIDE_DIST_PATH` 启动会沿用 Electron 的解析逻辑：`path.txt` 缺失时回退到 override 根目录下的 `electron` 可执行文件。macOS 和 Windows 的 override 必须保留 Electron 标准的 `path.txt`，因为这两个平台受支持的可执行文件布局使用 app bundle 和 `electron.exe`，而不是 Linux 的根目录可执行文件。
+
 ## Agent 配置说明
 
-全新安装默认只安装并启用 Claude Code 和 Codex。其他本机 agent 需要先到 **Settings → Agents** 点该 agent 的 **Install / 安装**；安装且启用后，Clawd 才会在启动时继续同步对应 hook / plugin / extension。单独关闭 agent 只会停止事件入口，不会卸载文件；**Uninstall / 卸载** 只删除 Clawd 管理的 hook / plugin / extension 条目，并同时禁用该 agent。
+全新安装默认只安装并启用 Claude Code 和 Codex。其他本机 agent 需要先到 **Settings → AI 编程工具** 点该 agent 的 **Install / 安装**；安装且启用后，Clawd 才会在启动时继续同步对应 hook / plugin / extension。单独关闭 agent 只会停止事件入口，不会卸载文件；**Uninstall / 卸载** 只删除 Clawd 管理的 hook / plugin / extension 条目，并同时禁用该 agent。
 
 **自定义 HTTP Agent** — Settings 可以注册其他本机可执行文件并分配稳定的 `custom-...` ID，但“注册”不会自动安装 hook，也不会让普通应用自动上报事件。自定义 Agent v1 仅支持状态：应用或你编写的 adapter 必须主动向 Clawd 运行时的 `/state` 地址 POST 生命周期事件；权限决定仍留在应用自己的界面中。动态端口发现、请求体、三平台示例以及禁用/移除语义见 [custom-agent-http.md](custom-agent-http.md)。
 
@@ -40,43 +62,53 @@ Claude Code 只有一个用户级 statusline 槽位，因此 Clawd 绝不会静�
 
 普通本机修复命令 `npm run install:claude-hooks` 不会开启采集。显式调试命令 `npm run install:claude-hooks -- --statusline` 可以安装并显示 Clawd 状态栏，但 Settings 开关关闭时，应用仍会把其本机 context/quota POST 当作成功 no-op；下次本机启动 reconcile 也会移除这个 Clawd 管理的调试槽位。Remote SSH 部署是另一项显式操作；若远端已有自己的 statusline，请在 profile 中开启 **部署时串联远端已有的 statusline**，以便保留并在卸载时恢复原注册。
 
-**Codex CLI** — 开箱即用。Clawd 会在检测到 Codex 时自动注册 official hooks 到 `~/.codex/hooks.json`，并在用户没有显式关闭 hooks 时启用 `[features].hooks = true`。Installer 会把已废弃的 `[features].codex_hooks` 迁移到 `hooks`，同时保留用户显式设置的 false。Official hooks 提供实时状态和真实 Allow/Deny 权限气泡。**Settings → Agents → Codex → 随 Codex 启动** 单独控制本机 Codex 的 `SessionStart` 能否在 Clawd 未运行时拉起桌宠；关闭它不会停用状态或审批接入，Clawd 已运行时仍然正常工作。全新安装默认关闭，升级用户则保留此前的开启行为；Remote SSH 与 WSL hook 永远不会冷启动桌面应用。`~/.codex/sessions/` JSONL 轮询只保留为状态 / metadata fallback，用于 hook 被禁用或 hook 未覆盖事件；审批不再从 JSONL 猜测。Codex 发出 `request_user_input` 时，Clawd 会从 transcript 中识别该调用，播放通知反应并显示问题/选项的只读预览。回答仍在 Codex 原生界面中完成，卡片不会注入选择；匹配的工具输出写入后会自动关闭。
+**Codex CLI** — 开箱即用。Clawd 会在检测到 Codex 时自动注册 official hooks 到 `~/.codex/hooks.json`，并在用户没有显式关闭 hooks 时启用 `[features].hooks = true`。Installer 会把已废弃的 `[features].codex_hooks` 迁移到 `hooks`，同时保留用户显式设置的 false。Official hooks 提供实时状态和真实 Allow/Deny 权限气泡。**Settings → AI 编程工具 → Codex → 随 Codex 启动** 单独控制本机 Codex 的 `SessionStart` 能否在 Clawd 未运行时拉起桌宠；关闭它不会停用状态或审批接入，Clawd 已运行时仍然正常工作。全新安装默认关闭，升级用户则保留此前的开启行为；Remote SSH 与 WSL hook 永远不会冷启动桌面应用。`~/.codex/sessions/` JSONL 轮询只保留为状态 / metadata fallback，用于 hook 被禁用或 hook 未覆盖事件；审批不再从 JSONL 猜测。Codex 发出 `request_user_input` 时，Clawd 会从 transcript 中识别该调用，播放通知反应并显示问题/选项的只读预览。回答仍在 Codex 原生界面中完成，卡片不会注入选择；匹配的工具输出写入后会自动关闭。
 
-**Copilot CLI** — 需要本机 Copilot CLI 追踪时，先到 **Settings → Agents** 安装。安装且启用后，Clawd 启动时会自动在 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json` 注册 hooks（marker-based 合并，你已有的 hook 条目和其他 `hooks/*.json` 文件原样保留）。SSH 远程部署走应用内 **Settings → 远程 SSH → 部署 / 修复 Hook** 自动配置。`hooks.json` 或 `settings.json` 顶层 `disableAllHooks: true` 时 doctor 会报 warning 并不挂 Fix 按钮。详见 [copilot-setup.zh-CN.md](copilot-setup.zh-CN.md)（含手动备选与 `COPILOT_HOME` 说明）。
+**Copilot CLI** — 需要本机 Copilot CLI 追踪时，先到 **Settings → AI 编程工具** 安装。安装且启用后，Clawd 启动时会自动在 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json` 注册 hooks（marker-based 合并，你已有的 hook 条目和其他 `hooks/*.json` 文件原样保留）。SSH 远程部署走应用内 **Settings → 远程 SSH → 部署 / 修复 Hook** 自动配置。`hooks.json` 或 `settings.json` 顶层 `disableAllHooks: true` 时 doctor 会报 warning 并不挂 Fix 按钮。详见 [copilot-setup.zh-CN.md](copilot-setup.zh-CN.md)（含手动备选与 `COPILOT_HOME` 说明）。
 
-**Gemini CLI** — hooks 配置在 `~/.gemini/settings.json`。需要本机 Gemini 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:gemini-hooks`。
+**Gemini CLI** — hooks 配置在 `~/.gemini/settings.json`。需要本机 Gemini 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:gemini-hooks`。
 
-**Antigravity CLI (agy)** — hooks 配置在 `~/.gemini/config/hooks.json`。需要本机 agy 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:antigravity-hooks`。Clawd 对 agy 是**仅状态同步**集成：桌宠会反映 working / idle / attention 状态，**但 Clawd 不显示任何权限气泡**。所有 Allow / Deny / Always-allow 决策都在 agy 自己的 5 选项终端菜单里完成 —— 想要永久规则就在 agy 菜单里选择标有「Persist to settings.json」的选项。Clawd-在前的方案 dogfood 后发现单次任务变 8-10 次确认，所以 PreToolUse hook 故意不注册。
+**Antigravity CLI (agy)** — hooks 配置在 `~/.gemini/config/hooks.json`。需要本机 agy 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:antigravity-hooks`。Clawd 对 agy 是**仅状态同步**集成：桌宠会反映 working / idle / attention 状态，**但 Clawd 不显示任何权限气泡**。所有 Allow / Deny / Always-allow 决策都在 agy 自己的 5 选项终端菜单里完成 —— 想要永久规则就在 agy 菜单里选择标有「Persist to settings.json」的选项。Clawd-在前的方案 dogfood 后发现单次任务变 8-10 次确认，所以 PreToolUse hook 故意不注册。
 
-**Cursor Agent** — hooks 配置在 `~/.cursor/hooks.json`。需要本机 Cursor Agent 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:cursor-hooks`。
+**Cursor Agent** — hooks 配置在 `~/.cursor/hooks.json`。需要本机 Cursor Agent 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:cursor-hooks`。
 
-**CodeBuddy** — 使用与 Claude Code 兼容的 hooks，配置写入 `~/.codebuddy/settings.json`。需要本机 CodeBuddy 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。PermissionRequest 条目使用版本化 marker `clawd-on-desk.permission.v1`；注册和卸载不会碰其他 HTTP hook，包括仅仅叫 `clawd` 的第三方条目。裸跑 `node hooks/codebuddy-install.js` 会保留已有、由该 marker 管理的自定义权限 URL；用 `--permission-url local` 可明确恢复本机 Clawd 地址，用 `--permission-url https://example/permission` 可明确设置自定义 HTTP(S) 地址。
+Clawd 可以在 Node 的 SQLite 模块可用时读取 Cursor 标准桌面配置中的聊天名称（Node 22.13+、23.4+ 或 24+；Node 22.12 需开启实验性 SQLite 模块）。名称不可用时会使用经过敏感信息过滤的 prompt 首行；疑似含密钥的首行不显示。标题读取失败不影响状态追踪。使用自定义 `--user-data-dir` 的 Cursor 同样采用首行回退。
 
-**WorkBuddy** — 使用与 Claude Code 兼容的 hooks，当前 WorkBuddy AI 的配置写入 `~/.workbuddy-ai/settings.json`，旧版使用 `~/.workbuddy/settings.json`。需要本机 WorkBuddy 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `node hooks/workbuddy-install.js`。WorkBuddy 是 macOS/Windows 的 Electron 桌面应用，没有独立的 Linux/WSL CLI；状态类动效已在 macOS 上验证可用。集成为**仅状态 + 通知**：桌面版审批始终由 WorkBuddy 原生沙箱与 GUI 确认卡片处理，因此 Clawd 不会注册 `/permission` HTTP hook。权限请求只会以「等待确认」的 Notification 形式（带 `session_id`）传给 Clawd——铃铛/提醒提示可用（已在 Windows 实测），但同意/拒绝的决定始终留在 WorkBuddy 内。
+**CodeBuddy** — 使用与 Claude Code 兼容的 hooks，配置写入 `~/.codebuddy/settings.json`。需要本机 CodeBuddy 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。PermissionRequest 条目使用版本化 marker `clawd-on-desk.permission.v1`；注册和卸载不会碰其他 HTTP hook，包括仅仅叫 `clawd` 的第三方条目。裸跑 `node hooks/codebuddy-install.js` 会保留已有、由该 marker 管理的自定义权限 URL；用 `--permission-url local` 可明确恢复本机 Clawd 地址，用 `--permission-url https://example/permission` 可明确设置自定义 HTTP(S) 地址。
 
-**Kiro CLI** — 需要本机 Kiro 追踪时，先到 **Settings → Agents** 安装；如果你想在启动 Clawd 前先注册 hooks，也可执行 `npm run install:kiro-hooks`。Kiro 内置的 `kiro_default` 不是一个可编辑的 JSON agent，所以 Clawd 会维护一个自定义 `clawd` agent，并在集成安装后每次启动时先同步最新的 `kiro_default` 配置，再追加 hooks。需要 hooks 时，请用 `kiro-cli --agent clawd` 新开会话，或者在现有会话里执行 `/agent swap clawd`。目前在 macOS 与 Windows 上，状态类动效已验证可用；但涉及终端里 `t / y / n` 的原生权限确认，仍然只能在终端处理。
+**Grok Build** — 使用与 Claude Code 兼容的 hooks，写入 `~/.grok/hooks/clawd-on-desk.json`（或 `$GROK_HOME/hooks/clawd-on-desk.json`）。需要本机 Grok 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `node hooks/grok-install.js`。集成为**仅状态 + 通知**：Grok 没有阻塞式 `PermissionRequest`，因此 Clawd 不会注册 `/permission`。允许/拒绝始终留在 Grok 终端里。权限询问仍可通过 Notification 让桌宠响铃。
 
-**Kimi Code** — Clawd 用同一个集成同时支持两代 Kimi。新版 Kimi Code（TypeScript CLI）的 hooks 在 `~/.kimi-code/config.toml`，旧版 Kimi CLI（Python，上游已停更）的在 `~/.kimi/config.toml`；哪个目录存在 Clawd 就装哪个（两个都在就都装）。需要本机 Kimi 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 会在启动时持续同步 hooks。也可以手动执行 `npm run install:kimi-hooks`。在 Clawd 中 Kimi 采用 hook-only 集成：状态和权限提示都来自 hook 事件，不依赖日志轮询。在新版 Kimi Code 上，权限气泡由 CLI 原生的 `PermissionRequest`/`PermissionResult` hook 事件驱动——气泡会显示正在等待批准的具体命令，你在终端里作出选择后气泡立即消失，无需任何配置。如果你用过 Kimi Code 内置的旧版迁移，Clawd 下一次同步会自动把迁移过来的 hook 条目升级为新格式（旧的 env 前缀命令写法在 Windows 上无法执行）。旧版 `~/.kimi` 安装的权限提示**默认启用 suspect 启发式**：现行 kimi-cli 版本的 `PreToolUse` 从不携带显式审批字段（1.37 与 1.49 实测），旧的 explicit-only 默认值意味着提示卡根本不会出现。安装器会把模式以 `--permission-mode=suspect` 参数的形式持久化到每条 hook 的 `command` 里；此前选择过的模式——包括 `explicit`——在重新同步时始终原样保留，绝不会被翻转（用已停用的 `CLAWD_KIMI_PERMISSION_MODE=…` env 前缀形式装过的配置会连值一起迁移成参数形式）。想退出默认：在运行安装命令前设置 `CLAWD_KIMI_PERMISSION_MODE=explicit`（持久化），或在运行 kimi-cli 时临时设置该环境变量——运行时环境变量的优先级永远高于持久化参数。需要了解的代价：suspect 启发式下，*已免审*的门控命令若运行超过约 0.8 秒，会短暂弹出一张误报提示卡（卡片几秒后自动关闭；宠物会保持通知姿势直到该命令跑完）。嫌烦可在 **Settings → Agents** 里整体关闭 Kimi 的权限提示。注意：自动同步会按预期行重写 `command` 字段，你对该字段的手工修改会在下次启动时被静默还原。
+**WorkBuddy** — 使用与 Claude Code 兼容的 hooks，当前 WorkBuddy AI 的配置写入 `~/.workbuddy-ai/settings.json`，旧版使用 `~/.workbuddy/settings.json`。需要本机 WorkBuddy 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `node hooks/workbuddy-install.js`。WorkBuddy 是 macOS/Windows 的 Electron 桌面应用，没有独立的 Linux/WSL CLI；状态类动效已在 macOS 上验证可用。集成为**仅状态 + 通知**：桌面版审批始终由 WorkBuddy 原生沙箱与 GUI 确认卡片处理，因此 Clawd 不会注册 `/permission` HTTP hook。权限请求只会以「等待确认」的 Notification 形式（带 `session_id`）传给 Clawd——铃铛/提醒提示可用（已在 Windows 实测），但同意/拒绝的决定始终留在 WorkBuddy 内。
 
-**Qwen Code** — hooks 配置在 `~/.qwen/settings.json`。需要本机 Qwen 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:qwen-hooks`。Qwen Code 在 Clawd 中采用 hook-only 集成：状态更新和阻塞式 `PermissionRequest` 审批都来自 Qwen hook 事件。如果 Qwen settings 里有 `disableAllHooks: true`，Clawd 可以注册条目，但 Qwen 不会触发它们，直到用户移除该开关。
+**Kiro CLI** — 需要本机 Kiro 追踪时，先到 **Settings → AI 编程工具** 安装；如果你想在启动 Clawd 前先注册 hooks，也可执行 `npm run install:kiro-hooks`。Kiro 内置的 `kiro_default` 不是一个可编辑的 JSON agent，所以 Clawd 会维护一个自定义 `clawd` agent，并在集成安装后每次启动时先同步最新的 `kiro_default` 配置，再追加 hooks。需要 hooks 时，请用 `kiro-cli --agent clawd` 新开会话，或者在现有会话里执行 `/agent swap clawd`。目前在 macOS 与 Windows 上，状态类动效已验证可用；但涉及终端里 `t / y / n` 的原生权限确认，仍然只能在终端处理。
 
-**ZCode** — config-file hooks 配置在 `~/.zcode/cli/config.json` 的 `hooks.events.*`。需要本机 ZCode 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 会持续同步全部 7 个支持事件——6 个状态事件加上阻塞式 `PermissionRequest` 审批 hook（由 Clawd 本地气泡或远程审批产生人工 allow/deny；Clawd 无决定时由 ZCode 自己的权限流程接管）。在完成 ZCode 工具面与会话身份审计前，全局和 per-session 权限自动化都会 defer。也可以手动执行 `npm run install:zcode-hooks`。安装后请新建一个 ZCode 会话，让它读取当前 hook 配置。ZCode 只有在 `hooks.enabled: true` 时才执行 config-file hooks：字段缺失时 Clawd 会补 true，但用户显式设置的全局 `hooks.enabled: false` 或单项 hook `enabled: false` 都会保留，Doctor 只提示，不提供会覆盖该选择的 Fix。如果 ZCode 曾导入 Claude 配置，Clawd 只会从 ZCode 配置里删除明确引用自身 `clawd-hook.js` 的旧条目，绝不修改 `~/.claude/settings.json`。
+**KiroCrew** — 可在 **Settings → AI 编程工具** 安装可选的 state-only gateway bridge，也可运行 `npm run install:kirocrew-hooks`；卸载命令为 `npm run uninstall:kirocrew-hooks`。Hooks 写入 `~/.kiro/crew/hooks.json`（或 `<KIROCREW_HOME>/hooks.json`），覆盖 AgentSpawn、UserPromptSubmit、PostToolUse 和 Stop 四个事件。安装或卸载前先停止 KiroCrew gateway，完成后再启动以加载新配置。Clawd 不注册 PreToolUse 或权限 hook，审批仍由 KiroCrew 处理；gateway payload 中的 cwd 不会用作项目路径。
 
-**CodeWhale** — lifecycle hooks 配置在 `~/.codewhale/config.toml`（`[[hooks.hooks]]` 条目）。需要本机 CodeWhale 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:codewhale-hooks`。Phase 1 是 state-only：Clawd 只驱动生命周期、工具调用和模式切换动画，不弹权限气泡，也不追踪子代理。详见 [codewhale-setup.md](codewhale-setup.md)。
+**Kimi Code** — Clawd 用同一个集成同时支持两代 Kimi。新版 Kimi Code（TypeScript CLI）的 hooks 在 `~/.kimi-code/config.toml`，旧版 Kimi CLI（Python，上游已停更）的在 `~/.kimi/config.toml`；哪个目录存在 Clawd 就装哪个（两个都在就都装）。需要本机 Kimi 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 会在启动时持续同步 hooks。也可以手动执行 `npm run install:kimi-hooks`。在 Clawd 中 Kimi 采用 hook-only 集成：状态和权限提示都来自 hook 事件，不依赖日志轮询。在新版 Kimi Code 上，权限气泡由 CLI 原生的 `PermissionRequest`/`PermissionResult` hook 事件驱动——气泡会显示正在等待批准的具体命令，你在终端里作出选择后气泡立即消失，无需任何配置。如果你用过 Kimi Code 内置的旧版迁移，Clawd 下一次同步会自动把迁移过来的 hook 条目升级为新格式（旧的 env 前缀命令写法在 Windows 上无法执行）。旧版 `~/.kimi` 安装的权限提示**默认启用 suspect 启发式**：现行 kimi-cli 版本的 `PreToolUse` 从不携带显式审批字段（1.37 与 1.49 实测），旧的 explicit-only 默认值意味着提示卡根本不会出现。安装器会把模式以 `--permission-mode=suspect` 参数的形式持久化到每条 hook 的 `command` 里；此前选择过的模式——包括 `explicit`——在重新同步时始终原样保留，绝不会被翻转（用已停用的 `CLAWD_KIMI_PERMISSION_MODE=…` env 前缀形式装过的配置会连值一起迁移成参数形式）。想退出默认：在运行安装命令前设置 `CLAWD_KIMI_PERMISSION_MODE=explicit`（持久化），或在运行 kimi-cli 时临时设置该环境变量——运行时环境变量的优先级永远高于持久化参数。需要了解的代价：suspect 启发式下，*已免审*的门控命令若运行超过约 0.8 秒，会短暂弹出一张误报提示卡（卡片几秒后自动关闭；宠物会保持通知姿势直到该命令跑完）。嫌烦可在 **Settings → AI 编程工具** 里整体关闭 Kimi 的权限提示。注意：自动同步会按预期行重写 `command` 字段，你对该字段的手工修改会在下次启动时被静默还原。
 
-**Reasonix CLI** — hooks 配置在 `<Reasonix home>/settings.json`（macOS/Linux 为 `~/.reasonix/settings.json`，当前 Windows 版本为 `%APPDATA%\reasonix\settings.json`）。在 Windows 上，Clawd 也会跟随 Reasonix 的兼容回退读取旧的 `~/.reasonix/settings.json`；卸载时会从两处配置中分别删除 Clawd 管理的条目。需要本机 Reasonix 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步当前生效的 hooks。也可以手动执行 `npm run install:reasonix-hooks`。Phase 1 是 state-only：Clawd 只驱动生命周期、工具调用、通知、压缩和子代理结束动效，权限决策仍留在 Reasonix 自己的终端流程。
+**Qwen Code** — hooks 配置在 `~/.qwen/settings.json`。需要本机 Qwen 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:qwen-hooks`。Qwen Code 在 Clawd 中采用 hook-only 集成：状态更新和阻塞式 `PermissionRequest` 审批都来自 Qwen hook 事件。如果 Qwen settings 里有 `disableAllHooks: true`，Clawd 可以注册条目，但 Qwen 不会触发它们，直到用户移除该开关。
 
-**opencode** — 使用 `~/.config/opencode/` 下当前生效的 plugin 配置：`config.json` → `opencode.json` → `opencode.jsonc`，后者优先。需要本机 opencode 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 plugin。也可以手动执行 `node hooks/opencode-install.js`。
+**ZCode** — config-file hooks 配置在 `~/.zcode/cli/config.json` 的 `hooks.events.*`。需要本机 ZCode 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 会持续同步全部 7 个支持事件——6 个状态事件加上阻塞式 `PermissionRequest` 审批 hook（由 Clawd 本地气泡或远程审批产生人工 allow/deny；Clawd 无决定时由 ZCode 自己的权限流程接管）。在完成 ZCode 工具面与会话身份审计前，全局和 per-session 权限自动化都会 defer。也可以手动执行 `npm run install:zcode-hooks`。安装后请新建一个 ZCode 会话，让它读取当前 hook 配置。ZCode 只有在 `hooks.enabled: true` 时才执行 config-file hooks：字段缺失时 Clawd 会补 true，但用户显式设置的全局 `hooks.enabled: false` 或单项 hook `enabled: false` 都会保留，Doctor 只提示，不提供会覆盖该选择的 Fix。如果 ZCode 曾导入 Claude 配置，Clawd 只会从 ZCode 配置里删除明确引用自身 `clawd-hook.js` 的旧条目，绝不修改 `~/.claude/settings.json`。
 
-**MiMo Code** — 使用 `~/.config/mimocode/` 下当前生效的 plugin 配置：`config.json` → `mimocode.json` → 默认 `mimocode.jsonc`，后者优先。需要本机 MiMo Code 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步生效的 plugin entry。也可以手动执行 `npm run install:mimocode-plugin`。MiMo Code 与 opencode 使用同一套 plugin SDK 和 Allow / Always / Deny 权限行为；`task` 创建的子会话不参与可见的多会话动画聚合。
+**CodeWhale** — lifecycle hooks 配置在 `~/.codewhale/config.toml`（`[[hooks.hooks]]` 条目）。需要本机 CodeWhale 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:codewhale-hooks`。Phase 1 是 state-only：Clawd 只驱动生命周期、工具调用和模式切换动画，不弹权限气泡，也不追踪子代理。详见 [codewhale-setup.md](codewhale-setup.md)。
 
-**Pi** — 使用全局 extension 目录 `~/.pi/agent/extensions/clawd-on-desk`。需要本机 Pi 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 extension。也可以手动执行 `npm run install:pi-extension`。交互式 Pi 会话会向 Clawd 上报生命周期和工具活动，但 Pi 是 state-only：Clawd 不显示权限气泡、不调用 Pi 终端确认，并保留 Pi 默认 YOLO 执行行为。
+**Reasonix CLI** — hooks 配置在 `<Reasonix home>/settings.json`（macOS/Linux 为 `~/.reasonix/settings.json`，当前 Windows 版本为 `%APPDATA%\reasonix\settings.json`）。在 Windows 上，Clawd 也会跟随 Reasonix 的兼容回退读取旧的 `~/.reasonix/settings.json`；卸载时会从两处配置中分别删除 Clawd 管理的条目。需要本机 Reasonix 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步当前生效的 hooks。也可以手动执行 `npm run install:reasonix-hooks`。Phase 1 是 state-only：Clawd 只驱动生命周期、工具调用、通知、压缩和子代理结束动效，权限决策仍留在 Reasonix 自己的终端流程。
 
-**OpenClaw** — 使用 `~/.openclaw/openclaw.json` 里的 plugin 路径。需要本机 OpenClaw 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 plugin。也可以手动执行 `npm run install:openclaw-plugin`，由 OpenClaw CLI 处理首次安装。Phase 1 只做状态动画，面向本地 `openclaw tui --local` 会话；暂不接 OpenClaw 权限气泡，也不支持 OpenClaw 终端聚焦。
+**opencode** — 使用 `~/.config/opencode/` 下当前生效的 plugin 配置：`config.json` → `opencode.json` → `opencode.jsonc`，后者优先。需要本机 opencode 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 plugin。也可以手动执行 `node hooks/opencode-install.js`。v1 入口保留在 `plugin` 键；仅探测到 opencode 2.x（`@opencode/cli`）时才写入 v2 的 `plugins` 键。探测到 v1 时会清除 Clawd 自有的 v2 条目，探测结果未知时不改该键，以免旧版（1.18.15 及之前）因未知键拒绝整个配置。若自动探测找不到已知宿主，确认实际会读取配置的主版本后，可在 Clawd 进程环境中设置 `CLAWD_OPENCODE_HOST=v1` 或 `v2`，再执行安装 / 修复。v2 插件运行在共享后台 service 中；安装或修复后运行 `opencode service restart` 加载新版本，其会话的“跳转终端”会降级。
 
-**Hermes Agent** — 从 [hermes-agent.org](https://hermes-agent.org/) 或 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 安装 Hermes。需要本机 Hermes 追踪时，先到 **Settings → Agents** 安装 Clawd 集成；安装且 Hermes 存在后，Clawd 会把 plugin 复制到 Hermes 的托管 plugin 目录，并通过 `hermes plugins enable clawd-on-desk` 启用它。也可以手动执行 `npm run install:hermes-plugin` 强制同步，或执行 `npm run uninstall:hermes-plugin` 移除 Clawd 的 Hermes plugin。Hermes 支持状态、会话、终端聚焦和受支持的权限气泡；具体边界见 [known-limitations.zh-CN.md](known-limitations.zh-CN.md)。
+**MiMo Code** — 使用 `~/.config/mimocode/` 下当前生效的 plugin 配置：`config.json` → `mimocode.json` → 默认 `mimocode.jsonc`，后者优先。需要本机 MiMo Code 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步生效的 plugin entry。也可以手动执行 `npm run install:mimocode-plugin`。MiMo Code 与 opencode 使用同一套 plugin SDK 和 Allow / Always / Deny 权限行为；`task` 创建的子会话不参与可见的多会话动画聚合。
 
-**QwenWork（千问办公）** — agent id `qwenwork`；hooks 写入 `~/.QwenWorkCN/settings.json`（这是 QwenWork 真实的用户数据目录，不是它 hooks 文档里写的 `~/.qwenwork`）。需要本机 QwenWork 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:qwenwork-hooks`，卸载用 `npm run uninstall:qwenwork-hooks`。
+**MiniMax Code** — 实验性的 state-only 集成，覆盖 `mcode` CLI 和 MiniMax Code 桌面端。Clawd 将本地插件安装到 `<MINIMAX_DATA_DIR 或 MAVIS_DATA_DIR 或 ~/.minimax>/plugins/clawd-state/`；可在 **Settings → AI 编程工具** 安装 / 卸载，也可手动运行 `npm run install:minimax-hooks` / `npm run uninstall:minimax-hooks`。macOS 和 Windows 桌面端通常会自动发现插件；如果 hook 未运行，可执行 `mcode plugin enable clawd-state@local` 或在应用的插件面板启用。Doctor 只能检查插件文件，不能读取应用内的启用状态。插件上报 10 个状态事件（含 `SessionEnd`），不注册 `PermissionRequest`；MiniMax 的 hook 执行上限为 1–10 秒，人工审批仍由 MiniMax 原生处理。已有非空目录需先验证 `.clawd-managed.json` 所有权；空目录可替换，卸载仅移除经验证属于 Clawd 的目录。若中断后留下 `.clawd-minimax-staging-*` / `.clawd-minimax-removing-*`，请手动删除；`plugins/` 与数据目录必须在同一文件系统。会话标题取首次 prompt 的第一行，并在同一会话中保持不变。
+
+**Pi** — 使用全局 extension 目录 `~/.pi/agent/extensions/clawd-on-desk`。需要本机 Pi 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 extension。也可以手动执行 `npm run install:pi-extension`。交互式 Pi 会话会向 Clawd 上报生命周期和工具活动，但 Pi 是 state-only：Clawd 不显示权限气泡、不调用 Pi 终端确认，并保留 Pi 默认 YOLO 执行行为。
+
+**OMP (oh-my-pi)** — 使用按 agent 目录解析的 extension：默认环境为 `~/.omp/agent/extensions/clawd-on-desk`。需要本机 OMP 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 extension。也可以手动执行 `node hooks/omp-install.js`，用 `node hooks/omp-install.js --uninstall` 移除。Clawd 按 OMP 自身的方式解析该目录——`PI_CONFIG_DIR` 改 config root、`PI_CODING_AGENT_DIR` 改无 profile 时的默认值、`OMP_PROFILE` / `PI_PROFILE` 选中 `~/.omp/profiles/<name>/agent`——因此安装会落在**Clawd 自身环境**下 OMP 真正会加载的目录里。若 OMP 跑在与 Clawd 不同的 profile 下，它不会加载这份 extension；请在该 profile 的 shell 里手动执行安装器补装，Doctor 也会列出它未纳管的 profile。交互式 OMP 会话会向 Clawd 上报生命周期和工具活动，但 OMP 是 state-only：Clawd 不显示权限气泡，并保留 OMP 自身的执行行为。如果该 extensions 目录里已存在社区 bridge `clawd-on-desk-omp.ts`，Clawd 会跳过安装自己的 extension（并且只回收经 marker 验证属于自己、先前写入的那份拷贝），避免 OMP 同时加载两者而把每个事件上报两次。
+
+**OpenClaw** — 使用 `~/.openclaw/openclaw.json` 里的 plugin 路径。需要本机 OpenClaw 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 plugin。也可以手动执行 `npm run install:openclaw-plugin`，由 OpenClaw CLI 处理首次安装。Phase 1 只做状态动画，面向本地 `openclaw tui --local` 会话；暂不接 OpenClaw 权限气泡，也不支持 OpenClaw 终端聚焦。
+
+**Hermes Agent** — 从 [hermes-agent.org](https://hermes-agent.org/) 或 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 安装 Hermes。需要本机 Hermes 追踪时，先到 **Settings → AI 编程工具** 安装 Clawd 集成；安装且 Hermes 存在后，Clawd 会把 plugin 复制到 Hermes 的托管 plugin 目录，并通过 `hermes plugins enable clawd-on-desk` 启用它。也可以手动执行 `npm run install:hermes-plugin` 强制同步，或执行 `npm run uninstall:hermes-plugin` 移除 Clawd 的 Hermes plugin。Hermes 支持状态、会话、终端聚焦和受支持的权限气泡；具体边界见 [known-limitations.zh-CN.md](known-limitations.zh-CN.md)。如果 Hermes 装在远端主机上，请改用 **Settings → 远程 SSH** 部署；Phase 1 范围和 gateway 重启规则见 [guide-remote-ssh.zh-CN.md](guide-remote-ssh.zh-CN.md)。
+
+**QwenWork（千问办公）** — agent id `qwenwork`；hooks 写入 `~/.QwenWorkCN/settings.json`（这是 QwenWork 真实的用户数据目录，不是它 hooks 文档里写的 `~/.qwenwork`）。需要本机 QwenWork 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:qwenwork-hooks`，卸载用 `npm run uninstall:qwenwork-hooks`。
 
 - **平台**：只支持 macOS / Windows 桌面端。[qwenwork.cn/download](https://qwenwork.cn/download) 提供 macOS 14+、Windows 10+ 与 HarmonyOS 6.1+，没有 Linux 客户端，因此 QwenWork 不出现在 WSL Pair 列表里，也没有 Linux 进程名。
 - **hook-only / state-only**：Clawd 用 QwenWork 的生命周期事件驱动动画、Session HUD 和 Dashboard。`PermissionRequest` / `PermissionDenied` 仅作观察并映射成 `working`（它们是正常工具流的一部分，每个任务会触发 40+ 次，映射成 `notification` 会一直闪）。
@@ -86,7 +118,7 @@ Claude Code 只有一个用户级 statusline 槽位，因此 Clawd 绝不会静�
 - **所有权**：合并与卸载只处理 command 中带 `qwenwork-hook.js` marker 的条目。仅仅名为 `clawd` 的 hook 不会被动；Clawd hook 与第三方 hook 混在同一 entry 时，第三方 hook 原样保留。
 - **可选调试日志**：`CLAWD_QWENWORK_HOOK_DEBUG=1` 会往 `~/.clawd/qwenwork-hook-debug.jsonl` 追加事件与字段结构摘要（不含 prompt、tool input、路径）。再加 `CLAWD_QWENWORK_HOOK_DEBUG_RAW=1` 才会记录完整原始 payload——**此时该文件含敏感数据**，用完请删除。macOS/Linux 上文件按 `0600` 创建；若 hook 新建调试目录则使用 `0700`，已有的共享 `~/.clawd` 目录保持原权限不变。
 
-**Qoder** — hooks 写入 `~/.qoder/settings.json`。需要本机 Qoder 追踪时，先到 **Settings → Agents** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:qoder-hooks`。Phase 1 是 state-only：hook 恒返回 `{}`，`PermissionRequest` / `PermissionDenied` 只作为通知观察——Clawd 不弹权限气泡、不代答权限决策，权限流程由 Qoder 原生接管。启动恢复只识别 Qoder CLI 进程（`qodercli` / `qoder-cli`），闲置打开的 Qoder IDE 不会被当成进行中的 agent 工作。
+**Qoder** — hooks 写入 `~/.qoder/settings.json`。需要本机 Qoder 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 hooks。也可以手动执行 `npm run install:qoder-hooks`。Phase 1 是 state-only：hook 恒返回 `{}`，`PermissionRequest` / `PermissionDenied` 只作为通知观察——Clawd 不弹权限气泡、不代答权限决策，权限流程由 Qoder 原生接管。启动恢复只识别 Qoder CLI 进程（`qodercli` / `qoder-cli`），闲置打开的 Qoder IDE 不会被当成进行中的 agent 工作。
 
 ## 权限处理自动化
 
@@ -104,7 +136,13 @@ Clawd 可以把受支持、仍待处理的权限请求镜像到专用 Telegram b
 
 ## 飞书 / Lark 远程审批
 
-Clawd 也可以通过飞书（中国）或 Lark（国际）的自建应用发送交互卡片。两者属于同一个远程审批通道，可在 **Settings → 远程审批 → 飞书 / Lark** 中选择平台。权限范围、用户 ID 差异和卡片语言见 [feishu-lark-remote-approval.md](feishu-lark-remote-approval.md)。
+Clawd 也可以通过飞书（中国）或 Lark（国际）的自建应用发送交互卡片。两者属于同一个远程审批通道，可在 **设置 → 权限与审批 → IM 渠道 → 飞书 / Lark** 中选择平台。权限范围、用户 ID 差异和卡片语言见 [feishu-lark-remote-approval.md](feishu-lark-remote-approval.md)。
+
+## Slack 通知
+
+与上面两个通道不同，Slack 仅做**通知**：会话结束、报错或等待权限时 Clawd 会推送消息，但决定始终在桌面应用中做出——本版本的 Slack 不能执行 Allow 或 Deny。可在 **设置 → 权限与审批 → IM 渠道 → Slack** 使用 Incoming Webhook（推荐）或带 `chat:write` 权限的 `xoxb-` bot token 配置。
+
+消息发往 Slack 频道，内容可包含会话标题（由你的 prompt 推导）、文件夹名和主机名，因此**建议使用私有频道**。配置、完整字段清单、密钥存储和排障见 [slack-notifications.md](slack-notifications.md)。
 
 ## 远程 SSH 模式（Claude Code, Codex CLI & Copilot CLI）
 
@@ -128,7 +166,7 @@ DMG / 安装包用户的入口是 Clawd 应用内的 **Settings → 远程 SSH**
 **来自远端机器的 Claude 使用信息与订阅额度：**
 - **Claude Code** — 部署还会在远端的 `~/.claude/settings.json` 注册 Clawd statusline，把其上报的上下文窗口和可用 Pro/Max `rate_limits` 通过隧道送回 Clawd。这仍是上面说明的官方本地 statusline 机制，不会额外请求 Anthropic。若远端已有自己的 statusline，可在 profile 中启用 **部署时串联远端已有的 statusline**：原 statusline 继续负责输出，注册会保存在 `~/.claude/hooks/clawd-statusline-chain.json`，卸载时恢复；Clawd 只读取上下文窗口与可用额度。
 
-全新本机安装下，如果只是接收远程 Copilot CLI 事件，请到 **Settings → Agents** 打开 **Copilot CLI**，这样 Clawd 才会接收远程 hook 事件；不需要点 **Install / 安装**，除非你也想在本机安装 Copilot hooks。
+全新本机安装下，如果只是接收远程 Copilot CLI 事件，请到 **Settings → AI 编程工具** 打开 **Copilot CLI**，这样 Clawd 才会接收远程 hook 事件；不需要点 **Install / 安装**，除非你也想在本机安装 Copilot hooks。
 
 Remote SSH hook 同时携带一般 remote 标记和专用 secure marker；身份缺失或损坏会
 fail closed，绝不回退端口扫描。远端 PID 不会当作本机终端身份，因此远程会话不支持
@@ -144,105 +182,73 @@ Keychain 登录。准确边界见专门指南。
 
 ## WSL（Windows Subsystem for Linux）
 
-> 本节的主线是 Claude Code / 其他 hook 型 agent 的 WSL 配置。关于 `Codex CLI + WSL` 的官方支持现状、Codex hooks feature flag 行为、以及 Clawd 当前为什么默认扫不到 WSL Linux home 下的 Codex 日志，见：[codex-wsl-clarification.zh-CN.md](codex-wsl-clarification.zh-CN.md)
+在 Windows 上运行 Clawd，并在 agent 所在的 WSL 发行版里安装集成。推荐打开 **Settings → AI 编程工具 → Connected → WSL Scan**，找到对应的 agent / 发行版行，选择 **Pair**。如果 Windows 没有安装该 agent，行可能位于 **Unavailable** 折叠区。请确认 Clawd 中该 agent 已**启用**：Pair 通常不会替你打开被关闭的 agent，也不会安装或标记 Windows 本机集成为已安装。
 
-如果 agent 跑在 WSL 里、Clawd 跑在 Windows 宿主上，集成会向 `127.0.0.1:23333-23337` 上报。WSL1 天然共享这条 loopback；WSL2 通常需要镜像网络，默认 NAT 并不能让 Linux 访问 Windows 的 loopback 服务。应用内 Pair 会探测这条链路，并在安装成功但网络不可达时给出警告。
+Pair 会分别安装集成和探测连通性。安装成功不代表能连接 Windows Clawd；探测失败或结果未知都不能视为已连接。随后启动新的 agent 会话，确认它出现在 Clawd 中。Codex 的独立 home 与共享 home 路径见 [Codex + WSL 说明](codex-wsl-clarification.zh-CN.md)。
 
-对于已支持的 agent，请在 **Settings → Agents** 的 Connected 区执行 **WSL Scan**，再找到对应发行版并点击 **Pair**。仅存在于 WSL 的 agent 仍可能位于 **Unavailable** 折叠区，因为本机安装状态与 WSL 配对是两套状态。Pair 会打开 Clawd 的事件入口，但不会把它标记为 Windows 本机集成，也不会在 Windows 安装文件。
+**WSL 中的 Hermes Agent：** 所选发行版必须已经安装 Hermes。Pair 会向 WSL 复制私有临时安装 payload，在主 Hermes home 和发现的 profiles 中安装并启用 `clawd-on-desk`，随后移除临时文件。**Unpair** 只禁用/移除该发行版中的 Clawd Hermes 插件，保留无关插件；当本机或其他 WSL 来源仍可能工作时，不会全局禁用 Hermes 事件。自定义 WSL `HERMES_HOME` 从发行版的登录 shell 解析。
 
-**WSL 中的 Hermes Agent：** 请先在目标发行版里安装 Hermes。Pair 会把一份私有临时安装 payload 传入 WSL，在 Hermes 主 home 和已发现 profiles 中安装并启用 `clawd-on-desk`，随后删除临时 payload。**Unpair** 只禁用/移除该发行版里的 Clawd Hermes plugin，保留其他 plugin；如果本机或其他 WSL 来源仍可能使用 Hermes，也不会关闭全局 Hermes 事件入口。自定义 WSL `HERMES_HOME` 会从该发行版的 login shell 中解析。
+### Pair 不可用时的手动安装
 
-**配置步骤：**
-
-```bash
-# 在 WSL shell 中执行：
-mkdir -p ~/.claude/hooks
-
-# 从 Windows 侧的 Clawd 仓库复制 hook 文件（按实际路径调整 /mnt/ 前缀）
-cp /mnt/d/animation/hooks/{server-config,json-utils,shared-process,clawd-hook,install,codex-hook,codex-install,codex-install-utils,codex-remote-monitor,codex-session-index,codex-subagent-fields,copilot-hook,copilot-install}.js ~/.claude/hooks/
-
-# 以远程模式注册 Claude hooks
-node ~/.claude/hooks/install.js --remote
-
-# 如果 WSL 中安装了 Codex CLI，也以远程模式注册 Codex official hooks
-node ~/.claude/hooks/codex-install.js --remote
-
-# 如果 WSL 中安装了 Copilot CLI，也以远程模式注册 Copilot CLI hooks
-node ~/.claude/hooks/copilot-install.js --remote
-```
-
-配置完成后，在 Windows 上启动 Clawd，在 WSL 里运行 Claude Code —— Clawd 会自动感知你的会话。权限气泡也能正常弹出。
-
-应用内 WSL 部署路径会故意以不带 `--statusline` 的方式运行 Claude installer，因此只提供 transcript fallback，不宣称能拿到自定义 provider 的权威窗口。上面的手动 `--remote` 命令会在 WSL 的独立 home 中安装一条可见 statusline，但 Windows 端应用只有在 **采集本机 Claude 使用信息** 开启时才接受它的 context/quota metadata；开关关闭时这些 POST 会被当作成功 no-op。Windows 本机启动 reconcile 也无法移除 WSL 独立 home 里的 statusline。
-
-如果 Codex 运行在 WSL 里，official hooks 需要安装到 WSL 自己的 `~/.codex` 下。如果你希望 WSL 与 Windows 共用同一份 Codex home，也可以在 WSL 里先设置 `CODEX_HOME=/mnt/c/Users/<windows-user>/.codex` 再运行 Codex。
-
-### WSL 网络与 Hook 注册（替代方案）
-
-Clawd 跑在 Windows 的 Electron 应用里，而你的 AI 编程助手（Claude Code、Kiro CLI 等）可能跑在 WSL 里。WSL 中的 hook 脚本会把 HTTP 请求发到 `127.0.0.1:23333`，所以 WSL 和 Windows 必须共享同一个 localhost。
-
-- **WSL1** — 开箱即用。WSL1 天然与 Windows 共享 localhost，无需额外配置。
-- **WSL2** — 需要镜像网络模式。WSL2 默认拥有独立网络栈，`127.0.0.1` 指向 WSL 自身而不是 Windows。请在 `%USERPROFILE%\.wslconfig` 中启用镜像模式（文件不存在就新建），然后执行 `wsl --shutdown` 重启 WSL：
-
-```ini
-[wsl2]
-networkingMode=mirrored
-```
-
-**在 WSL 中手动注册 hooks：**
-
-Clawd 在 Windows 启动时会自动注册 Claude Code hooks 到 `~/.claude/settings.json`。但如果你的 Agent 跑在 WSL 里，hooks 需要注册到 WSL 自己的 home 目录。请在 WSL 中执行：
+在 WSL 内使用 Linux Node.js 和完整源码仓库，只运行你需要的 agent 安装器。Claude Code 默认命令会检测 WSL，安装模式与 Pair 一致，默认不安装 statusline：
 
 ```bash
-git clone https://github.com/rullerzhou-afk/clawd-on-desk.git
-cd clawd-on-desk
-
-# Claude Code
+# 在 WSL 中执行；使用不含空格的 Linux 目标路径，并保留此仓库。
+git clone https://github.com/rullerzhou-afk/clawd-on-desk.git ~/clawd-on-desk
+cd ~/clawd-on-desk
 node hooks/install.js
 
-# Codex CLI
-node hooks/codex-install.js --remote
-
-# Kiro CLI - 会将 hooks 注册到 ~/.kiro/agents/ 下所有自定义 agent，
-# 并自动创建一个 clawd agent
-node hooks/kiro-install.js
-
-# Kimi Code CLI（Kimi-CLI）
-node hooks/kimi-install.js
-
-# Qwen Code
-node hooks/qwen-code-install.js
-
-# Cursor Agent
-node hooks/cursor-install.js
-
-# Gemini CLI
-node hooks/gemini-install.js
-
-# Antigravity CLI (agy)
-node hooks/antigravity-install.js
-
-# CodeBuddy
-# 保留已有、由版本化 marker 管理的自定义权限 URL
-node hooks/codebuddy-install.js
-# 明确指定目标：
-# node hooks/codebuddy-install.js --permission-url local
-# node hooks/codebuddy-install.js --permission-url https://approval.example/permission
-
-# WorkBuddy
-node hooks/workbuddy-install.js
-
-# opencode
-node hooks/opencode-install.js
-
-# Pi
-node hooks/pi-install.js
-
-# OpenClaw
-node hooks/openclaw-install.js
+# 可选：同时安装 Claude statusline，上报上下文与配额元数据。
+node hooks/install.js --statusline
 ```
 
-> 提示：如果仓库克隆在 WSL 内（如 `~/clawd-on-desk`），hook 脚本会自动使用 WSL 的 Node.js 路径。如果仓库放在 Windows 盘里（如 `/mnt/c/...`），请确保 WSL 的 PATH 中有 `node`。
+已有第三方 statusline 会被保留，除非你显式选择串联，详见 [Agent 配置说明](#agent-配置说明)。只有 Windows 端 **Collect local Claude usage** 开启时，Clawd 才会接收 WSL Claude 的上下文/配额元数据；关闭后，相应 POST 虽返回成功，但不会摄入数据。Pair 本身不安装 statusline，仅提供 transcript fallback，不保证自定义 provider 的权威上下文窗口。Windows 启动同步无法移除 WSL 独立 home 中的 statusline。
+
+其他 hook agent 的手动命令也从同一仓库执行：
+
+| Agent | 命令 |
+| --- | --- |
+| Codex CLI | `node hooks/codex-install.js --remote` |
+| Copilot CLI | `node hooks/copilot-install.js --remote` |
+| Kiro CLI | `node hooks/kiro-install.js` |
+| Kimi Code CLI（Kimi-CLI） | `node hooks/kimi-install.js` |
+| Qwen Code | `node hooks/qwen-code-install.js` |
+| Cursor Agent | `node hooks/cursor-install.js` |
+| Gemini CLI | `node hooks/gemini-install.js` |
+| Antigravity CLI（agy） | `node hooks/antigravity-install.js` |
+| CodeBuddy | `node hooks/codebuddy-install.js` |
+
+Kiro 会为 `~/.kiro/agents/` 中的自定义 agent 注册 hooks，并创建 `clawd` agent。CodeBuddy 裸跑安装器会保留已有的 managed 自定义权限 URL；显式替代参数是 `--permission-url local` 或 `--permission-url https://approval.example/permission`。通用安装命令也可从 [Agent 配置说明](#agent-配置说明) 找到。
+
+WorkBuddy 没有经过验证的独立 Linux/WSL CLI，请使用其 macOS/Windows 桌面集成。opencode、MiMo Code、Pi、OpenClaw 当前不在 WSL Pair 映射中，其 WSL 集成仍未验证；存在通用安装器不等于已有可验证的 WSL 教程。
+
+如果完整源码仓库只在 Windows 上，可以将 `hooks/` 下**全部顶层 JavaScript 文件**复制到 WSL。Pair 的持久 hook agent 同样复制这个完整集合；Hermes 使用前述独立临时 payload。不要手动挑选文件：hooks 存在直接及传递依赖。
+
+```bash
+# 在 WSL 中执行；把引号内的来源路径替换为完整源码仓库的位置。
+mkdir -p ~/.claude/hooks
+cp "/mnt/c/path/to/clawd-on-desk/hooks/"*.js ~/.claude/hooks/
+node ~/.claude/hooks/install.js
+
+# 可选的 Claude statusline：
+node ~/.claude/hooks/install.js --statusline
+```
+
+其他 hook agent 使用表格中的安装器文件名，在复制目录中执行并保留表中参数。Claude 与 Kimi CLI 都会在写配置前检查本次请求的 hook 入口及其传递本地依赖；遇到缺失或不可读文件时，从同一源码版本恢复完整集合后重试。Pair 的 Kimi payload 还会在没有 `agents/` 目录的条件下实际加载复制后的运行入口，因此不能只凭 installer 成功就认定 runtime 可加载。
+
+Claude 默认 WSL hook 命令目前没有给路径加引号。最终的 Linux Node 和 hook 路径应避免空格；Windows **复制来源**可以加引号，但安装器能读取含空格路径，不代表生成的 hook 命令能从该路径执行。
+
+Claude 的旧 `--remote` 用法仍受支持。它还会安装 statusline、设置 `CLAWD_REMOTE=1`、使用 remote 命令形态与 host 标签、将状态 hook 超时从 5 秒改为 10 秒，并跳过 SessionStart PID 预解析。上面的 WSL 显式 statusline 选项使用 `--statusline`；`--remote` 有更广的语义。这个默认选择只针对 Claude，不能机械套用到其他 agent 的安装器。
+
+### 网络与排障
+
+Windows Clawd 监听 `127.0.0.1:23333-23337` 范围内的回环端口。**Linux Node → Windows Clawd** 通常需要 WSL2 mirrored networking；默认 NAT 不会把 Windows 回环服务暴露给 Linux。mirrored 模式要求 Windows 11 22H2 或更高版本。Microsoft 的 [WSL 网络文档](https://learn.microsoft.com/en-us/windows/wsl/networking#mirrored-mode-networking) 说明了 `%USERPROFILE%\.wslconfig` 中的 `networkingMode=mirrored` 与重启步骤；重启 WSL 会停止其中运行的会话。WSL1 共享回环地址，但这一网络事实不代表当前 Codex 支持 WSL1。
+
+**Codex 共享 home 的 Windows interop** 使用 Windows `node.exe` 执行 hook，访问 Windows 回环服务，因此该传输路径不要求 mirrored networking。共享 `CODEX_HOME` 本身并不决定使用 interop：由 WSL 拥有的原生 launcher 仍使用 Linux Node 和 Linux 网络路径。修改网络前先核对 [三种路径对照](codex-wsl-clarification.zh-CN.md#配置与执行路径)。
+
+普通 WSL **状态事件**会在 23333–23337 中发现服务。Claude 的 HTTP **PermissionRequest** URL 在安装时固定写入，不会在权限请求触发时逐端口探测。安装器使用显式端口或有效的本地 `~/.clawd/runtime.json`，否则回退 23333。独立 WSL home 通常没有 Windows 的 runtime 记录，所以 Pair 和手动安装通常都注册 23333。如果 Windows Clawd 实际监听 23334 或更高端口，可能出现状态正常而权限气泡不可达。请对照 Windows 的实际 runtime 端口与 WSL Claude 配置中的 URL；状态探测成功不能验证权限 URL。WSL 权限端口自动同步仍是后续待解决的限制。
+
+如果新会话没有出现，依次检查所选发行版、agent 启用状态、已注册命令及其 Node 路径，再看连通性结果。安装、可达和真实会话到达是三个独立检查。
 
 ## Windows 说明
 
@@ -252,13 +258,15 @@ node hooks/openclaw-install.js
 ## macOS 说明
 
 - **源码运行**（`npm start`）：Intel 和 Apple Silicon 均可直接使用。
-- **正式 DMG 安装包**：GitHub 正式 Release 同时提供 x64 与 arm64 DMG；发布工作流会用 Developer ID 签名、Apple 公证并 stapled。手动 `workflow_dispatch` 在没有签名凭据时可能只生成 ad-hoc 验证 artifact，不能当作正式安装包分发。
+- **Homebrew**：`brew install --cask clawd-on-desk` 会从对应当前架构的官方 DMG 中安装已签名并公证的应用。之后可用 `brew upgrade --cask clawd-on-desk` 升级。
+- **正式 DMG 安装包**：GitHub 正式 Release 同时提供 x64 与 arm64 DMG，其中的应用已使用 Developer ID 签名、通过 Apple 公证并附有公证票据；DMG 容器本身不单独签名。手动 `workflow_dispatch` 在没有签名凭据时可能只生成 ad-hoc 验证 artifact，不能当作正式安装包分发。
 - **自动更新桥接**：旧版 DMG 没有 ZIP 更新载荷，不能把自己自动升级到首个支持应用内更新的版本。现有用户需要从 GitHub Releases 手动安装一次首个桥接版 DMG；装上桥接版后，后续正式版本可在 Clawd 内下载，选择“立即重启”安装，或选择“稍后”并在退出、重新打开后完成。真实能力仍以同一 Developer ID 的 A→B 真机升级记录为准，不能用单元测试代替。
 - **源码自动更新**：源码运行时，“检查更新”会执行 `git pull` + `npm install`（依赖有变化时）并自动重启。
 
 ## Linux 说明
 
 - **源码运行**（`npm start`）：默认启用 Electron sandbox。如果你的 Linux 开发环境仍然遇到 chrome-sandbox 初始化失败，可临时使用 `CLAWD_DISABLE_SANDBOX=1 npm start` 作为兼容方案。
+- **Homebrew**：`brew install --cask clawd-on-desk` 会安装 x86_64 AppImage；目前没有 Linux ARM 的 cask 产物。之后可用 `brew upgrade --cask clawd-on-desk` 升级。
 - **安装包**：AppImage 和 `.deb` 可从 [GitHub Releases](https://github.com/rullerzhou-afk/clawd-on-desk/releases) 下载。deb 安装后应用图标会出现在 GNOME 应用菜单。
 - **终端聚焦**：依赖 `wmctrl` 或 `xdotool`（有一个就行）。安装：`sudo apt install wmctrl` 或 `sudo apt install xdotool`。
-- **自动更新**：AppImage / deb 安装包仍需从 GitHub Releases 手动下载；源码运行时，“检查更新”会执行 `git pull` + `npm install`（依赖有变化时）并自动重启。
+- **自动更新**：Clawd 不会自行更新 Linux 安装包。Homebrew 管理的安装可用 `brew upgrade --cask clawd-on-desk` 升级；直接安装的 AppImage / deb 仍需从 GitHub Releases 手动下载。源码运行时，“检查更新”会执行 `git pull` + `npm install`（依赖有变化时）并自动重启。
