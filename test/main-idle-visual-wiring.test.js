@@ -86,6 +86,7 @@ describe("main default idle visual wiring", () => {
       "registerPermissionIpc({"
     );
     assert.ok(registration.includes("setAccessoryMirror: setAccessoryMirrored,"));
+    assert.ok(registration.includes("refreshIdleVisualAfterDrag,"));
   });
 
   it("accepts visual settlement only from the live renderer main frame", () => {
@@ -108,5 +109,33 @@ describe("main default idle visual wiring", () => {
 
   it("gives the settings controller the active-theme dep that setIdleVisual validates against", () => {
     assert.ok(mainSource.includes("getActiveTheme: () => themeRuntime.getActiveTheme(),"));
+  });
+
+  it("updates the sync-IPC pet config before pushing it to the renderer", () => {
+    const delivery = sectionBetween(
+      mainSource,
+      "function deliverRendererThemeConfig()",
+      "const recapRuntime"
+    );
+    const setIndex = delivery.indexOf("rendererConfigChannel.setPetConfig(cfg);");
+    const sendIndex = delivery.indexOf('sendToRenderer("theme-config", cfg);');
+
+    assert.ok(setIndex >= 0, "the pet config must be cached for the next preload read");
+    assert.ok(sendIndex >= 0, "the live renderer still needs the pushed config");
+    assert.ok(setIndex < sendIndex, "cache the config before sending it");
+  });
+
+  it("updates the sync-IPC hit config before the hit window load push", () => {
+    const onLoad = sectionBetween(
+      mainSource,
+      "onDidFinishLoad: () => {",
+      "onRenderProcessGone: (details, ownedHitWin)"
+    );
+    const setIndex = onLoad.indexOf("rendererConfigChannel.setHitConfig(hitConfig);");
+    const sendIndex = onLoad.indexOf('sendToHitWin("theme-config", hitConfig);');
+
+    assert.ok(setIndex >= 0, "the hit config must be cached for reloads");
+    assert.ok(sendIndex >= 0, "the live hit window still needs the pushed config");
+    assert.ok(setIndex < sendIndex, "cache the hit config before sending it");
   });
 });

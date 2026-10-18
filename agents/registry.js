@@ -10,6 +10,7 @@ const antigravityCli = require("./antigravity-cli");
 const cursorAgent = require("./cursor-agent");
 const codebuddy = require("./codebuddy");
 const kiroCli = require("./kiro-cli");
+const kirocrew = require("./kirocrew");
 const kimiCli = require("./kimi-cli");
 const qwenCode = require("./qwen-code");
 const zcode = require("./zcode");
@@ -17,6 +18,7 @@ const codewhale = require("./codewhale");
 const opencode = require("./opencode");
 const mimocode = require("./mimocode");
 const pi = require("./pi");
+const omp = require("./omp");
 const openclaw = require("./openclaw");
 const hermes = require("./hermes");
 const qoder = require("./qoder");
@@ -25,6 +27,8 @@ const qoderwork = require("./qoderwork");
 const qwenwork = require("./qwenwork");
 const workbuddy = require("./workbuddy");
 const traecode = require("./traecode");
+const grokBuild = require("./grok-build");
+const minimax = require("./minimax");
 
 const AGENTS = [
   claudeCode,
@@ -36,6 +40,7 @@ const AGENTS = [
   cursorAgent,
   codebuddy,
   kiroCli,
+  kirocrew,
   kimiCli,
   qwenCode,
   zcode,
@@ -43,6 +48,7 @@ const AGENTS = [
   opencode,
   mimocode,
   pi,
+  omp,
   openclaw,
   hermes,
   qoder,
@@ -51,6 +57,8 @@ const AGENTS = [
   qwenwork,
   workbuddy,
   traecode,
+  grokBuild,
+  minimax,
 ];
 const AGENT_MAP = new Map(AGENTS.map((a) => [a.id, a]));
 

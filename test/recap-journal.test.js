@@ -127,13 +127,114 @@ test("async retained restore snapshots files and yields between bounded record b
     store.childPath("events", `${localDate}.jsonl`),
     Array.from({ length: 1200 }, () => JSON.stringify(record)).join("\n") + "\n"
   );
+  const restoredRecords = [];
   let yields = 0;
-  const restored = await journal.loadRetainedAsync(localDate, {
-    yieldEvery: 100,
-    yieldToMain: async () => { yields += 1; },
-  });
-  assert.equal(restored.records.length, 1200);
+  const result = await journal.forEachRetainedAsync(
+    localDate,
+    (value) => restoredRecords.push(value),
+    { yieldEvery: 100, yieldToMain: async () => { yields += 1; } }
+  );
+  assert.equal(restoredRecords.length, 1200);
   assert.ok(yields >= 12);
+  assert.equal(Object.hasOwn(result, "records"), false);
+});
+
+test("issue #1141: retained restore streams each record before it yields and keeps no array", async (t) => {
+  const { journal, store } = fixture(t);
+  const localDate = "2026-08-30";
+  const record = journal.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 29, 18),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  });
+  fs.writeFileSync(
+    store.childPath("events", `${localDate}.jsonl`),
+    Array.from({ length: 1200 }, () => JSON.stringify(record)).join("\n") + "\n"
+  );
+  let deliveredAtFirstYield = null;
+  let delivered = 0;
+  const result = await journal.forEachRetainedAsync(
+    localDate,
+    () => { delivered += 1; },
+    {
+      yieldEvery: 100,
+      yieldToMain: async () => {
+        if (deliveredAtFirstYield === null) deliveredAtFirstYield = delivered;
+      },
+    }
+  );
+  assert.equal(deliveredAtFirstYield, 100);
+  assert.equal(delivered, 1200);
+  assert.equal(Object.hasOwn(result, "records"), false);
+});
+
+test("issue #1141: retained restore keeps one valid record under a blank-line flood at the default bound", async (t) => {
+  const { journal, store } = fixture(t);
+  const record = journal.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 29, 18),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  });
+  fs.writeFileSync(
+    store.childPath("events", "2026-08-30.jsonl"),
+    `${JSON.stringify(record)}\n${"\n".repeat(100000)}`
+  );
+  const restoredRecords = [];
+  const result = await journal.forEachRetainedAsync(
+    "2026-08-30",
+    (value) => restoredRecords.push(value)
+  );
+  assert.equal(result.truncated, false);
+  assert.equal(restoredRecords.length, 1);
+  assert.equal(restoredRecords[0].localDate, "2026-08-30");
+});
+
+test("issue #1141: retained restore rejects a missing callback and a callback failure", async (t) => {
+  const { journal, store } = fixture(t);
+  await assert.rejects(() => journal.forEachRetainedAsync("2026-08-30"), TypeError);
+  const record = journal.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 29, 18),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  });
+  fs.writeFileSync(store.childPath("events", "2026-08-30.jsonl"), `${JSON.stringify(record)}\n`);
+  await assert.rejects(
+    () => journal.forEachRetainedAsync("2026-08-30", () => { throw new Error("callback boom"); }),
+    /callback boom/
+  );
+});
+
+test("issue #1141: retained restore reports the first date of each accepted dedupe key", async (t) => {
+  const { journal, store } = fixture(t);
+  const identity = { sessionId: "s1", dedupeId: "tool-1" };
+  const first = journal.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 1, 0),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity", "tool-call"],
+  }, identity);
+  const other = journal.buildRecord({
+    occurredAt: Date.UTC(2026, 7, 10, 0),
+    agentId: "codex",
+    scope: "local",
+    metrics: ["activity"],
+  }, { sessionId: "s2", dedupeId: "tool-2" });
+  fs.writeFileSync(
+    store.childPath("events", "2026-08-01.jsonl"),
+    `${JSON.stringify(first)}\n${JSON.stringify(first)}\n`
+  );
+  fs.writeFileSync(store.childPath("events", "2026-08-10.jsonl"), `${JSON.stringify(other)}\n`);
+
+  const collected = [];
+  const result = await journal.forEachRetainedAsync("2026-08-14", (value) => collected.push(value));
+  assert.equal(collected.length, 2);
+  assert.equal(result.restoredDedupeKeys.size, 2);
+  assert.equal(result.restoredDedupeKeys.get(first.dedupeKeyHash), "2026-08-01");
+  assert.equal(result.restoredDedupeKeys.get(other.dedupeKeyHash), "2026-08-10");
+  assert.equal(journal.append(first), false, "a restored disk key must stay live in the dedupe memory");
 });
 
 test("hydration never ages a newer live dedupe key back to an older disk date", async (t) => {
@@ -151,7 +252,7 @@ test("hydration never ages a newer live dedupe key back to an older disk date", 
   let announceYield;
   let paused = false;
   const yielded = new Promise((resolve) => { announceYield = resolve; });
-  const loading = journal.loadRetainedAsync("2026-08-14", {
+  const loading = journal.forEachRetainedAsync("2026-08-14", () => {}, {
     yieldToMain: () => {
       if (paused) return Promise.resolve();
       paused = true;
@@ -182,12 +283,17 @@ test("hydration never ages a newer live dedupe key back to an older disk date", 
   assert.equal(journal.append(replay), false);
 });
 
-test("async retained restore refuses an unbounded in-memory rebuild", async (t) => {
+test("async retained restore refuses work that exceeds its safety bound", async (t) => {
   const { journal, store } = fixture(t);
   fs.writeFileSync(store.childPath("events", "2026-08-30.jsonl"), "x".repeat(256));
-  const restored = await journal.loadRetainedAsync("2026-08-30", { maxBytes: 128 });
+  let delivered = 0;
+  const restored = await journal.forEachRetainedAsync(
+    "2026-08-30",
+    () => { delivered += 1; },
+    { maxBytes: 128 }
+  );
   assert.equal(restored.truncated, true);
-  assert.deepStrictEqual(restored.records, []);
+  assert.equal(delivered, 0);
 });
 
 test("retained restore dedupes a replayed stable identity on disk", async (t) => {
@@ -202,8 +308,9 @@ test("retained restore dedupes a replayed stable identity on disk", async (t) =>
     store.childPath("events", "2026-08-30.jsonl"),
     `${JSON.stringify(record)}\n${JSON.stringify(record)}\n`
   );
-  const restored = await journal.loadRetainedAsync("2026-08-30");
-  assert.equal(restored.records.length, 1);
+  const collected = [];
+  await journal.forEachRetainedAsync("2026-08-30", (value) => collected.push(value));
+  assert.equal(collected.length, 1);
   assert.equal(journal.readDate("2026-08-30").length, 1);
 });
 
@@ -216,13 +323,18 @@ test("retained restore bounds invalid input lines and warning volume", async (t)
     logWarn: (...args) => warnings.push(args),
   });
   fs.writeFileSync(store.childPath("events", "2026-08-30.jsonl"), "x\n".repeat(200));
-  const restored = await journal.loadRetainedAsync("2026-08-30", {
-    maxRecords: 100,
-    yieldEvery: 10,
-    yieldToMain: async () => {},
-  });
+  let delivered = 0;
+  const restored = await journal.forEachRetainedAsync(
+    "2026-08-30",
+    () => { delivered += 1; },
+    {
+      maxRecords: 100,
+      yieldEvery: 10,
+      yieldToMain: async () => {},
+    }
+  );
   assert.equal(restored.truncated, true);
-  assert.deepStrictEqual(restored.records, []);
+  assert.equal(delivered, 0);
   assert.ok(warnings.length <= 1);
   assert.ok(fs.existsSync(root));
 });
@@ -230,7 +342,7 @@ test("retained restore bounds invalid input lines and warning volume", async (t)
 test("retained restore also bounds blank-line floods", async (t) => {
   const { journal, store } = fixture(t);
   fs.writeFileSync(store.childPath("events", "2026-08-30.jsonl"), "\n".repeat(200));
-  const restored = await journal.loadRetainedAsync("2026-08-30", {
+  const restored = await journal.forEachRetainedAsync("2026-08-30", () => {}, {
     maxRecords: 100,
     yieldEvery: 10,
     yieldToMain: async () => {},
@@ -255,7 +367,7 @@ test("retained restore holds no file handle across a yield and aborts after rese
   let announceYield;
   let paused = false;
   const yielded = new Promise((resolve) => { announceYield = resolve; });
-  const loading = journal.loadRetainedAsync(localDate, {
+  const loading = journal.forEachRetainedAsync(localDate, () => {}, {
     yieldEvery: 100,
     yieldToMain: () => {
       if (paused) return Promise.resolve();

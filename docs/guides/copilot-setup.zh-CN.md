@@ -2,7 +2,7 @@
 
 [返回 README](../../README.zh-CN.md) · [English](copilot-setup.md)
 
-> **Copilot CLI 改为按需安装。** 全新安装后，若需要本机 Copilot CLI 追踪，请先到 **Settings → Agents** 点击 Copilot CLI 的 **Install / 安装**。安装且启用后，Clawd 启动时会把 `copilot-hook.js` 写入 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json`（marker-based 增量合并，不会覆盖用户其他 hook）。
+> **Copilot CLI 改为按需安装。** 全新安装后，若需要本机 Copilot CLI 追踪，请先到 **Settings → AI 编程工具** 点击 Copilot CLI 的 **Install / 安装**。安装且启用后，Clawd 启动时会把 `copilot-hook.js` 写入 `<COPILOT_HOME 或 ~/.copilot>/hooks/hooks.json`（marker-based 增量合并，不会覆盖用户其他 hook）。
 >
 > 本文档保留作为**高级/手动备选**：调试、定制事件子集、离线参考、或测试 Clawd 行为时用。
 
