@@ -28,6 +28,52 @@ const {
 } = require("../hooks/dsh-install");
 
 const DSH_BRIDGE_SOURCE_DIR = path.join(__dirname, "..", "hooks", "dsh-clawd-bridge");
+const NO_DSH_DESKTOP = Object.freeze({
+  status: "not-found",
+  appRoot: null,
+  launcherPath: null,
+  staticVersion: null,
+  checkedPaths: [],
+  reason: null,
+});
+function dshDesktopFound() {
+  return {
+    status: "found",
+    appRoot: "/fake/DeepSeek Harness.app",
+    launcherPath: "/fake/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+    staticVersion: SUPPORTED_DSH_VERSION,
+    checkedPaths: [],
+    reason: null,
+  };
+}
+
+// A verified Clawd bridge installed only in the desktop profile.
+function writeDesktopClawdPlugin(homeDir) {
+  const dshHome = path.join(homeDir, ".dsh");
+  const managedRoot = resolveManagedRoot({ homeDir, dshHome });
+  const profileDir = path.join(dshHome, "profiles", "desktop");
+  const pluginDir = path.join(profileDir, "node_modules", ...BRIDGE_PACKAGE_NAME.split("/"));
+  const bundleHash = dshInstallTest.hashBridgeDirectorySync(fs, DSH_BRIDGE_SOURCE_DIR);
+  const generationDir = path.join(managedRoot, "generations", bundleHash);
+  writeJson(path.join(profileDir, "package.json"), {
+    name: "dsh-profile-desktop",
+    dependencies: { [BRIDGE_PACKAGE_NAME]: `file:${generationDir}` },
+    dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", BRIDGE_PACKAGE_NAME] } },
+  });
+  fs.cpSync(DSH_BRIDGE_SOURCE_DIR, pluginDir, { recursive: true });
+  fs.cpSync(DSH_BRIDGE_SOURCE_DIR, generationDir, { recursive: true });
+  const marker = {
+    owner: MANAGED_OWNER,
+    schemaVersion: 1,
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    bundleHash,
+    supportedDshRange: SUPPORTED_DSH_RANGE,
+    installedDshVersion: SUPPORTED_DSH_VERSION,
+  };
+  writeJson(path.join(pluginDir, "clawd-manifest.json"), marker);
+  writeJson(path.join(generationDir, "clawd-manifest.json"), marker);
+  return { managedRoot, profileDir, pluginDir };
+}
 
 const tempDirs = [];
 
@@ -164,7 +210,7 @@ describe("agent installation detector", () => {
       dsh: { profile: { bundles: [] } },
     });
 
-    let report = detectAgentInstallations({ homeDir, now: 1, env: {} });
+    let report = detectAgentInstallations({ homeDir, now: 1, env: {}, dshDesktopDiscovery: NO_DSH_DESKTOP });
     let dsh = byId(report, "deepseek-harness");
     assert.strictEqual(dsh.detectedInstalled, true);
     assert.strictEqual(dsh.clawdIntegration.detected, false);
@@ -195,11 +241,58 @@ describe("agent installation detector", () => {
     writeJson(path.join(pluginDir, "clawd-manifest.json"), marker);
     writeJson(path.join(generationDir, "clawd-manifest.json"), marker);
 
-    report = detectAgentInstallations({ homeDir, now: 2, env: {} });
+    report = detectAgentInstallations({ homeDir, now: 2, env: {}, dshDesktopDiscovery: NO_DSH_DESKTOP });
     dsh = byId(report, "deepseek-harness");
     assert.strictEqual(dsh.clawdIntegration.detected, true);
     assert.strictEqual(dsh.clawdIntegration.reason, "managed-plugin");
     assert.strictEqual(dsh.clawdIntegration.paths.pluginDir, canonicalRealpath(pluginDir));
+  });
+
+  it("detects a desktop-only DSH installation from the app bundle", () => {
+    const homeDir = makeHome();
+    const report = detectAgentInstallations({
+      homeDir,
+      now: 1,
+      env: {},
+      dshDesktopDiscovery: dshDesktopFound(),
+    });
+    const dsh = byId(report, "deepseek-harness");
+    assert.strictEqual(dsh.detectedInstalled, true);
+    assert.strictEqual(dsh.confidence, "high");
+    assert.strictEqual(dsh.reason, "desktop-app");
+  });
+
+  it("reports a healthy desktop-only Clawd integration with both desktop paths", () => {
+    const homeDir = makeHome();
+    const { managedRoot, profileDir, pluginDir } = writeDesktopClawdPlugin(homeDir);
+
+    const report = detectAgentInstallations({
+      homeDir,
+      now: 2,
+      env: {},
+      dshManagedRoot: managedRoot,
+      dshDesktopDiscovery: dshDesktopFound(),
+    });
+    const dsh = byId(report, "deepseek-harness");
+    assert.strictEqual(dsh.clawdIntegration.detected, true);
+    assert.strictEqual(dsh.clawdIntegration.reason, "managed-plugin");
+    assert.strictEqual(dsh.clawdIntegration.paths.desktopProfileDir, profileDir);
+    assert.strictEqual(dsh.clawdIntegration.paths.desktopPluginDir, canonicalRealpath(pluginDir));
+  });
+
+  it("does not treat a desktop app outside every family as a healthy integration", () => {
+    const homeDir = makeHome();
+    const { managedRoot } = writeDesktopClawdPlugin(homeDir);
+
+    const report = detectAgentInstallations({
+      homeDir,
+      now: 2,
+      env: {},
+      dshManagedRoot: managedRoot,
+      dshDesktopDiscovery: { ...dshDesktopFound(), staticVersion: "9.9.9" },
+    });
+    const dsh = byId(report, "deepseek-harness");
+    assert.strictEqual(dsh.clawdIntegration.detected, false);
   });
 
   it("detects a DSH CLI on PATH before the profile home is initialized", {
@@ -533,6 +626,49 @@ describe("agent installation detector", () => {
     }
   });
 
+  for (const fixture of [
+    ["qoder", ".qoder", ".auth", "dir"],
+    ["qoder", ".qoder", "state.json", "file"],
+    ["zcode", ".zcode", path.join("v2", "credentials.json"), "file"],
+    ["zcode", ".zcode", path.join("cli", "exec"), "dir"],
+    ["codebuddy", ".codebuddy", "logs", "dir"],
+    ["codebuddy", ".codebuddy", "history.jsonl", "file"],
+  ]) {
+    const [agentId, relativeDir, artifact, kind] = fixture;
+    it(`detects ${agentId} from a product-owned artifact (${artifact})`, () => {
+      const homeDir = makeHome();
+      const artifactPath = path.join(homeDir, relativeDir, artifact);
+      mkdirp(path.dirname(artifactPath));
+      if (kind === "dir") {
+        mkdirp(artifactPath);
+      } else {
+        writeText(artifactPath, "{}");
+      }
+
+      const entry = byId(detectAgentInstallations({ homeDir, now: 1, env: {} }), agentId);
+
+      assert.strictEqual(entry.detectedInstalled, true, `${agentId} ${artifact}`);
+      assert.strictEqual(entry.confidence, "high");
+      assert.strictEqual(entry.reason, "product-artifact");
+    });
+  }
+
+  it("still reports insufficient when a hook-config folder holds neither product config nor product artifacts", () => {
+    for (const [agentId, relativeDir] of [
+      ["qoder", ".qoder"],
+      ["zcode", ".zcode"],
+      ["codebuddy", ".codebuddy"],
+    ]) {
+      const homeDir = makeHome();
+      mkdirp(path.join(homeDir, relativeDir));
+      writeJson(path.join(homeDir, relativeDir, agentId === "zcode" ? path.join("cli", "config.json") : "settings.json"), {});
+
+      const entry = byId(detectAgentInstallations({ homeDir, now: 1, env: {} }), agentId);
+      assert.strictEqual(entry.detectedInstalled, null, `${agentId} empty folder with no artifacts`);
+      assert.strictEqual(entry.reason, "insufficient-evidence", `${agentId} empty folder reason`);
+    }
+  });
+
   it("fails an unreadable reporter config closed to insufficient evidence", () => {
     const homeDir = makeHome();
     const configPath = path.join(homeDir, ".qoder", "settings.json");
@@ -829,6 +965,7 @@ describe("agent installation detector", () => {
     const homeDir = makeHome();
     const executablePath = path.join(homeDir, "NovaAI.exe");
     writeText(executablePath, "");
+    if (process.platform !== "win32") fs.chmodSync(executablePath, 0o755);
     const application = {
       id: "custom-nova-ai-0123456789ab",
       executablePath,
@@ -851,6 +988,37 @@ describe("agent installation detector", () => {
       snapshot: { customApplications: [application], customToolDiscoveryPaths: [] },
     });
     assert.strictEqual(missing.customAgents[0].detectedInstalled, false);
+    assert.strictEqual(missing.customAgents[0].reason, "not-found");
+  });
+
+  it("reports a registered POSIX file without execute permission as not-executable", { skip: process.platform === "win32" }, () => {
+    const homeDir = makeHome();
+    const executablePath = path.join(homeDir, "NovaAI");
+    writeText(executablePath, "");
+    fs.chmodSync(executablePath, 0o644);
+    const application = { id: "custom-nova-ai-0123456789ab", executablePath };
+    const report = detectAgentInstallations({
+      homeDir,
+      platform: "linux",
+      now: 1,
+      snapshot: { customApplications: [application], customToolDiscoveryPaths: [] },
+    });
+    assert.strictEqual(report.customAgents[0].detectedInstalled, false);
+    assert.strictEqual(report.customAgents[0].reason, "not-executable");
+  });
+
+  it("reports a registered directory as not-file", () => {
+    const homeDir = makeHome();
+    const executablePath = path.join(homeDir, "NovaAI");
+    mkdirp(executablePath);
+    const application = { id: "custom-nova-ai-0123456789ab", executablePath };
+    const report = detectAgentInstallations({
+      homeDir,
+      now: 1,
+      snapshot: { customApplications: [application], customToolDiscoveryPaths: [] },
+    });
+    assert.strictEqual(report.customAgents[0].detectedInstalled, false);
+    assert.strictEqual(report.customAgents[0].reason, "not-file");
   });
 
   it("does not infer built-in agent installs from generic Windows app-name guesses", () => {

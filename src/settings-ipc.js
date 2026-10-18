@@ -4,6 +4,10 @@ const defaultFs = require("fs");
 const defaultPath = require("path");
 const { pathToFileURL } = require("url");
 const { detectAgentInstallations: defaultDetectAgentInstallations } = require("./agent-installation-detector");
+const {
+  readDeepSeekHarnessNotices: defaultReadDshNotices,
+  acknowledgeDeepSeekHarnessNotice: defaultAcknowledgeDshNotice,
+} = require("../hooks/dsh-install");
 const { DEFAULT_INTEGRATION_INSTALLED_IDS } = require("./prefs");
 const settingsThemeImporter = require("./settings-theme-importer");
 const {
@@ -33,6 +37,11 @@ const INTERNAL_SETTINGS_COMMANDS = new Set([
   "remoteSsh.markDeployed",
   "remoteSsh.markRemoteNode",
   "feishuApproval.commitResolvedApprover",
+  // Official theme install/uninstall are main-process capabilities. The
+  // renderer can only reach the dedicated, owner-gated IPC handlers; it must
+  // never mint a staging path or target directory through settings:command.
+  "officialTheme.commitInstall",
+  "officialTheme.uninstall",
 ]);
 const SOUND_OVERRIDE_DIALOG_STRINGS = {
   en: { title: "Choose a sound file", filterName: "Audio" },
@@ -43,6 +52,38 @@ const SOUND_OVERRIDE_DIALOG_STRINGS = {
   "pt-BR": { title: "Escolha um arquivo de som", filterName: "Áudio" },
   es: { title: "Elige un archivo de sonido", filterName: "Audio" },
 };
+
+// The Settings page only shows unacknowledged notices, and only the fields it
+// renders. Path fields (residues, locks) are diagnostic material that belongs
+// in logs, not in the renderer.
+const DSH_NOTICE_KIND_RANK = Object.freeze({
+  "restart-required": 0,
+  "failed-target": 1,
+  "manual-command": 2,
+  "first-install": 3,
+});
+
+function toDshNoticeView(notice) {
+  if (!notice || notice.acknowledged) return null;
+  const view = { id: notice.id, profile: notice.profile, kind: notice.kind };
+  const payload = notice.payload || {};
+  if (notice.kind === "manual-command") {
+    view.commands = Array.isArray(payload.commands) ? payload.commands.slice() : [];
+  } else if (notice.kind === "failed-target") {
+    view.operation = payload.operation;
+    view.reason = payload.reason;
+    view.message = payload.message;
+  }
+  return view;
+}
+
+function compareDshNoticeViews(left, right) {
+  const rankLeft = DSH_NOTICE_KIND_RANK[left.kind] === undefined ? 99 : DSH_NOTICE_KIND_RANK[left.kind];
+  const rankRight = DSH_NOTICE_KIND_RANK[right.kind] === undefined ? 99 : DSH_NOTICE_KIND_RANK[right.kind];
+  if (rankLeft !== rankRight) return rankLeft - rankRight;
+  if (left.profile !== right.profile) return left.profile === "web" ? -1 : 1;
+  return 0;
+}
 
 const AGENT_DISCOVERY_DIALOG_STRINGS = {
   en: { file: "Choose a tool executable", directory: "Choose a tool installation folder" },
@@ -103,6 +144,65 @@ function requiredDependency(value, name) {
   if (!value) throw new Error(`registerSettingsIpc requires ${name}`);
   return value;
 }
+
+const UNINSTALL_OFFICIAL_THEME_DIALOG_STRINGS = {
+  en: {
+    uninstall: "Uninstall",
+    cancel: "Cancel",
+    message: (name) => `Uninstall official theme "${name}"?`,
+    detail: (mib) => `This frees about ${mib} MB and cannot be undone. Re-downloading later is not a lossless upgrade: this theme's customizations and Clawd-managed sound overrides will be cleared.`,
+    archiveDetail: (mib) => `The download package is about ${mib} MB; the installed theme may use more disk space. Uninstalling cannot be undone. Re-downloading later is not a lossless upgrade: this theme's customizations and Clawd-managed sound overrides will be cleared.`,
+    unknownDetail: "The installed size is unavailable. Uninstalling cannot be undone. Re-downloading later is not a lossless upgrade: this theme's customizations and Clawd-managed sound overrides will be cleared.",
+  },
+  zh: {
+    uninstall: "卸载",
+    cancel: "取消",
+    message: (name) => `确认卸载官方主题 "${name}"？`,
+    detail: (mib) => `将释放约 ${mib} MB，且不可撤销。以后重新下载不是无损升级：该主题的自定义设置和 Clawd 管理的声音覆盖会被清除。`,
+    archiveDetail: (mib) => `下载包约 ${mib} MB；主题安装后占用的磁盘空间可能更大。卸载不可撤销。以后重新下载不是无损升级：该主题的自定义设置和 Clawd 管理的声音覆盖会被清除。`,
+    unknownDetail: "无法确定已安装主题占用的空间。卸载不可撤销。以后重新下载不是无损升级：该主题的自定义设置和 Clawd 管理的声音覆盖会被清除。",
+  },
+  "zh-TW": {
+    uninstall: "解除安裝",
+    cancel: "取消",
+    message: (name) => `確定要解除安裝官方主題「${name}」？`,
+    detail: (mib) => `將釋放約 ${mib} MB，且無法復原。之後重新下載並非無損升級：此主題的自訂設定與 Clawd 管理的音效覆寫會被清除。`,
+    archiveDetail: (mib) => `下載包約 ${mib} MB；主題安裝後佔用的磁碟空間可能更大。解除安裝後無法復原。之後重新下載並非無損升級：此主題的自訂設定與 Clawd 管理的音效覆寫會被清除。`,
+    unknownDetail: "無法確定已安裝主題佔用的空間。解除安裝後無法復原。之後重新下載並非無損升級：此主題的自訂設定與 Clawd 管理的音效覆寫會被清除。",
+  },
+  ko: {
+    uninstall: "제거",
+    cancel: "취소",
+    message: (name) => `공식 테마 "${name}"을(를) 제거할까요?`,
+    detail: (mib) => `약 ${mib} MB가 확보되며 되돌릴 수 없습니다. 나중에 다시 받는 것은 무손실 업그레이드가 아니며, 이 테마의 사용자 설정과 Clawd가 관리하는 사운드 오버라이드가 지워집니다.`,
+    archiveDetail: (mib) => `다운로드 패키지는 약 ${mib} MB이며 설치된 테마는 더 많은 디스크 공간을 사용할 수 있습니다. 제거는 되돌릴 수 없습니다. 나중에 다시 받는 것은 무손실 업그레이드가 아니며, 이 테마의 사용자 설정과 Clawd가 관리하는 사운드 오버라이드가 지워집니다.`,
+    unknownDetail: "설치된 테마가 사용하는 공간을 확인할 수 없습니다. 제거는 되돌릴 수 없습니다. 나중에 다시 받는 것은 무손실 업그레이드가 아니며, 이 테마의 사용자 설정과 Clawd가 관리하는 사운드 오버라이드가 지워집니다.",
+  },
+  ja: {
+    uninstall: "アンインストール",
+    cancel: "キャンセル",
+    message: (name) => `公式テーマ「${name}」をアンインストールしますか？`,
+    detail: (mib) => `約 ${mib} MB 解放され、元に戻せません。後で再ダウンロードしても無損失アップグレードではなく、このテーマのカスタマイズと Clawd 管理のサウンド上書きは消去されます。`,
+    archiveDetail: (mib) => `ダウンロードパッケージは約 ${mib} MB で、インストール後のテーマはより多くのディスク容量を使用する場合があります。アンインストールは元に戻せません。後で再ダウンロードしても無損失アップグレードではなく、このテーマのカスタマイズと Clawd 管理のサウンド上書きは消去されます。`,
+    unknownDetail: "インストール済みテーマの使用容量を確認できません。アンインストールは元に戻せません。後で再ダウンロードしても無損失アップグレードではなく、このテーマのカスタマイズと Clawd 管理のサウンド上書きは消去されます。",
+  },
+  "pt-BR": {
+    uninstall: "Desinstalar",
+    cancel: "Cancelar",
+    message: (name) => `Desinstalar o tema oficial "${name}"?`,
+    detail: (mib) => `Libera cerca de ${mib} MB e não pode ser desfeito. Baixar de novo depois não é uma atualização sem perdas: as personalizações e os overrides de som gerenciados pelo Clawd deste tema serão apagados.`,
+    archiveDetail: (mib) => `O pacote de download tem cerca de ${mib} MB; o tema instalado pode ocupar mais espaço em disco. A desinstalação não pode ser desfeita. Baixar de novo depois não é uma atualização sem perdas: as personalizações e os overrides de som gerenciados pelo Clawd deste tema serão apagados.`,
+    unknownDetail: "O tamanho instalado não está disponível. A desinstalação não pode ser desfeita. Baixar de novo depois não é uma atualização sem perdas: as personalizações e os overrides de som gerenciados pelo Clawd deste tema serão apagados.",
+  },
+  es: {
+    uninstall: "Desinstalar",
+    cancel: "Cancelar",
+    message: (name) => `¿Desinstalar el tema oficial "${name}"?`,
+    detail: (mib) => `Libera unos ${mib} MB y no se puede deshacer. Volver a descargarlo no es una actualización sin pérdidas: se borrarán las personalizaciones y los reemplazos de sonido gestionados por Clawd de este tema.`,
+    archiveDetail: (mib) => `El paquete de descarga ocupa unos ${mib} MB; el tema instalado puede usar más espacio en disco. La desinstalación no se puede deshacer. Volver a descargarlo no es una actualización sin pérdidas: se borrarán las personalizaciones y los reemplazos de sonido gestionados por Clawd de este tema.`,
+    unknownDetail: "El tamaño instalado no está disponible. La desinstalación no se puede deshacer. Volver a descargarlo no es una actualización sin pérdidas: se borrarán las personalizaciones y los reemplazos de sonido gestionados por Clawd de este tema.",
+  },
+};
 
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -187,6 +287,7 @@ function registerSettingsIpc(options = {}) {
   const settingsController = requiredDependency(options.settingsController, "settingsController");
   const themeLoader = requiredDependency(options.themeLoader, "themeLoader");
   const codexPetMain = requiredDependency(options.codexPetMain, "codexPetMain");
+  const officialThemeMain = options.officialThemeMain || null;
   const dialog = requiredDependency(options.dialog, "dialog");
   const shell = requiredDependency(options.shell, "shell");
   const app = requiredDependency(options.app, "app");
@@ -223,8 +324,24 @@ function registerSettingsIpc(options = {}) {
     || (() => ({ status: "error", message: "text scale preview unavailable" }));
   const getTextScaleContext = options.getTextScaleContext
     || (() => ({ percent: 100 }));
+  const getSizeContext = options.getSizeContext || (() => null);
   const getAllAgents = requiredDependency(options.getAllAgents, "getAllAgents");
   const detectAgentInstallations = options.detectAgentInstallations || defaultDetectAgentInstallations;
+  const readDshNotices = typeof options.readDshNotices === "function" ? options.readDshNotices : defaultReadDshNotices;
+  const acknowledgeDshNotice = typeof options.acknowledgeDshNotice === "function"
+    ? options.acknowledgeDshNotice
+    : defaultAcknowledgeDshNotice;
+  const platform = options.platform || process.platform;
+  // Injectable for tests; production refreshes the Windows registry snapshot.
+  const refreshDshDesktopDiscovery = typeof options.refreshDshDesktopDiscovery === "function"
+    ? options.refreshDshDesktopDiscovery
+    : async () => {
+      const { refreshDshDesktopDiscovery: refresh } = require("../hooks/dsh-install.js");
+      return refresh({});
+    };
+  const refreshWslDetection = typeof options.refreshWslDetection === "function"
+    ? options.refreshWslDetection
+    : require("./agent-installation-detector").refreshWslDetection;
   const getHookServerPort = options.getHookServerPort || (() => null);
   const getRecentHookEvents = options.getRecentHookEvents || (() => []);
   const checkForUpdates = options.checkForUpdates || (() => {});
@@ -368,7 +485,7 @@ function registerSettingsIpc(options = {}) {
     }
   });
   // Distinct quota-reporting sources (this machine + WSL / SSH remotes). The
-  // General tab uses it to hide the "merge across machines" switch when it is
+  // Sessions tab uses it to hide the "merge across machines" switch when it is
   // a single-machine no-op.
   handle("settings:get-quota-source-count", () => {
     try {
@@ -486,6 +603,12 @@ function registerSettingsIpc(options = {}) {
         message: "permission automation is gated; use the setPermissionAutomationMode command",
       };
     }
+    if (payload.key === "mobilePermissionPreviewEnabled") {
+      return {
+        status: "error",
+        message: "mobile permission preview is gated; use the setMobilePermissionPreviewEnabled command",
+      };
+    }
     return settingsController.applyUpdate(payload.key, payload.value);
   });
   handle("settings:begin-size-preview", () => settingsSizePreviewSession.begin());
@@ -516,6 +639,7 @@ function registerSettingsIpc(options = {}) {
   // the slider asks main for the committed value of the display the settings
   // window currently sits on.
   handle("settings:get-text-scale-context", () => getTextScaleContext());
+  handle("settings:get-size-context", () => getSizeContext());
   handle("settings:get-preview-sound-url", () => {
     try { return themeLoader.getPreviewSoundUrl(); }
     catch { return null; }
@@ -657,17 +781,135 @@ function registerSettingsIpc(options = {}) {
           && isPlainObject(activeTheme._capabilities)
           ? activeTheme._capabilities
           : null;
-        return codexPetMain.decorateThemeMetadata({
+        const decorated = codexPetMain.decorateThemeMetadata({
           ...theme,
           active,
           ...(runtimeCapabilities
             ? { capabilities: { ...(theme.capabilities || {}), ...runtimeCapabilities } }
             : {}),
         });
+        return officialThemeMain
+          ? officialThemeMain.decorateThemeMetadata(decorated)
+          : decorated;
       });
     } catch (err) {
       console.warn("Clawd: settings:list-themes failed:", err && err.message);
       return [];
+    }
+  });
+
+  // Official theme catalog + installed-state list. List-level `catalogStatus`
+  // (offline/invalid) is separate from each card's per-theme state.
+  handle("settings:list-official-themes", async (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (!officialThemeMain) {
+      return {
+        status: "error",
+        catalogStatus: "invalid",
+        catalogVersion: null,
+        checkedAt: null,
+        themes: [],
+        message: "official themes are unavailable",
+      };
+    }
+    try {
+      await officialThemeMain.refreshCatalog();
+      return await officialThemeMain.listOfficialThemes({ catalogReady: true });
+    } catch (err) {
+      return {
+        status: "error",
+        catalogStatus: "offline",
+        catalogVersion: null,
+        checkedAt: null,
+        themes: [],
+        message: (err && err.message) || String(err),
+      };
+    }
+  });
+
+  handle("settings:install-official-theme", async (event, themeId) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (!officialThemeMain) {
+      return { status: "error", message: "official themes are unavailable" };
+    }
+    if (typeof themeId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(themeId)) {
+      return { status: "error", message: "invalid official theme id" };
+    }
+    return officialThemeMain.installTheme(themeId);
+  });
+
+  handle("settings:cancel-official-theme-install", (event) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (!officialThemeMain) {
+      return { status: "error", message: "official themes are unavailable" };
+    }
+    return officialThemeMain.cancelInstall();
+  });
+
+  handle("settings:uninstall-official-theme", async (event, themeId) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (typeof themeId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(themeId)) {
+      return { status: "error", message: "invalid official theme id" };
+    }
+    return settingsController.applyCommand("officialTheme.uninstall", { themeId });
+  });
+
+  handle("settings:confirm-uninstall-official-theme", async (event, themeId) => {
+    const rejected = rejectUntrustedSettingsEvent(event);
+    if (rejected) return rejected;
+    if (typeof themeId !== "string" || !themeId) return { confirmed: false };
+    let displayName = themeId;
+    let bytes = null;
+    let byteKind = null;
+    if (officialThemeMain) {
+      try {
+        const listing = await officialThemeMain.listOfficialThemes();
+        const card = (listing.themes || []).find((entry) => entry && entry.id === themeId);
+        if (card) {
+          const localize = (value) => {
+            if (typeof value === "string" && value) return value;
+            if (isPlainObject(value)) {
+              const lang = getLang();
+              return value[lang] || value.en || value.zh || Object.values(value)[0] || themeId;
+            }
+            return themeId;
+          };
+          displayName = localize(card.officialThemeName) || localize(card.name) || themeId;
+          if (Number.isFinite(card.officialThemeUnpackedBytes) && card.officialThemeUnpackedBytes > 0) {
+            bytes = card.officialThemeUnpackedBytes;
+            byteKind = "unpacked";
+          } else if (Number.isFinite(card.officialThemeBytes) && card.officialThemeBytes > 0) {
+            bytes = card.officialThemeBytes;
+            byteKind = "archive";
+          }
+        }
+      } catch {}
+    }
+    const mib = bytes ? Math.max(1, Math.round(bytes / (1024 * 1024))) : null;
+    const lang = getLang();
+    const strings = UNINSTALL_OFFICIAL_THEME_DIALOG_STRINGS[lang] || UNINSTALL_OFFICIAL_THEME_DIALOG_STRINGS.en;
+    try {
+      const { response } = await dialog.showMessageBox(getDialogParent(event), {
+        type: "warning",
+        buttons: [strings.uninstall, strings.cancel],
+        defaultId: 1,
+        cancelId: 1,
+        message: strings.message(displayName),
+        detail: byteKind === "unpacked"
+          ? strings.detail(mib)
+          : byteKind === "archive"
+            ? strings.archiveDetail(mib)
+            : strings.unknownDetail,
+        noLink: true,
+      });
+      return { confirmed: response === 0 };
+    } catch (err) {
+      console.warn("Clawd: confirm-uninstall-official-theme dialog failed:", err && err.message);
+      return { confirmed: false };
     }
   });
 
@@ -787,8 +1029,15 @@ function registerSettingsIpc(options = {}) {
       const options = opts && typeof opts === "object" ? opts : {};
       const detectorOptions = { fs, path, now, snapshot: settingsController.getSnapshot() };
       if (options.refreshWsl) {
-        const { refreshWslDetection } = require("./agent-installation-detector");
         await refreshWslDetection({ ...detectorOptions, skipDefaultIntegrations: false });
+        // The manual Scan waits for the Windows registry too, so the report it
+        // returns already sees the desktop app. Opening the page without a scan
+        // skips this to avoid a PowerShell on every visit.
+        if (platform === "win32") {
+          try {
+            await refreshDshDesktopDiscovery();
+          } catch {}
+        }
         return detectAgentInstallations(detectorOptions);
       }
       return detectAgentInstallations(detectorOptions);
@@ -806,6 +1055,47 @@ function registerSettingsIpc(options = {}) {
         wslSupported: process.platform === "win32",
         error: err && err.message ? err.message : String(err),
       };
+    }
+  });
+
+  handle("settings:dsh-notices", async () => {
+    try {
+      const state = await readDshNotices({});
+      if (state && state.errors) {
+        const broken = ["web", "desktop"].filter((profile) => state.errors[profile]);
+        if (broken.length) {
+          console.warn(`Clawd: DeepSeek Harness notices unreadable for ${broken.join(", ")}`);
+        }
+      }
+      const notices = [];
+      for (const profile of ["web", "desktop"]) {
+        for (const notice of (state && state[profile]) || []) {
+          const view = toDshNoticeView(notice);
+          if (view) notices.push(view);
+        }
+      }
+      notices.sort(compareDshNoticeViews);
+      return { notices };
+    } catch (err) {
+      console.warn("Clawd: settings:dsh-notices failed:", err && err.message);
+      return { notices: [] };
+    }
+  });
+
+  handle("settings:dsh-notice-ack", async (_ev, payload) => {
+    const request = payload && typeof payload === "object" ? payload : {};
+    if (request.profile !== "web" && request.profile !== "desktop") {
+      return { status: "error", message: "invalid DeepSeek Harness notice profile" };
+    }
+    if (typeof request.id !== "string" || request.id.length < 1 || request.id.length > 200) {
+      return { status: "error", message: "invalid DeepSeek Harness notice id" };
+    }
+    try {
+      const result = await acknowledgeDshNotice({}, { profile: request.profile, id: request.id });
+      if (result && result.error) return { status: "error", message: result.error };
+      return { status: "ok", found: !!(result && result.found === true) };
+    } catch (err) {
+      return { status: "error", message: err && err.message ? err.message : String(err) };
     }
   });
 
@@ -914,25 +1204,11 @@ function registerSettingsIpc(options = {}) {
   });
 
   handle("settings:regenerate-mobile-token", async () => {
-    try {
-      const lanWsServer = options.getLanWsServer ? options.getLanWsServer() : null;
-      if (!lanWsServer) return { status: "error", message: "LAN bridge not available" };
-      const newToken = lanWsServer.regenerateToken();
-      return { status: "ok", token: newToken };
-    } catch (err) {
-      return { status: "error", message: (err && err.message) || String(err) };
-    }
+    return settingsController.applyCommand("mobilePreview.regenerateToken", {});
   });
 
   handle("settings:reset-mobile-access", async () => {
-    try {
-      const lanWsServer = options.getLanWsServer ? options.getLanWsServer() : null;
-      if (!lanWsServer) return { status: "error", message: "LAN bridge not available" };
-      const newToken = lanWsServer.resetMobileAccess();
-      return { status: "ok", token: newToken };
-    } catch (err) {
-      return { status: "error", message: (err && err.message) || String(err) };
-    }
+    return settingsController.applyCommand("mobilePreview.resetAccess", {});
   });
 
   return {

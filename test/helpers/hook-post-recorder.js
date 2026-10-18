@@ -87,11 +87,13 @@ function successfulResponse(callback, body = "ok") {
 
 function successfulRequest(callback, body, attempt) {
   const req = new EventEmitter();
-  req.write = () => true;
+  const chunks = [];
+  req.write = (payload) => { chunks.push(String(payload)); return true; };
   req.setTimeout = () => req;
   req.destroy = () => req;
   req.end = (payload) => {
-    if (attempt) attempt.body = payload == null ? "" : String(payload);
+    if (payload != null) chunks.push(String(payload));
+    if (attempt) attempt.body = chunks.join("");
     successfulResponse(callback, body);
     return req;
   };
