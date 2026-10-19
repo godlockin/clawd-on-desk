@@ -6,6 +6,19 @@ const { sanitizeDisplayLabel } = require("./session-automation-store");
 
 const MODE_OFF = "off";
 const MODE_AUTO_TOOLS = "auto-tools";
+const RESOLVED_PERMISSION_OPTIONS = Object.freeze({
+  disposition: Object.freeze({ reason: "resolved", decided: true }),
+});
+
+// Lower rank is stricter: a session that asks every time must never be widened
+// by a broader global mode just because one request failed verification.
+const MODE_STRICTNESS = Object.freeze({ off: 0, "auto-tools": 1, unattended: 2 });
+
+function stricterMode(left, right) {
+  const safeLeft = Object.prototype.hasOwnProperty.call(MODE_STRICTNESS, left) ? left : MODE_OFF;
+  const safeRight = Object.prototype.hasOwnProperty.call(MODE_STRICTNESS, right) ? right : MODE_OFF;
+  return MODE_STRICTNESS[safeLeft] <= MODE_STRICTNESS[safeRight] ? safeLeft : safeRight;
+}
 
 function trustedIdentityFromEntry(entry) {
   if (!entry || typeof entry !== "object") return null;
@@ -13,6 +26,17 @@ function trustedIdentityFromEntry(entry) {
   const agentId = typeof entry.agentId === "string" ? entry.agentId.trim() : "";
   const sessionId = typeof entry.sessionId === "string" ? entry.sessionId.trim() : "";
   if (!agentId || !sessionId || !assessment || assessment.eligible !== true) return null;
+  return { agentId, sessionId };
+}
+
+// The identity a request claims about itself, whether or not verification
+// succeeded. Only used to stop an unverified request from falling back past a
+// stricter per-session setting it claims to own.
+function claimedIdentityFromEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const agentId = typeof entry.agentId === "string" ? entry.agentId.trim() : "";
+  const sessionId = typeof entry.sessionId === "string" ? entry.sessionId.trim() : "";
+  if (!agentId || !sessionId) return null;
   return { agentId, sessionId };
 }
 
@@ -80,11 +104,18 @@ function createSessionAutomationCoordinator(options = {}) {
   function getEffectiveMode(entry, config = {}) {
     const record = getRecordForEntry(entry);
     if (record) return record.mode;
-    if (config.sessionOnly === true) return MODE_OFF;
-    const globalMode = getGlobalMode();
-    return globalMode === MODE_AUTO_TOOLS || globalMode === "unattended"
-      ? globalMode
-      : MODE_OFF;
+    let fallback = MODE_OFF;
+    if (config.sessionOnly !== true) {
+      const globalMode = getGlobalMode();
+      if (globalMode === MODE_AUTO_TOOLS || globalMode === "unattended") fallback = globalMode;
+    }
+    // A request whose identity verification failed must not fall back to a
+    // broader global mode and bypass the session's own stricter setting. When
+    // the claimed session has a record, only ever tighten: return the stricter
+    // of the record and the fallback.
+    const claimed = claimedIdentityFromEntry(entry);
+    const claimedRecord = claimed ? store.get(claimed) : null;
+    return claimedRecord ? stricterMode(claimedRecord.mode, fallback) : fallback;
   }
 
   function canResolve(entry, config = {}) {
@@ -92,16 +123,36 @@ function createSessionAutomationCoordinator(options = {}) {
     return canAutoResolve(entry, {
       sessionOnly: config.sessionOnly === true,
       mode,
+      ignoreReviewHold: config.ignoreReviewHold === true,
     }) === true;
   }
 
+  // Offering session trust is a HUMAN action, so it must not depend on an
+  // external review that never ran: a request accepted while automation was
+  // off carries no verdict, and hiding the offer there would silently remove
+  // the feature whenever a review command is configured (#995 review).
+  //
+  // The offer is the only place the review hold is ignored. `resolveIfAllowed`
+  // and `sweep` stay strict, so granting trust never releases a pending
+  // request whose gate did not clear it -- that request keeps its card and is
+  // decided by a human. The grant applies to subsequent requests, which are
+  // reviewed normally.
   function canOfferSessionTrust(entry) {
-    return canResolve(entry, { sessionOnly: true, mode: MODE_AUTO_TOOLS });
+    return canResolve(entry, {
+      sessionOnly: true,
+      mode: MODE_AUTO_TOOLS,
+      ignoreReviewHold: true,
+    });
   }
 
   function resolveIfAllowed(entry, config = {}) {
     if (!canResolve(entry, config)) return false;
-    resolvePermissionEntry(entry, "allow", "Allowed by session automation");
+    resolvePermissionEntry(
+      entry,
+      "allow",
+      "Allowed by session automation",
+      RESOLVED_PERMISSION_OPTIONS
+    );
     return true;
   }
 
@@ -169,14 +220,24 @@ function createSessionAutomationCoordinator(options = {}) {
     });
     if (result.status === "applied") {
       entry.sessionTrustError = null;
-      resolvePermissionEntry(entry, "allow", "Allowed and trusted for this session");
+      resolvePermissionEntry(
+        entry,
+        "allow",
+        "Allowed and trusted for this session",
+        RESOLVED_PERMISSION_OPTIONS
+      );
       sweep(identity);
       if (suppressFutureConfirmation) persistWarningPreference();
       return result;
     }
     if (result.status === "equivalent" && canResolve(entry, { sessionOnly: true })) {
       entry.sessionTrustError = null;
-      resolvePermissionEntry(entry, "allow", "Allowed by existing session automation");
+      resolvePermissionEntry(
+        entry,
+        "allow",
+        "Allowed by existing session automation",
+        RESOLVED_PERMISSION_OPTIONS
+      );
       if (suppressFutureConfirmation) persistWarningPreference();
       return result;
     }
@@ -209,7 +270,12 @@ function createSessionAutomationCoordinator(options = {}) {
     }
     const current = store.get(identity);
     if (current && current.mode === MODE_AUTO_TOOLS && canResolve(entry, { sessionOnly: true })) {
-      resolvePermissionEntry(entry, "allow", "Allowed by existing session automation");
+      resolvePermissionEntry(
+        entry,
+        "allow",
+        "Allowed by existing session automation",
+        RESOLVED_PERMISSION_OPTIONS
+      );
       return Object.freeze({ status: "equivalent", record: current });
     }
     const expectedGrantId = current ? current.grantId : null;
@@ -239,7 +305,12 @@ function createSessionAutomationCoordinator(options = {}) {
     }
     const latest = store.get(identity);
     if (latest && latest.mode === MODE_AUTO_TOOLS && canResolve(entry, { sessionOnly: true })) {
-      resolvePermissionEntry(entry, "allow", "Allowed by sibling session automation");
+      resolvePermissionEntry(
+        entry,
+        "allow",
+        "Allowed by sibling session automation",
+        RESOLVED_PERMISSION_OPTIONS
+      );
       return Object.freeze({ status: "equivalent", record: latest });
     }
     if (!warningResult || warningResult.confirmed !== true) {
@@ -329,7 +400,12 @@ function createSessionAutomationCoordinator(options = {}) {
         activeGrantId: latest.grantId,
       };
       entry.remoteApprovalSkipClientName = remote.clientName || "";
-      resolvePermissionEntry(entry, "allow", "Allowed by existing session automation");
+      resolvePermissionEntry(
+        entry,
+        "allow",
+        "Allowed by existing session automation",
+        RESOLVED_PERMISSION_OPTIONS
+      );
       if (typeof client.renderActiveSessionTrust === "function") {
         client.renderActiveSessionTrust(cardWork, {
           grantId: latest.grantId,
@@ -381,7 +457,12 @@ function createSessionAutomationCoordinator(options = {}) {
       activeGrantId,
     };
     entry.remoteApprovalSkipClientName = remote.clientName || "";
-    resolvePermissionEntry(entry, "allow", "Allowed and trusted for this session");
+    resolvePermissionEntry(
+      entry,
+      "allow",
+      "Allowed and trusted for this session",
+      RESOLVED_PERMISSION_OPTIONS
+    );
     if (result.status === "applied") sweep(identity);
     if (typeof client.renderActiveSessionTrust === "function") {
       client.renderActiveSessionTrust(cardWork, {

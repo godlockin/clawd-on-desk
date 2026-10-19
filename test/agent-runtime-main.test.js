@@ -3,6 +3,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const createAgentRuntimeMain = require("../src/agent-runtime-main");
@@ -11,6 +12,9 @@ const { resolveCodexOfficialHookState } = require("../src/server-codex-official-
 const { makeSessionKey } = require("../src/session-key");
 const { digestCodexTurnId } = require("../src/codex-turn-id");
 const { CODEX_LOCAL_WORKING_STALE_FLOOR_MS } = require("../src/state-stale-cleanup");
+const {
+  CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+} = require("../hooks/codex-internal-worker");
 const themeLoader = require("../src/theme-loader");
 
 const SRC_DIR = path.join(__dirname, "..", "src");
@@ -44,15 +48,18 @@ function makeFakeMonitorClass(instances) {
   };
 }
 
-function makeRealStateHarness() {
+function makeRealStateHarness({ preserveThemeTimings = false, ctxOverrides = {} } = {}) {
   themeLoader.init(SRC_DIR);
   const theme = JSON.parse(JSON.stringify(themeLoader.loadTheme("clawd")));
   // Composition tests assert lifecycle effects synchronously; animation hold
   // timers are state presentation policy and are covered in state.test.js.
-  theme.timings.minDisplay = {};
-  theme.timings.autoReturn = {};
+  if (!preserveThemeTimings) {
+    theme.timings.minDisplay = {};
+    theme.timings.autoReturn = {};
+  }
   const sounds = [];
   const stateChanges = [];
+  const snapshots = [];
   const noop = () => {};
   const state = require("../src/state")({
     lang: "en",
@@ -77,6 +84,7 @@ function makeRealStateHarness() {
     buildContextMenu: noop,
     buildTrayMenu: noop,
     pendingPermissions: [],
+    broadcastSessionSnapshot: (snapshot) => snapshots.push(snapshot),
     resolvePermissionEntry: noop,
     dismissPermissionsForDnd: noop,
     focusTerminalWindow: noop,
@@ -84,11 +92,119 @@ function makeRealStateHarness() {
     processKill: () => true,
     getCursorScreenPoint: () => ({ x: 100, y: 100 }),
     t: (key) => key,
+    ...ctxOverrides,
   });
-  return { state, sounds, stateChanges };
+  return { state, sounds, stateChanges, snapshots, theme };
 }
 
 describe("agent-runtime-main", () => {
+  it("presents manual compaction after Stop while continuing to reject late work", ({ mock }) => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    const harness = makeRealStateHarness();
+    const instances = [];
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => makeFakeMonitorClass(instances),
+      loadCodexAgent: () => ({ id: "codex" }), codexSubagentClassifier: {},
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    const rawSessionId = "codex:manual-after-stop", sessionId = localSessionKey(rawSessionId);
+    const opts = { agentId: "codex", hookSource: "codex-official", turnId: "finished-turn",
+      sourcePid: 42, profileId: "local", rawSessionId };
+    try {
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", opts);
+      runtime.updateSessionFromServer(sessionId, "idle", "Stop", opts);
+      runtime.updateSessionFromServer(sessionId, "sweeping", "PreCompact", opts);
+      assert.equal(harness.state.getCurrentState(), "sweeping");
+      const before = harness.stateChanges.length;
+      runtime.startCodexLogMonitor().emit(rawSessionId, "sweeping", "event_msg:context_compacted", {
+        turnId: opts.turnId, sourcePid: 42,
+      });
+      assert.deepEqual(harness.stateChanges.slice(before), ["sweeping"]);
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      assert.equal(harness.state.getCurrentState(), "idle");
+      runtime.updateSessionFromServer(sessionId, "working", "PostToolUse", opts);
+      assert.equal(harness.state.sessions.get(sessionId).state, "idle");
+    } finally { runtime.cleanup(); harness.state.cleanup(); }
+  });
+  it("replays a long compaction's completion cue before compact SessionStart can return idle", ({ mock }) => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    const harness = makeRealStateHarness({ preserveThemeTimings: true });
+    const instances = [];
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => makeFakeMonitorClass(instances),
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {}, getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    const rawSessionId = "codex:long-compaction";
+    const sessionId = localSessionKey(rawSessionId);
+    const opts = { agentId: "codex", hookSource: "codex-official", turnId: "compact-turn",
+      sourcePid: 42, profileId: "local", rawSessionId };
+    const hold = harness.theme.timings.minDisplay.sweeping;
+    try {
+      runtime.updateSessionFromServer(sessionId, "sweeping", "PreCompact", opts);
+      assert.strictEqual(harness.state.getCurrentState(), "sweeping");
+      mock.timers.tick(hold + 1000);
+      const afterStart = harness.stateChanges.length;
+      runtime.updateSessionFromServer(sessionId, "sweeping", "PreCompact", opts);
+      assert.strictEqual(harness.stateChanges.length, afterStart,
+        "ordinary repeated start hooks must still dedupe");
+      const monitor = runtime.startCodexLogMonitor();
+      const before = harness.stateChanges.length;
+      monitor.emit(rawSessionId, "sweeping", "event_msg:context_compacted", {
+        turnId: opts.turnId, sourcePid: 42,
+      });
+      assert.deepStrictEqual(harness.stateChanges.slice(before), ["sweeping"],
+        "completion must restart the SVG timeline rather than dedupe the start cue");
+      mock.timers.tick(1000);
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", {
+        ...opts, sessionStartSource: "compact",
+      });
+      assert.strictEqual(harness.state.getCurrentState(), "sweeping");
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "idle");
+      mock.timers.tick(hold - 1001);
+      assert.strictEqual(harness.state.getCurrentState(), "sweeping",
+        "the minimum display duration must run from completion, not PreCompact");
+      mock.timers.tick(1);
+      assert.strictEqual(harness.state.getCurrentState(), "idle");
+      runtime.updateSessionFromServer(sessionId, "working", "PreToolUse", opts);
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working",
+        "compaction must leave the turn open for subsequent tool activity");
+      assert.deepStrictEqual(harness.sounds, []);
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("shows sweeping for official PreCompact and keeps the Codex turn open", ({ mock }) => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {}, getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    const sessionId = localSessionKey("codex:compact-start");
+    const opts = { agentId: "codex", hookSource: "codex-official", turnId: "compact-turn",
+      sourcePid: 42, profileId: "local", rawSessionId: "codex:compact-start" };
+    try {
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", opts);
+      runtime.updateSessionFromServer(sessionId, "working", "PreToolUse", opts);
+      const before = harness.sounds.filter(name => name === "complete").length;
+      runtime.updateSessionFromServer(sessionId, "sweeping", "PreCompact", opts);
+      mock.timers.tick(1000);
+      assert.strictEqual(harness.state.getCurrentState(), "sweeping");
+      assert.ok(harness.stateChanges.includes("sweeping"));
+      assert.strictEqual(harness.sounds.filter(name => name === "complete").length, before);
+      runtime.updateSessionFromServer(sessionId, "working", "PostToolUse", opts);
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
   it("keeps Codex monitor ownership and agent deferred wrappers out of main", () => {
     const mainSource = fs.readFileSync(path.join(SRC_DIR, "main.js"), "utf8");
 
@@ -133,6 +249,62 @@ describe("agent-runtime-main", () => {
       runtime.shouldSuppressCodexLogEvent("codex-1", "working", "event_msg:guardian_assessment"),
       false
     );
+  });
+
+  it("lets a live compaction item reach a session with recent official hooks", () => {
+    const CodexLogMonitor = require("../agents/codex-log-monitor");
+    const codexConfig = require("../agents/codex");
+    class ManualCodexLogMonitor extends CodexLogMonitor {
+      start() {} // Exercise the production parser without a background poller.
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-compaction-runtime-"));
+    const fileName = "rollout-2026-03-25T15-10-51-019d23d4-f1a9-7633-b9c7-758327137228.jsonl";
+    const filePath = path.join(dir, fileName);
+    const sessionId = localSessionKey("codex:019d23d4-f1a9-7633-b9c7-758327137228");
+    const turnId = "turn-compaction";
+    const updates = [];
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => ManualCodexLogMonitor,
+      loadCodexAgent: () => ({
+        ...codexConfig,
+        logConfig: { ...codexConfig.logConfig, sessionDir: dir },
+      }),
+      updateSession: (...args) => updates.push(args),
+    });
+    try {
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", {
+        agentId: "codex", hookSource: "codex-official", turnId,
+      });
+      runtime.updateSessionFromServer(sessionId, "working", "PreToolUse", {
+        agentId: "codex", hookSource: "codex-official", turnId,
+      });
+      updates.length = 0;
+      const monitor = runtime.startCodexLogMonitor();
+      monitor._findCodexWriterPid = () => null;
+      fs.writeFileSync(filePath, [
+        { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+        { type: "response_item", payload: { type: "function_call", name: "shell_command" } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+      monitor._pollFile(filePath, fileName);
+      assert.deepStrictEqual(updates, [], "covered hook events must still be suppressed");
+
+      fs.appendFileSync(filePath, JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "item_completed", turn_id: turnId,
+          item: { type: "ContextCompaction", id: "compaction-1" },
+        },
+      }) + "\n");
+      monitor._pollFile(filePath, fileName);
+      assert.strictEqual(updates.length, 1);
+      assert.deepStrictEqual(updates[0].slice(0, 3), [
+        sessionId, "sweeping", "event_msg:context_compacted",
+      ]);
+      assert.strictEqual(updates[0][3].recapDedupeId, turnId);
+    } finally {
+      runtime.cleanup();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("records privacy-safe local cross-channel turn identity diagnostics", () => {
@@ -313,6 +485,87 @@ describe("agent-runtime-main", () => {
       "codex-user-input-resolved",
     ]);
   });
+
+  it("issue #1103: official hooks suppress lifecycle but allow title refresh", () => {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+      clearCodexNotifyBubbles: () => assert.fail("a title cannot clear a bubble"),
+      codexSubagentClassifier: {},
+    });
+    try {
+      const monitor = runtime.startCodexLogMonitor();
+      const sid = localSessionKey("codex:title-refresh");
+      harness.state.updateSession(sid, "working", "UserPromptSubmit", {
+        agentId: "codex", rawSessionId: "codex:title-refresh", profileId: "local", cwd: "/projects/title-fixture",
+      });
+      const session = harness.state.sessions.get(sid);
+      session.updatedAt = 1000; // Detect accidental lifecycle updates.
+      session.metadataUpdatedAt = 777;
+      const inspect = () => {
+        const current = harness.state.sessions.get(sid);
+        return { at: current.updatedAt, state: current.state, metadataAt: current.metadataUpdatedAt,
+          events: JSON.stringify(current.recentEvents), soundCount: harness.sounds.length, stateCount: harness.stateChanges.length };
+      };
+      const before = inspect();
+      const broadcastCount = harness.snapshots.length;
+      runtime.markCodexOfficialHookSession(sid);
+      monitor.emit("codex:title-refresh", "thinking", "event_msg:task_started", {});
+      assert.deepStrictEqual(inspect(), before);
+      assert.strictEqual(harness.snapshots.length, broadcastCount);
+      monitor.emit("codex:title-refresh", null, "session_index:title", { sessionTitle: "Arrived title" });
+      assert.strictEqual(harness.state.sessions.get(sid).sessionTitle, "Arrived title");
+      assert.ok(harness.snapshots.length > broadcastCount);
+      assert.strictEqual(harness.snapshots.at(-1).sessions.find(s => s.id === sid).displayTitle, "Arrived title");
+      assert.deepStrictEqual(inspect(), before);
+      monitor.emit("codex:absent-title", null, "session_index:title", { sessionTitle: "Absent" });
+      assert.strictEqual(harness.state.sessions.size, 1);
+      const foreign = localSessionKey("codex:foreign-agent");
+      harness.state.updateSession(foreign, "working", "Test", { agentId: "claude-code", sessionTitle: "Keep foreign" });
+      monitor.emit("codex:foreign-agent", null, "session_index:title", { sessionTitle: "Wrong owner" });
+      assert.strictEqual(harness.state.sessions.get(foreign).sessionTitle, "Keep foreign");
+    } finally {
+      runtime.cleanup();harness.state.cleanup();
+    }
+  });
+
+  for (const [label, foreignSource] of [
+    ["WSL host", { host: "wsl:Ubuntu", wslDistro: "Ubuntu" }],
+    ["WSL marker only", { wslDistro: "Ubuntu" }],
+    ["local-profile remote host", { host: "manual-remote" }],
+  ]) {
+    it(`issue #1103: ignores local index titles for a ${label} session`, () => {
+      const harness = makeRealStateHarness();
+      const runtime = createAgentRuntimeMain({
+        loadCodexLogMonitor: () => makeFakeMonitorClass([]),
+        loadCodexAgent: () => ({ id: "codex" }),
+        isAgentEnabled: () => true,
+        getStateRuntime: () => harness.state,
+        updateSession: (...args) => harness.state.updateSession(...args),
+        codexSubagentClassifier: {},
+      });
+      try {
+        const rawSessionId = "codex:foreign-title";
+        const sid = localSessionKey(rawSessionId);
+        harness.state.updateSession(sid, "working", "UserPromptSubmit", {
+          agentId: "codex", rawSessionId, profileId: "local", sessionTitle: "Keep foreign", ...foreignSource,
+        });
+        const broadcastCount = harness.snapshots.length;
+        runtime.startCodexLogMonitor().emit(rawSessionId, null, "session_index:title", { sessionTitle: "Local title" });
+        assert.strictEqual(harness.state.sessions.get(sid).sessionTitle, "Keep foreign");
+        assert.strictEqual(harness.snapshots.length, broadcastCount);
+      } finally {
+        runtime.cleanup();
+        harness.state.cleanup();
+      }
+    });
+  }
 
   it("handles JSONL token_count as metadata without clearing bubbles or changing state", () => {
     const instances = [];
@@ -1065,6 +1318,631 @@ describe("agent-runtime-main", () => {
     }
   });
 
+  it("issue #1073 follow-up: does not rebuild a local Codex session from late JSONL after official SessionEnd", () => {
+    let currentTime = 1_000;
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      now: () => currentTime,
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:late-jsonl-after-session-end";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      assert.ok(harness.state.sessions.has(sessionId));
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(!harness.state.sessions.has(sessionId), "official SessionEnd retires the row");
+
+      // Move past the official-hook suppression TTL so only the tombstone can
+      // keep a late rollout tail from rebuilding the row.
+      currentTime += 11 * 60 * 1000;
+      const monitor = runtime.startCodexLogMonitor();
+      monitor.emit(rawSessionId, "attention", "event_msg:task_complete", { turnId: "turn-1", sourcePid: 42 });
+      assert.ok(!harness.state.sessions.has(sessionId), "late task_complete must not rebuild");
+      // A non-start work event (not the metadata-only token_count branch) must
+      // reach and be stopped by the tombstone gate.
+      monitor.emit(rawSessionId, "working", "event_msg:exec_command_end", { turnId: "turn-1", sourcePid: 42 });
+      assert.ok(!harness.state.sessions.has(sessionId), "late non-start work must not rebuild");
+
+      monitor.emit(rawSessionId, "thinking", "event_msg:task_started", { turnId: "turn-2", sourcePid: 42 });
+      assert.ok(harness.state.sessions.has(sessionId), "a new turn rebuilds the row");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: keeps the turn fence after official SessionEnd so closed turns stay closed", () => {
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {},
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:fence-after-session-end";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", opts);
+      runtime.updateSessionFromServer(sessionId, "idle", "Stop", opts);
+      assert.deepStrictEqual(runtime.getCodexTurnFenceSnapshot(sessionId).closedTurnIds, ["turn-1"]);
+
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(!harness.state.sessions.has(sessionId));
+
+      const snapshot = runtime.getCodexTurnFenceSnapshot(sessionId);
+      assert.ok(snapshot, "SessionEnd must not clear the turn fence");
+      assert.deepStrictEqual(snapshot.closedTurnIds, ["turn-1"]);
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: releases the SessionEnd tombstone on a fresh official lifecycle", () => {
+    let currentTime = 1_000;
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      now: () => currentTime,
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:tombstone-release-official";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(!harness.state.sessions.has(sessionId), "official SessionEnd retires the row");
+
+      // A fresh official lifecycle proves the same raw id is live again and
+      // must release the tombstone.
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      assert.ok(harness.state.sessions.has(sessionId));
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "idle");
+
+      // Past the official-activity TTL, so only the tombstone can drop the JSONL
+      // event that follows.
+      currentTime += 11 * 60 * 1000;
+      const monitor = runtime.startCodexLogMonitor();
+      monitor.emit(rawSessionId, "working", "event_msg:exec_command_end", { turnId: "turn-2", sourcePid: 42 });
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: keeps processing the new turn after a tombstoned session restarts from JSONL", () => {
+    let currentTime = 1_000;
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      now: () => currentTime,
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:tombstone-release-jsonl";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(!harness.state.sessions.has(sessionId));
+
+      currentTime += 11 * 60 * 1000;
+      const monitor = runtime.startCodexLogMonitor();
+      monitor.emit(rawSessionId, "thinking", "event_msg:task_started", { turnId: "turn-2", sourcePid: 42 });
+      assert.ok(harness.state.sessions.has(sessionId));
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "thinking");
+
+      // The same new turn's later rollout events must still flow through.
+      monitor.emit(rawSessionId, "working", "event_msg:exec_command_end", { turnId: "turn-2", sourcePid: 42 });
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: does not tombstone a retained session whose replyable completion mapping survived", () => {
+    let currentTime = 1_000;
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness({
+      ctxOverrides: {
+        hasReplyableCompletionMapping: (_sessionId, session) =>
+          !!session && session.agentId === "codex",
+      },
+    });
+    const runtime = createAgentRuntimeMain({
+      now: () => currentTime,
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:retained-replyable";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(harness.state.sessions.has(sessionId), "replyable row survives SessionEnd");
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "idle");
+
+      // The retained row must not be tombstoned: a later rollout event is still
+      // processed normally. Move past the official-activity TTL to isolate it.
+      currentTime += 11 * 60 * 1000;
+      const monitor = runtime.startCodexLogMonitor();
+      monitor.emit(rawSessionId, "working", "event_msg:exec_command_end", { turnId: "turn-2", sourcePid: 42 });
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: releases the SessionEnd tombstone on a fresh official UserPromptSubmit", () => {
+    let currentTime = 1_000;
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      now: () => currentTime,
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:tombstone-release-prompt";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(!harness.state.sessions.has(sessionId));
+
+      currentTime += 11 * 60 * 1000;
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", { ...opts, turnId: "turn-2" });
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "thinking");
+
+      const monitor = runtime.startCodexLogMonitor();
+      // Past the official-activity TTL so the JSONL event is not suppressed as a
+      // duplicate; only the released tombstone governs it.
+      currentTime += 11 * 60 * 1000;
+      monitor.emit(rawSessionId, "working", "event_msg:exec_command_end", { turnId: "turn-2", sourcePid: 42 });
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: releases the SessionEnd tombstone on a synthetic backfill turn start", () => {
+    let currentTime = 1_000;
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      now: () => currentTime,
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:tombstone-release-synthetic";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "idle", "SessionStart", opts);
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(!harness.state.sessions.has(sessionId));
+
+      currentTime += 11 * 60 * 1000;
+      const monitor = runtime.startCodexLogMonitor();
+      monitor.emit(rawSessionId, "thinking", "event_msg:user_message", {
+        syntheticBackfill: true,
+        turnBoundaryOpen: true,
+        turnId: "turn-2",
+        sourcePid: 42,
+      });
+      assert.ok(harness.state.sessions.has(sessionId), "synthetic turn start must rebuild");
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "thinking");
+
+      monitor.emit(rawSessionId, "working", "event_msg:exec_command_end", { turnId: "turn-2", sourcePid: 42 });
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: keeps the tombstone when a late turn start is fence-rejected", () => {
+    let currentTime = 1_000;
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      now: () => currentTime,
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:tombstone-fence-rejected";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", opts);
+      runtime.updateSessionFromServer(sessionId, "idle", "Stop", opts);
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      assert.ok(!harness.state.sessions.has(sessionId));
+
+      currentTime += 11 * 60 * 1000;
+      const monitor = runtime.startCodexLogMonitor();
+      // A start for the already-closed turn is fence-rejected; it must not
+      // release the tombstone, or the following housekeeping event rebuilds.
+      monitor.emit(rawSessionId, "thinking", "event_msg:task_started", { turnId: "turn-1", sourcePid: 42 });
+      assert.ok(!harness.state.sessions.has(sessionId), "late closed-turn start must not rebuild");
+      monitor.emit(rawSessionId, "sweeping", "event_msg:context_compacted", { sourcePid: 42 });
+      assert.ok(!harness.state.sessions.has(sessionId), "housekeeping must not rebuild after a rejected start");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: suppresses a recognized ambient-suggestion thread", () => {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:ambient-suppressed";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", {
+        ...opts,
+        codexInternalThread: CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+      });
+      assert.ok(!harness.state.sessions.has(sessionId), "a marked prompt must not open a row");
+
+      runtime.updateSessionFromServer(sessionId, "working", "PreToolUse", opts);
+      assert.ok(!harness.state.sessions.has(sessionId), "tool events must stay suppressed");
+      runtime.updateSessionFromServer(sessionId, "idle", "Stop", opts);
+      assert.ok(!harness.state.sessions.has(sessionId), "Stop must stay suppressed");
+      assert.deepStrictEqual(harness.sounds.filter((name) => name === "complete"), []);
+
+      // SessionEnd clears the sid, so a later unmarked event builds normally.
+      runtime.updateSessionFromServer(sessionId, "sleeping", "SessionEnd", opts);
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", { ...opts, turnId: "turn-2" });
+      assert.ok(harness.state.sessions.has(sessionId), "SessionEnd must clear the suppression");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: dismisses a row that recognition arrives after", () => {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:ambient-dismisses-row";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", opts);
+      assert.ok(harness.state.sessions.has(sessionId));
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", {
+        ...opts,
+        codexInternalThread: CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+      });
+      assert.ok(!harness.state.sessions.has(sessionId), "the existing row must be dismissed");
+      assert.deepStrictEqual(harness.sounds.filter((name) => name === "complete"), []);
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: retires an ambient-suggestion row without completion, automation end, or recap", () => {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const recapCalls = [];
+    const originalRecordRecap = harness.state.recordRecapEventOnly;
+    harness.state.recordRecapEventOnly = (...args) => {
+      recapCalls.push(args);
+      return originalRecordRecap.apply(harness.state, args);
+    };
+    const archiveLifecycle = [];
+    const notifyClears = [];
+    const userInputClears = [];
+    const permissionClears = [];
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+      clearCodexNotifyBubbles: (...args) => notifyClears.push(args),
+      clearCodexUserInputBubbles: (...args) => userInputClears.push(args),
+      getPermissionRuntime: () => ({
+        dismissPermissionsForSession: (...args) => permissionClears.push(args),
+      }),
+      onCodexArchiveLifecycleEnd: (payload) => archiveLifecycle.push(payload),
+    });
+    try {
+      const rawSessionId = "codex:ambient-spy";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", opts);
+      assert.ok(harness.state.sessions.has(sessionId));
+      const soundsBefore = harness.sounds.filter((name) => name === "complete").length;
+      recapCalls.length = 0;
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", {
+        ...opts,
+        codexInternalThread: CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+      });
+
+      assert.ok(!harness.state.sessions.has(sessionId));
+      assert.deepStrictEqual(archiveLifecycle, [], "recognition must not run the archive automation lifecycle");
+      assert.deepStrictEqual(recapCalls, [], "recognition must not record a recap event");
+      assert.strictEqual(harness.sounds.filter((name) => name === "complete").length, soundsBefore);
+      assert.deepStrictEqual(notifyClears.map(([sid]) => sid), [sessionId]);
+      assert.deepStrictEqual(userInputClears.map(([sid]) => sid), [sessionId]);
+      assert.deepStrictEqual(permissionClears.map(([sid]) => sid), [sessionId]);
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: leaves other local Codex sessions alone", () => {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const ambientRaw = "codex:ambient-other-sid";
+      const otherRaw = "codex:other-sid";
+      const ambientId = localSessionKey(ambientRaw);
+      const otherId = localSessionKey(otherRaw);
+
+      runtime.updateSessionFromServer(ambientId, "thinking", "UserPromptSubmit", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId: ambientRaw,
+        sourcePid: 42,
+        codexInternalThread: CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+      });
+      assert.ok(!harness.state.sessions.has(ambientId));
+
+      runtime.updateSessionFromServer(otherId, "thinking", "UserPromptSubmit", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId: otherRaw,
+        sourcePid: 42,
+        turnId: "turn-1",
+      });
+      assert.strictEqual(harness.state.sessions.get(otherId).state, "thinking");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: ignores the ambient marker on a remote Codex profile", () => {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:remote-ambient";
+      const sessionId = makeSessionKey({ profileId: "remote-1", rawSessionId });
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "remote-1",
+        rawSessionId,
+        host: "remote-host",
+        sourcePid: 42,
+        codexInternalThread: CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+      });
+      assert.ok(harness.state.sessions.has(sessionId), "remote profiles are never suppressed");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
+  it("issue #1073 follow-up: shows a side chat from prompt to completion", () => {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+    });
+    try {
+      const rawSessionId = "codex:user-side-chat";
+      const sessionId = localSessionKey(rawSessionId);
+      const opts = {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId,
+        sourcePid: 42,
+        turnId: "turn-1",
+      };
+
+      runtime.updateSessionFromServer(sessionId, "thinking", "UserPromptSubmit", opts);
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "thinking");
+      runtime.updateSessionFromServer(sessionId, "working", "PreToolUse", opts);
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "working");
+      runtime.updateSessionFromServer(sessionId, "attention", "Stop", opts);
+      assert.strictEqual(harness.state.sessions.get(sessionId).state, "idle");
+      assert.strictEqual(harness.sounds.filter((name) => name === "complete").length, 1);
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+    }
+  });
+
   it("keeps token telemetry outside liveness and restores stale-idled work on the next lifecycle event", () => {
     const instances = [];
     const FakeMonitor = makeFakeMonitorClass(instances);
@@ -1231,5 +2109,402 @@ describe("agent-runtime-main", () => {
     assert.strictEqual(runtime.getCodexTurnFenceSnapshot("local-session"), null);
     assert.strictEqual(runtime.getCodexOfficialActivitySnapshot("local-session"), null);
     assert.deepStrictEqual(clearCalls, [["codex"]]);
+  });
+
+  it("clears the Qoder title tracker on disable and shutdown", () => {
+    let clears = 0;
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {},
+      qoderSessionTitleTracker: { clear: () => { clears++; return 1; } },
+      getStateRuntime: () => ({ clearSessionsByAgent: () => 2 }),
+    });
+    assert.strictEqual(runtime.clearSessionsByAgent("qoder"), 2);
+    assert.strictEqual(clears, 1);
+    runtime.cleanup();
+    assert.strictEqual(clears, 2);
+  });
+
+  // ── Local Codex archive lifecycle (#655) ────────────────────────────────
+  const ARCHIVE_UUID = {
+    a: "019d23d4-f1a9-7633-b9c7-758327137228",
+    b: "019d23d4-f1a9-7633-b9c7-758327137229",
+    c: "019d23d4-f1a9-7633-b9c7-75832713722a",
+    d: "019d23d4-f1a9-7633-b9c7-75832713722b",
+    e: "019d23d4-f1a9-7633-b9c7-75832713722c",
+    f: "019d23d4-f1a9-7633-b9c7-75832713722d",
+  };
+
+  function makeTempArchiveHome() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-archive-runtime-"));
+    const archiveDir = path.join(root, "archived_sessions");
+    fs.mkdirSync(archiveDir);
+    return { root, archiveDir };
+  }
+
+  function archiveSessionMetaLine(id) {
+    return JSON.stringify({
+      timestamp: "2026-03-25T15:10:51.000Z",
+      type: "session_meta",
+      payload: { id, session_id: id, cwd: "/repo" },
+    });
+  }
+
+  function writeArchivedRollout(archiveDir, bare) {
+    const filePath = path.join(archiveDir, `rollout-2026-03-25T15-10-51-${bare}.jsonl`);
+    fs.writeFileSync(filePath, `${archiveSessionMetaLine(bare)}\n`);
+    return filePath;
+  }
+
+  function makeArchiveRuntimeHarness({ root, extraOptions = {} } = {}) {
+    const instances = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const harness = makeRealStateHarness();
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+      loadCodexArchiveTracker: () => require("../src/codex-archive-tracker"),
+      codexArchiveOptions: {
+        codexHome: root,
+        setInterval: () => 0,
+        clearInterval: () => {},
+      },
+      ...extraOptions,
+    });
+    const monitor = runtime.startCodexLogMonitor();
+    return { runtime, monitor, harness, instances };
+  }
+
+  it("does not build an archive tracker unless a loader is composed", () => {
+    const instances = [];
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => makeFakeMonitorClass(instances),
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+    });
+    runtime.startCodexLogMonitor();
+    assert.strictEqual(runtime.getCodexArchiveTracker(), null);
+    assert.strictEqual(
+      runtime.shouldSuppressCodexArchive(`codex:${ARCHIVE_UUID.a}`, { agentId: "codex", profileId: "local" }),
+      false
+    );
+    runtime.cleanup();
+  });
+
+  it("retires a local Codex task on archive evidence, suppresses late callbacks, and resumes after unarchive", async () => {
+    const { root, archiveDir } = makeTempArchiveHome();
+    const { runtime, monitor, harness } = makeArchiveRuntimeHarness({ root });
+    const bare = ARCHIVE_UUID.a;
+    const raw = `codex:${bare}`;
+    const id = localSessionKey(raw);
+    const official = (state, event) => runtime.updateSessionFromServer(id, state, event, {
+      agentId: "codex",
+      hookSource: "codex-official",
+      profileId: "local",
+      rawSessionId: raw,
+      sourcePid: 42,
+      turnId: "A",
+    });
+    try {
+      assert.notStrictEqual(official("working", "UserPromptSubmit"), false);
+      assert.notStrictEqual(official("attention", "Stop"), false);
+      assert.ok(harness.state.sessions.get(id));
+      const completionSoundsBefore = harness.sounds.filter((name) => name === "complete").length;
+
+      const archivedPath = writeArchivedRollout(archiveDir, bare);
+      await runtime.getCodexArchiveTracker().scanNow();
+
+      assert.strictEqual(harness.state.sessions.get(id), undefined);
+      assert.strictEqual(
+        harness.sounds.filter((name) => name === "complete").length,
+        completionSoundsBefore,
+        "archive retirement is not a completion"
+      );
+
+      assert.strictEqual(official("working", "PostToolUse"), false);
+      assert.strictEqual(harness.state.sessions.get(id), undefined);
+      monitor.emit(raw, "working", "response_item:function_call", { turnId: "A" });
+      assert.strictEqual(harness.state.sessions.get(id), undefined);
+
+      fs.unlinkSync(archivedPath);
+      await runtime.getCodexArchiveTracker().scanNow();
+      assert.notStrictEqual(official("thinking", "UserPromptSubmit"), false);
+      assert.ok(harness.state.sessions.get(id), "fresh activity after unarchive recreates the task");
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("archives one local Codex task without touching a sibling sharing the same PID", async () => {
+    const { root, archiveDir } = makeTempArchiveHome();
+    const { runtime, harness } = makeArchiveRuntimeHarness({ root });
+    const rawA = `codex:${ARCHIVE_UUID.b}`;
+    const rawB = `codex:${ARCHIVE_UUID.c}`;
+    const idA = localSessionKey(rawA);
+    const idB = localSessionKey(rawB);
+    const opts = (raw) => ({
+      agentId: "codex",
+      hookSource: "codex-official",
+      profileId: "local",
+      rawSessionId: raw,
+      sourcePid: 42,
+    });
+    try {
+      runtime.updateSessionFromServer(idA, "attention", "Stop", opts(rawA));
+      runtime.updateSessionFromServer(idB, "attention", "Stop", opts(rawB));
+      writeArchivedRollout(archiveDir, ARCHIVE_UUID.b);
+      await runtime.getCodexArchiveTracker().scanNow();
+
+      assert.strictEqual(harness.state.sessions.get(idA), undefined);
+      assert.ok(harness.state.sessions.get(idB));
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retire a remote Codex session that collides on the raw id", async () => {
+    const { root, archiveDir } = makeTempArchiveHome();
+    const { runtime, harness } = makeArchiveRuntimeHarness({ root });
+    const bare = ARCHIVE_UUID.d;
+    const raw = `codex:${bare}`;
+    const localId = localSessionKey(raw);
+    const remoteId = makeSessionKey({ profileId: "profile-a", rawSessionId: raw });
+    try {
+      runtime.updateSessionFromServer(localId, "attention", "Stop", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId: raw,
+        sourcePid: 42,
+      });
+      runtime.updateSessionFromServer(remoteId, "attention", "Stop", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "profile-a",
+        rawSessionId: raw,
+        host: "box",
+        turnId: "R",
+      });
+      writeArchivedRollout(archiveDir, bare);
+      await runtime.getCodexArchiveTracker().scanNow();
+
+      assert.strictEqual(harness.state.sessions.get(localId), undefined);
+      assert.ok(harness.state.sessions.get(remoteId));
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("scopes archive suppression to local Codex and rejects non-canonical ids", () => {
+    const bare = ARCHIVE_UUID.e;
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {},
+      codexArchiveTracker: { isArchived: (raw) => raw === bare, start() {}, stop() {} },
+    });
+    const raw = `codex:${bare}`;
+    assert.strictEqual(runtime.shouldSuppressCodexArchive(raw, { agentId: "codex", profileId: "local" }), true);
+    assert.strictEqual(runtime.shouldSuppressCodexArchive(bare, { agentId: "codex" }), true);
+    assert.strictEqual(runtime.shouldSuppressCodexArchive(raw, { agentId: "codex", profileId: "profile-a" }), false);
+    assert.strictEqual(
+      runtime.shouldSuppressCodexArchive(raw, { agentId: "codex", profileId: "local", wslDistro: "Ubuntu" }),
+      false
+    );
+    assert.strictEqual(
+      runtime.shouldSuppressCodexArchive(raw, { agentId: "codex", profileId: "local", host: "box" }),
+      false
+    );
+    assert.strictEqual(runtime.shouldSuppressCodexArchive(raw, { agentId: "claude-code", profileId: "local" }), false);
+    assert.strictEqual(runtime.shouldSuppressCodexArchive("not-a-uuid", { agentId: "codex", profileId: "local" }), false);
+  });
+
+  it("gates archived local Codex lifecycle including a late PermissionRequest card", () => {
+    const bare = ARCHIVE_UUID.e;
+    const raw = `codex:${bare}`;
+    const updates = [];
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {},
+      codexArchiveTracker: { isArchived: () => true, start() {}, stop() {} },
+      updateSession: (...args) => updates.push(args),
+    });
+    const opts = {
+      agentId: "codex",
+      profileId: "local",
+      rawSessionId: raw,
+      hookSource: "codex-official",
+    };
+    runtime.updateSessionFromServer(localSessionKey(raw), "working", "PreToolUse", opts);
+    runtime.updateSessionFromServer(localSessionKey(raw), "notification", "PermissionRequest", opts);
+    assert.strictEqual(updates.length, 0);
+  });
+
+  it("revokes the archived session's automation grant before dismissal and leaves siblings untouched", async () => {
+    const { root, archiveDir } = makeTempArchiveHome();
+    const raw = `codex:${ARCHIVE_UUID.a}`;
+    const id = localSessionKey(raw);
+    const otherRaw = `codex:${ARCHIVE_UUID.b}`;
+    const otherId = localSessionKey(otherRaw);
+    const harness = makeRealStateHarness();
+    const lifecycleEnds = [];
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => makeFakeMonitorClass([]),
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      getStateRuntime: () => harness.state,
+      updateSession: (...args) => harness.state.updateSession(...args),
+      loadCodexArchiveTracker: () => require("../src/codex-archive-tracker"),
+      codexArchiveOptions: {
+        codexHome: root,
+        setInterval: () => 0,
+        clearInterval: () => {},
+      },
+      onCodexArchiveLifecycleEnd: (payload) => {
+        // The grant/candidate must be revoked while the session still exists,
+        // i.e. before dismissal and before any async authorization could land.
+        lifecycleEnds.push({
+          ...payload,
+          sessionPresent: harness.state.sessions.has(payload.sessionId),
+        });
+      },
+    });
+    try {
+      runtime.startCodexLogMonitor();
+      runtime.updateSessionFromServer(id, "attention", "Stop", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId: raw,
+        sourcePid: 42,
+      });
+      runtime.updateSessionFromServer(otherId, "attention", "Stop", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        profileId: "local",
+        rawSessionId: otherRaw,
+        sourcePid: 42,
+      });
+      const completionSoundsBefore = harness.sounds.filter((name) => name === "complete").length;
+
+      writeArchivedRollout(archiveDir, ARCHIVE_UUID.a);
+      await runtime.getCodexArchiveTracker().scanNow();
+
+      assert.deepStrictEqual(lifecycleEnds, [{
+        agentId: "codex",
+        sessionId: id,
+        reason: "codex-session-archived",
+        sessionPresent: true,
+      }]);
+      assert.strictEqual(harness.state.sessions.get(id), undefined);
+      assert.ok(harness.state.sessions.get(otherId), "a sibling task keeps its card");
+      assert.strictEqual(
+        harness.sounds.filter((name) => name === "complete").length,
+        completionSoundsBefore,
+        "archive retirement is not a completion"
+      );
+
+      // Unarchive must not resurrect a stale grant: a fresh archive cycle has
+      // no lifecycle-end to replay.
+      fs.unlinkSync(path.join(archiveDir, `rollout-2026-03-25T15-10-51-${ARCHIVE_UUID.a}.jsonl`));
+      await runtime.getCodexArchiveTracker().scanNow();
+      assert.strictEqual(lifecycleEnds.length, 1);
+    } finally {
+      runtime.cleanup();
+      harness.state.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("suppresses archived JSONL lifecycle and passive user-input cards but keeps quota/context", () => {
+    const instances = [];
+    const calls = [];
+    const quotaCalls = [];
+    const metadataCalls = [];
+    const shown = [];
+    const bare = ARCHIVE_UUID.f;
+    const raw = `codex:${bare}`;
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      codexSubagentClassifier: {},
+      isAgentEnabled: () => true,
+      codexArchiveTracker: { isArchived: (value) => value === bare, start() {}, stop() {} },
+      updateSession: (...args) => calls.push(["update", ...args]),
+      getStateRuntime: () => ({
+        updateAccountQuota: (...args) => quotaCalls.push(args),
+        updateSessionMetadata: (...args) => metadataCalls.push(args),
+      }),
+      showCodexUserInputBubble: (input) => { shown.push(input); return true; },
+      clearCodexUserInputBubbles: (...args) => calls.push(["clear", ...args]),
+    });
+    const monitor = runtime.startCodexLogMonitor();
+
+    monitor.emit(raw, "working", "response_item:function_call", {
+      turnId: "A",
+      contextUsage: { used: 10, limit: 100, percent: 10, source: "codex" },
+      codexQuota: { codexFiveHour: { usedPercent: 1, resetAt: 1 } },
+    });
+    assert.strictEqual(calls.filter((call) => call[0] === "update").length, 0);
+    assert.strictEqual(metadataCalls.length, 1);
+    assert.strictEqual(quotaCalls.length, 1);
+
+    monitor.options.onUserInputRequest(raw, {
+      callId: "call-1",
+      questions: [],
+      autoResolutionMs: null,
+    }, { recapOccurredAt: Date.now(), turnId: "A" });
+    assert.strictEqual(shown.length, 0);
+  });
+
+  it("starts the archive tracker on an enable/install command even when the pre-commit gate is still false", () => {
+    let starts = 0;
+    let stops = 0;
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {},
+      // Settings calls startMonitorForAgent inside the pre-commit window, where
+      // the persisted gate it just wrote is not observable yet.
+      isAgentEnabled: () => false,
+      codexArchiveTracker: {
+        isArchived: () => false,
+        start: () => { starts += 1; },
+        stop: () => { stops += 1; },
+      },
+    });
+    runtime.startMonitorForAgent("codex");
+    assert.strictEqual(starts, 1);
+    runtime.startMonitorForAgent("claude-code");
+    assert.strictEqual(starts, 1);
+    runtime.stopMonitorForAgent("codex");
+    assert.strictEqual(stops, 1);
+    runtime.clearSessionsByAgent("codex");
+    assert.strictEqual(stops, 2);
+    runtime.cleanup();
+    assert.strictEqual(stops, 3);
+    runtime.startMonitorForAgent("codex");
+    assert.strictEqual(starts, 1, "a disposed runtime must not revive the tracker");
+  });
+
+  it("still respects the persisted gate when constructing the monitor at startup", () => {
+    let starts = 0;
+    const runtime = createAgentRuntimeMain({
+      codexSubagentClassifier: {},
+      loadCodexLogMonitor: () => makeFakeMonitorClass([]),
+      loadCodexAgent: () => ({ id: "codex" }),
+      isAgentEnabled: () => false,
+      codexArchiveTracker: { isArchived: () => false, start: () => { starts += 1; }, stop() {} },
+    });
+    runtime.startCodexLogMonitor();
+    assert.strictEqual(starts, 0);
+    runtime.cleanup();
   });
 });

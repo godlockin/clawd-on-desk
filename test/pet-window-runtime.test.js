@@ -33,6 +33,7 @@ function makeWindow(bounds = { x: 10, y: 20, width: 100, height: 100 }) {
     setShape: (shape) => calls.push(["setShape", shape]),
     setIgnoreMouseEvents: (value) => calls.push(["setIgnoreMouseEvents", value]),
     setAlwaysOnTop: (...args) => calls.push(["setAlwaysOnTop", ...args]),
+    setVisibleOnAllWorkspaces: (...args) => calls.push(["setVisibleOnAllWorkspaces", ...args]),
     setFocusable: (value) => calls.push(["setFocusable", value]),
     showInactive: () => calls.push(["showInactive"]),
     hide: () => calls.push(["hide"]),
@@ -194,6 +195,9 @@ function createRuntime(overrides = {}) {
       : {}),
     ...(overrides.now ? { now: overrides.now } : {}),
     ...(overrides.edgeLog ? { edgeLog: overrides.edgeLog } : {}),
+    ...(overrides.onStrandedDragLockReleased
+      ? { onStrandedDragLockReleased: overrides.onStrandedDragLockReleased }
+      : {}),
     isNearWorkAreaEdge: () => overrides.nearEdge || false,
     flushRuntimeStateToPrefs: () => calls.push(["flushRuntimeStateToPrefs"]),
     handleMiniDisplayChange: () => calls.push(["handleMiniDisplayChange"]),
@@ -2786,6 +2790,41 @@ describe("PR #751 second-review batch C: event-evidence bit, per-side clamp elig
   });
 });
 
+// Fake BrowserWindow constructor for the pet-window creation contracts;
+// `patchWindow` can replace a method before the runtime first touches it.
+function makePatchedBrowserWindow(patchWindow = () => {}) {
+  const createWindow = makeBrowserWindow([]);
+  return function PatchedBrowserWindow(options) {
+    const win = createWindow(options);
+    patchWindow(win);
+    return win;
+  };
+}
+
+function createPetRenderWindowForTest(harness, BrowserWindow, extraOptions = {}) {
+  return harness.runtime.createRenderWindow({
+    BrowserWindow,
+    size: { width: 120, height: 120 },
+    initialWindowBounds: { x: 40, y: 0, width: 120, height: 120 },
+    initialVirtualBounds: { x: 40, y: 0, width: 120, height: 120 },
+    preloadPath: "preload.js",
+    loadFilePath: "index.html",
+    themeConfig: { ok: true },
+    setRenderWindow: harness.setRenderWin,
+    isQuitting: () => false,
+    ...extraOptions,
+  });
+}
+
+function createPetHitWindowForTest(harness, BrowserWindow) {
+  return harness.runtime.createHitWindow({
+    BrowserWindow,
+    preloadPath: "preload-hit.js",
+    loadFilePath: "hit.html",
+    hitThemeConfig: { ok: true },
+  });
+}
+
 describe("pet-window-runtime", () => {
   it("keeps context menu owner creation outside the pet runtime and preserves parent ownership", () => {
     const runtimeSource = fs.readFileSync(path.join(SRC_DIR, "pet-window-runtime.js"), "utf8");
@@ -2806,18 +2845,29 @@ describe("pet-window-runtime", () => {
     assert.doesNotMatch(petRuntimeOptions, /[,{]\s*isNearWorkAreaEdge\s*,/);
   });
 
-  it("creates the Windows hit window with Electron activation disabled", () => {
+  it("prepares the Windows non-focusable hit window before its first show", () => {
     const instances = [];
     const harness = createRuntime();
+    let preparedWindow = null;
     harness.runtime.createHitWindow({
       BrowserWindow: makeBrowserWindow(instances),
       preloadPath: "preload-hit.js",
       loadFilePath: "hit.html",
       hitThemeConfig: { ok: true },
       guardAlwaysOnTop: (win) => harness.calls.push(["guard", win]),
+      prepareActivation: (win) => {
+        preparedWindow = win;
+        win.calls.push(["prepareActivation"]);
+      },
     });
 
+    assert.equal(instances[0].options.show, false);
     assert.equal(instances[0].options.focusable, false);
+    assert.strictEqual(preparedWindow, instances[0]);
+    assert.ok(
+      instances[0].calls.findIndex((call) => call[0] === "prepareActivation")
+        < instances[0].calls.findIndex((call) => call[0] === "showInactive"),
+    );
     assert.deepStrictEqual(instances[0].calls.filter((call) => call[0] === "setIgnoreMouseEvents"), [
       ["setIgnoreMouseEvents", false],
     ]);
@@ -2839,6 +2889,168 @@ describe("pet-window-runtime", () => {
     });
 
     assert.equal(instances[0].options.focusable, true);
+  });
+
+  it("falls back before show when per-window activation preparation fails", () => {
+    const instances = [];
+    const harness = createRuntime();
+    harness.runtime.createHitWindow({
+      BrowserWindow: makeBrowserWindow(instances),
+      preloadPath: "preload-hit.js",
+      loadFilePath: "hit.html",
+      hitThemeConfig: { ok: true },
+      prepareActivation: () => false,
+    });
+
+    const focusableIndex = instances[0].calls.findIndex(
+      (call) => call[0] === "setFocusable" && call[1] === true,
+    );
+    const showIndex = instances[0].calls.findIndex((call) => call[0] === "showInactive");
+    assert.ok(focusableIndex >= 0 && focusableIndex < showIndex);
+  });
+
+  describe("cross-workspace visibility (#979)", () => {
+    const LINUX = { isLinux: true, isWin: false, isMac: false };
+    const WINDOWS = { isWin: true, isMac: false, isLinux: false };
+    const MAC = { isMac: true, isWin: false, isLinux: false };
+
+    const callNames = (win) => win.calls.map((call) => call[0]);
+    const allWorkspacesCalls = (win) => (
+      win.calls.filter((call) => call[0] === "setVisibleOnAllWorkspaces")
+    );
+
+    it("pins both Linux pet windows to all workspaces before showInactive()", () => {
+      const harness = createRuntime(LINUX);
+      const BrowserWindow = makePatchedBrowserWindow();
+      const renderWin = createPetRenderWindowForTest(harness, BrowserWindow);
+      const hitWin = createPetHitWindowForTest(harness, BrowserWindow);
+
+      for (const win of [renderWin, hitWin]) {
+        assert.deepStrictEqual(allWorkspacesCalls(win), [["setVisibleOnAllWorkspaces", true]]);
+        const names = callNames(win);
+        assert.ok(names.indexOf("setVisibleOnAllWorkspaces") < names.indexOf("showInactive"));
+      }
+    });
+
+    it("leaves both pet windows' workspace visibility alone on Windows", () => {
+      const harness = createRuntime(WINDOWS);
+      const BrowserWindow = makePatchedBrowserWindow();
+      const renderWin = createPetRenderWindowForTest(harness, BrowserWindow);
+      const hitWin = createPetHitWindowForTest(harness, BrowserWindow);
+
+      assert.deepStrictEqual(allWorkspacesCalls(renderWin), []);
+      assert.deepStrictEqual(allWorkspacesCalls(hitWin), []);
+    });
+
+    it("keeps delegating macOS cross-Space visibility to reapplyMacVisibility()", () => {
+      const harness = createRuntime(MAC);
+      const BrowserWindow = makePatchedBrowserWindow();
+      const delegations = () => harness.calls.filter((call) => call[0] === "reapplyMacVisibility").length;
+
+      const beforeRender = delegations();
+      const renderWin = createPetRenderWindowForTest(harness, BrowserWindow);
+      const afterRender = delegations();
+      const hitWin = createPetHitWindowForTest(harness, BrowserWindow);
+
+      assert.ok(afterRender > beforeRender, "render window creation must delegate to reapplyMacVisibility()");
+      assert.ok(delegations() > afterRender, "hit window creation must delegate to reapplyMacVisibility()");
+      assert.deepStrictEqual(allWorkspacesCalls(renderWin), []);
+      assert.deepStrictEqual(allWorkspacesCalls(hitWin), []);
+    });
+
+    it("still shows both Linux pet windows when setVisibleOnAllWorkspaces is missing", () => {
+      const harness = createRuntime(LINUX);
+      const BrowserWindow = makePatchedBrowserWindow((win) => {
+        delete win.setVisibleOnAllWorkspaces;
+      });
+
+      let renderWin;
+      let hitWin;
+      assert.doesNotThrow(() => {
+        renderWin = createPetRenderWindowForTest(harness, BrowserWindow);
+        hitWin = createPetHitWindowForTest(harness, BrowserWindow);
+      });
+      for (const win of [renderWin, hitWin]) {
+        assert.equal(typeof win.setVisibleOnAllWorkspaces, "undefined");
+        assert.ok(callNames(win).includes("showInactive"));
+        assert.ok(callNames(win).includes("loadFile"));
+      }
+    });
+
+    it("still shows both Linux pet windows when setVisibleOnAllWorkspaces throws", () => {
+      const harness = createRuntime(LINUX);
+      let throws = 0;
+      const BrowserWindow = makePatchedBrowserWindow((win) => {
+        win.setVisibleOnAllWorkspaces = (...args) => {
+          win.calls.push(["setVisibleOnAllWorkspaces", ...args]);
+          throws += 1;
+          throw new Error("window manager rejected the hint");
+        };
+      });
+
+      let renderWin;
+      let hitWin;
+      assert.doesNotThrow(() => {
+        renderWin = createPetRenderWindowForTest(harness, BrowserWindow);
+        hitWin = createPetHitWindowForTest(harness, BrowserWindow);
+      });
+      assert.equal(throws, 2);
+      for (const win of [renderWin, hitWin]) {
+        const names = callNames(win);
+        assert.ok(names.includes("setVisibleOnAllWorkspaces"));
+        assert.ok(names.indexOf("setVisibleOnAllWorkspaces") < names.indexOf("showInactive"));
+        assert.ok(names.includes("loadFile"));
+      }
+    });
+
+    // The sticky render window must never take WM keyboard focus, or mutter's
+    // MRU focus hands it the keyboard on every workspace switch. Today the
+    // constructor has already mapped the window (show defaults to true) and
+    // mutter re-reads the hint; keeping the hint ahead of showInactive() also
+    // puts it before the first map if the window is ever created hidden.
+    it("marks the Linux render window no-input during creation, ahead of showInactive()", () => {
+      const harness = createRuntime(LINUX);
+      const BrowserWindow = makePatchedBrowserWindow();
+      const hinted = [];
+      const renderWin = createPetRenderWindowForTest(harness, BrowserWindow, {
+        applyNoInputHint: (win) => {
+          hinted.push(win);
+          win.calls.push(["applyNoInputHint"]);
+        },
+      });
+
+      assert.deepStrictEqual(hinted, [renderWin]);
+      const names = callNames(renderWin);
+      assert.ok(names.indexOf("applyNoInputHint") < names.indexOf("showInactive"));
+    });
+
+    it("leaves the no-input hint alone on Windows and macOS", () => {
+      for (const platform of [WINDOWS, MAC]) {
+        const harness = createRuntime(platform);
+        let hinted = 0;
+        createPetRenderWindowForTest(harness, makePatchedBrowserWindow(), {
+          applyNoInputHint: () => { hinted += 1; },
+        });
+        assert.equal(hinted, 0);
+      }
+    });
+
+    it("still shows the Linux render window when the no-input hint throws", () => {
+      const harness = createRuntime(LINUX);
+      let throws = 0;
+      let renderWin;
+      assert.doesNotThrow(() => {
+        renderWin = createPetRenderWindowForTest(harness, makePatchedBrowserWindow(), {
+          applyNoInputHint: () => {
+            throws += 1;
+            throw new Error("X server refused the hint");
+          },
+        });
+      });
+      assert.equal(throws, 1);
+      assert.ok(callNames(renderWin).includes("showInactive"));
+      assert.ok(callNames(renderWin).includes("loadFile"));
+    });
   });
 
   it("reloadWindowWebContents ignores destroyed windows and webContents", () => {
@@ -3683,6 +3895,21 @@ describe("pet-window-runtime cloak self-heal (#525)", () => {
     assert.equal(preview.inspector.calls.length, 0);
   });
 
+  for (const platform of ["win32", "darwin"]) {
+    it(`reports the settings size preview protection period on ${platform}`, () => {
+      const h = createRuntime({
+        isWin: platform === "win32",
+        isMac: platform === "darwin",
+        isLinux: false,
+      });
+      assert.equal(h.runtime.isSettingsSizePreviewActive(), false);
+      h.runtime.beginSettingsSizePreviewProtection();
+      assert.equal(h.runtime.isSettingsSizePreviewActive(), true);
+      h.runtime.endSettingsSizePreviewProtection();
+      assert.equal(h.runtime.isSettingsSizePreviewActive(), false);
+    });
+  }
+
   it("recoverIfCloaked backs off exponentially after a failed recovery and resets on success", () => {
     let clock = 1_000_000;
     const inspector = makeCloakInspector({ flag: 1, uncloakClears: false });
@@ -4000,5 +4227,127 @@ describe("manual show intent hook (#935 override latch)", () => {
     h.runtime.setFullscreenAutoHidden(true);
     h.runtime.setFullscreenAutoHidden(false);
     assert.deepStrictEqual(notes, [], "only a manual SHOW is user intent");
+  });
+});
+
+describe("stranded drag-lock release (#997 / #998)", () => {
+  it("fires the onStrandedDragLockReleased hook on every real release", () => {
+    const released = [];
+    const harness = createRuntime({
+      onStrandedDragLockReleased: () => released.push("hook"),
+    });
+
+    // Every recovery entry funnels through releaseStrandedDragLock, so the
+    // cross-process cleanup hook must fire for each of them.
+    harness.runtime.setDragLocked(true);
+    harness.runtime.bringPetToPrimaryDisplay();
+    assert.deepStrictEqual(released, ["hook"], "bring-to-primary must fire the hook");
+
+    harness.runtime.setDragLocked(true);
+    harness.runtime.setPetHidden(true);
+    assert.deepStrictEqual(released, ["hook", "hook"], "manual hide must fire the hook");
+
+    // A release with no lock, and a normal drag end, must both stay quiet.
+    harness.runtime.releaseStrandedDragLock();
+    assert.deepStrictEqual(released, ["hook", "hook"], "no-lock release stays quiet");
+
+    harness.runtime.setDragLocked(true);
+    harness.runtime.setDragLocked(false);
+    assert.deepStrictEqual(released, ["hook", "hook"], "normal drag end must not fire it");
+  });
+
+  it("bringPetToPrimaryDisplay releases a stranded lock so the input window follows", () => {
+    const harness = createRuntime({
+      effectivePixelSize: { width: 200, height: 160 },
+    });
+    harness.runtime.setDragLocked(true);
+    harness.hitWin.calls.length = 0;
+
+    harness.runtime.bringPetToPrimaryDisplay();
+
+    assert.equal(harness.runtime.isDragLocked(), false);
+    // syncHitWin() defers while the lock is held, so the release must land
+    // BEFORE the move for the input window to follow.
+    assert.ok(
+      harness.hitWin.calls.some((call) => call[0] === "setBounds"),
+      "hitWin bounds must be re-synced after the release",
+    );
+  });
+
+  it("manual hide releases a stranded lock; manual show does not", () => {
+    const harness = createRuntime();
+
+    harness.runtime.setDragLocked(true);
+    harness.runtime.setPetHidden(true);
+    assert.equal(harness.runtime.isDragLocked(), false);
+
+    harness.runtime.setDragLocked(true);
+    harness.runtime.setPetHidden(false);
+    assert.equal(
+      harness.runtime.isDragLocked(),
+      true,
+      "showing the pet must not release a lock a live drag may legitimately hold",
+    );
+  });
+
+  it("releaseStrandedDragLock is a no-op without a lock", () => {
+    const harness = createRuntime();
+    assert.equal(harness.runtime.releaseStrandedDragLock(), false);
+    assert.equal(harness.runtime.isDragLocked(), false);
+  });
+});
+
+describe("pet-window theme config transport", () => {
+  function makeConfigChannel() {
+    return {
+      pet: undefined,
+      hit: undefined,
+      setPetConfig(config) { this.pet = config; },
+      setHitConfig(config) { this.hit = config; },
+    };
+  }
+
+  it("hands the pet config to the channel and keeps it out of additionalArguments", () => {
+    const instances = [];
+    const harness = createRuntime();
+    const channel = makeConfigChannel();
+
+    createPetRenderWindowForTest(harness, makeBrowserWindow(instances), {
+      rendererConfigChannel: channel,
+    });
+
+    assert.deepStrictEqual(channel.pet, { ok: true });
+    assert.strictEqual(
+      instances[0].options.webPreferences.additionalArguments,
+      undefined,
+      "Windows caps the launch command line at 32,767 characters",
+    );
+  });
+
+  it("hands the hit config to the channel and only leaves the platform argument", () => {
+    const instances = [];
+    const harness = createRuntime();
+    const channel = makeConfigChannel();
+
+    harness.runtime.createHitWindow({
+      BrowserWindow: makeBrowserWindow(instances),
+      preloadPath: "preload-hit.js",
+      loadFilePath: "hit.html",
+      hitThemeConfig: { ok: true },
+      rendererConfigChannel: channel,
+    });
+
+    assert.deepStrictEqual(channel.hit, { ok: true });
+    assert.deepStrictEqual(instances[0].options.webPreferences.additionalArguments, [
+      `--hit-platform=${process.platform}`,
+    ]);
+  });
+
+  it("never puts theme JSON back on the command line", () => {
+    const source = fs.readFileSync(path.join(SRC_DIR, "pet-window-runtime.js"), "utf8");
+
+    assert.ok(!source.includes('"--theme-config=" +'));
+    assert.ok(!source.includes('"--hit-theme-config=" +'));
+    assert.ok(source.includes("32,767"));
   });
 });

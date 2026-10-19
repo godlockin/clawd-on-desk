@@ -6,8 +6,13 @@
 // from an indefinite stall into "✖ deliberately hangs" with exit code 1.
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const path = require("node:path");
 
-const { DEFAULT_TEST_TIMEOUT_MS, resolveTimeoutArgs } = require("./run-tests");
+const {
+  DEFAULT_TEST_TIMEOUT_MS,
+  resolveTimeoutArgs,
+  resolveTestRunnerInvocation,
+} = require("./run-tests");
 
 test("the runner always passes a per-test timeout by default", () => {
   assert.deepStrictEqual(resolveTimeoutArgs({}), [`--test-timeout=${DEFAULT_TEST_TIMEOUT_MS}`]);
@@ -27,4 +32,15 @@ test("a malformed override falls back to the default rather than disabling the t
       `CLAWD_TEST_TIMEOUT_MS=${JSON.stringify(value)} must not silently remove the timeout`,
     );
   }
+});
+
+test("full-suite runner uses one top-level glob instead of a Windows-long filename argv", () => {
+  const invocation = resolveTestRunnerInvocation({ CLAWD_TEST_TIMEOUT_MS: "5000" });
+  assert.deepStrictEqual(invocation.args, [
+    "--test",
+    "--test-timeout=5000",
+    "test/*.test.js",
+  ]);
+  assert.strictEqual(invocation.cwd, path.join(__dirname, ".."));
+  assert.ok(invocation.args.join(" ").length < 1024);
 });

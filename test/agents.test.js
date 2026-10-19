@@ -28,7 +28,13 @@ const VALID_STATES = new Set(Object.keys(state.STATE_PRIORITY));
 // Special internal values that agent maps are allowed to use
 const SPECIAL_VALUES = new Set(["codex-turn-end"]);
 
-const REQUIRED_CAPABILITIES = ["httpHook", "permissionApproval", "sessionEnd", "subagent"];
+const REQUIRED_CAPABILITIES = [
+  "httpHook",
+  "permissionApproval",
+  "mobilePermissionObservation",
+  "sessionEnd",
+  "subagent",
+];
 
 const agents = registry.getAllAgents();
 
@@ -125,6 +131,20 @@ describe("Agent config modules — data integrity", () => {
     assert.strictEqual(ids.length, unique.size, `Duplicate IDs: ${ids.filter((id, i) => ids.indexOf(id) !== i)}`);
   });
 
+  it("mobile permission observation is explicit and limited to audited adapters", () => {
+    const enabled = agents
+      .filter((agent) => agent.capabilities.mobilePermissionObservation === true)
+      .map((agent) => agent.id)
+      .sort();
+    assert.deepStrictEqual(enabled, [
+      "claude-code",
+      "codebuddy",
+      "codex",
+      "hermes",
+      "qwen-code",
+    ]);
+  });
+
   it("codex has interactiveBubble=true so settings UI renders its bubble sub-toggle", () => {
     const codex = agents.find((a) => a.id === "codex");
     assert.ok(codex);
@@ -144,6 +164,9 @@ describe("Agent config modules — data integrity", () => {
     assert.strictEqual(qoder.capabilities.permissionApproval, false);
     assert.strictEqual(qoder.capabilities.interactiveBubble, false);
     assert.strictEqual(qoder.capabilities.notificationHook, true);
+    assert.ok(qoder.processNames.win.includes("qoder cn.exe"));
+    assert.ok(qoder.processNames.win.includes("qoderclicn.exe"));
+    assert.ok(!qoder.startupRecoveryProcessNames.win.includes("qoder cn.exe"));
   });
 
   it("codewhale is state-only and exposes only passive notifications", () => {

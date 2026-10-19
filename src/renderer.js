@@ -23,9 +23,31 @@ const ACCESSORY_SETTLE_TIMEOUT_MS = visualSwapPolicy.ACCESSORY_SETTLE_TIMEOUT_MS
 const SWAP_VISIBILITY_RESCUE_BUFFER_MS = visualSwapPolicy.SWAP_VISIBILITY_RESCUE_BUFFER_MS || 750;
 const EYE_ATTACH_RETRY_MS = 16;
 const EYE_ATTACH_MAX_ATTEMPTS = 60;
+// A freshly-committed <object> may not expose its contentDocument at the exact
+// load callback; retry sampling on the same bounded cadence as eye attachment.
+const DISCRETE_SAMPLING_RETRY_MS = 16;
+// A synchronous first attempt runs immediately; only its failures schedule
+// retries, so this many retries means at most DISCRETE_SAMPLING_MAX_RETRIES + 1
+// document-ready checks per committed OBJECT.
+const DISCRETE_SAMPLING_MAX_RETRIES = 60;
+// A document's animation timeline is rewritten at most once. Re-running the
+// sampler on the same document (a retry that raced the first pass, a duplicate
+// commit callback) would otherwise snap an already-snapped duration again.
+const discreteSampledDocuments = new WeakSet();
 const WAKE_OBJECT_RELOAD_RETRIES = 1;
 const LOW_POWER_PAUSE_STYLE_ID = "clawd-low-power-pause-svg";
-const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
+// Deep sleep can sit on screen all night, so those states always pause: the
+// user's low-power switch is about optional idle states, not about burning CPU
+// on a sleeping pose.
+const DEEP_SLEEP_PAUSE_STATES = new Set(["collapsing", "sleeping"]);
+const LOW_POWER_OPTIONAL_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
+// Mirrors the set in src/tick.js (the main process keeps its own copy). Keep
+// this as the union of both policies even though the renderer now consults the
+// split sets directly.
+const LOW_POWER_PAUSE_STATES = new Set([
+  ...LOW_POWER_OPTIONAL_PAUSE_STATES,
+  ...DEEP_SLEEP_PAUSE_STATES,
+]);
 const LOW_POWER_BOUNDARY_EPSILON_MS = 80;
 const CLOUDLING_POINTER_BRIDGE_STATES = new Set(["idle", "mini-idle", "mini-peek"]);
 const CODEX_PET_VISUAL_BY_FILE = Object.freeze({
@@ -102,6 +124,11 @@ function initWithConfig(cfg) {
       ? tc.rendering.objectChannelFiles
       : []
   );
+  _discreteSampling = new Map(
+    tc.rendering && tc.rendering.discreteSampling && typeof tc.rendering.discreteSampling === "object"
+      ? Object.entries(tc.rendering.discreteSampling)
+      : []
+  );
   _lowPowerStaticImageOverrides = (tc.rendering && tc.rendering.lowPowerStaticImageOverrides) || {};
   _petTintSupported = tc.petTintSupported === true;
   if (Object.prototype.hasOwnProperty.call(tc, "petTintPayload")) {
@@ -170,6 +197,7 @@ function initWithConfig(cfg) {
   _miniFlipAssets = !!tc.miniFlipAssets;
   _hasRoamVisual = !!tc.hasRoamVisual;
   _roamFlipAssets = !!tc.roamFlipAssets;
+  _rightSideMirrorFiles = Array.isArray(tc.rightSideMirrorFiles) ? tc.rightSideMirrorFiles : [];
 
   applyObjectScaleStyle(clawdEl, getObjectSvgName(clawdEl), null);
   applyObjectScaleStyle(pendingNext, getObjectSvgName(pendingNext), null);
@@ -278,13 +306,18 @@ function setCurrentScriptedSvgLowPowerPaused(paused) {
   } catch {}
 }
 
+function shouldPauseAnimationsForState(state) {
+  return DEEP_SLEEP_PAUSE_STATES.has(state)
+    || (lowPowerIdleMode && LOW_POWER_OPTIONAL_PAUSE_STATES.has(state));
+}
+
 function shouldPauseForLowPower() {
   if (isReacting || isDragReacting) return false;
-  return lowPowerIdleMode && LOW_POWER_PAUSE_STATES.has(currentState);
+  return shouldPauseAnimationsForState(currentState);
 }
 
 function shouldSuppressPassiveTrackingForLowPower() {
-  return lowPowerIdleMode && lowPowerSvgPaused && shouldPauseForLowPower();
+  return lowPowerSvgPaused && shouldPauseForLowPower();
 }
 
 function setLowPowerSvgPaused(paused) {
@@ -331,11 +364,27 @@ function getLowPowerAnimationBoundaryDelayMs(root) {
       : (Number.isFinite(animation.currentTime) ? animation.currentTime : null);
     if (!Number.isFinite(localTime) || localTime < 0) continue;
 
+    // endTime is the end of the whole effect and already includes any delay;
+    // activeDuration alone would undercount a delayed animation and pause it
+    // mid-tail.
+    if (Number.isFinite(timing.endTime) && timing.endTime > localTime) {
+      delayMs = Math.max(delayMs, timing.endTime - localTime);
+      continue;
+    }
+
     const activeDuration = Number.isFinite(timing.activeDuration)
       ? timing.activeDuration
       : (Number.isFinite(timing.endTime) ? timing.endTime : null);
     if (Number.isFinite(activeDuration) && activeDuration > localTime) {
       delayMs = Math.max(delayMs, activeDuration - localTime);
+      continue;
+    }
+
+    const delay = Number.isFinite(timing.delay) ? timing.delay : 0;
+    // An infinite animation still waiting out its delay has no loop boundary;
+    // its next meaningful boundary is the end of that delay.
+    if (delay > 0 && localTime < delay) {
+      delayMs = Math.max(delayMs, delay - localTime);
       continue;
     }
 
@@ -410,7 +459,9 @@ function scheduleLowPowerIdlePause() {
 }
 
 function noteLowPowerActivity() {
-  if (!lowPowerIdleMode && !lowPowerSvgPaused) return;
+  // Cheap path for the default configuration: nothing is paused and the
+  // current state has no mandatory pause, so there is nothing to reschedule.
+  if (!shouldPauseForLowPower() && !lowPowerSvgPaused) return;
   if (lowPowerSvgPaused) {
     resumeCurrentSvgForLowPower();
   }
@@ -419,11 +470,9 @@ function noteLowPowerActivity() {
 
 function setLowPowerIdleMode(enabled) {
   lowPowerIdleMode = !!enabled;
-  if (lowPowerIdleMode) {
-    scheduleLowPowerIdlePause();
-  } else {
-    resumeCurrentSvgForLowPower();
-  }
+  // Re-evaluate either way: turning the switch off must still keep deep sleep
+  // paused, while optional idle states resume.
+  scheduleLowPowerIdlePause();
 }
 
 function isSvgFile(file) {
@@ -501,6 +550,7 @@ let _eyeTrackingStates;
 let _trustedScriptedSvgFiles = new Set();
 let _forceSvgObjectChannel = false;
 let _objectChannelFiles = new Set();
+let _discreteSampling = new Map();
 let _imgCacheBustSeq = 0;
 let _miniViewBox = null;
 let _fileViewBoxes = {};
@@ -522,6 +572,8 @@ let _miniFlipAssets = false; // theme's mini assets drawn in reverse direction
 let _hasRoamVisual = false;  // theme binds a dedicated roam visual (≠ idle)
 let _roamFlipAssets = false; // theme's roam visual is drawn facing left, not right
 let _roamHeadingLeft = false; // current walk direction; roam visuals are drawn facing right
+let _rightSideMirrorFiles = []; // idle animations mirrored while the pet sits on the right half
+let _petOnRightSide = false;
 let _inMiniMode = false;
 let _miniPreEntryMode = false;
 let _viewportOffsetY = 0;
@@ -567,6 +619,9 @@ function miniFlipContext() {
     hasRoamVisual: _hasRoamVisual,
     roamHeadingLeft: _roamHeadingLeft,
     roamFlipAssets: _roamFlipAssets,
+    file: currentDisplayedSvg,
+    petOnRightSide: _petOnRightSide,
+    rightSideMirrorFiles: _rightSideMirrorFiles,
     miniFlipAssets: _miniFlipAssets,
     inMiniMode: _inMiniMode,
     miniPreEntryMode: _miniPreEntryMode,
@@ -1249,6 +1304,7 @@ function releaseImg(el) {
 // --- Reaction state (visual side) ---
 let isReacting = false;
 let reactTimer = null;
+let isSettingsPreviewReaction = false;
 let currentIdleSvg = null;    // tracks which SVG is currently showing
 let currentState = null;      // last state name received from main (for re-pulse)
 let lastCloudlingPointerPayload = null;
@@ -1430,7 +1486,9 @@ function refreshAccessoryMediaChannel() {
 }
 
 function resolveLowPowerStaticImageOverride(state, file) {
-  if (!lowPowerIdleMode) return null;
+  // Scripted SVGs cannot be stopped by the CSS pause injection, so deep sleep
+  // needs its static substitute even when low-power idle mode is off.
+  if (!shouldPauseAnimationsForState(state)) return null;
   const override = _lowPowerStaticImageOverrides && _lowPowerStaticImageOverrides[state];
   if (!override || override.from !== file || !override.to) return null;
   return override.to;
@@ -1505,11 +1563,26 @@ function getAssetUrl(file) {
 // --- IPC-triggered reactions (from hit window via main relay) ---
 window.electronAPI.onStartDragReaction((requestOrDirection, legacyDirection) => startDragReaction(requestOrDirection, legacyDirection));
 window.electronAPI.onEndDragReaction(() => endDragReaction());
-window.electronAPI.onPlayClickReaction((svg, duration) => playReaction(svg, duration));
+window.electronAPI.onPlayClickReaction((svg, duration, options) => playReaction(svg, duration, options));
+// Settings cancels its own reaction preview when it closes; without this the
+// pet would hold the reaction visual, and its paused cursor polling, until the
+// clip's own timer fired. A reaction the user started by clicking the pet runs
+// on the same channel and must survive Settings closing, so only a preview is
+// cancelled here.
+window.electronAPI.onCancelClickReaction(() => {
+  if (!isSettingsPreviewReaction) return;
+  if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
+  endReaction();
+});
 
-function playReaction(requestOrFile, durationMs) {
+function playReaction(requestOrFile, durationMs, options) {
+  // A reaction preview now runs as long as the clip, so the next one can start
+  // while this timer is still pending. Clearing it first keeps the old timer
+  // from firing mid-clip and ending the new reaction early.
+  if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
   const visualRequest = normalizeVisualRequest(requestOrFile);
   const svgFile = visualRequest ? visualRequest.file : requestOrFile;
+  isSettingsPreviewReaction = !!(options && options.settingsPreview);
   isReacting = true;
   detachEyeTracking();
   resumeCurrentSvgForLowPower();
@@ -1525,7 +1598,11 @@ function playReaction(requestOrFile, durationMs) {
 function endReaction() {
   if (!isReacting) return;
   isReacting = false;
+  isSettingsPreviewReaction = false;
   reactTimer = null;
+  // A drag reaction holds the same cursor-polling pause and is still running;
+  // endDragReaction() releases it when the drag itself ends.
+  if (isDragReacting) return;
   window.electronAPI.resumeFromReaction();
 }
 
@@ -1533,6 +1610,7 @@ function cancelReaction() {
   if (isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
+    isSettingsPreviewReaction = false;
   }
   if (isDragReacting) {
     isDragReacting = false;
@@ -1697,6 +1775,7 @@ function startDragReaction(requestOrDirection, legacyDirection) {
   if (!isDragReacting && isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
+    isSettingsPreviewReaction = false;
   }
 
   isDragReacting = true;
@@ -1712,7 +1791,9 @@ function endDragReaction() {
   isDragReacting = false;
   currentDragSvg = null;
   currentDragDirection = null;
-  if (!wasDragReacting) return;
+  // A click reaction that started during the drag holds the same cursor-polling
+  // pause and is still running; endReaction() releases it when that one ends.
+  if (!wasDragReacting || isReacting) return;
   window.electronAPI.resumeFromReaction();
 }
 
@@ -1753,6 +1834,7 @@ function normalizeVisualRequest(value) {
     file: value.file,
     source: value.source,
     visualGeneration: value.visualGeneration,
+    ...(value.restartAnimation === true ? { restartAnimation: true } : {}),
   });
 }
 
@@ -1790,6 +1872,221 @@ function settleSuccessfulVisual(request, actualFile, channel, options = {}) {
     channel,
     verified: true,
   });
+}
+
+/**
+ * Snap one animation's period and delay to the shared sampling grid.
+ *
+ * A per-animation `steps(round(D * rate))` does not cap the document: two loops
+ * with different periods tick at different moments and the whole picture can
+ * change on almost every compositor frame. Snapping both the duration and the
+ * delay to 1/rate-second multiples puts every loop's jumps on the same clock,
+ * so the document as a whole moves at most `rate` times per second.
+ *
+ * The period moves by at most half a grid step (20.8 ms at 24 Hz) once the
+ * loop is at least half a grid step long; anything shorter, such as a 1 ms
+ * loop at 24 Hz, is promoted to one full grid step (41.67 ms). That is why a
+ * fast loop can sound different after it is declared for sampling.
+ */
+function computeDiscreteSamplingTiming({ durationMs, delayMs }, rate) {
+  const gridMs = 1000 / rate;
+  const steps = Math.max(1, Math.round(durationMs / gridMs));
+  const delay = Number.isFinite(delayMs) ? delayMs : 0;
+  return {
+    durationMs: steps * gridMs,
+    delayMs: Math.round(delay / gridMs) * gridMs,
+    steps,
+  };
+}
+
+/**
+ * A CSSAnimation that loops forever is the only thing worth sampling. One-shot
+ * animations (sleep-collapse, transitions) finish long before the cap pays off,
+ * and changing their duration would move the moment they land. Cursor-follow
+ * transitions are returned by getAnimations() too, which is why the constructor
+ * check matters more than the shape of the effect.
+ */
+function readSampleableAnimation(animation, contentWindow) {
+  if (!animation || !animation.effect) return null;
+  const effect = animation.effect;
+  if (
+    typeof effect.getComputedTiming !== "function"
+    || typeof effect.updateTiming !== "function"
+  ) {
+    return null;
+  }
+  const CSSAnimationCtor = contentWindow && contentWindow.CSSAnimation;
+  if (typeof CSSAnimationCtor !== "function" || !(animation instanceof CSSAnimationCtor)) {
+    return null;
+  }
+  if (animation.playState !== "running") return null;
+  if (animation.playbackRate !== 1) return null;
+
+  let timing = null;
+  try {
+    timing = effect.getComputedTiming();
+  } catch {
+    return null;
+  }
+  // iterationStart belongs to EffectTiming, not Animation; a non-zero start
+  // offset breaks the phase assumption behind the shared grid.
+  if (!timing) return null;
+  if (timing.iterationStart !== 0 && timing.iterationStart !== undefined) return null;
+  // Only infinite loops share a document-wide cadence. Scheduled animations
+  // still have iterations set from their CSS, even while pending.
+  if (timing.iterations !== Infinity) return null;
+  if (!Number.isFinite(timing.duration) || timing.duration <= 0) return null;
+  return {
+    animation,
+    durationMs: timing.duration,
+    delayMs: Number.isFinite(timing.delay) ? timing.delay : 0,
+  };
+}
+
+/**
+ * Rewrite every sampleable animation onto one grid and one start time.
+ * Pending animations have no startTime yet; their ready promise is awaited and
+ * the identity check runs again before touching them, because the document may
+ * have been replaced while they were coming up.
+ */
+function alignDiscreteSamplingAnimations(animations, contentWindow, rate, isStillCurrent) {
+  const sampleable = [];
+  for (const animation of animations) {
+    const entry = readSampleableAnimation(animation, contentWindow);
+    if (entry) sampleable.push(entry);
+  }
+  if (!sampleable.length) return;
+
+  const currentStarts = sampleable
+    .map(({ animation }) => animation.startTime)
+    .filter((value) => Number.isFinite(value));
+  let commonStartTime = currentStarts.length ? Math.min(...currentStarts) : null;
+
+  for (const { animation, durationMs, delayMs } of sampleable) {
+    const next = computeDiscreteSamplingTiming({ durationMs, delayMs }, rate);
+    try {
+      animation.effect.updateTiming({
+        duration: next.durationMs,
+        delay: next.delayMs,
+        easing: `steps(${next.steps}, end)`,
+      });
+    } catch {}
+  }
+
+  for (const { animation } of sampleable) {
+    const applyStartTime = () => {
+      if (!isStillCurrent()) return;
+      // Writing a start time to a paused animation clears its hold time and
+      // restarts it, so a pause that happened while ready was pending wins.
+      if (animation.playState !== "running") return;
+      if (commonStartTime === null && Number.isFinite(animation.startTime)) {
+        // No animation had a usable start time when the pass began; the first
+        // one to come up defines the shared origin for the rest.
+        commonStartTime = animation.startTime;
+      }
+      if (commonStartTime === null) return;
+      try {
+        animation.startTime = commonStartTime;
+      } catch {}
+    };
+
+    if (Number.isFinite(animation.startTime)) {
+      applyStartTime();
+      continue;
+    }
+    let ready = null;
+    try {
+      ready = animation.ready;
+    } catch {
+      ready = null;
+    }
+    if (ready && typeof ready.then === "function") {
+      ready.then(applyStartTime, () => {});
+    }
+  }
+}
+
+/**
+ * Give a document-backed SVG at most `rate` visual changes per second by
+ * snapping each of its infinite CSS animations onto a shared 1/rate-second grid
+ * (see computeDiscreteSamplingTiming). This ceiling holds only while every
+ * continuous visual change comes from aligned animations: finite entrances,
+ * cursor-follow transitions, scripted and SMIL animation are not covered.
+ * Only files the theme opts into via
+ * rendering.discreteSampling are touched, and only on the <object> channel (an
+ * <img> playback exposes no contentDocument). SMIL animations are not CSS
+ * animations and are deliberately out of scope.
+ *
+ * The contentDocument can still be transiently null at the commit point, so the
+ * synchronous first attempt plus at most DISCRETE_SAMPLING_MAX_RETRIES retries
+ * wait for this exact OBJECT element and file. Retries live only while that
+ * element is still the displayed, connected object for the file: a successful
+ * swap changes clawdEl, releasing the element disconnects it, and a failed or
+ * cancelled swap simply leaves the old object in place with its retry intact.
+ * Each document is aligned at most once. Sampling stays best-effort: if the
+ * document never arrives we stop quietly.
+ */
+function applyDiscreteSampling(objectEl, file) {
+  const rate = _discreteSampling.get(file);
+  if (!rate || !objectEl || objectEl.tagName !== "OBJECT") return;
+
+  const trySample = (attempt) => {
+    // Bind the retry to the element that was committed. A newer committed
+    // object, a different displayed file, or a released element silently
+    // retires it; a failed/cancelled swap keeps the same element on screen and
+    // therefore keeps this retry alive.
+    if (clawdEl !== objectEl || currentDisplayedSvg !== file || !objectEl.isConnected) return;
+
+    let contentDocument = null;
+    try {
+      contentDocument = objectEl.contentDocument;
+    } catch {
+      contentDocument = null;
+    }
+    if (!contentDocument || typeof contentDocument.getAnimations !== "function") {
+      if (attempt < DISCRETE_SAMPLING_MAX_RETRIES) {
+        setTimeout(() => trySample(attempt + 1), DISCRETE_SAMPLING_RETRY_MS);
+      } else {
+        console.warn("Timed out waiting for SVG document to apply discrete sampling");
+      }
+      return;
+    }
+
+    if (discreteSampledDocuments.has(contentDocument)) return;
+
+    let contentWindow = null;
+    try {
+      contentWindow = objectEl.contentWindow;
+    } catch {
+      contentWindow = null;
+    }
+    // Without a window we cannot prove which realm the animations belong to,
+    // so leave the document unmarked and let a later commit try again.
+    if (!contentWindow) return;
+
+    let animations = [];
+    try {
+      animations = contentDocument.getAnimations();
+    } catch {
+      return;
+    }
+    discreteSampledDocuments.add(contentDocument);
+
+    const isSameDocument = () => {
+      if (clawdEl !== objectEl || currentDisplayedSvg !== file || !objectEl.isConnected) {
+        return false;
+      }
+      try {
+        return objectEl.contentDocument === contentDocument;
+      } catch {
+        return false;
+      }
+    };
+
+    alignDiscreteSamplingAnimations(animations, contentWindow, rate, isSameDocument);
+  };
+
+  trySample(0);
 }
 
 /**
@@ -2036,6 +2333,10 @@ function swapToFile(file, state, useObjectChannel, options = {}) {
       settleSuccessfulVisual(next.__clawdVisualRequest, file, "object", {
         fallback: next.__clawdFallbackFromObject === true,
       });
+      // Fresh document every time (first load, same-file re-entry, system-wake
+      // force reload): each carries its own refreshed animation timeline, so the
+      // cap must be reapplied here rather than once per file.
+      applyDiscreteSampling(next, file);
 
       if (commitState && tracksEyesForFile(commitState, file)) {
         attachEyeTracking(next);
@@ -2264,7 +2565,10 @@ function renderStateFile(requestOrState, legacySvg) {
     cancelPendingSwap("superseded");
   }
 
-  if ((alreadyDisplayed && displayedChannelMatches) || (alreadyPending && pendingChannelMatches)) {
+  // A new cue can intentionally replay the same file (compaction completion
+  // after PreCompact). Give it a fresh timeline and normal settlement ACK.
+  if (!visualRequest?.restartAnimation
+    && ((alreadyDisplayed && displayedChannelMatches) || (alreadyPending && pendingChannelMatches))) {
     // Same file, no swap — but the flip is state-dependent (mini flip vs roam
     // heading), so re-apply it for the incoming state. E.g. a leftward roam
     // entering mini pre-entry reuses the same crabwalk asset; without this the
@@ -2688,7 +2992,9 @@ function recoverFromSystemWake(payload) {
   // Do this even when the local mirror says false: the injected pause style or
   // the embedded SVG timeline can outlive that boolean across a system sleep.
   resumeCurrentSvgForLowPower();
-  if (lowPowerIdleMode) scheduleLowPowerIdlePause();
+  // Re-run the whole policy (including the fresh 5s grace) instead of freezing
+  // deep sleep on the first frame after wake.
+  scheduleLowPowerIdlePause();
 
   const needsEyes = tracksEyesForFile(currentState, currentDisplayedSvg);
   const shouldReloadEyeObject = lowPowerIdleMode
@@ -2795,7 +3101,7 @@ window.electronAPI.onEyeMove((dx, dy) => {
   lastEyeDx = effectiveDx;
   lastEyeDy = dy;
 
-  if (lowPowerIdleMode) noteLowPowerActivity();
+  noteLowPowerActivity();
 
   if (shouldSuppressPassiveTrackingForLowPower()) {
     _cancelLayerAnimLoop();
@@ -2838,6 +3144,13 @@ if (window.electronAPI && typeof window.electronAPI.onRoamHeading === "function"
     // without a swap, and if this message lands after the state-change (IPC
     // order across channels is not contractual) the flip captured at IMG
     // creation is stale — refresh both the on-screen and the pending element.
+    applyMiniFlip(clawdEl, currentState);
+  });
+}
+
+if (window.electronAPI && typeof window.electronAPI.onPetScreenSide === "function") {
+  window.electronAPI.onPetScreenSide((onRight) => {
+    _petOnRightSide = !!onRight;
     applyMiniFlip(clawdEl, currentState);
   });
 }

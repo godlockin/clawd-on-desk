@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Clawd — Qoder hook (Phase 1: state-only).
 //
-// Registered in ~/.qoder/settings.json by hooks/qoder-install.js. Reads the
+// Registered in Qoder / Qoder CN settings.json by hooks/qoder-install.js. Reads the
 // hook payload from stdin (JSON with hook_event_name), POSTs a state event to
 // the running Clawd server, and ALWAYS writes `{}` to stdout. Clawd never
 // answers a Qoder permission decision in Phase 1, so PermissionRequest /
@@ -12,6 +12,8 @@ const crypto = require("crypto");
 const { postStateToRunningServer, readHostPrefix, applyWslSourceFields } = require("./server-config");
 const { createPidResolver, readStdinJson, getPlatformConfig, applyOrcaPaneKey } = require("./shared-process");
 
+const SESSION_TITLE_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F\u061C\u200E-\u200F\u202A-\u202E\u2066-\u2069]+/g;
+const SESSION_TITLE_MAX = 80;
 const TOOL_MATCH_STRING_MAX = 240;
 const TOOL_MATCH_ARRAY_MAX = 16;
 const TOOL_MATCH_OBJECT_KEYS_MAX = 32;
@@ -46,6 +48,19 @@ const NO_DECISION_OUTPUT = "{}";
 function normalizeSessionId(value) {
   const raw = value != null && value !== "" ? String(value) : "default";
   return raw.startsWith("qoder:") ? raw : `qoder:${raw}`;
+}
+
+function normalizeSessionTitle(value) {
+  if (typeof value !== "string") return null;
+  const collapsed = value
+    .replace(SESSION_TITLE_CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!collapsed) return null;
+  const characters = Array.from(collapsed);
+  return characters.length > SESSION_TITLE_MAX
+    ? `${characters.slice(0, SESSION_TITLE_MAX - 1).join("")}\u2026`
+    : collapsed;
 }
 
 function normalizeToolUseId(value) {
@@ -95,15 +110,15 @@ function isQoderAgentCommandLine(cmd) {
   const normalized = cmd.toLowerCase().replace(/\\/g, "/");
   return normalized.includes("node_modules/.bin/qodercli")
     || normalized.includes("node_modules/.bin/qoder")
-    || /(^|[\s"'/])qoder(cli|-cli)?(\.js)?($|[\s"'/])/.test(normalized);
+    || /(^|[\s"'/])qoder(cn|cli(?:cn)?|-cli)?(\.(?:js|exe|cmd))?($|[\s"'/])/.test(normalized);
 }
 
 const config = getPlatformConfig();
 const defaultResolve = createPidResolver({
   agentNames: {
-    win: new Set(["qoder.exe", "qodercli.exe", "qoder-cli.exe"]),
-    mac: new Set(["qoder", "qodercli", "qoder-cli"]),
-    linux: new Set(["qoder", "qodercli", "qoder-cli"]),
+    win: new Set(["qoder.exe", "qodercli.exe", "qoder-cli.exe", "qoder cn.exe", "qodercn.exe", "qoderclicn.exe"]),
+    mac: new Set(["qoder", "qodercli", "qoder-cli", "qoder cn", "qodercn", "qoderclicn"]),
+    linux: new Set(["qoder", "qodercli", "qoder-cli", "qoder cn", "qodercn", "qoderclicn"]),
   },
   agentCmdlineCheck: isQoderAgentCommandLine,
   platformConfig: config,
@@ -198,6 +213,11 @@ function buildStateBody(hookName, payload, options = {}) {
   if (payload && typeof payload.transcript_path === "string" && payload.transcript_path) {
     body.transcript_path = payload.transcript_path;
   }
+  const sessionTitle = normalizeSessionTitle(payload && payload.session_title)
+    || normalizeSessionTitle(payload && payload.sessionTitle)
+    || normalizeSessionTitle(payload && payload.session_name)
+    || normalizeSessionTitle(payload && payload.sessionName);
+  if (sessionTitle) body.session_title = sessionTitle;
   if (payload && TOOL_METADATA_EVENTS.has(hookName)) {
     maybeAddToolMetadata(body, payload);
   }
@@ -270,6 +290,7 @@ module.exports = {
   normalizeSessionId,
   normalizeToolMatchValue,
   buildToolInputFingerprint,
+  normalizeSessionTitle,
   isQoderAgentCommandLine,
   resolveHookName,
   shouldResolvePid,
