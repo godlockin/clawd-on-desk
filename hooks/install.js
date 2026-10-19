@@ -518,6 +518,13 @@ function getClaudeHookScriptPath() {
   return asarUnpackedPath(path.resolve(__dirname, "clawd-hook.js").replace(/\\/g, "/"));
 }
 
+// Source (packaged) path of the command-wrapper permission hook. Materialized
+// into the AppImage persistent generation like the other entries so the
+// registered command survives the transient /tmp/.mount_* (see resolver).
+function getClaudePermissionWrapperScriptPath() {
+  return asarUnpackedPath(path.resolve(__dirname, "clawd-permission-hook.js").replace(/\\/g, "/"));
+}
+
 function getClaudeAutoStartScriptPath() {
   return asarUnpackedPath(path.resolve(__dirname, "auto-start.js").replace(/\\/g, "/"));
 }
@@ -538,6 +545,7 @@ function claudeSourceHookPaths() {
     state: getClaudeHookScriptPath(),
     autoStart: getClaudeAutoStartScriptPath(),
     statusline: getClaudeStatuslineScriptPath(),
+    permissionWrapper: getClaudePermissionWrapperScriptPath(),
   };
 }
 
@@ -672,7 +680,7 @@ function resolveClaudeHookPaths(options = {}, config = {}) {
   try {
     const platform = options.platform || process.platform;
     const plan = planAppImageHookBundle(
-      [source.state, source.autoStart, source.statusline],
+      [source.state, source.autoStart, source.statusline, source.permissionWrapper],
       {
         appImagePath: decision.appImagePath,
         homeDir: options.homeDir,
@@ -693,8 +701,9 @@ function resolveClaudeHookPaths(options = {}, config = {}) {
       state: targetFor(source.state),
       autoStart: targetFor(source.autoStart),
       statusline: targetFor(source.statusline),
+      permissionWrapper: targetFor(source.permissionWrapper),
     };
-    if (!target.state || !target.autoStart || !target.statusline) {
+    if (!target.state || !target.autoStart || !target.statusline || !target.permissionWrapper) {
       return {
         ok: false,
         reason: "appimage-plan-incomplete",
@@ -1673,9 +1682,11 @@ function registerHooks(options = {}) {
       changed = true;
     }
 
-    const wrapperScript = asarUnpackedPath(
-      path.resolve(__dirname, spec.script).replace(/\\/g, "/")
-    );
+    // AppImage mode: persistent-generation copy (resolver target). Direct mode:
+    // the packaged source path. Either way the command survives the transient
+    // /tmp/.mount_* because materialized targets are content-addressed under
+    // the user's home.
+    const wrapperScript = resolvedHookPaths.target.permissionWrapper;
     const baseSpec = buildCommandHookSpec(nodeBin, wrapperScript, "", {
       platform,
       remote: options.remote,
@@ -2068,9 +2079,11 @@ async function registerHooksAsync(options = {}) {
       changed = true;
     }
 
-    const wrapperScript = asarUnpackedPath(
-      path.resolve(__dirname, spec.script).replace(/\\/g, "/")
-    );
+    // AppImage mode: persistent-generation copy (resolver target). Direct mode:
+    // the packaged source path. Either way the command survives the transient
+    // /tmp/.mount_* because materialized targets are content-addressed under
+    // the user's home.
+    const wrapperScript = resolvedHookPaths.target.permissionWrapper;
     const baseSpec = buildCommandHookSpec(nodeBin, wrapperScript, "", {
       platform,
       remote: options.remote,

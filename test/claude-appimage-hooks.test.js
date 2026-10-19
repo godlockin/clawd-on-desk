@@ -165,7 +165,10 @@ describe("Claude AppImage hook resolver", () => {
     const hooksDir = path.join(mount, "resources", "app.asar.unpacked", "hooks");
     fs.mkdirSync(hooksDir, { recursive: true });
     const sourcePaths = {};
-    for (const [key, name] of [["state", "clawd-hook.js"], ["autoStart", "auto-start.js"], ["statusline", "claude-statusline.js"]]) {
+    // permissionWrapper joined the materialized bundle (godlockin fork's
+    // command-wrapper PermissionRequest) — the fixture must own a stub for it
+    // inside the fake APPDIR or the closure collector fails OUTSIDE_HOOKS.
+    for (const [key, name] of [["state", "clawd-hook.js"], ["autoStart", "auto-start.js"], ["statusline", "claude-statusline.js"], ["permissionWrapper", "clawd-permission-hook.js"]]) {
       const file = path.join(hooksDir, name);
       fs.writeFileSync(file, "module.exports = true;\n");
       sourcePaths[key] = file;
@@ -181,6 +184,7 @@ describe("Claude AppImage hook resolver", () => {
     assert.strictEqual(resolved.ok, true, JSON.stringify(resolved));
     assert.strictEqual(resolved.mode, "appimage-materialized");
     assert.ok(resolved.target.state.startsWith(resolved.generationDir + path.sep));
+    assert.ok(resolved.target.permissionWrapper.startsWith(resolved.generationDir + path.sep));
     assert.strictEqual(
       fs.readFileSync(path.join(resolved.generationDir, ".clawd-appimage-path"), "utf8"),
       `${APPIMAGE}\n`

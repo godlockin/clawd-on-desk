@@ -3841,9 +3841,15 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
         }
       }
 
+      // godlockin fork: PermissionRequest is the command-wrapper hook (long-poll
+      // /permission, empty-stdout fall-through), not an http entry — the wrapper
+      // resolves the port from runtime.json at runtime, so there is no URL to
+      // migrate. The invariants that survive: the stale http URL is gone and a
+      // wrapper command hook is registered.
       const permissionUrls = getHttpUrls(after, "PermissionRequest");
-      assert.ok(permissionUrls.includes(buildPermissionUrl(23333)), "the permission URL must migrate to the requested port");
       assert.ok(!permissionUrls.some((url) => url.includes(":23335")), "the stale 23335 URL must be gone");
+      const wrapperHooks = getCommandHookEntries(after, "PermissionRequest", "clawd-permission-hook.js");
+      assert.ok(wrapperHooks.length >= 1, "the command-wrapper permission hook must be registered");
 
       const mixed = after.hooks.SessionStart.find((entry) => entry && entry.wrapperCustom === "keep-me");
       assert.ok(mixed, "the mixed wrapper must survive");

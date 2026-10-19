@@ -40,6 +40,13 @@ function entriesContainHttpHookUrl(entries, expectedUrl) {
 
 const HOOK_MARKER = "clawd-hook.js";
 const AUTO_START_MARKER = "auto-start.js";
+// godlockin fork: PermissionRequest is a command-wrapper hook (long-poll
+// /permission, empty-stdout fall-through, anthropics/claude-code#46193) — not
+// an entry of type "http". The wrapper resolves the port at runtime from
+// ~/.clawd/runtime.json, so there is no URL literal to compare; its presence
+// satisfies the permission-hook health check on its own. Mirror of the
+// PERMISSION_WRAPPER_MARKER in hooks/install.js — keep in sync.
+const PERMISSION_WRAPPER_MARKER = "clawd-permission-hook.js";
 
 // Bounds the issues array so a pathological settings.json (thousands of
 // malformed entries) cannot blow up Doctor payloads or logs.
@@ -464,7 +471,11 @@ function inspectClaudeHookHealth(rawSettings, options = {}) {
     }
   }
 
-  if (expectedPermissionUrl && !entriesContainHttpHookUrl(hooks.PermissionRequest, expectedPermissionUrl)) {
+  if (
+    expectedPermissionUrl
+    && !entriesContainHttpHookUrl(hooks.PermissionRequest, expectedPermissionUrl)
+    && findMarkerCommandsForEvent(hooks, "PermissionRequest", PERMISSION_WRAPPER_MARKER).length === 0
+  ) {
     pushIssue(issues, { code: "permission-url-mismatch", event: "PermissionRequest", automaticRepairable: true });
   }
 

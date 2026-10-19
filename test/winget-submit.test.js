@@ -405,7 +405,10 @@ describe("WinGet submission transaction", () => {
             generatedRoot: testFixture.generatedRoot,
             expectedDigests: testFixture.expectedDigests,
           },
-          { env: {}, execute: fake.execute },
+          // Explicitly empty, not {}: runSubmission spreads process.env under
+          // dependencies.env, so {} inherits an ambient GH_TOKEN and the
+          // "token absent" premise silently evaporates on dev shells.
+          { env: { GH_TOKEN: "" }, execute: fake.execute },
         ),
         /GH_TOKEN is required/,
       );

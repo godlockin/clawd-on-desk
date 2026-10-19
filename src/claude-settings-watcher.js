@@ -20,6 +20,9 @@ const {
 } = require("./claude-hook-health");
 
 const HOOK_MARKER = "clawd-hook.js";
+// godlockin fork: command-wrapper PermissionRequest (see claude-hook-health.js)
+// counts as a managed permission hook even though it carries no http URL.
+const PERMISSION_WRAPPER_MARKER = "clawd-permission-hook.js";
 const SETTINGS_FILENAME = "settings.json";
 const MANAGED_COMMAND_MARKERS = Object.freeze([
   HOOK_MARKER,
@@ -77,7 +80,8 @@ function settingsNeedClaudeHookResync(rawSettings, expectedPermissionUrl) {
   const hasManagedCommandHook = Object.values(hooks).some((entries) => (
     entriesContainCommandMarker(entries, HOOK_MARKER)
   ));
-  const hasManagedPermissionHook = entriesContainHttpHookUrl(hooks.PermissionRequest, expectedPermissionUrl);
+  const hasManagedPermissionHook = entriesContainHttpHookUrl(hooks.PermissionRequest, expectedPermissionUrl)
+    || entriesContainCommandMarker(hooks.PermissionRequest, PERMISSION_WRAPPER_MARKER);
   return !hasManagedCommandHook || !hasManagedPermissionHook;
 }
 

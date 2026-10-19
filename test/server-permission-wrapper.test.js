@@ -25,6 +25,11 @@ function makeReq(method, url, body) {
   const req = new EventEmitter();
   req.method = method;
   req.url = url;
+  // Upstream transport gate (rejectUnsafeLocalHookRequest) requires a loopback
+  // Host header, no Origin header, and a JSON Content-Type; otherwise the
+  // request is rejected 403/415 before the permission handler ever runs.
+  req.headers = { host: "127.0.0.1:23333", "content-type": "application/json" };
+  req.rawHeaders = ["Host", "127.0.0.1:23333", "Content-Type", "application/json"];
   setImmediate(() => {
     if (body != null) req.emit("data", Buffer.from(typeof body === "string" ? body : JSON.stringify(body)));
     req.emit("end");
