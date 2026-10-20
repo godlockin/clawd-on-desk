@@ -86,6 +86,7 @@ docs/**
 !docs/releases/release-v1.1.0.md
 !docs/releases/release-v1.2.0.md
 !docs/releases/release-v1.3.0.md
+!docs/releases/release-v1.4.0.md
 
 # Temp files from testing
 .tmp_*
@@ -123,8 +124,12 @@ logs/
 scripts/*
 # Deterministic source-backed macOS tray asset generator
 !scripts/generate-mac-tray-icons.js
+<<<<<<< HEAD
 # Fork-maintenance: delete stale sync/upstream-* branches already merged into main
 !scripts/cleanup-sync-branches.sh
+=======
+!scripts/generate-readme-contributors.js
+>>>>>>> upstream/main
 !scripts/update-official-theme-catalog-snapshot.js
 !scripts/manual/
 scripts/manual/*
