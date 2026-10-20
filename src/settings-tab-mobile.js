@@ -183,7 +183,7 @@
           actions: [
             { id: "reset", label: t("mobilePermissionConsentReset"), tone: "accent", defaultFocus: true },
             { id: "keep", label: t("mobilePermissionConsentKeep"), tone: "neutral" },
-            { id: "cancel", label: t("cancel"), tone: "neutral" },
+            { id: "cancel", label: t("permissionAutomationCancel"), tone: "neutral" },
           ],
         }).then(function(choice) {
           if (choice !== "reset" && choice !== "keep") {

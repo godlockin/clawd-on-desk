@@ -5973,6 +5973,16 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(async () => {
+    // Linux X11: Electron's getCursorScreenPoint() freezes once the cursor
+    // leaves our windows; replace it with a live xcb_query_pointer for every
+    // caller. Same backend check as linux-x11-input-hint. The screen module is
+    // only usable after ready.
+    require("./linux-x11-cursor").installLinuxX11CursorFallback(screen, {
+      isLinuxX11: isLinux && app.commandLine.getSwitchValue("ozone-platform") === "x11",
+      displayName: app.commandLine.getSwitchValue("display"),
+      onError: (err) => console.warn("Clawd: linux-x11-cursor failed:", err && err.message),
+    });
+
     // Older macOS and development builds retain the padded runtime icon from
     // #416. Packaged Tahoe+ leaves the Dock untouched so macOS can apply the
     // user's Default/Dark/Clear/Tinted treatment to the bundle icon (#941).
