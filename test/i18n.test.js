@@ -552,7 +552,7 @@ describe("i18n locales", () => {
       remoteSshFieldAutoStartCodex: "Iniciar la supervisión de respaldo de Codex al conectar",
       remoteSshErrForwardFailed: "El puerto remoto no está disponible. Inténtalo de nuevo más tarde. Si cambias el puerto de reenvío remoto (23333-23337), ejecuta Desplegar / Reparar hooks antes de conectarte.",
       remoteSshConnectWarnNoDeploy: "Los hooks no están desplegados para este destino. Ejecuta primero Desplegar / Reparar hooks; Conectar permanecerá desactivado hasta que el despliegue esté listo.",
-      agentsSubtitle: "Descubre automáticamente herramientas de IA en este equipo y en WSL, o añade manualmente una IA que Clawd aún no incluya. Una vez conectada, gestiona aquí su estado, sus solicitudes de permiso y sus notificaciones.",
+      agentsSubtitle: "Una vez conectada, la mascota sigue el trabajo de la herramienta y muestra sus aprobaciones. Expande una tarjeta para ajustarla.",
       shortcutLabelPetReveal: "Clic en la mascota: Mostrar superposiciones de la mascota",
       bubbleNotificationDesc: "El interruptor controla los avisos pasivos de Codex / Kimi Code. Los segundos fijan el límite máximo de cierre automático; estados de sesión posteriores pueden descartarlo antes. 0 los oculta.",
       langChinese: "简体中文",

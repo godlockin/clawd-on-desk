@@ -1654,6 +1654,8 @@ function loadAgentsTabForTest({
   collapsedGroups = {},
   settingsAPI = {},
   doctor = null,
+  doctorModal = null,
+  confirmAction = "uninstall",
   navigator: navigatorOverrides = {},
 } = {}) {
   const raf = createQueuedRaf();
@@ -1661,6 +1663,9 @@ function loadAgentsTabForTest({
   const content = new FakeElement("main");
   content.id = "content";
   body.appendChild(content);
+  const modalRoot = new FakeElement("div");
+  modalRoot.id = "modalRoot";
+  body.appendChild(modalRoot);
 
   const localStorageData = {
     "clawd.settings.collapsedGroups.v1": JSON.stringify(collapsedGroups),
@@ -1672,6 +1677,7 @@ function loadAgentsTabForTest({
     getElementById(id) {
       if (id === "content") return content;
       if (id === "toastStack") return toastStack;
+      if (id === "modalRoot") return modalRoot;
       return null;
     },
   };
@@ -1699,6 +1705,7 @@ function loadAgentsTabForTest({
       ...settingsAPI,
     },
     doctor,
+    ClawdSettingsDoctorModal: doctorModal,
     ClawdSettingsSizeSlider: {
       SIZE_UI_MIN: 1,
       SIZE_UI_MAX: 100,
@@ -1715,6 +1722,50 @@ function loadAgentsTabForTest({
         en: {
           agentsTitle: "Agents",
           agentsSubtitle: "subtitle",
+          agentStatusReceivesHook: "Receives state via Hook",
+          agentStatusReceivesPlugin: "Receives state via plugin",
+          agentStatusReceivesExtension: "Receives state via extension",
+          agentStatusReceivesLogPoll: "Receives state by log polling",
+          agentStatusApprovalByPet: "approvals handled by the pet",
+          agentStatusStateOnly: "state only, no approvals",
+          agentStatusPaused: "Paused · the pet no longer reacts to it",
+          agentStatusCustom: "Registered HTTP tool · state only",
+          agentStatusCustomMissing: "Executable problem: {reason}",
+          agentStatusFixLink: "Fix it",
+          agentGroupApproval: "Approvals",
+          agentGroupAlerts: "Alerts",
+          agentGroupConnection: "Connection",
+          agentGroupWsl: "WSL",
+          agentGroupQuota: "Quota",
+          agentGroupInfo: "Info",
+          agentDescToggle: "Details",
+          agentDisconnectLink: "Disconnect {agent}…",
+          agentDisconnectDetail: "Removes the hooks / plugin Clawd wrote into {agent}'s config; the card moves back to Discover and add.",
+          agentRemoveCustomLink: "Remove {agent}…",
+          agentRemoveCustomDetail: "Deletes this registration; Clawd stops receiving its state.",
+          agentDiscoverBodyNote: "Once installed, its approval and alert settings appear here.",
+          rowAgentEnableWithoutInstall: "Open the intake without installing local files",
+          rowAgentEnableWithoutInstallDesc: "Only for when it runs on an SSH host or in WSL and you installed the hooks yourself.",
+          agentInstallAllDetected: "Install all",
+          agentDetectedEmpty: "No unconnected tools detected.",
+          rowCodexNativeNotificationSoundNote: "Auto only",
+          kimiQuotaRowUnconfigured: "Not connected",
+          kimiQuotaRowConnected: "Connected",
+          kimiQuotaRowDisconnected: "Disconnected, key kept locally",
+          kimiQuotaRowConnect: "Connect Kimi key…",
+          kimiQuotaRowManage: "Manage…",
+          kimiQuotaTitle: "Subscription quota",
+          kimiQuotaDesc: "Kimi quota desc",
+          kimiQuotaStatusLoading: "Checking local connection...",
+          rowManageClaudeHooks: "Manage hooks automatically",
+          rowManageClaudeHooksDesc: "Checks at launch and restores the hooks.",
+          rowStartWithClaude: "Start with Claude Code",
+          rowStartWithClaudeDesc: "Launches Clawd when a Claude Code session starts.",
+          rowStartWithClaudeDisabledDesc: "Requires automatic Claude hook management.",
+          rowClaudeQuotaCollection: "Read local Claude quota and context usage",
+          rowClaudeQuotaCollectionDesc: "Claude quota desc",
+          rowCodexHookHealthNotify: "Warn me when the approval hook stops working",
+          rowCodexHookHealthNotifyDesc: "One tray notification at launch.",
           agentsEmpty: "empty",
           agentSectionConnected: "Connected",
           agentSectionRecommended: "Detected locally",
@@ -1741,6 +1792,8 @@ function loadAgentsTabForTest({
           rowAgentIdleAlertsDesc: "Idle alert desc",
           rowAgentPermissions: "Permissions",
           rowAgentPermissionsDesc: "Permissions desc",
+          rowAgentSubagentPermissions: "Subagent permissions",
+          rowAgentSubagentPermissionsDesc: "Subagent permissions desc",
           rowStartWithCodex: "Start with Codex",
           rowStartWithCodexDesc: "Start with Codex desc",
           rowCodexPermissionMode: "Permission mode",
@@ -1749,7 +1802,6 @@ function loadAgentsTabForTest({
           codexPermissionModeIntercept: "Intercept",
           rowCodexNativeNotificationSound: "Native sound",
           rowCodexNativeNotificationSoundDesc: "Native sound desc",
-          badgePermissionBubble: "Permission bubble",
           traecodeEnableHint: "Enable hooks in Trae before they fire.",
           minimaxEnableHint: "Enable the Clawd plugin in MiniMax Code before hooks fire.",
           dshNoticeProfileWeb: "Web",
@@ -1770,10 +1822,7 @@ function loadAgentsTabForTest({
           eventSourceLogPoll: "Log poll",
           eventSourcePlugin: "Plugin",
           eventSourceExtension: "Extension",
-          agentIntegrationInstalled: "Installed",
-          agentIntegrationNotInstalled: "Not installed",
           agentIntegrationInstall: "Install",
-          agentCodexHookNeedsAttention: "Needs attention",
           codexHookHealthReasonInactive: "Hook inactive",
           codexHookHealthReasonDisabled: "Hooks disabled",
           codexHookHealthReasonNeedsReview: "Needs review",
@@ -1782,10 +1831,6 @@ function loadAgentsTabForTest({
           agentIntegrationUninstallConfirm: "Confirm uninstall",
           agentIntegrationInstallSkipped: "No local installation was found for {agents}.",
           agentListSeparator: ", ",
-          agentInstallHintTitle: "Connect detected agents",
-          agentInstallHintDesc: "Detected local signals for {agents}.",
-          agentInstallHintInstallRecommended: "Install recommended",
-          agentInstallHintDismiss: "Not now",
           agentCleanupHintTitle: "Review missing local agents",
           agentCleanupHintDesc: "Missing local installs for {agents}.",
           agentCleanupHintRemove: "Remove integrations",
@@ -1835,6 +1880,9 @@ function loadAgentsTabForTest({
   core.state.activeTab = "agents";
   core.runtime.agentMetadata = Array.isArray(agentMetadata) ? agentMetadata : [];
   context.ClawdSettingsTabAgents.init(core);
+  // Tests exercise the real uninstall command path without driving the modal
+  // shell: the confirm answer is injected so cancel/confirm are both testable.
+  core.helpers.showSettingsConfirmModal = () => Promise.resolve(confirmAction);
 
   let contentRenderCount = 0;
   function renderContent() {
@@ -11796,10 +11844,11 @@ describe("settings renderer browser environment", () => {
     const agentsSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8");
     const uiCoreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     assert.ok(agentsSource.includes("confirmDisableClaudeHookManagement"));
-    assert.ok(agentsSource.includes("runDisconnectClaudeHooks"));
+    assert.ok(agentsSource.includes("showClaudeHooksDisableConfirmModal"));
     assert.ok(agentsSource.includes("showSettingsConfirmModal({"));
     assert.ok(agentsSource.includes("claudeHooksDisableConfirmTitle"));
-    assert.ok(agentsSource.includes("claudeHooksDisconnectConfirmTitle"));
+    assert.ok(!agentsSource.includes("runDisconnectClaudeHooks"));
+    assert.ok(!agentsSource.includes("claudeHooksDisconnectConfirm"));
     assert.ok(uiCoreSource.includes("buttons.find((action) => action.action && action.action.defaultFocus)"));
     assert.ok(uiCoreSource.includes("const button = buildButton({"));
     assert.ok(uiCoreSource.includes('["neutral", "accent", "danger", "quiet"]'));
@@ -11812,7 +11861,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(!mainSource.includes("CLAUDE_HOOKS_DIALOG_STRINGS"));
     assert.ok(i18nSource.includes("claudeHooksDisableConfirmTitle"));
     assert.ok(i18nSource.includes("claudeHooksDisableConfirmKeep"));
-    assert.ok(i18nSource.includes("claudeHooksDisconnectConfirmKeep"));
+    assert.ok(!i18nSource.includes("claudeHooksDisconnectConfirm"));
   });
 
   it("renders three permission automation modes with two confirmation-gated automatic choices", () => {
@@ -13231,7 +13280,11 @@ describe("settings renderer browser environment", () => {
     assert.match(collectText(rows[0]), /The Clawd plugin keeps working.*click Uninstall and then Install here.*restart any running dsh web/);
     assert.doesNotMatch(collectText(rows[0]), /Open Doctor|Not installed:|raw installer error/);
     assert.match(collectText(rows[1]), /Not installed: repair interrupted Open Doctor and click Repair Now/);
-    assert.strictEqual(collectText(harness.content.querySelector(".agent-integration-action")), "Uninstall");
+    const dshCard = findAgentCard(harness.content, "DeepSeek Harness (experimental)");
+    dshCard.querySelector(".agent-disconnect-link").dispatchEvent({ type: "click", bubbles: true });
+    const dshDetail = dshCard.querySelector(".agent-disconnect-detail");
+    assert.strictEqual(dshDetail.hidden, false, "clicking Disconnect… reveals the uninstall row");
+    assert.strictEqual(collectText(dshDetail.querySelector(".agent-integration-action")), "Uninstall");
     harness.core.state.snapshot = { agents: { "deepseek-harness": { integrationInstalled: false, enabled: false } } };
     harness.core.ops.requestRender({ content: true });
     assert.strictEqual(collectText(harness.content.querySelector(".agent-integration-action")), "Install");
@@ -13351,7 +13404,10 @@ describe("settings renderer browser environment", () => {
     await flushAsync();
     const afterRender = getCalls;
 
-    harness.content.querySelector(".agent-integration-action").click();
+    const dshCard = findAgentCard(harness.content, "DeepSeek Harness (experimental)");
+    dshCard.querySelector(".agent-disconnect-link").dispatchEvent({ type: "click", bubbles: true });
+    assert.strictEqual(dshCard.querySelector(".agent-disconnect-detail").hidden, false);
+    dshCard.querySelector(".agent-disconnect-detail .agent-integration-action").click();
     await flushAsync();
     await flushAsync();
     const afterInstall = getCalls;
@@ -13434,7 +13490,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(autoStart, "Start with Codex should mount inside the Codex group");
     assert.strictEqual(autoStart.element.classList.contains("on"), false);
     assert.strictEqual(autoStart.element.classList.contains("disabled"), false);
-    assert.strictEqual(autoStart.row.querySelector(".row-label").textContent, "Start with Codex");
+    assert.strictEqual(autoStart.row.querySelector(".row-label")._textContent, "Start with Codex");
 
     autoStart.element.dispatchEvent({ type: "click" });
     await Promise.resolve();
@@ -13576,7 +13632,21 @@ describe("settings renderer browser environment", () => {
     assert.ok(agentsSource.includes('descExtraKey: manageHooksEnabled ? null : "rowStartWithClaudeDisabledDesc"'));
     // Confirm/disconnect flows moved with the switches.
     assert.ok(agentsSource.includes("confirmDisableClaudeHookManagement"));
-    assert.ok(agentsSource.includes("runDisconnectClaudeHooks"));
+    assert.ok(!agentsSource.includes("runDisconnectClaudeHooks"));
+
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        manageClaudeHooksAutomatically: true,
+        agents: { "claude-code": { integrationInstalled: true, enabled: true } },
+      },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+      ],
+    });
+    harness.core.ops.requestRender({ content: true });
+    const manageRow = findAgentRow(findAgentCard(harness.content, "Claude Code"), "Manage hooks automatically");
+    assert.ok(manageRow.querySelector(".switch"), "manage hooks keeps its switch");
+    assert.strictEqual(manageRow.querySelector(".settings-button"), null, "manage hooks has no Disconnect button");
   });
 
   it("keeps every provider's quota collection opt-in on its own Agents card", () => {
@@ -15158,7 +15228,8 @@ describe("settings renderer browser environment", () => {
     const agentsSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8");
     assert.ok(agentsSource.includes("function buildAgentGroup(agent)"));
     assert.ok(agentsSource.includes("const masterRow = buildAgentMasterRow(agent);"));
-    assert.ok(agentsSource.includes("const detailRows = buildAgentDetailRows(agent);"));
+    assert.ok(agentsSource.includes("buildAgentDetailRows(agent)"));
+    assert.ok(agentsSource.includes("buildAgentDiscoverRows(agent)"));
     assert.ok(agentsSource.includes('id: `agents:${agent.id}`'));
     assert.ok(agentsSource.includes("defaultCollapsed: true"));
     assert.ok(agentsSource.includes("headerContent: masterRow"));
@@ -15233,6 +15304,13 @@ describe("settings renderer browser environment", () => {
     harness.core.runtime.agentInstallationHintsFetched = true;
     harness.core.ops.requestRender({ content: true });
     await flush();
+
+    const quotaRowButton = harness.content.querySelector(".kimi-quota-row-action");
+    const quotaPanel = harness.content.querySelector(".kimi-quota-panel");
+    assert.ok(quotaRowButton);
+    assert.strictEqual(quotaPanel.hidden, true);
+    quotaRowButton.dispatchEvent({ type: "click", bubbles: false });
+    assert.strictEqual(quotaPanel.hidden, false);
 
     const card = harness.content.querySelector(".kimi-quota-card");
     assert.ok(card);
@@ -15420,8 +15498,15 @@ describe("settings renderer browser environment", () => {
       ["Nova AI", "QoderWork"]
     );
     assert.strictEqual(harness.content.querySelector(".agent-section-recommended"), null);
-    // Its executable resolves, so no missing-binary badge yet.
-    assert.strictEqual(connected.querySelector(".custom-missing"), null);
+    const statusFor = (name) => {
+      const section = harness.content.querySelector(".agent-section-connected");
+      const label = section.querySelectorAll(".agent-summary-row .row-label")
+        .find((node) => node._textContent === name);
+      return label.parentNode.querySelector(".agent-status");
+    };
+    // Its executable resolves, so the status line is the normal registered one.
+    assert.strictEqual(statusFor("Nova AI").classList.contains("warn"), false);
+    assert.match(collectText(statusFor("Nova AI")), /Registered HTTP tool/);
 
     // Losing the executable no longer moves the agent out of Connected, so the
     // row itself has to report it.
@@ -15435,7 +15520,7 @@ describe("settings renderer browser environment", () => {
       };
       harness.core.ops.requestRender({ content: true });
       harness.raf.flush();
-      return harness.content.querySelector(".agent-section-connected .custom-missing");
+      return statusFor("Nova AI");
     };
 
     const missing = showUnavailableReason("not-found", 2);
@@ -15447,9 +15532,10 @@ describe("settings renderer browser environment", () => {
       "a vanished executable must not evict the agent from Connected"
     );
     assert.ok(missing, "the row reports the missing executable");
-    assert.strictEqual(missing.textContent, "Path missing");
-    assert.strictEqual(showUnavailableReason("not-executable", 3).textContent, "Not executable");
-    assert.strictEqual(showUnavailableReason("not-file", 4).textContent, "Not a file");
+    assert.strictEqual(missing.classList.contains("warn"), true);
+    assert.match(collectText(missing), /Executable problem: Path missing/);
+    assert.match(collectText(showUnavailableReason("not-executable", 3)), /Not executable/);
+    assert.match(collectText(showUnavailableReason("not-file", 4)), /Not a file/);
   });
 
   it("renders Custom AI detection under one manual folder picker", () => {
@@ -15472,7 +15558,10 @@ describe("settings renderer browser environment", () => {
     assert.ok(agentsSource.includes("function buildWslScanControl("));
     assert.ok(agentsSource.includes('control.className = "custom-tool-wsl-scan"'));
     assert.ok(!agentsSource.includes('toolbar.className = "agent-scan-toolbar"'));
+    assert.ok(!agentsSource.includes('className: "custom-tool-scan"'));
+    assert.ok(agentsSource.includes("function buildRescanControl("));
     assert.ok(css.includes(".custom-tool-result-status"));
+    assert.match(css, /\.agent-custom-tools-section\s*\{[^}]*margin-top:\s*14px;/s);
     assert.match(css, /\.agent-custom-tools-section \.custom-tool-discovery-row\s*\{[^}]*flex-direction:\s*row;/s);
     assert.match(css, /\.agent-custom-tools-section \.row-text\s*\{[^}]*flex:\s*1 1 360px;[^}]*min-width:\s*0;/s);
     assert.match(css, /\.agent-custom-tools-section \.custom-tool-discovery-control\s*\{[^}]*justify-content:\s*flex-end;[^}]*margin-left:\s*auto;/s);
@@ -15481,12 +15570,10 @@ describe("settings renderer browser environment", () => {
     assert.match(css, /\.agent-section-summary\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\) auto;/s);
     assert.match(css, /@media \(max-width:\s*980px\)\s*\{\s*\.agent-unavailable-group > \.collapsible-group-header\s*\{[^}]*grid-template-columns:\s*18px minmax\(0,\s*1fr\);[^}]*\}\s*\.agent-unavailable-group > \.collapsible-group-header > \.collapsible-group-summary\s*\{[^}]*grid-column:\s*2;/s);
     assert.match(css, /@media \(max-width:\s*760px\)\s*\{[\s\S]*?\.agent-custom-tools-section \.custom-tool-discovery-row\s*\{[^}]*flex-direction:\s*column;/);
-    // The primary picker must keep a higher-specificity selector than the
-    // generic `.soft-btn.accent` tinted rule that follows it, or the cascade
-    // falls back to source order and drops the solid accent fill.
-    assert.match(css, /\.agent-custom-tools-section \.soft-btn\.custom-tool-path-picker\s*\{[^}]*background:\s*var\(--accent\);/s);
+    // The picker is a normal neutral button now, with no oversized accent rule.
+    assert.ok(!css.includes(".soft-btn.custom-tool-path-picker"));
+    assert.ok(!agentsSource.includes('labelKey: "customToolManualAdd",\n      tone: "accent"'));
     assert.ok(!/\.custom-tool-path-picker\s*\{[^}]*width:\s*100%;/s.test(css));
-    assert.ok(!/\.custom-tool-scan\s*\{[^}]*width:\s*100%;/s.test(css));
     assert.match(css, /@media \(max-width:\s*760px\)\s*\{[\s\S]*?\.custom-tool-discovery-actions,[\s\S]*?\{[^}]*width:\s*100%;/s);
   });
 
@@ -15662,9 +15749,20 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(harness.content.querySelector(".agent-section-connected"), null);
     assert.strictEqual(discoverSubtabs.querySelector(".custom-tool-wsl-scan"), null);
     assert.strictEqual(harness.content.querySelector(".agent-cleanup-hint-banner"), null);
-    assert.ok(harness.content.querySelector(".agent-install-hint-banner"));
+    assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
+    // Rescan rides on the subtab row of Discover, mirroring Scan WSL.
+    assert.ok(discoverSubtabs.querySelector(".agent-rescan"));
+    assert.ok(discoverSubtabs.querySelector(".agent-rescan .agent-scan-status"));
+    const detectedTitle = harness.content.querySelector(".agent-detected-title");
+    assert.ok(detectedTitle);
+    assert.match(collectText(detectedTitle), /Detected locally · 1/);
 
-    // The pill is the only heading for this half, and an unrecognized path
+    // The manual picker is the last section on the page.
+    const discoverPanel = harness.content.children.find((node) => node.getAttribute("role") === "tabpanel" && !node.hidden);
+    const lastChild = discoverPanel.children[discoverPanel.children.length - 1];
+    assert.ok(lastChild.classList.contains("agent-custom-tools-section"));
+
+    // The manual picker card has no title of its own, and an unrecognized path
     // states its status once, localized, with no badge repeating it.
     assert.strictEqual(harness.content.querySelector(".agent-custom-tools-section .section-title"), null);
     const resultRow = harness.content.querySelector(".custom-tool-result-row");
@@ -15698,8 +15796,8 @@ describe("settings renderer browser environment", () => {
     harness.core.ops.requestRender({ content: true });
     harness.raf.flush();
 
-    const button = harness.content.querySelector(".custom-tool-scan");
-    const status = harness.content.querySelector(".custom-tool-scan-status");
+    const button = harness.content.querySelector(".agent-rescan-button");
+    const status = harness.content.querySelector(".agent-rescan .agent-scan-status");
     assert.strictEqual(button.textContent, "Rescan");
     assert.match(status.textContent, /^Last scanned at /);
 
@@ -15850,14 +15948,9 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(calls[0][1].path, pickedPath);
     assert.ok(harness.core.runtime.agentMetadata.some((agent) => agent.id === id));
     assert.ok(harness.content.querySelector(".custom-agent-remove"));
-    assert.ok(harness.content.querySelector(".custom-registration"));
+    assert.match(collectText(harness.content.querySelector(".agent-status")), /Registered HTTP tool · state only/);
     assert.ok(harness.content.querySelector(".custom-agent-copy"));
-    assert.strictEqual(
-      harness.content
-        .querySelectorAll(".agent-badge")
-        .some((badge) => badge.classList.contains("accent")),
-      false
-    );
+    assert.strictEqual(harness.content.querySelector(".agent-badge"), null);
 
     const activity = harness.content.querySelector(".custom-agent-activity");
     assert.ok(!activity.textContent.includes("PreToolUse"));
@@ -15987,7 +16080,11 @@ describe("settings renderer browser environment", () => {
     harness.core.runtime.agentsSubtab = "discover";
     harness.core.ops.requestRender({ content: true });
     harness.raf.flush();
-    assert.strictEqual(harness.content.querySelector(".agent-section-recommended"), null);
+    const detected = harness.content.querySelector(".agent-section-recommended");
+    assert.ok(detected);
+    assert.match(collectText(detected.querySelector(".agent-detected-title")), /Detected locally · 0/);
+    assert.ok(detected.querySelector(".agent-detected-empty"));
+    assert.strictEqual(detected.querySelector(".agent-install-all"), null);
     assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
     assert.strictEqual(harness.content.querySelector(".agent-cleanup-hint-banner"), null);
     assert.deepStrictEqual(commandCalls, [], "null must not clear either dismissal bucket");
@@ -16040,7 +16137,7 @@ describe("settings renderer browser environment", () => {
     const unavailable = harness.content.querySelector(".agent-section-unavailable");
     assert.ok(recommended);
     assert.ok(unavailable);
-    assert.strictEqual(recommended.querySelector(".section-title").textContent, "Detected locally");
+    assert.match(collectText(recommended.querySelector(".section-title")), /Detected locally · 1/);
     assert.deepStrictEqual(labelsFor(recommended), ["Qwen Code"]);
     assert.strictEqual(harness.content.querySelector(".agent-section-connected"), null);
 
@@ -16056,7 +16153,8 @@ describe("settings renderer browser environment", () => {
     assert.deepStrictEqual(labelsFor(unavailable), ["Pi"]);
     assert.ok(
       unavailable.parentNode.children.indexOf(harness.content.querySelector(".agent-custom-tools-section"))
-      < unavailable.parentNode.children.indexOf(unavailable)
+      > unavailable.parentNode.children.indexOf(unavailable),
+      "the manual picker sits last on the discover page"
     );
   });
 
@@ -16064,7 +16162,7 @@ describe("settings renderer browser environment", () => {
   // test used "high", so dropping medium from the set was invisible. Antigravity
   // squatting in ~/.gemini produces exactly a medium parent-dir hit, so this is
   // the confidence the Gemini half of #895 travels on.
-  it("offers medium-confidence detections in the install hint banner", () => {
+  it("counts medium-confidence detections in the detected section", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {
         agents: { "gemini-cli": { integrationInstalled: false, enabled: false } },
@@ -16084,14 +16182,15 @@ describe("settings renderer browser environment", () => {
 
     harness.core.ops.requestRender({ content: true });
 
-    assert.ok(harness.content.querySelector(".agent-install-hint-banner"));
-    assert.match(harness.content.querySelector(".agent-install-hint-desc").textContent, /Gemini CLI/);
+    assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
     const recommended = harness.content.querySelector(".agent-section-recommended");
     assert.ok(recommended);
+    assert.match(collectText(recommended.querySelector(".agent-detected-title")), /Detected locally · 1/);
     assert.deepStrictEqual(
       recommended.querySelectorAll(".agent-summary-row .row-label").map((el) => el.textContent),
       ["Gemini CLI"]
     );
+    assert.ok(recommended.querySelector(".agent-integration-action"));
   });
 
   // #895 T9: before the first detection resolves there is no evidence at all, so
@@ -16184,7 +16283,7 @@ describe("settings renderer browser environment", () => {
     }
   });
 
-  it("renders an install hint banner for detected local agents that are not integrated", () => {
+  it("renders the detected section for unintegrated local agents", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {
         agents: {
@@ -16212,16 +16311,19 @@ describe("settings renderer browser environment", () => {
 
     harness.core.ops.requestRender({ content: true });
 
-    const banner = harness.content.querySelector(".agent-install-hint-banner");
-    assert.ok(banner, "detected unintegrated agents should render a banner");
-    assert.ok(harness.content.querySelector(".agent-install-hint-install"));
-    assert.ok(harness.content.querySelector(".agent-install-hint-dismiss"));
-    const desc = harness.content.querySelector(".agent-install-hint-desc").textContent;
-    assert.match(desc, /Qwen Code/);
-    assert.doesNotMatch(desc, /Hermes/);
+    assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
+    const recommended = harness.content.querySelector(".agent-section-recommended");
+    assert.ok(recommended);
+    assert.match(collectText(recommended.querySelector(".agent-detected-title")), /Detected locally · 1/);
+    assert.deepStrictEqual(
+      recommended.querySelectorAll(".agent-summary-row .row-label").map((el) => el.textContent),
+      ["Qwen Code"]
+    );
+    assert.ok(recommended.querySelector(".agent-integration-action"));
+    assert.strictEqual(recommended.querySelector(".agent-install-all"), null);
   });
 
-  it("hides install hint banners after the agent is dismissed", () => {
+  it("keeps historical install dismissals out of the detected count and actions", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {
         agents: {
@@ -16243,6 +16345,9 @@ describe("settings renderer browser environment", () => {
     harness.core.ops.requestRender({ content: true });
 
     assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
+    const detected = harness.content.querySelector(".agent-section-recommended");
+    assert.match(collectText(detected.querySelector(".agent-detected-title")), /Detected locally · 1/);
+    assert.ok(detected.querySelector(".agent-integration-action"));
   });
 
   it("clears install dismissals when the detector no longer sees the agent", async () => {
@@ -16280,27 +16385,31 @@ describe("settings renderer browser environment", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
     assert.strictEqual(calls[0][0], "clearAgentInstallHints");
     assert.deepStrictEqual([...calls[0][1].agentIds], ["qwen-code"]);
   });
 
-  it("wires install hint banner buttons to bulk install and dismiss commands", async () => {
+  it("installs every detected agent in order through Install all", async () => {
     const calls = [];
     const detectionResult = {
       checkedAt: 2,
-      agents: [{ agentId: "qwen-code", detectedInstalled: true, confidence: "high" }],
+      agents: [
+        { agentId: "qwen-code", detectedInstalled: true, confidence: "high" },
+        { agentId: "gemini-cli", detectedInstalled: true, confidence: "high" },
+      ],
       skippedAgentIds: [],
     };
     const harness = loadAgentsTabForTest({
       snapshot: {
         agents: {
           "qwen-code": { integrationInstalled: false, enabled: false },
+          "gemini-cli": { integrationInstalled: false, enabled: false },
         },
         dismissedAgentInstallHints: {},
       },
       agentMetadata: [
-        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: {} },
+        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: "gemini-cli", name: "Gemini CLI", eventSource: "hook", capabilities: {} },
       ],
       settingsAPI: {
         command: (action, payload) => {
@@ -16312,46 +16421,47 @@ describe("settings renderer browser environment", () => {
     });
     harness.core.runtime.agentInstallationHints = detectionResult;
     harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.runtime.agentsSubtab = "discover";
 
     harness.core.ops.requestRender({ content: true });
-    harness.content.querySelector(".agent-install-hint-install").dispatchEvent({ type: "click", bubbles: false });
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    const recommended = harness.content.querySelector(".agent-section-recommended");
+    const renderedIds = recommended.querySelectorAll(".agent-summary-row .row-label")
+      .map((label) => (label._textContent === "Qwen Code" ? "qwen-code" : "gemini-cli"));
+    assert.strictEqual(renderedIds.length, 2);
+    harness.content.querySelector(".agent-install-all").dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
 
-    assert.strictEqual(calls[0][0], "installAgentIntegration");
-    assert.strictEqual(calls[0][1].agentId, "qwen-code");
-
-    calls.length = 0;
-    harness.core.runtime.agentInstallationHintsFetched = true;
-    harness.core.ops.requestRender({ content: true });
-    harness.content.querySelector(".agent-install-hint-dismiss").dispatchEvent({ type: "click", bubbles: false });
-    await Promise.resolve();
-    await Promise.resolve();
-
-    assert.strictEqual(calls[0][0], "dismissAgentInstallHints");
-    assert.deepStrictEqual([...calls[0][1].agentIds], ["qwen-code"]);
+    assert.deepStrictEqual(
+      calls.map((call) => [call[0], call[1] && call[1].agentId]),
+      renderedIds.map((agentId) => ["installAgentIntegration", agentId]),
+      "Install all must send every detected agent exactly once, in card order"
+    );
   });
 
   it("shows a non-error toast when a recommended install is skipped", async () => {
     const toasts = [];
     const detectionResult = {
       checkedAt: 2,
-      agents: [{ agentId: "qwen-code", detectedInstalled: true, confidence: "high" }],
+      agents: [
+        { agentId: "qwen-code", detectedInstalled: true, confidence: "high" },
+        { agentId: "gemini-cli", detectedInstalled: true, confidence: "high" },
+      ],
       skippedAgentIds: [],
     };
     const harness = loadAgentsTabForTest({
       snapshot: {
         agents: {
           "qwen-code": { integrationInstalled: false, enabled: false },
+          "gemini-cli": { integrationInstalled: false, enabled: false },
         },
         dismissedAgentInstallHints: {},
       },
       agentMetadata: [
         { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: {} },
+        { id: "gemini-cli", name: "Gemini CLI", eventSource: "hook", capabilities: {} },
       ],
       settingsAPI: {
-        command: () => Promise.resolve({ status: "skipped", message: "Qwen missing" }),
+        command: () => Promise.resolve({ status: "skipped", message: "missing" }),
         detectAgentInstallations: () => Promise.resolve(detectionResult),
       },
     });
@@ -16360,12 +16470,11 @@ describe("settings renderer browser environment", () => {
     };
     harness.core.runtime.agentInstallationHints = detectionResult;
     harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.runtime.agentsSubtab = "discover";
 
     harness.core.ops.requestRender({ content: true });
-    harness.content.querySelector(".agent-install-hint-install").dispatchEvent({ type: "click", bubbles: false });
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    harness.content.querySelector(".agent-install-all").dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
 
     assert.strictEqual(toasts.length, 1);
     assert.match(toasts[0].message, /Qwen Code/);
@@ -16597,6 +16706,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "intercept",
@@ -16672,6 +16782,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "intercept",
@@ -16699,6 +16810,7 @@ describe("settings renderer browser environment", () => {
       changes: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "native",
@@ -16708,6 +16820,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "native",
@@ -16730,6 +16843,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "intercept",
@@ -16762,6 +16876,7 @@ describe("settings renderer browser environment", () => {
       changes: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "native",
@@ -16772,6 +16887,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "native",
@@ -16791,6 +16907,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           "claude-code": {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             subagentPermissionsEnabled: true,
@@ -16849,6 +16966,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codebuddy: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
           },
@@ -16886,6 +17004,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           workbuddy: {
+            integrationInstalled: true,
             enabled: true,
             notificationHookEnabled: true,
           },
@@ -16924,6 +17043,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "intercept",
@@ -16953,6 +17073,7 @@ describe("settings renderer browser environment", () => {
       changes: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "native",
@@ -16962,6 +17083,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           codex: {
+            integrationInstalled: true,
             enabled: true,
             permissionsEnabled: true,
             permissionMode: "native",
@@ -16980,6 +17102,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           "gemini-cli": {
+            integrationInstalled: true,
             enabled: true,
             notificationHookEnabled: true,
           },
@@ -17028,7 +17151,7 @@ describe("settings renderer browser environment", () => {
     );
   });
 
-  it("ignores stale Codex hook health results after the badge becomes not installed", async () => {
+  it("ignores stale Codex hook health results after the status line becomes not installed", async () => {
     let resolveHealth;
     const healthPromise = new Promise((resolve) => { resolveHealth = resolve; });
     const harness = loadAgentsTabForTest({
@@ -17047,11 +17170,11 @@ describe("settings renderer browser environment", () => {
     });
 
     harness.core.ops.requestRender({ content: true });
-    const findIntegrationBadge = () => harness.content.querySelectorAll(".agent-badge")
-      .find((candidate) => candidate.classList.contains("integration"));
-    let badge = findIntegrationBadge();
-    assert.ok(badge);
-    assert.strictEqual(badge.textContent, "Installed");
+    const findStatus = () => harness.content.querySelector(".agent-status");
+    let status = findStatus();
+    assert.ok(status);
+    assert.match(collectText(status), /Receives state via Hook/);
+    assert.strictEqual(status.classList.contains("warn"), false);
 
     harness.core.ops.applyChanges({
       changes: {
@@ -17065,18 +17188,19 @@ describe("settings renderer browser environment", () => {
         },
       },
     });
-    badge = findIntegrationBadge();
-    assert.ok(badge);
-    assert.strictEqual(badge.textContent, "Not installed");
+    status = findStatus();
+    assert.ok(status);
+    assert.strictEqual(status.classList.contains("off"), true);
+    assert.match(collectText(status), /Receives state via Hook/);
 
     resolveHealth({ healthy: false, signature: "not-registered", reasonKey: "codexHookHealthReasonInactive" });
     await Promise.resolve();
     await Promise.resolve();
 
-    badge = findIntegrationBadge();
-    assert.strictEqual(badge.textContent, "Not installed");
-    assert.strictEqual(badge.classList.contains("hook-warning"), false);
-    assert.strictEqual(badge.title, "");
+    status = findStatus();
+    assert.strictEqual(status.classList.contains("warn"), false);
+    assert.strictEqual(status.classList.contains("off"), true);
+    assert.strictEqual(collectText(status).includes("Hook inactive"), false);
   });
   it("does not initialize an expanded agent group at 0px height during rerender", () => {
     const harness = loadAgentsTabForTest({
@@ -19663,7 +19787,7 @@ describe("settings renderer browser environment", () => {
       };
       const harness = loadAgentsTabForTest({
         snapshot: {
-          agents: { "qwen-code": { integrationInstalled: false, enabled: false } },
+          agents: { "qwen-code": { integrationInstalled: true, enabled: true } },
           dismissedAgentInstallHints: {},
         },
         agentMetadata: [
@@ -19681,6 +19805,10 @@ describe("settings renderer browser environment", () => {
 
     // Paired + registered: badge on, Pair + Unpair buttons.
     let harness = buildHarness({ hooksDeployed: true, hooksFilesPresent: true });
+    const wslGroup = harness.content.querySelectorAll(".agent-detail-group")
+      .find((group) => collectText(group.querySelector(".agent-detail-group-label")) === "WSL");
+    assert.ok(wslGroup, "WSL instance rows live in the WSL group");
+    assert.ok(wslGroup.querySelector(".agent-instance-row"));
     assert.strictEqual(harness.content.querySelectorAll(".agent-instance-deployed").length, 1);
     assert.strictEqual(harness.content.querySelectorAll(".agent-instance-action").length, 2);
 
@@ -19726,7 +19854,7 @@ describe("settings renderer browser environment", () => {
       };
       const harness = loadAgentsTabForTest({
         snapshot: {
-          agents: { hermes: { integrationInstalled: false, enabled: false } },
+          agents: { hermes: { integrationInstalled: true, enabled: true } },
           dismissedAgentInstallHints: {},
         },
         agentMetadata: [
@@ -19741,6 +19869,10 @@ describe("settings renderer browser environment", () => {
     }
 
     let harness = renderHermes(true);
+    const wslGroup = harness.content.querySelectorAll(".agent-detail-group")
+      .find((group) => collectText(group.querySelector(".agent-detail-group-label")) === "WSL");
+    assert.ok(wslGroup, "Hermes WSL instance rows live in the WSL group");
+    assert.ok(wslGroup.querySelector(".agent-instance-row"));
     assert.strictEqual(harness.content.querySelectorAll(".agent-instance-deployed").length, 0,
       "Claude registration must never render a Hermes deployed badge");
     assert.strictEqual(harness.content.querySelectorAll(".agent-instance-action").length, 2,
@@ -19753,6 +19885,720 @@ describe("settings renderer browser environment", () => {
     harness = renderHermes(null);
     assert.strictEqual(harness.content.querySelectorAll(".agent-instance-action").length, 1,
       "unknown evidence conservatively keeps Pair but hides Unpair");
+  });
+
+  // ── A1 layout contract tests ─────────────────────────────────────────
+
+  function findAgentCard(content, name) {
+    const labels = content.querySelectorAll(".agent-summary-row .row-label");
+    const label = labels.find((node) => node._textContent === name);
+    if (!label) return null;
+    let node = label;
+    while (node && !node.classList.contains("agent-subgroup")) node = node.parentNode;
+    return node;
+  }
+
+  function findAgentStatus(content, name) {
+    const card = findAgentCard(content, name);
+    return card ? card.querySelector(".agent-status") : null;
+  }
+
+  function findAgentRow(card, labelText) {
+    return card.querySelectorAll(".row-label")
+      .find((node) => node._textContent === labelText)
+      ?.parentNode.parentNode || null;
+  }
+
+  function detailGroupLabels(card) {
+    return card.querySelectorAll(".agent-detail-group-label").map((node) => node.textContent);
+  }
+
+  function detailGroupRows(card, labelText) {
+    const group = card.querySelectorAll(".agent-detail-group")
+      .find((node) => node.querySelector(".agent-detail-group-label").textContent === labelText);
+    if (!group) return [];
+    return group.querySelector(".agent-detail-group-rows").children
+      .filter((child) => child.classList.contains("row"))
+      .map((row) => row.querySelector(".row-label")._textContent);
+  }
+
+  it("renders the five status-line cases from local state", async () => {
+    const customId = "custom-status-ai-0123456789ab";
+    const connected = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "claude-code": { integrationInstalled: true, enabled: true },
+          "gemini-cli": { integrationInstalled: true, enabled: true },
+          codex: { integrationInstalled: true, enabled: false },
+          [customId]: { integrationInstalled: false, enabled: true },
+        },
+      },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: "gemini-cli", name: "Gemini CLI", eventSource: "hook", capabilities: {} },
+        { id: "codex", name: "Codex", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: customId, name: "Nova AI", eventSource: "custom-http", custom: true, capabilities: {} },
+      ],
+    });
+    connected.core.runtime.agentInstallationHints = {
+      checkedAt: 1,
+      agents: [],
+      customAgents: [{ agentId: customId, detectedInstalled: true, confidence: "high" }],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    connected.core.runtime.agentInstallationHintsFetched = true;
+    connected.core.ops.requestRender({ content: true });
+
+    const approval = findAgentStatus(connected.content, "Claude Code");
+    assert.match(collectText(approval), /Receives state via Hook · approvals handled by the pet/);
+    assert.strictEqual(approval.classList.contains("off"), false);
+
+    const stateOnly = findAgentStatus(connected.content, "Gemini CLI");
+    assert.match(collectText(stateOnly), /Receives state via Hook · state only, no approvals/);
+
+    const paused = findAgentStatus(connected.content, "Codex");
+    assert.match(collectText(paused), /Paused · the pet no longer reacts to it/);
+    assert.strictEqual(paused.classList.contains("off"), true);
+
+    const custom = findAgentStatus(connected.content, "Nova AI");
+    assert.match(collectText(custom), /Registered HTTP tool · state only/);
+    assert.strictEqual(custom.classList.contains("warn"), false);
+
+    // Losing the executable turns the same line into the amber warning.
+    connected.core.runtime.agentInstallationHints = {
+      checkedAt: 2,
+      agents: [],
+      customAgents: [{ agentId: customId, detectedInstalled: false, confidence: "low", reason: "not-executable" }],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    connected.core.ops.requestRender({ content: true });
+    const missing = findAgentStatus(connected.content, "Nova AI");
+    assert.strictEqual(missing.classList.contains("warn"), true);
+    assert.match(collectText(missing), /Executable problem: Not executable/);
+
+    const discover = loadAgentsTabForTest({
+      snapshot: { agents: { "opencode": { integrationInstalled: false, enabled: false } } },
+      agentMetadata: [
+        { id: "opencode", name: "OpenCode", eventSource: "plugin-event", capabilities: {} },
+      ],
+    });
+    discover.core.runtime.agentInstallationHints = { checkedAt: 1, agents: [], customTools: [], skippedAgentIds: [] };
+    discover.core.runtime.agentInstallationHintsFetched = true;
+    discover.core.runtime.agentsSubtab = "discover";
+    discover.core.ops.requestRender({ content: true });
+
+    const uninstalled = findAgentStatus(discover.content, "OpenCode");
+    assert.match(collectText(uninstalled), /Receives state via plugin · state only, no approvals/);
+    assert.strictEqual(uninstalled.classList.contains("off"), true);
+  });
+
+  it("turns the status line into a Doctor fix link when the hook is unhealthy", async () => {
+    const opens = [];
+    const doctorModal = { open: (core) => opens.push(core) };
+    const unhealthy = loadAgentsTabForTest({
+      snapshot: { agents: { codex: { integrationInstalled: true, enabled: true } } },
+      agentMetadata: [{ id: "codex", name: "Codex", eventSource: "hook", capabilities: { permissionApproval: true } }],
+      doctor: {
+        codexHookHealth: () => Promise.resolve({
+          healthy: false,
+          signature: "not-registered",
+          reasonKey: "codexHookHealthReasonInactive",
+        }),
+      },
+      doctorModal,
+    });
+    unhealthy.core.ops.requestRender({ content: true });
+    await flushAsync();
+    await flushAsync();
+
+    const status = findAgentStatus(unhealthy.content, "Codex");
+    assert.strictEqual(status.classList.contains("warn"), true);
+    assert.match(collectText(status), /Hook inactive/);
+    const fix = status.querySelector(".agent-status-fix");
+    assert.ok(fix, "an unhealthy hook offers Fix it");
+    fix.dispatchEvent({ type: "click", bubbles: true });
+    assert.strictEqual(opens.length, 1);
+    assert.strictEqual(opens[0], unhealthy.core);
+
+    const healthy = loadAgentsTabForTest({
+      snapshot: { agents: { codex: { integrationInstalled: true, enabled: true } } },
+      agentMetadata: [{ id: "codex", name: "Codex", eventSource: "hook", capabilities: { permissionApproval: true } }],
+      doctor: { codexHookHealth: () => Promise.resolve({ healthy: true, signature: "ok" }) },
+      doctorModal,
+    });
+    healthy.core.ops.requestRender({ content: true });
+    await flushAsync();
+    await flushAsync();
+    assert.strictEqual(findAgentStatus(healthy.content, "Codex").querySelector(".agent-status-fix"), null);
+
+    // A late unhealthy reply must not repaint a card that has since paused.
+    let resolveLate;
+    const late = loadAgentsTabForTest({
+      snapshot: { agents: { codex: { integrationInstalled: true, enabled: true } } },
+      agentMetadata: [{ id: "codex", name: "Codex", eventSource: "hook", capabilities: { permissionApproval: true } }],
+      doctor: { codexHookHealth: () => new Promise((resolve) => { resolveLate = resolve; }) },
+    });
+    late.core.ops.requestRender({ content: true });
+    late.core.ops.applyChanges({
+      changes: { agents: { codex: { integrationInstalled: true, enabled: false } } },
+      snapshot: { agents: { codex: { integrationInstalled: true, enabled: false } } },
+    });
+    resolveLate({ healthy: false, signature: "not-registered", reasonKey: "codexHookHealthReasonInactive" });
+    await flushAsync();
+    await flushAsync();
+    const paused = findAgentStatus(late.content, "Codex");
+    assert.match(collectText(paused), /Paused · the pet no longer reacts to it/);
+    assert.strictEqual(paused.classList.contains("warn"), false);
+
+    // Out-of-order probes: the newest sync wins, never the late first reply.
+    let call = 0;
+    const resolvers = [];
+    const race = loadAgentsTabForTest({
+      snapshot: { agents: { codex: { integrationInstalled: true, enabled: true } } },
+      agentMetadata: [{ id: "codex", name: "Codex", eventSource: "hook", capabilities: { permissionApproval: true } }],
+      doctor: {
+        codexHookHealth: () => new Promise((resolve) => {
+          call += 1;
+          resolvers.push(resolve);
+        }),
+      },
+    });
+    race.core.ops.requestRender({ content: true });
+    race.core.ops.applyChanges({
+      changes: { agents: { codex: { integrationInstalled: true, enabled: true, permissionMode: "intercept" } } },
+      snapshot: { agents: { codex: { integrationInstalled: true, enabled: true, permissionMode: "intercept" } } },
+    });
+    const newest = resolvers[resolvers.length - 1];
+    newest({ healthy: true, signature: "ok" });
+    resolvers[0]({ healthy: false, signature: "not-registered", reasonKey: "codexHookHealthReasonInactive" });
+    await flushAsync();
+    await flushAsync();
+    assert.strictEqual(findAgentStatus(race.content, "Codex").classList.contains("warn"), false);
+  });
+
+  it("refreshes a status line in place without re-rendering the Agents page", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: { "claude-code": { integrationInstalled: true, enabled: true } },
+      },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+      ],
+    });
+    harness.core.ops.requestRender({ content: true });
+    const card = findAgentCard(harness.content, "Claude Code");
+    const header = card.querySelector(".agent-summary-row");
+    const before = harness.getContentRenderCount();
+    assert.match(collectText(findAgentStatus(harness.content, "Claude Code")), /Receives state via Hook/);
+
+    harness.core.ops.applyChanges({
+      changes: { agents: { "claude-code": { integrationInstalled: true, enabled: false } } },
+      snapshot: {
+        agents: { "claude-code": { integrationInstalled: true, enabled: false } },
+      },
+    });
+
+    assert.strictEqual(harness.getContentRenderCount(), before, "status changes patch in place");
+    assert.strictEqual(findAgentCard(harness.content, "Claude Code").querySelector(".agent-summary-row"), header);
+    const status = findAgentStatus(harness.content, "Claude Code");
+    assert.match(collectText(status), /Paused · the pet no longer reacts to it/);
+    assert.strictEqual(status.classList.contains("off"), true);
+  });
+
+  it("keeps exactly one header control: master switch or Install", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "claude-code": { integrationInstalled: true, enabled: true },
+          "qwen-code": { integrationInstalled: false, enabled: false },
+        },
+      },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: {} },
+      ],
+    });
+    harness.core.runtime.agentInstallationHints = { checkedAt: 1, agents: [], customTools: [], skippedAgentIds: [] };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+
+    const connectedControl = findAgentCard(harness.content, "Claude Code")
+      .querySelector(".agent-summary-row .row-control");
+    assert.ok(connectedControl.querySelector(".switch"));
+    assert.strictEqual(connectedControl.querySelector(".settings-button"), null);
+
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.ops.requestRender({ content: true });
+    const discoverControl = findAgentCard(harness.content, "Qwen Code")
+      .querySelector(".agent-summary-row .row-control");
+    assert.strictEqual(discoverControl.querySelector(".switch"), null);
+    assert.ok(discoverControl.querySelector(".settings-button"));
+    assert.match(collectText(discoverControl), /Install/);
+  });
+
+  it("groups connected card bodies in the A1 order with no empty groups", () => {
+    const customId = "custom-groups-ai-0123456789ab";
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "claude-code": { integrationInstalled: true, enabled: true },
+          codex: { integrationInstalled: true, enabled: true },
+          "kimi-cli": { integrationInstalled: true, enabled: true },
+          opencode: { integrationInstalled: true, enabled: true },
+          [customId]: { integrationInstalled: false, enabled: true },
+        },
+      },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: { permissionApproval: true, notificationHook: true } },
+        { id: "codex", name: "Codex", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: "kimi-cli", name: "Kimi Code", eventSource: "hook", capabilities: { permissionApproval: true, notificationHook: true } },
+        { id: "opencode", name: "OpenCode", eventSource: "plugin-event", capabilities: { permissionApproval: true } },
+        { id: customId, name: "Nova AI", eventSource: "custom-http", custom: true, capabilities: { notificationHook: true } },
+      ],
+    });
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1,
+      agents: [],
+      customAgents: [{ agentId: customId, detectedInstalled: true, confidence: "high" }],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+
+    const claude = findAgentCard(harness.content, "Claude Code");
+    assert.deepStrictEqual(detailGroupLabels(claude), ["Approvals", "Alerts", "Connection", "Quota"]);
+    assert.deepStrictEqual(detailGroupRows(claude, "Approvals"), ["Permissions", "Subagent permissions"]);
+    assert.deepStrictEqual(detailGroupRows(claude, "Alerts"), ["Idle alerts"]);
+    assert.deepStrictEqual(detailGroupRows(claude, "Connection"), ["Manage hooks automatically", "Start with Claude Code"]);
+    assert.deepStrictEqual(detailGroupRows(claude, "Quota"), ["Read local Claude quota and context usage"]);
+
+    const codex = findAgentCard(harness.content, "Codex");
+    assert.deepStrictEqual(detailGroupLabels(codex), ["Approvals", "Connection"]);
+    assert.deepStrictEqual(detailGroupRows(codex, "Approvals"), ["Permission mode", "Native sound", "Permissions"]);
+    assert.deepStrictEqual(detailGroupRows(codex, "Connection"), [
+      "Start with Codex",
+      "Warn me when the approval hook stops working",
+    ]);
+    const soundRow = findAgentRow(codex, "Native sound");
+    assert.ok(soundRow.querySelector(".row-note"));
+
+    const kimi = findAgentCard(harness.content, "Kimi Code");
+    assert.deepStrictEqual(detailGroupLabels(kimi), ["Approvals", "Alerts", "Quota"]);
+    assert.deepStrictEqual(detailGroupRows(kimi, "Quota"), ["Subscription quota"]);
+
+    assert.deepStrictEqual(detailGroupLabels(findAgentCard(harness.content, "OpenCode")), ["Approvals"]);
+
+    const custom = findAgentCard(harness.content, "Nova AI");
+    assert.deepStrictEqual(detailGroupLabels(custom), ["Alerts", "Info"]);
+    assert.strictEqual(custom.querySelectorAll(".custom-agent-detail").length, 7);
+
+    for (const group of harness.content.querySelectorAll(".agent-detail-group")) {
+      assert.ok(group.querySelector(".agent-detail-group-rows").children.length > 0);
+    }
+  });
+
+  it("folds descriptions behind an (i) toggle only inside card-body rows", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        manageClaudeHooksAutomatically: false,
+        agents: {
+          "claude-code": { integrationInstalled: true, enabled: true },
+          codex: { integrationInstalled: true, enabled: true },
+          traecode: { integrationInstalled: true, enabled: true },
+        },
+      },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: "codex", name: "Codex", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: "traecode", name: "TraeCode", eventSource: "hook", capabilities: {} },
+      ],
+    });
+    // A registered custom tool's Info rows are values, not descriptions.
+    const customInfoId = "custom-info-ai-0123456789ab";
+    harness.core.runtime.agentMetadata.push({
+      id: customInfoId, name: "Info AI", eventSource: "custom-http", custom: true, capabilities: {},
+    });
+    harness.core.state.snapshot.agents[customInfoId] = { integrationInstalled: false, enabled: true };
+    harness.core.ops.requestRender({ content: true });
+
+    const claude = findAgentCard(harness.content, "Claude Code");
+    const manageRow = findAgentRow(claude, "Manage hooks automatically");
+    const desc = manageRow.querySelector(".row-desc");
+    const toggle = manageRow.querySelector(".row-desc-toggle");
+    assert.ok(desc.classList.contains("row-desc-collapsed"));
+    assert.ok(desc.id, "the disclosure target has a non-empty id");
+    assert.strictEqual(toggle.getAttribute("aria-controls"), desc.id);
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+    assert.strictEqual(manageRow.querySelector(".switch").getAttribute("aria-describedby"), desc.id);
+    assert.strictEqual(manageRow.querySelector(".row-desc-extra"), null, "manage hooks has no always-on extra note");
+
+    const collapsedIds = harness.content.querySelectorAll(".row-desc-collapsed").map((node) => node.id);
+    assert.strictEqual(new Set(collapsedIds).size, collapsedIds.length, "description ids are unique");
+    assert.ok(collapsedIds.every((id) => !!id));
+
+    toggle.dispatchEvent({ type: "click", bubbles: true });
+    assert.strictEqual(desc.classList.contains("row-desc-collapsed"), false);
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "true");
+    toggle.dispatchEvent({ type: "click", bubbles: true });
+    assert.strictEqual(desc.classList.contains("row-desc-collapsed"), true);
+
+    const codexMode = findAgentRow(findAgentCard(harness.content, "Codex"), "Permission mode");
+    const modeDesc = codexMode.querySelector(".row-desc");
+    assert.ok(modeDesc.id, "the Codex mode description is assigned an id");
+    assert.strictEqual(codexMode.querySelector(".row-desc-toggle").getAttribute("aria-controls"), modeDesc.id);
+
+    // Conditional extra notes stay visible and are never folded.
+    const autoStart = findAgentRow(claude, "Start with Claude Code");
+    const extra = autoStart.querySelector(".row-desc-extra");
+    assert.ok(extra);
+    assert.strictEqual(extra.classList.contains("row-desc-collapsed"), false);
+    assert.ok(autoStart.querySelector(".row-desc-toggle"));
+
+    // Card-header hints are not card-body rows, so they never get a toggle.
+    const traeHint = harness.content.querySelector(".agent-traecode-hint");
+    assert.ok(traeHint);
+    assert.strictEqual(traeHint.classList.contains("row-desc-collapsed"), false);
+    assert.strictEqual(traeHint.querySelector(".row-desc-toggle"), null);
+
+    const customCard = findAgentCard(harness.content, "Info AI");
+    const infoRows = customCard.querySelectorAll(".custom-agent-detail");
+    assert.strictEqual(infoRows.length, 7);
+    for (const infoRow of infoRows) {
+      assert.strictEqual(infoRow.querySelector(".row-desc-toggle"), null);
+      assert.ok(infoRow.querySelectorAll(".row-desc")
+        .every((node) => !node.classList.contains("row-desc-collapsed")));
+    }
+  });
+
+  it("reveals the disconnect block only after clicking its quiet link", async () => {
+    const makeHarness = (confirmAction) => loadAgentsTabForTest({
+      snapshot: {
+        agents: { "claude-code": { integrationInstalled: true, enabled: true } },
+      },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+      ],
+      confirmAction,
+      settingsAPI: {
+        command: (action, payload) => {
+          (makeHarness.calls || (makeHarness.calls = [])).push([action, payload]);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+
+    makeHarness.calls = [];
+    const cancelled = makeHarness("cancel");
+    cancelled.core.ops.requestRender({ content: true });
+    assert.strictEqual(await cancelled.core.helpers.showSettingsConfirmModal({}), "cancel");
+    assert.ok(cancelled.core.helpers.showSettingsConfirmModal);
+    const card = findAgentCard(cancelled.content, "Claude Code");
+    const link = card.querySelector(".agent-disconnect-link");
+    assert.match(collectText(link), /Disconnect Claude Code…/);
+    const detail = card.querySelector(".agent-disconnect-detail");
+    assert.strictEqual(detail.hidden, true);
+    link.dispatchEvent({ type: "click", bubbles: true });
+    assert.strictEqual(detail.hidden, false);
+    assert.strictEqual(link.getAttribute("aria-expanded"), "true");
+    const uninstall = detail.querySelector(".agent-integration-action");
+    assert.match(collectText(uninstall), /Uninstall/);
+    assert.ok(uninstall.classList.contains("danger"), "the disconnect block's Uninstall is a danger button");
+    uninstall.dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.deepStrictEqual(makeHarness.calls, [], "cancel sends zero commands");
+
+    makeHarness.calls = [];
+    const confirmed = makeHarness("uninstall");
+    confirmed.core.ops.requestRender({ content: true });
+    const confirmedCard = findAgentCard(confirmed.content, "Claude Code");
+    confirmedCard.querySelector(".agent-disconnect-link").dispatchEvent({ type: "click", bubbles: true });
+    confirmedCard.querySelector(".agent-disconnect-detail .agent-integration-action")
+      .dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(makeHarness.calls.length, 1);
+    assert.strictEqual(makeHarness.calls[0][0], "uninstallAgentIntegration");
+    assert.strictEqual(makeHarness.calls[0][1].agentId, "claude-code");
+
+    const discover = loadAgentsTabForTest({
+      snapshot: { agents: { "qwen-code": { integrationInstalled: false, enabled: false } } },
+      agentMetadata: [
+        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: {} },
+      ],
+    });
+    discover.core.runtime.agentInstallationHints = { checkedAt: 1, agents: [], customTools: [], skippedAgentIds: [] };
+    discover.core.runtime.agentInstallationHintsFetched = true;
+    discover.core.runtime.agentsSubtab = "discover";
+    discover.core.ops.requestRender({ content: true });
+    const headerInstall = discover.content.querySelector(".agent-integration-action");
+    assert.ok(headerInstall);
+    assert.strictEqual(headerInstall.classList.contains("danger"), false, "the header Install stays neutral");
+
+    const customId = "custom-disconnect-ai-0123456789ab";
+    const custom = loadAgentsTabForTest({
+      snapshot: { agents: { [customId]: { integrationInstalled: false, enabled: true } } },
+      agentMetadata: [
+        { id: customId, name: "Nova AI", eventSource: "custom-http", custom: true, capabilities: {} },
+      ],
+    });
+    custom.core.ops.requestRender({ content: true });
+    const customCard = findAgentCard(custom.content, "Nova AI");
+    assert.match(collectText(customCard.querySelector(".agent-disconnect-link")), /Remove Nova AI…/);
+    assert.ok(customCard.querySelector(".agent-disconnect-detail .custom-agent-remove"));
+
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    assert.ok(css.includes(".agent-disconnect-detail[hidden]"));
+    assert.match(css, /\.agent-disconnect-detail\[hidden\]\s*\{\s*display:\s*none;/);
+  });
+
+  it("counts detected agents, offers Install all, and keeps uninstalled cards minimal", async () => {
+    const detection = {
+      checkedAt: 3,
+      agents: [
+        { agentId: "qwen-code", detectedInstalled: true, confidence: "high" },
+        { agentId: "gemini-cli", detectedInstalled: true, confidence: "high" },
+      ],
+      skippedAgentIds: [],
+      wslAgents: [{
+        agentId: "qwen-code",
+        distro: "Ubuntu",
+        detectedInstalled: true,
+        wslParentDir: "/home/u/.qwen",
+      }],
+    };
+    const calls = [];
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          "qwen-code": { integrationInstalled: false, enabled: false },
+          "gemini-cli": { integrationInstalled: false, enabled: false },
+        },
+      },
+      agentMetadata: [
+        // Permission-capable on purpose: an accidental detail-row call would
+        // add a Permissions row to this card and fail the body assertion.
+        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: { permissionApproval: true } },
+        { id: "gemini-cli", name: "Gemini CLI", eventSource: "hook", capabilities: {} },
+      ],
+      settingsAPI: {
+        command: (action, payload) => {
+          calls.push([action, payload && payload.agentId]);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.runtime.agentInstallationHints = detection;
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.ops.requestRender({ content: true });
+
+    assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
+    const title = harness.content.querySelector(".agent-detected-title");
+    assert.match(collectText(title), /Detected locally · 2/);
+    const pillBadge = harness.content.querySelector(".agents-subtab-count");
+    assert.strictEqual(pillBadge.textContent, "2");
+
+    const qwenCard = findAgentCard(harness.content, "Qwen Code");
+    const body = qwenCard.querySelector(".collapsible-group-body-inner");
+    assert.strictEqual(body.children.length, 3, "note + intake switch + one WSL instance row");
+    assert.ok(body.children[0].classList.contains("agent-discover-note"));
+    assert.ok(body.children[2].classList.contains("agent-instance-row"));
+    assert.ok(!qwenCard.querySelectorAll(".row-label")
+      .some((label) => label._textContent === "Permissions"));
+    assert.strictEqual(
+      harness.core.state.mountedControls.agentSwitches.has(
+        harness.core.readers.agentSwitchStateId("qwen-code", "enabled")
+      ),
+      true
+    );
+    const headerLabel = qwenCard.querySelector(".agent-summary-row .row-label");
+    const intakeLabel = body.children[1].querySelector(".row-label");
+    assert.notStrictEqual(headerLabel.id, intakeLabel.id, "header and intake labels use different ids");
+    const labelIds = harness.content.querySelectorAll(".row-label")
+      .map((label) => label.id)
+      .filter(Boolean);
+    assert.strictEqual(new Set(labelIds).size, labelIds.length, "no duplicate row-label ids on the page");
+
+    const expectedIds = harness.content.querySelectorAll(".agent-section-recommended .agent-summary-row .row-label")
+      .map((label) => (label._textContent === "Qwen Code" ? "qwen-code" : "gemini-cli"));
+    harness.content.querySelector(".agent-install-all").dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    assert.deepStrictEqual(calls, expectedIds.map((agentId) => ["installAgentIntegration", agentId]));
+  });
+
+  it("shows the detected placeholder when nothing is unconnected", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: { agents: { "claude-code": { integrationInstalled: true, enabled: true } } },
+      agentMetadata: [
+        { id: "claude-code", name: "Claude Code", eventSource: "hook", capabilities: {} },
+      ],
+    });
+    harness.core.runtime.agentInstallationHints = { checkedAt: 1, agents: [], customTools: [], skippedAgentIds: [] };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.ops.requestRender({ content: true });
+
+    const detected = harness.content.querySelector(".agent-section-recommended");
+    assert.ok(detected);
+    assert.match(collectText(detected.querySelector(".agent-detected-title")), /Detected locally · 0/);
+    assert.ok(detected.querySelector(".agent-detected-empty"));
+    assert.strictEqual(collectText(detected.querySelector(".agent-detected-empty")), "No unconnected tools detected.");
+    assert.strictEqual(detected.querySelector(".agent-install-all"), null);
+  });
+
+  it("rescans from the Discover subtab row and keeps the control off Connected", async () => {
+    let resolveScan;
+    let scanCalls = 0;
+    const harness = loadAgentsTabForTest({
+      snapshot: { lang: "en", agents: {} },
+      agentMetadata: [],
+      settingsAPI: {
+        detectAgentInstallations: () => {
+          scanCalls += 1;
+          return new Promise((resolve) => { resolveScan = resolve; });
+        },
+      },
+    });
+    harness.core.runtime.agentInstallationHints = { checkedAt: 1700000000000, agents: [], customTools: [], skippedAgentIds: [] };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.ops.requestRender({ content: true });
+
+    const button = harness.content.querySelector(".agent-rescan .agent-rescan-button");
+    const status = harness.content.querySelector(".agent-rescan .agent-scan-status");
+    assert.ok(button);
+    assert.match(status.textContent, /^Last scanned at /);
+    assert.strictEqual(scanCalls, 0);
+
+    button.dispatchEvent({ type: "click", bubbles: false });
+    assert.strictEqual(scanCalls, 1);
+    assert.strictEqual(status.textContent, "Scanning...");
+    resolveScan({ checkedAt: 1700000005000, agents: [], customTools: [], skippedAgentIds: [] });
+    await new Promise((resolve) => setTimeout(resolve, 1250));
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.match(status.textContent, /^Last scanned at /);
+
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1,
+      agents: [],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.runtime.agentsSubtab = "connected";
+    harness.core.ops.requestRender({ content: true });
+    assert.strictEqual(harness.content.querySelector(".agent-rescan"), null);
+  });
+
+  it("puts the custom-tool card last with a neutral picker and no rescan", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: { agents: {}, customToolDiscoveryPaths: [] },
+      agentMetadata: [],
+    });
+    harness.core.runtime.agentInstallationHints = { checkedAt: 1, agents: [], customTools: [], skippedAgentIds: [] };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.ops.requestRender({ content: true });
+
+    const panel = harness.content.children.find((node) => node.getAttribute("role") === "tabpanel" && !node.hidden);
+    const last = panel.children[panel.children.length - 1];
+    assert.ok(last.classList.contains("agent-custom-tools-section"));
+    const picker = last.querySelector(".custom-tool-path-picker");
+    assert.strictEqual(picker.classList.contains("accent"), false);
+    assert.strictEqual(last.querySelector(".custom-tool-scan"), null);
+  });
+
+  it("summarizes Kimi quota state on one row and follows connect/disconnect", async () => {
+    let configured = false;
+    let collectionEnabled = false;
+    const makeHarness = () => {
+      const harness = loadAgentsTabForTest({
+        snapshot: { agents: { "kimi-cli": { integrationInstalled: true, enabled: true } } },
+        agentMetadata: [{
+          id: "kimi-cli",
+          name: "Kimi Code",
+          eventSource: "hook",
+          capabilities: { permissionApproval: true, notificationHook: true },
+        }],
+        settingsAPI: {
+          getKimiQuotaStatus: () => Promise.resolve({
+            status: "ok",
+            configured,
+            decryptable: configured,
+            collectionEnabled,
+            agentEnabled: true,
+            state: !configured ? "unconfigured" : (collectionEnabled ? "fresh" : "configured-disabled"),
+            lastQuotaCapturedAt: configured ? 1_786_708_953_953 : null,
+          }),
+          connectKimiQuota: () => { configured = true; collectionEnabled = true; return Promise.resolve({ status: "ok" }); },
+          disconnectKimiQuota: () => { collectionEnabled = false; return Promise.resolve({ status: "ok" }); },
+          refreshKimiQuota: () => Promise.resolve({ status: "ok" }),
+          reconnectKimiQuota: () => Promise.resolve({ status: "ok" }),
+          forgetKimiQuotaCredential: () => Promise.resolve({ status: "ok" }),
+        },
+      });
+      harness.core.runtime.agentInstallationHints = { checkedAt: 1, agents: [], customTools: [], skippedAgentIds: [] };
+      harness.core.runtime.agentInstallationHintsFetched = true;
+      harness.core.ops.requestRender({ content: true });
+      return harness;
+    };
+    const flushAll = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+
+    configured = false;
+    collectionEnabled = false;
+    const harness = makeHarness();
+    const action = harness.content.querySelector(".kimi-quota-row-action");
+    const note = harness.content.querySelector(".kimi-quota-note");
+    const panel = harness.content.querySelector(".kimi-quota-panel");
+    assert.strictEqual(action.disabled, true, "no flash of Not connected before the first read");
+    assert.strictEqual(note.textContent, "Checking local connection...");
+    await flushAll();
+    assert.strictEqual(note.textContent, "Not connected");
+    assert.match(collectText(action), /Connect Kimi key…/);
+    assert.strictEqual(panel.hidden, true);
+    action.dispatchEvent({ type: "click", bubbles: false });
+    assert.strictEqual(panel.hidden, false);
+
+    configured = true;
+    collectionEnabled = true;
+    const connected = makeHarness();
+    await flushAll();
+    assert.strictEqual(connected.content.querySelector(".kimi-quota-note").textContent, "Connected");
+    assert.match(collectText(connected.content.querySelector(".kimi-quota-row-action")), /Manage…/);
+
+    // Same mount: the card's own Disconnect action updates the summary row.
+    const dangerButton = connected.content.querySelector(".kimi-quota-danger-row button");
+    dangerButton.dispatchEvent({ type: "click", bubbles: false });
+    await flushAll();
+    assert.strictEqual(
+      connected.content.querySelector(".kimi-quota-note").textContent,
+      "Disconnected, key kept locally"
+    );
+    assert.match(collectText(connected.content.querySelector(".kimi-quota-row-action")), /Manage…/);
+
+    configured = true;
+    collectionEnabled = false;
+    const disabled = makeHarness();
+    await flushAll();
+    assert.strictEqual(disabled.content.querySelector(".kimi-quota-note").textContent, "Disconnected, key kept locally");
+    assert.match(collectText(disabled.content.querySelector(".kimi-quota-row-action")), /Manage…/);
+  });
+
+  it("removes the legacy badges, banners and disconnect button from the source", () => {
+    const agentsSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8");
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    assert.ok(!agentsSource.includes("actionButton:"));
+    assert.ok(!agentsSource.includes("agent-badge"));
+    assert.ok(!agentsSource.includes("buildAgentInstallHintBanner"));
+    assert.ok(!css.includes(".agent-badge"));
+
+    const defaultGroupIndex = css.indexOf("grid-template-columns: 58px minmax(0, 1fr)");
+    const mobileGroupIndex = css.indexOf("@media (max-width: 720px)", defaultGroupIndex);
+    assert.ok(defaultGroupIndex >= 0 && mobileGroupIndex > defaultGroupIndex,
+      "the narrow-window single-column rule must come after the default two-column rule");
+    const mobileBlock = css.slice(mobileGroupIndex, mobileGroupIndex + 160);
+    assert.match(mobileBlock, /\.agent-detail-group\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
   });
 });
 
@@ -20108,7 +20954,7 @@ describe("Settings tabs and segmented choice contracts", () => {
   it("preserves the Codex pending gate across full rerenders and recovers after failure", async () => {
     const pending = createDeferred();
     let calls = 0;
-    const harness = loadAgentsTabForTest({ snapshot: { agents: { codex: { enabled: true, permissionMode: "native" } } },
+    const harness = loadAgentsTabForTest({ snapshot: { agents: { codex: { integrationInstalled: true, enabled: true, permissionMode: "native" } } },
       agentMetadata: [{ id: "codex", name: "Codex", capabilities: { permissionApproval: true } }],
       collapsedGroups: { "agents:codex": false },
       settingsAPI: { command() { calls++; return pending.promise; } } });
