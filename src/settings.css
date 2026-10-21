@@ -1190,18 +1190,6 @@ html, body {
   color: var(--text-secondary);
   font-style: italic;
 }
-.agent-instance-section-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding-top: 6px;
-  padding-bottom: 2px;
-  color: var(--text-secondary);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  border-bottom: none !important;
-}
 .agent-instance-row {
   padding-left: 48px;
 }
@@ -1514,7 +1502,7 @@ html, body {
   margin-top: 14px;
 }
 .agent-custom-tools-section {
-  margin-bottom: 14px;
+  margin-top: 14px;
 }
 .agent-custom-tools-section .section-title {
   color: var(--text-primary);
@@ -1525,15 +1513,29 @@ html, body {
   align-items: center;
   min-height: 22px;
 }
+.agent-detected-title {
+  justify-content: space-between;
+  gap: 10px;
+}
+.agent-detected-empty {
+  margin: 4px 0 14px;
+}
 .agent-section-recommended .section-title {
   color: var(--accent);
 }
 .agent-text-input-row {
-  align-items: flex-start;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+.agent-text-input-row .row-text {
+  width: 100%;
+  flex: 1 1 auto;
 }
 .agent-text-input-control {
-  flex: 1 1 260px;
-  min-width: min(100%, 260px);
+  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .agent-custom-tools-section .custom-tool-discovery-row {
   align-items: center;
@@ -1571,10 +1573,6 @@ html, body {
   margin-left: auto;
   min-width: 0;
 }
-.agent-custom-tools-section .custom-tool-scan-status {
-  display: block;
-  margin-top: 7px;
-}
 @media (max-width: 760px) {
   .agent-custom-tools-section .custom-tool-discovery-row {
     align-items: stretch;
@@ -1592,29 +1590,22 @@ html, body {
     flex-direction: column;
   }
 }
-/* Needs the extra .soft-btn to outrank the later `.soft-btn.accent` tinted
-   rule — at equal specificity source order wins and the primary action
-   renders as a washed-out outline button. */
-.agent-custom-tools-section .soft-btn.custom-tool-path-picker {
-  min-height: 34px;
-  padding: 7px 16px;
-  border-color: var(--accent);
-  background: var(--accent);
-  color: #ffffff;
-  font-weight: 700;
+.agent-rescan {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
-.agent-custom-tools-section .soft-btn.custom-tool-path-picker:hover:not(:disabled) {
-  border-color: var(--accent-hover);
-  background: var(--accent-hover);
-}
-.custom-tool-scan {
-  min-height: 32px;
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
-  color: var(--accent);
+.agent-rescan-button {
+  min-height: 30px;
+  padding: 5px 12px;
+  border-color: var(--border);
+  font-size: 12px;
   font-weight: 600;
 }
-.custom-tool-scan:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--bg) 90%, var(--accent) 10%);
+.agent-rescan .agent-scan-status {
+  min-height: 18px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
 }
 /* Subtab pills on the left, the Windows-only WSL rescan on the right. */
 .agents-subtabs {
@@ -1712,17 +1703,10 @@ html, body {
   font-size: 12px;
   font-weight: 600;
 }
-.custom-tool-scan-status {
-  flex: 0 0 auto;
-  min-height: 18px;
-  color: var(--text-secondary);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-.custom-tool-scan-status.pending {
+.agent-scan-status.pending {
   color: var(--accent);
 }
-.custom-tool-scan-status.failed {
+.agent-scan-status.failed {
   color: var(--toast-error);
 }
 .custom-tool-result-row {
@@ -1857,71 +1841,152 @@ html, body {
     flex-wrap: wrap;
   }
 }
-.agent-badges {
-  display: inline-flex;
+.agent-status {
+  display: flex;
+  align-items: center;
   flex-wrap: wrap;
   gap: 6px;
-  margin-top: 6px;
-}
-.agent-badge {
-  display: inline-block;
-  font-size: 10px;
-  font-weight: 600;
+  margin-top: 4px;
+  font-size: 11.5px;
   color: var(--text-secondary);
-  background: rgba(0, 0, 0, 0.06);
-  padding: 2px 8px;
-  border-radius: 10px;
-  text-transform: uppercase;
+}
+.agent-status-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #187253;
+}
+.agent-status.warn {
+  color: #9a6700;
+}
+.agent-status.warn .agent-status-dot {
+  background: #9a6700;
+}
+.agent-status.off {
+  color: var(--text-tertiary);
+}
+.agent-status.off .agent-status-dot {
+  background: var(--text-tertiary);
+}
+.agent-status-fix {
+  padding: 0;
+  min-height: 0;
+  color: var(--accent);
+  font-size: 11.5px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+@media (prefers-color-scheme: dark) {
+  .agent-status-dot { background: #8ce99a; }
+  .agent-status.warn,
+  .agent-status.warn .agent-status-dot { color: #f6c343; }
+  .agent-status.warn .agent-status-dot { background: #f6c343; }
+}
+
+/* Card-body groups: label in a fixed left gutter, rows only name + control.
+   The dashed separators keep rows apart now that the descriptions are folded
+   behind the (i) toggle. */
+.agent-detail-group {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  border-bottom: 1px solid var(--row-border);
+}
+.agent-detail-group-label {
+  padding: 12px 0 0 14px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 700;
   letter-spacing: 0.04em;
 }
-@media (prefers-color-scheme: dark) {
-  .agent-badge { background: rgba(255, 255, 255, 0.08); }
+.agent-detail-group-rows .row {
+  padding: 10px 14px 10px 0;
+  border-bottom: 1px dashed var(--row-border);
 }
-.agent-badge.accent {
-  background: rgba(217, 119, 87, 0.12);
+.agent-detail-group-rows .row:last-child {
+  border-bottom: none;
+}
+.agent-detail-group-rows .row .row-label {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+@media (max-width: 720px) {
+  .agent-detail-group {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .agent-detail-group-label {
+    padding: 10px 14px 0;
+  }
+}
+.row-desc-collapsed {
+  display: none;
+}
+.row-desc-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 6px;
+  padding: 0;
+  border: 1px solid var(--text-tertiary);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 9.5px;
+  font-style: italic;
+  line-height: 1;
+  vertical-align: 1px;
+  cursor: pointer;
+}
+.row-desc-toggle:hover {
+  border-color: var(--accent);
   color: var(--accent);
 }
-.agent-badge.integration {
-  background: rgba(16, 120, 87, 0.1);
-  color: #187253;
+.row-note {
+  margin-right: 4px;
+  color: var(--text-tertiary);
+  font-size: 11px;
 }
-.agent-badge.integration.not-installed {
-  background: rgba(0, 0, 0, 0.05);
+
+/* "Disconnect …" footer: quiet link, consequence + real button only on click. */
+.agent-disconnect-row {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 14px 10px;
+}
+.agent-disconnect-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-tertiary);
+  font-family: inherit;
+  font-size: 11.5px;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.agent-disconnect-link:hover {
+  color: var(--danger-action);
+}
+.agent-disconnect-detail {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 0 14px 12px;
   color: var(--text-secondary);
+  font-size: 11px;
 }
-/* Registered custom AI whose executable is gone. Amber like hook-warning:
-   the agent is still connected and can still report state, but the binary it
-   was registered from is no longer where it was found. */
-.agent-badge.custom-missing {
-  background: rgba(180, 120, 20, 0.14);
-  color: #9a6700;
+.agent-disconnect-detail[hidden] {
+  display: none;
 }
-@media (prefers-color-scheme: dark) {
-  .agent-badge.custom-missing {
-    background: rgba(246, 195, 67, 0.16);
-    color: #f6c343;
-  }
-}
-/* Installed but the hook is broken/disabled/needs-review — amber warning.
-   Distinct from green (healthy) and muted (not installed). */
-.agent-badge.integration.hook-warning {
-  background: rgba(180, 120, 20, 0.14);
-  color: #9a6700;
-  cursor: help;
+.agent-disconnect-detail span {
+  min-width: 0;
 }
 @media (prefers-color-scheme: dark) {
-  .agent-badge.integration {
-    color: #8ce99a;
-    background: rgba(140, 233, 154, 0.12);
-  }
-  .agent-badge.integration.not-installed {
-    background: rgba(255, 255, 255, 0.08);
-    color: var(--text-secondary);
-  }
-  .agent-badge.integration.hook-warning {
-    background: rgba(246, 195, 67, 0.16);
-    color: #f6c343;
-  }
+  .agent-disconnect-link { color: var(--text-tertiary); }
 }
 .agent-integration-action {
   min-width: 72px;
@@ -2084,6 +2149,16 @@ html, body {
   align-items: stretch;
   flex-direction: column;
   gap: 10px;
+}
+
+.kimi-quota-panel[hidden] {
+  display: none;
+}
+
+.kimi-quota-row-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .kimi-quota-heading {
@@ -2312,8 +2387,15 @@ html, body {
   transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .codex-permission-mode-segmented button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
   background: transparent;
   white-space: nowrap;
+}
+.codex-permission-mode-segmented .settings-segmented-radio-label {
+  text-align: center;
 }
 .codex-permission-mode-segmented button.active {
   background: transparent;
