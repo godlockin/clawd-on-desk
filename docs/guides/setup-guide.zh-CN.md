@@ -34,7 +34,7 @@ npm install
 
 ### Claude Code 使用信息：官方状态栏，不抓取网页
 
-本机 Claude 使用信息采集**默认关闭**。可在 **Settings → General → 额度环 → 采集本机 Claude 使用信息** 中显式开启；开启后，Clawd 会把自己的可见 `statusLine.command` 添加到 `~/.claude/settings.json`。
+本机 Claude 使用信息采集**默认关闭**。可在 **Settings → Sessions → 额度环 → 采集本机 Claude 使用信息** 中显式开启；开启后，Clawd 会把自己的可见 `statusLine.command` 添加到 `~/.claude/settings.json`。
 
 这里使用的是 Claude Code 官方扩展机制，不是私有或逆向接口。Claude Code 的[官方 statusline 文档](https://code.claude.com/docs/en/statusline)会向状态栏命令提供 `context_window.current_usage`、`context_window.context_window_size`，以及可用时的 `rate_limits`；命令在本机执行，不消耗额外 API token。
 
@@ -94,7 +94,7 @@ Clawd 可以在 Node 的 SQLite 模块可用时读取 Cursor 标准桌面配置�
 
 **Reasonix CLI** — hooks 配置在 `<Reasonix home>/settings.json`（macOS/Linux 为 `~/.reasonix/settings.json`，当前 Windows 版本为 `%APPDATA%\reasonix\settings.json`）。在 Windows 上，Clawd 也会跟随 Reasonix 的兼容回退读取旧的 `~/.reasonix/settings.json`；卸载时会从两处配置中分别删除 Clawd 管理的条目。需要本机 Reasonix 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步当前生效的 hooks。也可以手动执行 `npm run install:reasonix-hooks`。Phase 1 是 state-only：Clawd 只驱动生命周期、工具调用、通知、压缩和子代理结束动效，权限决策仍留在 Reasonix 自己的终端流程。
 
-**opencode** — 使用 `~/.config/opencode/` 下当前生效的 plugin 配置：`config.json` → `opencode.json` → `opencode.jsonc`，后者优先。需要本机 opencode 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 plugin。也可以手动执行 `node hooks/opencode-install.js`。v1 入口保留在 `plugin` 键；仅探测到 opencode 2.x（`@opencode/cli`）时才写入 v2 的 `plugins` 键。探测到 v1 时会清除 Clawd 自有的 v2 条目，探测结果未知时不改该键，以免旧版（1.18.15 及之前）因未知键拒绝整个配置。若自动探测找不到已知宿主，确认实际会读取配置的主版本后，可在 Clawd 进程环境中设置 `CLAWD_OPENCODE_HOST=v1` 或 `v2`，再执行安装 / 修复。v2 插件运行在共享后台 service 中；安装或修复后运行 `opencode service restart` 加载新版本，其会话的“跳转终端”会降级。
+**opencode** — 使用 `~/.config/opencode/` 下当前生效的 plugin 配置：`config.json` → `opencode.json` → `opencode.jsonc`，后者优先。需要本机 opencode 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步 plugin。也可以手动执行 `node hooks/opencode-install.js`。确认是 opencode 2.x（`@opencode/cli`）宿主时，Clawd 只把入口写进 `plugins` 键，并移除 `plugin` 键里 Clawd 自己留下的条目。v1 宿主继续使用原有的 v1 注册路径，只清理 Clawd 自有的 v2 残留；探测不到版本时不改 v2 键，以免旧版（1.18.15 及之前）因未知键拒绝整个配置。若自动探测找不到已知宿主，确认实际会读取配置的主版本后，可在 Clawd 进程环境中设置 `CLAWD_OPENCODE_HOST=v1` 或 `v2`，再执行安装 / 修复。v2 插件运行在共享后台 service 中；安装或修复后运行 `opencode service restart` 加载新版本，其会话的“跳转终端”会降级。
 
 **MiMo Code** — 使用 `~/.config/mimocode/` 下当前生效的 plugin 配置：`config.json` → `mimocode.json` → 默认 `mimocode.jsonc`，后者优先。需要本机 MiMo Code 追踪时，先到 **Settings → AI 编程工具** 安装；安装且启用后，Clawd 才会在启动时继续同步生效的 plugin entry。也可以手动执行 `npm run install:mimocode-plugin`。MiMo Code 与 opencode 使用同一套 plugin SDK 和 Allow / Always / Deny 权限行为；`task` 创建的子会话不参与可见的多会话动画聚合。
 
@@ -133,6 +133,8 @@ Clawd 可以在 Node 的 SQLite 模块可用时读取 Cursor 标准桌面配置�
 ## Telegram 远程审批
 
 Clawd 可以把受支持、仍待处理的权限请求镜像到专用 Telegram bot；本地气泡仍然可用。通道失败或超时不会产生远程决定，也不会自动拒绝：有本地气泡时请求继续等待；只有 remote-only 且所有可用 client 都无决定时，才回到 agent 原生界面。设置、支持范围和迁移说明见 [telegram-approval.md](telegram-approval.md)。
+
+v0.14.0 退役了旧的 Go sidecar 传输通道。既有 legacy 用户会保留已保存的 bot token、允许用户与目标会话，但必须先在阻塞式 Settings 迁移面板中完成一次真实的 Telegram 验证回调，远程审批才会重新生效。检查失败或超时不会删除这些设置，也不会回退到已退役的运行时。
 
 ## 飞书 / Lark 远程审批
 
