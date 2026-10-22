@@ -123,6 +123,7 @@ const {
   selectSessionAutomationDialogParent,
 } = require("./session-automation-dialog-parent");
 const { createSessionFolderOpener } = require("./session-open-folder");
+const { createOpencodeSessionAttacher } = require("./opencode-session-attach");
 const { isTrustedMainFrameEvent, registerPetInteractionIpc } = require("./pet-interaction-ipc");
 const { createSystemWakeRecovery } = require("./system-wake-recovery");
 const { formatLocalTimestamp } = require("./log-timestamp");
@@ -5212,6 +5213,11 @@ const sessionHistoryRuntime = createSessionHistoryRuntime({
   ),
 });
 
+const openOpencodeSessionInTerminal = createOpencodeSessionAttacher({
+  getSession: (sessionId) => _state.sessions.get(sessionId),
+  isAgentEnabled: (agentId) => _runtimeAgentGate.isAgentEnabled(agentId),
+});
+
 registerSessionIpc({
   ipcMain,
   getSessionSnapshot: () => _state.buildSessionSnapshot(),
@@ -5223,6 +5229,7 @@ registerSessionIpc({
   focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
   hideSession: (sessionId) => hideDashboardSession(sessionId),
   openSessionFolder: (sessionId) => openDashboardSessionFolder(sessionId),
+  ...(process.platform === "win32" ? { openSessionInTerminal: openOpencodeSessionInTerminal } : {}),
   ackSessionCompletion: (sessionId) => _state.ackSessionCompletion(sessionId),
   setSessionAlias: (payload) => _settingsController.applyCommand("setSessionAlias", payload),
   setSessionAutomationOverride: (payload, context) => {
@@ -5973,6 +5980,16 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(async () => {
+    // Linux X11: Electron's getCursorScreenPoint() freezes once the cursor
+    // leaves our windows; replace it with a live xcb_query_pointer for every
+    // caller. Same backend check as linux-x11-input-hint. The screen module is
+    // only usable after ready.
+    require("./linux-x11-cursor").installLinuxX11CursorFallback(screen, {
+      isLinuxX11: isLinux && app.commandLine.getSwitchValue("ozone-platform") === "x11",
+      displayName: app.commandLine.getSwitchValue("display"),
+      onError: (err) => console.warn("Clawd: linux-x11-cursor failed:", err && err.message),
+    });
+
     // Older macOS and development builds retain the padded runtime icon from
     // #416. Packaged Tahoe+ leaves the Dock untouched so macOS can apply the
     // user's Default/Dark/Clear/Tinted treatment to the bundle icon (#941).
