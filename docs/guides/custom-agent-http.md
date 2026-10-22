@@ -16,7 +16,7 @@ After registration, copy these values from the custom agent card:
 - **State endpoint** — the current local `/state` URL;
 - **Minimum JSON payload** — a ready-to-adapt request body.
 
-The card remains under **Detected locally** while its saved executable exists. Removing a discovery path only removes that scan source; it does not remove the registration. Use **Remove** on the agent card to delete the registration.
+The card stays under **Connected**; a missing executable is shown on its status line. Removing a discovery path only removes that scan source; it does not remove the registration. Expand the agent card, click **Remove…**, then use **Remove** in the revealed row to delete the registration.
 
 ## 2. Discover the runtime port
 
