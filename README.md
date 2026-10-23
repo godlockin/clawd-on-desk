@@ -119,6 +119,7 @@ Community tool: [Live2Pet](https://github.com/receyuki/live2pet) by @receyuki tu
 | [Custom HTTP agents](docs/guides/custom-agent-http.md) | Connect a tool Clawd doesn't integrate with yet |
 | [Known limitations](docs/guides/known-limitations.md) | Per-agent feature gaps |
 | [Theme creation](docs/guides/guide-theme-creation.md) | Build and validate your own theme |
+| [Contributing themes](docs/guides/contributing-themes.md) | Submissions, licenses, catalog review, and updates |
 
 ## Community
 
