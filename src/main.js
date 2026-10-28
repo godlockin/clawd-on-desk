@@ -123,6 +123,7 @@ const {
   selectSessionAutomationDialogParent,
 } = require("./session-automation-dialog-parent");
 const { createSessionFolderOpener } = require("./session-open-folder");
+const { createOpencodeSessionAttacher } = require("./opencode-session-attach");
 const { isTrustedMainFrameEvent, registerPetInteractionIpc } = require("./pet-interaction-ipc");
 const { createSystemWakeRecovery } = require("./system-wake-recovery");
 const { formatLocalTimestamp } = require("./log-timestamp");
@@ -358,6 +359,11 @@ const _initialPrefsLoad = prefsModule.load(PREFS_PATH);
 // process, and a backup failure locks persistence as well. Runtime gates stay
 // closed until restart in either case.
 const _initialPrefsRecovered = _initialPrefsLoad.recovered === true;
+// #1183: must run before app ready, so it reads the startup snapshot directly
+// instead of waiting for the settings controller.
+if (isWin && _initialPrefsLoad.snapshot && _initialPrefsLoad.snapshot.disableHardwareAcceleration === true) {
+  app.disableHardwareAcceleration();
+}
 const _initialPrefsRecoveryBackupFailed = _initialPrefsLoad.recoveryBackupFailed === true;
 const _recapStartupAuthorityLost = (
   _initialPrefsLoad.locked === true
@@ -560,7 +566,8 @@ const _settingsController = createSettingsController({
     writeCodexAutoStartGate: _persistCodexAutoStartGate,
     deployHooksToWsl: async (distro, agentId) => {
       const { deployToWsl } = require("./wsl-deploy");
-      return deployToWsl(distro, { agentId, isPackaged: app.isPackaged, resourcesPath: process.resourcesPath });
+      return deployToWsl(distro, { agentId, isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
+        localServerPort: _server.getRuntimeStatus().port });
     },
     removeHooksFromWsl: async (distro, agentId) => {
       const { removeFromWsl } = require("./wsl-deploy");
@@ -3115,6 +3122,7 @@ const _serverCtx = {
     }
   },
 };
+Object.assign(_serverCtx, require("./local-server-port-hint"));
 const _server = require("./server")(_serverCtx);
 const { startHttpServer, getHookServerPort } = _server;
 
@@ -5212,6 +5220,11 @@ const sessionHistoryRuntime = createSessionHistoryRuntime({
   ),
 });
 
+const openOpencodeSessionInTerminal = createOpencodeSessionAttacher({
+  getSession: (sessionId) => _state.sessions.get(sessionId),
+  isAgentEnabled: (agentId) => _runtimeAgentGate.isAgentEnabled(agentId),
+});
+
 registerSessionIpc({
   ipcMain,
   getSessionSnapshot: () => _state.buildSessionSnapshot(),
@@ -5223,6 +5236,7 @@ registerSessionIpc({
   focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
   hideSession: (sessionId) => hideDashboardSession(sessionId),
   openSessionFolder: (sessionId) => openDashboardSessionFolder(sessionId),
+  ...(process.platform === "win32" ? { openSessionInTerminal: openOpencodeSessionInTerminal } : {}),
   ackSessionCompletion: (sessionId) => _state.ackSessionCompletion(sessionId),
   setSessionAlias: (payload) => _settingsController.applyCommand("setSessionAlias", payload),
   setSessionAutomationOverride: (payload, context) => {
@@ -5973,6 +5987,16 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(async () => {
+    // Linux X11: Electron's getCursorScreenPoint() freezes once the cursor
+    // leaves our windows; replace it with a live xcb_query_pointer for every
+    // caller. Same backend check as linux-x11-input-hint. The screen module is
+    // only usable after ready.
+    require("./linux-x11-cursor").installLinuxX11CursorFallback(screen, {
+      isLinuxX11: isLinux && app.commandLine.getSwitchValue("ozone-platform") === "x11",
+      displayName: app.commandLine.getSwitchValue("display"),
+      onError: (err) => console.warn("Clawd: linux-x11-cursor failed:", err && err.message),
+    });
+
     // Older macOS and development builds retain the padded runtime icon from
     // #416. Packaged Tahoe+ leaves the Dock untouched so macOS can apply the
     // user's Default/Dark/Clear/Tinted treatment to the bundle icon (#941).
