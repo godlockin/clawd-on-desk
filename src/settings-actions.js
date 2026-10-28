@@ -139,6 +139,7 @@ const {
   manageClaudeHooksAutomatically,
   openAtLogin,
   repairLocalServer,
+  restartClawd,
   uninstallHooks,
 } = require("./settings-actions-system");
 const {
@@ -590,6 +591,7 @@ const updateRegistry = {
   },
   fullscreenOverlay: requireBoolean("fullscreenOverlay"),
   fullscreenAutoHide: requireBoolean("fullscreenAutoHide"),
+  disableHardwareAcceleration: requireBoolean("disableHardwareAcceleration"),
   mobilePreviewEnabled: {
     validate: requireBoolean("mobilePreviewEnabled"),
     lockKey: "mobilePreview",
@@ -2748,6 +2750,7 @@ const commandRegistry = {
   uninstallAgentIntegration,
   repairLocalServer,
   repairDoctorIssue,
+  restartClawd,
   resizePet,
   registerShortcut,
   resetShortcut,
