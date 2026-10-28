@@ -9,10 +9,9 @@ const os = require("os");
 const childProcess = require("child_process");
 const {
   buildPermissionUrl,
-  DEFAULT_SERVER_PORT,
   isManagedPermissionUrl,
   PERMISSION_PATH,
-  readRuntimePort,
+  resolveInstallServerPort,
   readRemoteIdentity,
   resolveRemoteIdentityPath,
   resolveSshSecureMarkerPath,
@@ -1223,7 +1222,7 @@ function syncHttpHook(entries, expectedUrl) {
 }
 
 function getHookServerPort(explicitPort) {
-  return Number.isInteger(explicitPort) ? explicitPort : (readRuntimePort() || DEFAULT_SERVER_PORT);
+  return resolveInstallServerPort(explicitPort);
 }
 
 // HTTP hooks: Clawd no longer registers any HTTP-form hooks for Claude Code.

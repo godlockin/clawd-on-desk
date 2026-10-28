@@ -61,6 +61,7 @@ const FROZEN_KEYS = [
   "keepSizeAcrossDisplays",
   "fullscreenAutoHide",
   "openAtLogin",
+  "disableHardwareAcceleration",
   "hideBubbles",
   "bubbleFollowPet",
   "bubbleFollowPreference",
@@ -83,6 +84,7 @@ const EXPECTED_KEYS = {
     "showTray",
     "showDock",
     "openAtLogin",
+    "disableHardwareAcceleration",
   ],
   pet: [
     "size",
@@ -637,7 +639,13 @@ function sectionTitles(harness) {
 
 function sectionRowLabels(harness) {
   return harness.content.querySelectorAll(".section").map((section) => (
-    section.querySelectorAll(".row-label").map((node) => node.textContent)
+    section.querySelectorAll(".row-label").map((node) => {
+      const toggle = node.querySelector(".row-desc-toggle");
+      const suffix = toggle ? toggle.textContent : "";
+      return suffix && node.textContent.endsWith(suffix)
+        ? node.textContent.slice(0, -suffix.length)
+        : node.textContent;
+    })
   ));
 }
 
@@ -738,8 +746,8 @@ describe("settings tab split", () => {
     });
     assert.deepStrictEqual(sectionTitles(permissions), ["本机怎么处理", "按工具"]);
     assert.deepStrictEqual(sectionRowLabels(permissions), [
-      ["权限请求处理", "自动处理时暂停破坏性操作"],
-      ["Codex 审批处理"],
+      ["权限请求处理", "自动放行前，危险命令先问我"],
+      ["Codex 的审批归谁"],
     ]);
     const permissionPills = permissions.content.querySelector(".settings-tabs").querySelectorAll("button");
     assert.deepStrictEqual(permissionPills.map((button) => button.textContent), [
@@ -756,6 +764,41 @@ describe("settings tab split", () => {
       ["语言", "文字大小"],
       ["开机自启", "在菜单栏显示", "在 Dock 显示", "低功耗 idle", "工作时阻止休眠"],
     ]);
+  });
+
+  it("offers a restart only while the GPU switch differs from launch (#1183)", async () => {
+    const general = createHarness({
+      tab: "general",
+      platform: "Win32",
+      snapshot: makeSnapshot({ disableHardwareAcceleration: false }),
+      settingsAPI: {
+        getStartupRenderState: () => Promise.resolve({ hardwareAccelerationDisabled: false }),
+      },
+    });
+    await general.settle();
+    const row = () => general.core.state.mountedControls.generalSwitches
+      .get("disableHardwareAcceleration").row;
+    const restartButton = () => row().querySelectorAll("button")
+      .find((button) => button.textContent === "Restart Clawd") || null;
+    assert.ok(general.getSwitch("disableHardwareAcceleration"));
+    assert.strictEqual(restartButton(), null);
+
+    general.apply("disableHardwareAcceleration", true);
+    await general.settle();
+    assert.ok(restartButton(), "a pending GPU change shows the restart button");
+    assert.ok(row().querySelectorAll(".row-desc-extra")
+      .some((node) => node.textContent === "Not applied yet. Restart Clawd to switch."));
+
+    restartButton().click();
+    await general.settle();
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(general.commandCalls.filter((call) => call.action === "restartClawd"))),
+      [{ action: "restartClawd", payload: { confirmed: true } }],
+    );
+
+    general.apply("disableHardwareAcceleration", false);
+    await general.settle();
+    assert.strictEqual(restartButton(), null, "switching back to the launch value hides it");
   });
 
   it("patches every independent sync branch in place for its own key", async () => {
@@ -1053,7 +1096,7 @@ describe("settings tab split", () => {
     const channelsPanel = visiblePanel();
     assert.strictEqual(channelsPanel.children[0].className, "subtitle");
     assert.strictEqual(channelsPanel.children[0].textContent,
-      "把本地权限请求路由到远程渠道。密钥不写入 prefs，本地权限气泡仍然保留作为兜底。");
+      "本机的权限气泡照常弹；接好渠道后，同一条请求也会发过去，哪边先点算哪边。密钥存在本机，不进 prefs。");
     assert.deepStrictEqual(channelsPanel.children.slice(1).map((child) => [
       child.classList.contains("tg-approval-channel-card"),
       child.classList.contains("feishu-approval-channel-card"),
@@ -1072,8 +1115,8 @@ describe("settings tab split", () => {
     const mobileCard = lanPanel.querySelector(".mobile-channel-card");
     assert.ok(mobileCard, "the LAN sub-page renders the mobile card");
     assert.ok(mobileCard.querySelectorAll(".row-label")
-      .some((row) => row.textContent === harness.core.helpers.t("mobileToggle")),
-    "the LAN card contains the controls drawn by settings-tab-mobile.js");
+      .some((row) => row.textContent.startsWith(harness.core.helpers.t("mobileChannelName"))),
+    "the LAN card contains the header drawn by settings-tab-mobile.js");
     assert.strictEqual(harness.core.runtime.permissionsSubtab, "lan");
 
     pills()[0].click();
@@ -1213,7 +1256,52 @@ describe("settings tab split", () => {
   });
 
   it("routes local and remote in-place patches to their owning module", async () => {
-    const harness = createHarness({ tab: "permissions", snapshot: makeSnapshot() });
+    const harness = createHarness({
+      tab: "permissions",
+      snapshot: makeSnapshot({
+        feishuApproval: {
+          enabled: false,
+          platform: "feishu",
+          idType: "open_id",
+          approverId: "ou_1",
+          approverSource: "manual",
+          connectionTimeoutSeconds: 15,
+        },
+      }),
+      settingsAPI: {
+        command: (action) => {
+          if (action === "telegramApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          }
+          if (action === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          }
+          if (action === "feishuApproval.status") {
+            return Promise.resolve({ status: "ok", state: {
+              status: "stopped", configured: true, secretsStored: true,
+              secretsConfigured: true, credentialReady: true, credentialReason: "",
+              configurationReady: true, setupReason: "",
+            } });
+          }
+          if (action === "feishuApproval.secretInfo") {
+            return Promise.resolve({ status: "ok", configured: true, credentialPlatform: "feishu", appId: "cli_saved" });
+          }
+          if (action === "slackNotify.status") {
+            return Promise.resolve({ status: "ok", state: { status: "stopped" } });
+          }
+          if (action === "slackNotify.secretInfo") {
+            return Promise.resolve({ status: "ok", configured: false });
+          }
+          if (action === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "", transport: "", revision: 0, testOrigin: "" },
+            });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
     const local = harness.core.state.mountedControls.permissionAutomationMode;
     harness.apply("permissionAutomationMode", "auto-tools");
     assert.strictEqual(local.element, harness.core.state.mountedControls.permissionAutomationMode.element);
