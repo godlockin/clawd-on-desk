@@ -14,7 +14,7 @@ const CODEX_LOCAL_WORKING_STALE_FLOOR_MS = 20 * 60 * 1000;
 const OPENCODE_LOCAL_WORKING_STALE_FLOOR_MS = 20 * 60 * 1000;
 
 function isWorkingLikeState(state) {
-  return state === "working" || state === "juggling" || state === "thinking";
+  return state === "working" || state === "executing" || state === "juggling" || state === "thinking";
 }
 
 function isLocalCodexWorkingLikeSession(session) {
