@@ -48,7 +48,7 @@ describe("mobile permission preview consent commands", () => {
     assert.strictEqual(updateRegistry.mobilePreviewEnabled.lockKey, "mobilePreview");
     for (const name of [
       "setMobilePermissionPreviewEnabled",
-      "mobilePreview.regenerateToken",
+      "mobilePreview.refreshPairCode",
       "mobilePreview.resetAccess",
     ]) {
       assert.strictEqual(commandRegistry[name].lockKey, "mobilePreview", name);
@@ -2173,6 +2173,19 @@ describe("doctor repair commands", () => {
 
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /restartClawd/);
+  });
+
+  it("exposes restartClawd as a confirmed command for the GPU switch (#1183)", async () => {
+    const calls = [];
+    const deps = { restartClawd: () => calls.push("restart") };
+
+    const refused = await commandRegistry.restartClawd({}, deps);
+    assert.strictEqual(refused.status, "error");
+    assert.deepStrictEqual(calls, []);
+
+    const r = await commandRegistry.restartClawd({ confirmed: true }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(calls, ["restart"]);
   });
 
   it("rejects Doctor theme repair so Doctor does not reset user themes", async () => {
