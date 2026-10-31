@@ -6,6 +6,7 @@ Claude Code's **Handling tools** state is a tool-call hint, not an OS execution 
 
 | Limitation | Details |
 |---|---|
+| **Downgrading Clawd: duplicate hooks** | When downgrading to 1.5.0 or earlier, the older version does not recognize exec-style hooks and adds another copy, so events may be reported twice. Upgrading again automatically merges them; upgrade again before uninstalling the older version. |
 | **Windows: third-party screen capture overlays (#1282)** | Clawd stands down only for the Windows Snipping Tool overlay (verified on 11.2608). Overlays from other screen capture tools can still end up under the pet; pressing on the pet there drags it instead of starting a selection. |
 | **macOS pet topmost and fullscreen (#1275)** | Changing pet always-on-top takes effect after restarting Clawd. Auto-hide recognizes only native fullscreen Spaces (including Split View), not players that simply fill a normal window. With multiple displays it follows the active Space, which may differ from the pet’s display. |
 | **ZCode: hook config is snapshotted at app start** | ZCode's desktop runtime reads `~/.zcode/cli/config.json` once and keeps dispatching that snapshot: hooks installed (or edited) while ZCode is running do not fire in already-running sessions until ZCode is restarted — the request then falls through to ZCode's native UI. State events registered before the start keep working, so a silent `PermissionRequest` slot is easy to misread as a Clawd bug. Restart ZCode after installing or re-registering hooks. Observed on macOS ZCode 3.16.3 (#1264). |

@@ -116,6 +116,18 @@ describe("Windows NSIS Claude hook uninstall cleanup", () => {
     assert.match(nsis, /nsExec::ExecToLog 'powershell\.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "\$INSTDIR\\uninstall-claude-hooks\.ps1" -InstallDir "\$INSTDIR"'/);
   });
 
+  it("issue #1293: skips both integration cleanups during NSIS upgrades", () => {
+    const nsis = readText(NSIS_INCLUDE).replace(/\r\n/g, "\n");
+    const uninstall = nsis.match(/!macro customUnInstall\n([\s\S]*?)!macroend/);
+    assert.ok(uninstall, "customUnInstall should exist");
+
+    const guarded = uninstall[1].match(/\$\{ifNot\} \$\{isUpdated\}\n([\s\S]*?)\n\s*\$\{endIf\}/);
+    assert.ok(guarded, "customUnInstall should guard cleanup with ${ifNot} ${isUpdated}");
+    assert.match(guarded[1], /FileRead \$0 \$1/);
+    assert.match(guarded[1], /nsExec::ExecToLog '[^\n]*cleanup-integrations\.js/);
+    assert.match(guarded[1], /nsExec::ExecToLog 'powershell\.exe [^\n]*uninstall-claude-hooks\.ps1/);
+  });
+
   it("keeps the PowerShell permission port list in sync with SERVER_PORTS", () => {
     const script = readText(CLEANUP_SCRIPT);
     const match = script.match(/\$ClawdPermissionPorts\s*=\s*@\(([^)]*)\)/);
