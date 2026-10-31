@@ -86,6 +86,12 @@ correlated batch and the existing gates.
 
 ## Data Flow
 
+本机 Windows 在 Claude Code ≥ 2.1.160、Node 为绝对 `.exe` 路径，且 `GROK_HOME` 与 `~/.grok` 均不存在时，状态与 auto-start hook 使用 `command + args` exec form 直启 Node，省去每事件的 PowerShell 启动。Grok 1.0.30 读取这份配置时丢掉 args，因此发现 Grok 目录就保留或写回 #147 的 PowerShell 写法；版本未知时沿用已有 exec，否则保留旧写法，已知旧版本回退 PowerShell。
+
+门槛看可探测的 CLI 版本；Windows 已实测桌面端自带的 2.1.160、VS Code 自带的 2.1.276 / 2.1.296，以及 2.1.289，exec form 均送达全部触发事件（文档中 args 从 2.1.139 起支持）。Cursor 3.19 导入 Claude hook 时只取 command、丢掉 args，失败不拦操作；Cursor 事件走 Clawd 自己的 Cursor hook，`cursor-agent` 默认未启用。
+
+macOS/Linux、Remote SSH、WSL 保持原写法。exec form 归属只认 `args[0]` 的精确脚本文件名，同步/卸载、watcher 与 Doctor 共用读取规则。Claude stdin 的本地兜底上限为 4.5 秒，正常读取在 EOF 立即结束；其他 agent 的共享默认等待不变。async hook 进入后台后不受 timeout 限制，SessionStart 的 stdin 计时从同步进程快照之后开始；缓存未命中时，Windows 进程快照仍可能启动隐藏的 PowerShell。没有终端祖先的宿主（如桌面端）中，PowerShell 写法的 `source_pid` 是已退出的 wrapper，PID 缓存每个事件都失效、需重新快照；exec form 的 `source_pid` 稳定、缓存可命中，实测送达约 890 ms → 85 ms。
+
 ```text
 Claude Code 状态同步（command hook，非阻塞）：
   Claude Code 触发事件

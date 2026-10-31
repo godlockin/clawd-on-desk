@@ -669,6 +669,22 @@ function withPatchedInstallModule(patches, run) {
     .then((value) => { restore(); return value; }, (err) => { restore(); throw err; });
 }
 
+// Keep the real registration tests independent of the host's Grok install.
+function withIsolatedClaudeRegister(run) {
+  const { registerHooksAsync } = require("../hooks/install.js");
+  const path = require("node:path");
+  return withPatchedInstallModule({
+    registerHooksAsync: (options) => {
+      assert.strictEqual(typeof options.settingsPath, "string");
+      return registerHooksAsync({
+        ...options,
+        homeDir: options.homeDir || path.dirname(options.settingsPath),
+        env: {},
+      });
+    },
+  }, run);
+}
+
 // These exercise server.js's OWN default queue-backed implementation — every
 // other test in this file injects ctx.syncClawdHooksImpl and so never reaches
 // it. Passing syncClawdHooksImpl: undefined opts back into the real
@@ -904,7 +920,7 @@ describe("server Claude hook operation queue (default, non-injected implementati
 
   it("uses the injected AppImage resolver context for preflight, mutation, and verify", {
     skip: process.platform === "win32" ? "requires POSIX AppImage executable semantics" : false,
-  }, async () => {
+  }, async () => withIsolatedClaudeRegister(async () => {
     const fs = require("node:fs");
     const os = require("node:os");
     const path = require("node:path");
@@ -951,9 +967,9 @@ describe("server Claude hook operation queue (default, non-injected implementati
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }));
 
-  it("writes and verifies only the controlled Claude settings path", async () => {
+  it("writes and verifies only the controlled Claude settings path", async () => withIsolatedClaudeRegister(async () => {
     const fs = require("node:fs");
     const os = require("node:os");
     const path = require("node:path");
@@ -978,9 +994,9 @@ describe("server Claude hook operation queue (default, non-injected implementati
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }));
 
-  it("never touches an ambient CLAUDE_CONFIG_DIR when a controlled settings path is injected", async () => {
+  it("never touches an ambient CLAUDE_CONFIG_DIR when a controlled settings path is injected", async () => withIsolatedClaudeRegister(async () => {
     const fs = require("node:fs");
     const os = require("node:os");
     const path = require("node:path");
@@ -1011,7 +1027,7 @@ describe("server Claude hook operation queue (default, non-injected implementati
       else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }));
 
   it("forwards the controlled context into unregisterHooks/statusline", async () => {
     const captured = [];

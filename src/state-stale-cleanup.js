@@ -244,8 +244,8 @@ function getStaleSessionDecision(session, options = {}) {
   //
   // With an age window enabled, only check source liveness after it elapses. A
   // source_pid frequently belongs to a per-event launcher rather than to the
-  // session host — Windows Claude Code runs every hook through a throwaway
-  // pwsh wrapper, so the pid shipped with an event is already gone when the
+  // session host — Windows Claude Code's PowerShell hook form uses a throwaway
+  // pwsh wrapper, so the pid shipped with that event can be gone when the
   // next sweep reads it. Probing it while the turn is still reporting deletes
   // the live session between events, and the following event recreates it.
   if (isWorkingLikeState(session.state)) {

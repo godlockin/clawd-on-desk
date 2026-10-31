@@ -198,6 +198,7 @@ describe("agent installation detector", () => {
     await require("../hooks/install.js").registerHooksAsync({
       silent: true,
       homeDir: claudeHome,
+      env: {},
       nodeBin: process.execPath,
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
     });
