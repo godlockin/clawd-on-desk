@@ -559,6 +559,7 @@ opencode 托管 generation 注册（#1026）：
   失败时，hash 槽仍已释放，residualPaths/warning 指向隔离目录，后续安装可重新物化。对旧版本已经留下的半残
   canonical 目录，Repair 只在 released owner 的 bounded history 精确证明该 entry 且 effective config 无活动 Clawd
   entry 时，将其原子隔离为 `.recovery-*` 后继续；active/foreign/unproven residual 仍 fail closed，不覆盖可疑 bytes。
+  Windows NSIS 默认升级时向旧卸载器传 `--updated`，跳过集成清理；真卸载和显式 `--delete-app-data` 仍会清理。
   configPath-only 调用（Windows NSIS cleanup）仍扫配置，返回
   managedFilesRemoved:false + managed-root-unknown warning。Settings Uninstall 以 registrationRemoved
   true/false|null 判定是否提交 integrationInstalled:false；残留文件只 warning。
