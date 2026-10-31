@@ -150,7 +150,8 @@ function createRuntime(overrides = {}) {
     getCurrentSvg: () => "idle.svg",
     getCurrentHitBox: () => overrides.hitBox || null,
     getMiniMode: () => overrides.miniMode || false,
-    getMiniTransitioning: () => overrides.miniTransitioning || false,
+    getMiniTransitioning: () => typeof overrides.miniTransitioning === "function"
+      ? overrides.miniTransitioning() : (overrides.miniTransitioning || false),
     getMiniContainedSeam: () => overrides.miniContainedSeam || null,
     getMiniPeekOffset: () => 0,
     getCurrentPixelSize: () => overrides.currentPixelSize || { width: 100, height: 100 },
@@ -222,6 +223,110 @@ function createRuntime(overrides = {}) {
     setHitWin: (win) => { hitWin = win; },
   };
 }
+
+describe("macOS hit-window native drift recovery", () => {
+  function setup(extra = {}) {
+    const clock = createFakeClock();
+    const logs = [];
+    const h = createRuntime({ isWin: false, isMac: true, clock, edgeLog: (s) => logs.push(s), ...extra });
+    h.runtime.syncHitWin();
+    const target = { ...h.hitWin.bounds };
+    clock.advance(2000);
+    h.hitWin.calls.length = 0;
+    return { h, clock, target, logs };
+  }
+
+  it("repairs a same-target native drift on an ordinary sync", () => {
+    const { h, target } = setup();
+    h.hitWin.bounds.y += 363;
+    assert.deepEqual(h.runtime.syncHitWin(), { applied: true, deferred: false });
+    assert.deepEqual(h.hitWin.bounds, target);
+  });
+
+  it("repairs a late move event after all topology checks have completed", () => {
+    const { h, clock, target } = setup();
+    h.runtime.handleDisplayMetricsChanged();
+    clock.advance(5000);
+    h.hitWin.bounds.y += 363;
+    h.runtime.onHitNativeGeometryEvent();
+    clock.advance(250);
+    assert.deepEqual(h.hitWin.bounds, target);
+    clock.advance(5000);
+    assert.equal(clock.pendingCount(), 0);
+  });
+
+  it("catches a delayed native move without a move event and stops polling", () => {
+    const { h, clock, target } = setup();
+    h.runtime.handleDisplayMetricsChanged();
+    clock.advance(400);
+    h.hitWin.bounds.y += 363;
+    clock.advance(400);
+    assert.deepEqual(h.hitWin.bounds, target);
+    clock.advance(5000);
+    assert.equal(clock.pendingCount(), 0);
+    const count = h.hitWin.calls.length;
+    clock.advance(60000);
+    assert.equal(h.hitWin.calls.length, count);
+  });
+
+  it("bounds rejected native writes even with repeated sync and native echoes", () => {
+    const { h, clock, target, logs } = setup();
+    h.hitWin.bounds.y += 363;
+    h.hitWin.setBounds = (rect) => {
+      h.hitWin.calls.push(["setBounds", rect]);
+      h.runtime.onHitNativeGeometryEvent();
+    };
+    h.runtime.onHitNativeGeometryEvent();
+    clock.advance(10000);
+    for (let i = 0; i < 20; i++) h.runtime.syncHitWin();
+    assert.equal(h.hitWin.calls.filter(([name]) => name === "setBounds").length, 2);
+    assert.deepEqual(h.runtime.syncHitWin(), { applied: false, deferred: false });
+    assert.equal(logs.filter((s) => s.includes("action=mac-repair-limit")).length, 1);
+    assert.equal(clock.pendingCount(), 0);
+    // A new topology may make a previously rejected location writable.
+    h.hitWin.setBounds = (rect) => { h.hitWin.bounds = { ...rect }; };
+    h.runtime.handleDisplayMetricsChanged();
+    clock.advance(5000);
+    assert.deepEqual(h.hitWin.bounds, target);
+  });
+
+  for (const kind of ["drag", "mini", "peek", "preview", "roam"]) {
+    it(`defers native repair during ${kind}, then derives the latest target on release`, () => {
+      let active = false;
+      const { h, clock } = setup({
+        miniTransitioning: () => active && kind === "mini",
+        isMiniAnimating: () => active && kind === "peek",
+        isRoamAnimating: () => active && kind === "roam",
+      });
+      active = true;
+      if (kind === "drag") h.runtime.setDragLocked(true);
+      if (kind === "preview") h.runtime.beginSettingsSizePreviewProtection();
+      h.hitWin.bounds.y += 363;
+      h.runtime.onHitNativeGeometryEvent();
+      clock.advance(5000);
+      assert.equal(h.hitWin.calls.filter(([name]) => name === "setBounds").length, 0);
+      // The render may change during the protected period. Recovery must
+      // not replay the old hit rect.
+      h.renderWin.bounds.x += 50;
+      active = false;
+      if (kind === "drag") h.runtime.setDragLocked(false);
+      else if (kind === "preview") h.runtime.endSettingsSizePreviewProtection();
+      else h.runtime.releaseReconcileProtection();
+      clock.advance(500);
+      assert.deepEqual(h.hitWin.bounds, h.renderWin.bounds);
+      assert.equal(clock.pendingCount(), 0);
+    });
+  }
+
+  it("does not keep topology timers alive after the windows are destroyed", () => {
+    const { h, clock } = setup();
+    h.runtime.handleDisplayMetricsChanged();
+    h.hitWin.destroyed = true;
+    h.renderWin.destroyed = true;
+    clock.advance(5000);
+    assert.equal(clock.pendingCount(), 0);
+  });
+});
 
 describe("macOS physical edge pinning (#241)", () => {
   const dockDisplay = {
@@ -3672,6 +3777,83 @@ describe("pet-window-runtime", () => {
     const setBoundsCalls = renderWin.calls.filter((call) => call[0] === "setBounds");
     assert.equal(setBoundsCalls.length, 0);
   });
+
+  for (const handlerName of [
+    "handleDisplayMetricsChanged",
+    "handleDisplayRemoved",
+    "handleDisplayAdded",
+  ]) {
+    it(`${handlerName} reasserts a macOS hit window that the OS moved away from an unchanged render window`, () => {
+      const renderWin = makeWindow({ x: 200, y: 100, width: 100, height: 100 });
+      const hitWin = makeWindow({ x: 200, y: 100, width: 100, height: 100 });
+      const harness = createRuntime({
+        isWin: false,
+        isMac: true,
+        renderWin,
+        hitWin,
+        effectivePixelSize: { width: 100, height: 100 },
+        currentPixelSize: { width: 100, height: 100 },
+      });
+
+      // Seed the same-target optimization, then reproduce AppKit moving only
+      // the transparent input window during an unplug/scale transition. No
+      // native move event is required for the regression: the topology
+      // handler itself must invalidate the stale requested-rect cache.
+      harness.runtime.syncHitWin();
+      renderWin.calls.length = 0;
+      hitWin.calls.length = 0;
+      hitWin.bounds = { x: 200, y: 160, width: 100, height: 100 };
+
+      harness.runtime[handlerName]();
+
+      assert.deepEqual(
+        renderWin.calls.filter((call) => call[0] === "setBounds"),
+        [],
+        "an already-correct visual window should not be needlessly rewritten"
+      );
+      assert.deepEqual(
+        hitWin.calls.filter((call) => call[0] === "setBounds"),
+        [["setBounds", { x: 200, y: 100, width: 100, height: 100 }]],
+        "the native hit window must be realigned even though its derived target did not change"
+      );
+    });
+  }
+
+  for (const handlerName of ["handleDisplayMetricsChanged", "handleDisplayRemoved", "handleDisplayAdded"]) {
+    it(`${handlerName} preserves pointer capture and repairs stale hit geometry on the release sync`, () => {
+      const harness = createRuntime({ isWin: false, isMac: true });
+      harness.runtime.syncHitWin();
+      const target = { ...harness.hitWin.bounds };
+      harness.hitWin.bounds.y += 363;
+      harness.hitWin.calls.length = 0;
+      harness.runtime.setDragLocked(true);
+      harness.runtime[handlerName]();
+      assert.equal(harness.hitWin.calls.filter(([name]) => name === "setBounds").length, 0);
+      harness.runtime.setDragLocked(false);
+      harness.runtime.syncHitWin();
+      assert.deepEqual(harness.hitWin.bounds, target);
+      harness.hitWin.calls.length = 0;
+      harness.runtime.syncHitWin();
+      assert.equal(harness.hitWin.calls.filter(([name]) => name === "setBounds").length, 0,
+        "normal steady-state sync must retain the same-target optimization");
+    });
+
+    for (const protection of ["miniTransitioning", "isMiniAnimating"]) {
+      it(`${handlerName} defers stale-hit repair during ${protection}`, () => {
+        const harness = createRuntime({
+          isWin: false, isMac: true,
+          ...(protection === "isMiniAnimating" ? { isMiniAnimating: () => true } : { miniTransitioning: true }),
+        });
+        harness.runtime.syncHitWin();
+        harness.hitWin.bounds.y += 363;
+        harness.hitWin.calls.length = 0;
+        harness.renderWin.calls.length = 0;
+        harness.runtime[handlerName]();
+        assert.equal(harness.hitWin.calls.filter(([name]) => name === "setBounds").length, 0);
+        assert.equal(harness.renderWin.calls.filter(([name]) => name === "setBounds").length, 0);
+      });
+    }
+  }
 
   it("brings the pet to primary display and flushes runtime prefs", () => {
     const harness = createRuntime({

@@ -198,6 +198,12 @@ const SCHEMA = {
   sessionHudShowStateLabels: { type: "boolean", default: true },
   sessionHudShowElapsed: { type: "boolean", default: false },
   sessionHudShowContextUsage: { type: "boolean", default: true },
+  // Display-only and opt-in: completed ordinary ephemeral side chats are also
+  // collapsed; the Dashboard remains the complete session list.
+  sessionHudHideCompletedCodexEphemeral: { type: "boolean", default: false },
+  // Independent opt-in: active temporary side chats are also collapsed, without
+  // changing execution, canonical sessions or pending-attention visibility.
+  sessionHudHideActiveCodexEphemeral: { type: "boolean", default: false },
   sessionHudShowQuota: { type: "boolean", default: true },
   // Preserve the historical used-percentage presentation for existing users;
   // remaining is a display-only choice and never changes stored quota data.
@@ -377,6 +383,12 @@ const SCHEMA = {
   // so existing behavior — overlay by default, #538 stand-down as the escape
   // hatch — is untouched.
   fullscreenAutoHide: { type: "boolean", default: false },
+  // #1183: escape hatch for machines whose GPU compositor draws the
+  // transparent pet window as an opaque black square once part of it leaves
+  // the virtual desktop (edge snap / mini mode). Read once at startup, before
+  // app ready, because Electron can only turn GPU acceleration off then — a
+  // change takes effect on the next launch. Windows-only in effect.
+  disableHardwareAcceleration: { type: "boolean", default: false },
   // Text-window zoom (bubbles, HUD, dashboard, settings, resume input). The
   // pet itself scales via `size` and is never zoomed. `textScale` is the
   // global default; `textScaleByDisplay` overrides it per display id (the
