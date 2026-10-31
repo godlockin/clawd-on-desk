@@ -96,6 +96,13 @@ module.exports = function initRoam(ctx) {
       ctx.isImeEditingActive()
     )
       return false;
+    // #1282: precaution only — walking did not interrupt capture on the tested
+    // machine. The latest cached probe result can lag the foreground by ~1s.
+    if (
+      typeof ctx.isScreenCaptureOverlayForeground === "function" &&
+      ctx.isScreenCaptureOverlayForeground()
+    )
+      return false;
     return true;
   }
 
