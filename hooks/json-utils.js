@@ -557,6 +557,24 @@ function extractExistingNodeBinFromCommands(commands, marker) {
  * @returns {string|null}
  */
 function extractExistingNodeBin(settings, marker, options) {
+  if (options && options.claude && settings && settings.hooks) {
+    // Exec form already separates the executable from argv. Preserve its raw
+    // path (including UNC backslashes) without reparsing diagnostic text.
+    for (const entries of Object.values(settings.hooks)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        const hooks = options.nested && entry && Array.isArray(entry.hooks)
+          ? [entry, ...entry.hooks]
+          : [entry];
+        for (const hook of hooks) {
+          if (
+            hook && Array.isArray(hook.args) && getClaudeHookCommand(hook, marker) !== null
+            && isAbsoluteCommandToken(hook.command)
+          ) return hook.command;
+        }
+      }
+    }
+  }
   return extractExistingNodeBinFromCommands(findHookCommands(settings, marker, options), marker);
 }
 
@@ -579,6 +597,29 @@ function commandMatchesMarker(command, marker) {
 }
 
 const CLAUDE_STATE_HOOK_MARKER = "clawd-hook.js";
+const CLAUDE_COMMAND_MARKERS = new Set([CLAUDE_STATE_HOOK_MARKER, "auto-start.js", "auto-start.sh"]);
+
+// Read-only command text for Claude's shell and exec forms. Exec ownership is
+// proved by the script basename in args[0], never a marker in later arguments.
+// This text is for the existing marker/path readers, not for shell execution.
+function getClaudeHookCommand(hook, marker) {
+  if (!hook || typeof hook.command !== "string") return null;
+  if (!Object.prototype.hasOwnProperty.call(hook, "args")) return hook.command;
+  if (
+    !Array.isArray(hook.args) || !hook.args.length
+    || !hook.args.every((arg) => typeof arg === "string")
+  ) return null;
+  const basename = hook.args[0].split(/[\\/]/).pop();
+  if (marker ? basename !== marker : !CLAUDE_COMMAND_MARKERS.has(basename)) return null;
+  // The path parser consumes double-quoted backslash escapes; escape them so
+  // UNC prefixes survive the round trip as well as ordinary Windows paths.
+  return [hook.command, ...hook.args].map((arg) => quoteHookCommandArg(arg.replace(/\\/g, "\\\\"))).join(" ");
+}
+
+function claudeHookHasMarker(hook, marker) {
+  return (getClaudeHookCommand(hook, marker) || "").includes(marker);
+}
+
 const CLAUDE_HOOK_PATH_VAR_TOKENS = new Set([
   "$CLAWD_HOOK_PATH",
   "${CLAWD_HOOK_PATH}",
@@ -743,9 +784,9 @@ function findManagedClaudeEnvNodeBinCandidates(settings) {
     candidates.push(value);
   };
   const collect = (hook, event) => {
-    if (!hook || typeof hook.command !== "string") return;
-    if (classifyManagedClaudeStateHookCommand(hook.command, settings, event) !== "env") return;
-    const parsed = parseClaudeEnvStateHookCommand(hook.command, event);
+    const command = getClaudeHookCommand(hook, CLAUDE_STATE_HOOK_MARKER);
+    if (classifyManagedClaudeStateHookCommand(command, settings, event) !== "env") return;
+    const parsed = parseClaudeEnvStateHookCommand(command, event);
     for (const candidate of getClaudeEnvNodeBinCandidates(settings, parsed)) append(candidate);
   };
 
@@ -853,6 +894,7 @@ function findHookCommands(settings, marker, options) {
   const nested = options && options.nested;
   const flatArray = options && options.flatArray;
   const commands = [];
+  const commandText = (hook) => options && options.claude ? getClaudeHookCommand(hook, marker) : hook.command;
 
   // KiroCrew's hooks.json stores `hooks` as a FLAT array of hook objects
   // ({ event, command, ... }), not the Claude-style object of per-event
@@ -872,13 +914,15 @@ function findHookCommands(settings, marker, options) {
       if (!entry || typeof entry !== "object") continue;
       if (nested && Array.isArray(entry.hooks)) {
         for (const h of entry.hooks) {
-          if (h && commandMatchesMarker(h.command, marker)) {
-            commands.push(h.command);
+          const command = h && commandText(h);
+          if (commandMatchesMarker(command, marker)) {
+            commands.push(command);
           }
         }
       }
-      if (commandMatchesMarker(entry.command, marker)) {
-        commands.push(entry.command);
+      const command = commandText(entry);
+      if (commandMatchesMarker(command, marker)) {
+        commands.push(command);
       }
     }
   }
@@ -905,6 +949,8 @@ module.exports = {
   DEFAULT_BACKUP_KEEP,
   asarUnpackedPath,
   commandMatchesMarker,
+  getClaudeHookCommand,
+  claudeHookHasMarker,
   classifyManagedClaudeStateHookCommand,
   findManagedClaudeEnvNodeBinCandidates,
   getClaudeEnvNodeBinCandidate,
