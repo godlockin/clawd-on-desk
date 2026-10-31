@@ -339,8 +339,21 @@ function resolveWslDistroEnv() {
   return null;
 }
 
+// PowerShell also reads U+2018, U+2019, U+201A and U+201B as single quotes, so
+// inside a single-quoted string each of them is doubled, like ASCII `'`.
+// Otherwise a path containing one ends the string early and the rest of it
+// runs as PowerShell code.
+const POWERSHELL_SINGLE_QUOTE_RE = /['\u2018\u2019\u201A\u201B]/g;
+const POWERSHELL_DOUBLED_SINGLE_QUOTE_RE = /(['\u2018\u2019\u201A\u201B])\1/g;
+
 function quotePowerShellSingleArg(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+  return `'${String(value).replace(POWERSHELL_SINGLE_QUOTE_RE, (quote) => quote + quote)}'`;
+}
+
+// Inverse of the doubling in quotePowerShellSingleArg, applied to the text
+// between a single-quoted string's delimiters.
+function unescapePowerShellSingleQuoted(text) {
+  return String(text).replace(POWERSHELL_DOUBLED_SINGLE_QUOTE_RE, "$1");
 }
 
 function windowsPowerShellBin(options = {}) {
@@ -383,7 +396,7 @@ function decodeWindowsEncodedCommand(command) {
 function extractFirstQuotedToken(command) {
   const text = String(command || "").trim().replace(/^&\s+/, "");
   const single = text.match(/^'((?:''|[^'])*)'/);
-  if (single) return single[1].replace(/''/g, "'");
+  if (single) return unescapePowerShellSingleQuoted(single[1]);
   const double = text.match(/^"((?:\\"|[^"])*)"/);
   if (double) return double[1].replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
   const bare = text.match(/^(\S+)/);
@@ -911,5 +924,6 @@ module.exports = {
   decodeWindowsEncodedCommand,
   extractFirstQuotedToken,
   quotePowerShellSingleArg,
+  unescapePowerShellSingleQuoted,
   windowsPowerShellBin,
 };

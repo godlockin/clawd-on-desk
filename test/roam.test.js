@@ -1118,6 +1118,89 @@ describe("roam pauses during IME editing (#640)", () => {
   });
 });
 
+describe("issue #1282: roam pauses during screen capture", () => {
+  beforeEach(() => {
+    mock.method(Math, "random", () => 0.9);
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  });
+
+  afterEach(() => {
+    mock.timers.reset();
+    mock.reset();
+  });
+
+  it("issue #1282: does not start while capture is foreground and waits 8s after it ends", () => {
+    let capture = true;
+    const ctx = makeCtx({ isScreenCaptureOverlayForeground: () => capture });
+    const roam = roamModule(ctx);
+    roam.setEnabled(true);
+    roam.tick();
+    mock.timers.tick(12000);
+    assert.deepStrictEqual(ctx._stateLog, []);
+    assert.deepStrictEqual(ctx._appliedBounds, []);
+
+    capture = false;
+    roam.tick();
+    mock.timers.tick(7999);
+    assert.strictEqual(ctx.getCurrentState(), "idle");
+    mock.timers.tick(1);
+    assert.strictEqual(ctx.getCurrentState(), "roam");
+  });
+
+  it("issue #1282: cancels an active walk, releases reconcile protection and resumes after 8s", () => {
+    let capture = false;
+    let releases = 0;
+    const ctx = makeCtx({
+      isScreenCaptureOverlayForeground: () => capture,
+      releaseReconcileProtection: () => { releases++; },
+    });
+    const roam = roamModule(ctx);
+    roam.setEnabled(true);
+    roam.tick();
+    mock.timers.tick(8000);
+    mock.timers.tick(16);
+    assert.strictEqual(roam.isRoamAnimating(), true);
+    const writes = ctx._appliedBounds.length;
+
+    capture = true;
+    mock.timers.tick(16);
+    assert.strictEqual(roam.isRoamAnimating(), false);
+    assert.strictEqual(ctx.getCurrentState(), "idle");
+    assert.strictEqual(releases, 1);
+    assert.deepStrictEqual(ctx._stateLog.at(-1), {
+      type: "setState", state: "idle", svgOverride: undefined, options: { bypassMinDisplay: true },
+    });
+    mock.timers.tick(1000);
+    assert.strictEqual(ctx._appliedBounds.length, writes);
+
+    capture = false;
+    roam.tick();
+    mock.timers.tick(7999);
+    assert.strictEqual(ctx.getCurrentState(), "idle");
+    mock.timers.tick(1);
+    assert.strictEqual(ctx.getCurrentState(), "roam");
+  });
+
+  it("issue #1282: a pending walk rechecks capture when its timer expires", () => {
+    let capture = false;
+    const ctx = makeCtx({ isScreenCaptureOverlayForeground: () => capture });
+    const roam = roamModule(ctx);
+    roam.setEnabled(true);
+    roam.tick();
+    capture = true;
+    mock.timers.tick(8000);
+    assert.deepStrictEqual(ctx._stateLog, []);
+    assert.deepStrictEqual(ctx._appliedBounds, []);
+    roam.tick();
+    capture = false;
+    roam.tick();
+    mock.timers.tick(7999);
+    assert.strictEqual(ctx.getCurrentState(), "idle");
+    mock.timers.tick(1);
+    assert.strictEqual(ctx.getCurrentState(), "roam");
+  });
+});
+
 describe("roam pauses during settings size preview", () => {
   beforeEach(() => {
     mock.method(Math, "random", () => 0.9);
