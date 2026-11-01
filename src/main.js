@@ -1781,6 +1781,7 @@ function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
   sendToRenderer("pet-tint-change", resolvePetTintPayload(tintId, activeTheme));
   deliverAccessorySlotsSnapshot(activeTheme);
   sendToRenderer("low-power-idle-mode-change", lowPowerIdleMode);
+  sendToRenderer("pet-hidden-change", petWindowRuntime.isPetEffectivelyHidden());
   if (_mini.getMiniMode()) {
     sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
     // mini-clip is a renderer inline style — a renderer/theme reload (and
