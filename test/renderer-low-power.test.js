@@ -1,6 +1,6 @@
 "use strict";
 
-const { describe, it } = require("node:test");
+const { beforeEach, describe, it } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -2104,12 +2104,19 @@ describe("hidden pet page", () => {
   it("hidden pet page: leaves low-power pause feedback and SVG styles alone", () => {
     const harness = createRendererHarness();
     const svg = attachFakeSvgDocument(harness.clawd);
+    const scriptedPauses = [];
+    harness.clawd.contentWindow.__clawdSetLowPowerPaused = (paused) => scriptedPauses.push(paused);
     harness.api.setCurrentState("idle");
 
     harness.electronHandlers.onPetHiddenChange(true);
+    harness.electronHandlers.onPetHiddenChange(false);
 
     assert.strictEqual(harness.electronCalls.some((call) => call.name === "setLowPowerIdlePaused"), false);
     assert.strictEqual(svg.svgDoc.getElementById("clawd-low-power-pause-svg"), null);
+    assert.strictEqual(svg.root.pauseCalls, 0);
+    assert.strictEqual(svg.root.unpauseCalls, 0);
+    assert.strictEqual(harness.api.lowPowerSvgPaused, false);
+    assert.deepStrictEqual(scriptedPauses, []);
   });
 
   it("hidden pet page: preload forwards pet-hidden-change to the callback", () => {
@@ -3980,6 +3987,281 @@ describe("renderer pet accessory wardrobe", () => {
     harness.api.pendingNext.listeners.get("load")();
     assert.strictEqual(harness.mouthAccessory.style.display, "block");
     assert.strictEqual(mouthSvg.root.unpauseCalls, unpauseBefore + 1);
+  });
+
+  describe("hidden pet accessories", () => {
+    let harness;
+    let config;
+    let petSvg;
+    let mouthSvg;
+    let matrix;
+    let ctmCalls;
+
+    beforeEach(() => {
+      config = dualSlotConfig();
+      matrix = { a: 2, b: 0, c: 0, d: 2, e: 10, f: 12 };
+      ctmCalls = { head: 0, mouth: 0 };
+      for (const slotName of ["head", "mouth"]) {
+        const descriptor = {
+          staticFrame: { cx: 50, baseY: 40, width: 20 },
+          followTarget: {
+            id: `${slotName}-anchor`,
+            frame: { cx: 8, baseY: 6, width: 4 },
+          },
+        };
+        config.accessorySlots[slotName].attachments.files = {
+          "first.svg": descriptor,
+          "working.svg": descriptor,
+          "hidden.svg": { visibility: "hidden" },
+        };
+      }
+      harness = createRendererHarness({ initialObjectData: "", themeConfig: config });
+      petSvg = attachFakeSvgDocument(harness.api.pendingNext);
+      for (const slotName of ["head", "mouth"]) {
+        petSvg.elements.set(`${slotName}-anchor`, {
+          getCTM() {
+            ctmCalls[slotName]++;
+            return { ...matrix };
+          },
+        });
+      }
+      harness.api.pendingNext.listeners.get("load")();
+      harness.accessory.onload();
+      mouthSvg = attachFakeSvgDocument(harness.mouthAccessory);
+      harness.mouthAccessory.onload();
+      harness.api.setCurrentState("idle");
+    });
+
+    it("cancels both follow frames and pauses the mouth document when hidden", (t) => {
+      const requestFrame = t.mock.method(harness.context, "requestAnimationFrame");
+      const frames = Object.values(harness.api.accessorySlots).map((slot) => slot.raf);
+      assert.ok(frames.every(Boolean));
+      const pausesBefore = mouthSvg.root.pauseCalls;
+      const callsBefore = { ...ctmCalls };
+
+      harness.electronHandlers.onPetHiddenChange(true);
+
+      assert.strictEqual(harness.context.document.hidden, false);
+      for (const slotName of ["head", "mouth"]) {
+        assert.strictEqual(harness.api.accessorySlots[slotName].raf, null);
+      }
+      assert.ok(frames.every((frame) => frame.cleared));
+      assert.strictEqual(mouthSvg.root.pauseCalls, pausesBefore + 1);
+      assert.ok(mouthSvg.svgDoc.getElementById("clawd-low-power-pause-svg"));
+      drainActiveTimers(harness, (timer) => timer.ms === 16, 5);
+      assert.deepStrictEqual(ctmCalls, callsBefore);
+      assert.strictEqual(requestFrame.mock.callCount(), 0);
+      assert.ok(Object.values(harness.api.accessorySlots).every((slot) => slot.raf === null));
+      assert.strictEqual(harness.electronCalls.some((call) => call.name === "setLowPowerIdlePaused"), false);
+    });
+
+    it("lays out a new state and file once while hidden without resuming accessories", () => {
+      harness.electronHandlers.onPetHiddenChange(true);
+      const callsBefore = { ...ctmCalls };
+      const unpausesBefore = mouthSvg.root.unpauseCalls;
+      const positionsBefore = Object.values(harness.api.accessorySlots).map((slot) => slot.lastLayout.matrix.e);
+      matrix.e += 19;
+
+      harness.api.swapToFile("working.svg", "working", true);
+      const next = harness.api.pendingNext;
+      next.contentDocument = petSvg.svgDoc;
+      next.listeners.get("load")();
+
+      assert.strictEqual(harness.api.currentDisplayedSvg, "working.svg");
+      assert.strictEqual(harness.api.currentDisplayedState, "working");
+      for (const [index, slotName] of ["head", "mouth"].entries()) {
+        const slot = harness.api.accessorySlots[slotName];
+        assert.strictEqual(ctmCalls[slotName], callsBefore[slotName] + 1);
+        assert.strictEqual(slot.lastLayout.matrix.e, positionsBefore[index] + 19);
+        assert.strictEqual(slot.raf, null);
+      }
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, true);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore);
+    });
+
+    it("removes the hidden class and refreshes the current pose before resuming in the same task", () => {
+      harness.electronHandlers.onPetHiddenChange(true);
+      const callsBefore = { ...ctmCalls };
+      const positionsBefore = Object.values(harness.api.accessorySlots).map((slot) => slot.lastLayout.matrix.e);
+      const unpausesBefore = mouthSvg.root.unpauseCalls;
+      const hiddenDuringLayout = [];
+      for (const slotName of ["head", "mouth"]) {
+        const target = petSvg.elements.get(`${slotName}-anchor`);
+        const getCTM = target.getCTM;
+        target.getCTM = () => {
+          hiddenDuringLayout.push(harness.context.document.documentElement.classList.contains("pet-hidden"));
+          return getCTM();
+        };
+      }
+      matrix.e += 23;
+
+      harness.electronHandlers.onPetHiddenChange(false);
+
+      assert.deepStrictEqual(hiddenDuringLayout, [false, false]);
+      assert.strictEqual(harness.context.document.documentElement.classList.contains("pet-hidden"), false);
+      for (const [index, slotName] of ["head", "mouth"].entries()) {
+        const slot = harness.api.accessorySlots[slotName];
+        assert.strictEqual(ctmCalls[slotName], callsBefore[slotName] + 1);
+        assert.strictEqual(slot.lastLayout.matrix.e, positionsBefore[index] + 23);
+        assert.ok(slot.raf && !slot.raf.cleared);
+      }
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, false);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore + 1);
+      assert.strictEqual(mouthSvg.svgDoc.getElementById("clawd-low-power-pause-svg"), null);
+    });
+
+    it("refreshes on show during low-power pause and resumes only after low-power recovery", () => {
+      harness.electronHandlers.onPetHiddenChange(true);
+      harness.api.setLowPowerIdleMode(true);
+      harness.api.setLowPowerSvgPaused(true);
+      const callsBefore = { ...ctmCalls };
+      const unpausesBefore = mouthSvg.root.unpauseCalls;
+      const headPosition = harness.api.accessorySlots.head.lastLayout.matrix.e;
+      matrix.e += 29;
+
+      harness.electronHandlers.onPetHiddenChange(false);
+
+      assert.strictEqual(harness.context.document.documentElement.classList.contains("pet-hidden"), false);
+      assert.strictEqual(harness.api.accessorySlots.head.lastLayout.matrix.e, headPosition + 29);
+      for (const slotName of ["head", "mouth"]) {
+        assert.strictEqual(ctmCalls[slotName], callsBefore[slotName] + 1);
+        assert.strictEqual(harness.api.accessorySlots[slotName].raf, null);
+      }
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, true);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore);
+
+      harness.api.setLowPowerSvgPaused(false);
+
+      assert.ok(Object.values(harness.api.accessorySlots).every((slot) => slot.raf && !slot.raf.cleared));
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, false);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore + 1);
+    });
+
+    it("keeps accessories paused when low-power recovers while the page is hidden", () => {
+      harness.api.setLowPowerIdleMode(true);
+      harness.api.setLowPowerSvgPaused(true);
+      harness.electronHandlers.onPetHiddenChange(true);
+      const unpausesBefore = mouthSvg.root.unpauseCalls;
+
+      harness.api.setLowPowerSvgPaused(false);
+
+      assert.strictEqual(harness.api.lowPowerSvgPaused, false);
+      assert.ok(Object.values(harness.api.accessorySlots).every((slot) => slot.raf === null));
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, true);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore);
+      assert.ok(mouthSvg.svgDoc.getElementById("clawd-low-power-pause-svg"));
+
+      harness.electronHandlers.onPetHiddenChange(false);
+
+      assert.ok(Object.values(harness.api.accessorySlots).every((slot) => slot.raf && !slot.raf.cleared));
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, false);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore + 1);
+    });
+
+    it("pauses an accessory loaded while hidden before computing its first layout", () => {
+      harness.electronHandlers.onPetHiddenChange(true);
+      harness.electronHandlers.onPetAccessorySlotsChange({
+        themeId: "clawd",
+        accessoryGeneration: 6,
+        payloads: {
+          head: config.accessorySlots.head.payload,
+          mouth: { ...config.accessorySlots.mouth.payload, assetFile: "cigarette-new.svg" },
+        },
+      });
+      mouthSvg = attachFakeSvgDocument(harness.mouthAccessory);
+      const pausesDuringLayout = [];
+      const target = petSvg.elements.get("mouth-anchor");
+      const getCTM = target.getCTM;
+      target.getCTM = () => {
+        pausesDuringLayout.push(mouthSvg.root.pauseCalls);
+        return getCTM();
+      };
+
+      harness.mouthAccessory.onload();
+
+      assert.deepStrictEqual(pausesDuringLayout, [1]);
+      assert.strictEqual(mouthSvg.root.pauseCalls, 1);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, 0);
+      assert.ok(Object.values(harness.api.accessorySlots).every((slot) => slot.raf === null));
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, true);
+
+      harness.electronHandlers.onPetHiddenChange(false);
+
+      assert.strictEqual(mouthSvg.root.unpauseCalls, 1);
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, false);
+      assert.ok(Object.values(harness.api.accessorySlots).every((slot) => slot.raf && !slot.raf.cleared));
+    });
+
+    it("ignores duplicate hidden notifications including the initial false replay", (t) => {
+      const syncPause = t.mock.method(harness.context, "syncAccessorySvgLowPowerPaused");
+      let previousHidden = false;
+      for (const hidden of [false, true, true, false, false]) {
+        const callsBefore = { ...ctmCalls };
+        const syncsBefore = syncPause.mock.callCount();
+        const pausesBefore = mouthSvg.root.pauseCalls;
+        const unpausesBefore = mouthSvg.root.unpauseCalls;
+        const framesBefore = Object.values(harness.api.accessorySlots).map((slot) => slot.raf);
+
+        harness.electronHandlers.onPetHiddenChange(hidden);
+
+        if (hidden === previousHidden) {
+          assert.deepStrictEqual(ctmCalls, callsBefore);
+          assert.strictEqual(syncPause.mock.callCount(), syncsBefore);
+          assert.strictEqual(mouthSvg.root.pauseCalls, pausesBefore);
+          assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore);
+          assert.deepStrictEqual(Object.values(harness.api.accessorySlots).map((slot) => slot.raf), framesBefore);
+        }
+        previousHidden = hidden;
+      }
+    });
+
+    it("does not restart accessories on resize or visibility restore while hidden", (t) => {
+      const requestFrame = t.mock.method(harness.context, "requestAnimationFrame");
+      harness.electronHandlers.onPetHiddenChange(true);
+      const unpausesBefore = mouthSvg.root.unpauseCalls;
+      for (const refresh of [
+        () => harness.windowListeners.get("resize")({ type: "resize" }),
+        () => {
+          harness.context.document.hidden = true;
+          harness.documentListeners.get("visibilitychange")();
+          harness.context.document.hidden = false;
+          harness.documentListeners.get("visibilitychange")();
+        },
+      ]) {
+        const callsBefore = { ...ctmCalls };
+        matrix.f += 7;
+        refresh();
+        for (const slotName of ["head", "mouth"]) {
+          assert.strictEqual(ctmCalls[slotName], callsBefore[slotName] + 1);
+          assert.strictEqual(harness.api.accessorySlots[slotName].raf, null);
+        }
+        assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, true);
+        assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore);
+      }
+      assert.strictEqual(requestFrame.mock.callCount(), 0);
+    });
+
+    it("keeps a theme-hidden slot paused when the page is shown", () => {
+      harness.electronHandlers.onPetHiddenChange(true);
+      harness.api.swapToFile("hidden.svg", "working", true);
+      const next = harness.api.pendingNext;
+      next.contentDocument = petSvg.svgDoc;
+      next.listeners.get("load")();
+      const unpausesBefore = mouthSvg.root.unpauseCalls;
+
+      harness.electronHandlers.onPetHiddenChange(false);
+
+      for (const slotName of ["head", "mouth"]) {
+        const slot = harness.api.accessorySlots[slotName];
+        assert.strictEqual(slot.element.style.display, "none");
+        assert.strictEqual(slot.element.style.visibility, "hidden");
+        assert.strictEqual(slot.lastLayout, null);
+        assert.strictEqual(slot.raf, null);
+      }
+      assert.strictEqual(harness.api.accessorySlots.mouth.documentPaused, true);
+      assert.strictEqual(mouthSvg.root.unpauseCalls, unpausesBefore);
+      assert.ok(mouthSvg.svgDoc.getElementById("clawd-low-power-pause-svg"));
+    });
   });
 
   it("keeps sibling objects outside tint and pet-media swap cleanup", () => {
