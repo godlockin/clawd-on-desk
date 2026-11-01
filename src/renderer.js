@@ -34,6 +34,7 @@ const DISCRETE_SAMPLING_MAX_RETRIES = 60;
 // sampler on the same document (a retry that raced the first pass, a duplicate
 // commit callback) would otherwise snap an already-snapped duration again.
 const discreteSampledDocuments = new WeakSet();
+const discreteSamplingFollowByDocument = new WeakMap();
 // The zoom cancelDisplayScaleForCompositor wrote into each SVG document.
 const displayScaleZoomByDocument = new WeakMap();
 // Same settle time main.js gives display-metrics-changed, which arrives in bursts too.
@@ -74,6 +75,7 @@ let _lowPowerStaticImageOverrides = {};
 let _petTintPayload = { id: "none", filter: "" };
 let _petTintSupported = false;
 const ACCESSORY_SLOT_NAMES = Object.freeze(["head", "mouth"]);
+const ACCESSORY_SMIL_RATE = 12;
 function createAccessorySlotRuntime(element) {
   return {
     element,
@@ -86,6 +88,8 @@ function createAccessorySlotRuntime(element) {
     assetLoadTimer: null,
     assetWaiters: [],
     raf: null,
+    followTimer: null,
+    smilTimer: null,
     lastLayout: null,
     followKey: null,
     pausedRoot: null,
@@ -275,16 +279,48 @@ function setSvgRootLowPowerPaused(root, paused) {
   }
 }
 
+function stopAccessorySmilClock(slot) {
+  if (slot.smilTimer == null) return;
+  clearInterval(slot.smilTimer);
+  slot.smilTimer = null;
+}
+
+function startAccessorySmilClock(slot, root) {
+  stopAccessorySmilClock(slot);
+  try {
+    if (!root.querySelectorAll("animate, animateTransform, animateMotion, set").length) return;
+    root.pauseAnimations();
+    // SVG time is single precision; accumulating small steps loses time as
+    // the document ages. A fresh anchor also excludes time spent hidden.
+    const anchorTime = root.getCurrentTime();
+    const anchorNow = performance.now();
+    slot.smilTimer = setInterval(() => {
+      try {
+        root.setCurrentTime(anchorTime + (performance.now() - anchorNow) / 1000);
+      } catch {
+        stopAccessorySmilClock(slot);
+      }
+    }, 1000 / ACCESSORY_SMIL_RATE);
+  } catch {
+    stopAccessorySmilClock(slot);
+  }
+}
+
 function setAccessorySvgLowPowerPaused(slotName, paused) {
   const slot = _accessorySlots[slotName];
   if (!slot || !slot.element || slot.element.tagName !== "OBJECT") return false;
   const root = getObjectSvgRoot(slot.element);
-  if (!root) return false;
+  if (!root) {
+    stopAccessorySmilClock(slot);
+    return false;
+  }
   const next = !!paused;
   if (slot.pausedRoot === root && slot.documentPaused === next) return true;
   if (!setSvgRootLowPowerPaused(root, next)) return false;
   slot.pausedRoot = root;
   slot.documentPaused = next;
+  if (next) stopAccessorySmilClock(slot);
+  else startAccessorySmilClock(slot, root);
   return true;
 }
 
@@ -798,6 +834,10 @@ function cancelAccessoryFollow(slotName) {
     cancelAnimationFrame(slot.raf);
     slot.raf = null;
   }
+  if (slot.followTimer != null) {
+    clearTimeout(slot.followTimer);
+    slot.followTimer = null;
+  }
   slot.followKey = null;
 }
 
@@ -846,7 +886,7 @@ function clearAccessoryRuntime(slotName, options = {}) {
   if (!options.clearAsset) return;
   clearAccessoryAssetLoadTimer(slotName);
   if (slot.element) {
-    setAccessorySvgLowPowerPaused(slotName, false);
+    // Clearing data on a hidden object can retain its document, so leave it paused.
     slot.element.onload = null;
     slot.element.onerror = null;
     try {
@@ -1098,6 +1138,21 @@ function applyAccessoryLayout(context, layout) {
   return true;
 }
 
+function getAccessoryFollowDelayMs(context) {
+  try {
+    const doc = context.media.contentDocument;
+    const sampled = doc && discreteSamplingFollowByDocument.get(doc);
+    if (!sampled || _useLayeredTracking) return null;
+    // Cursor tracking moves the body through a transition between grid points.
+    if (bodyTarget && bodyTarget.ownerDocument === doc && bodyTarget.getAnimations().length > 0) return null;
+    const { animation, stepMs } = sampled;
+    if (animation.playState !== "running" || !Number.isFinite(animation.startTime)) return null;
+    return stepMs - (animation.currentTime % stepMs);
+  } catch {
+    return null;
+  }
+}
+
 function accessoryFollowTick(slotName, expectedKey) {
   const slot = getAccessorySlot(slotName);
   if (!slot) return;
@@ -1124,7 +1179,15 @@ function accessoryFollowTick(slotName, expectedKey) {
     return;
   }
   applyAccessoryLayout(context, layout);
-  slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, expectedKey));
+  const delayMs = getAccessoryFollowDelayMs(context);
+  if (delayMs != null) {
+    slot.followTimer = setTimeout(() => {
+      slot.followTimer = null;
+      slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, expectedKey));
+    }, delayMs);
+  } else {
+    slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, expectedKey));
+  }
 }
 
 function startAccessoryFollow(context) {
@@ -2033,6 +2096,9 @@ function alignDiscreteSamplingAnimations(animations, contentWindow, rate, isStil
       ready.then(applyStartTime, () => {});
     }
   }
+  // A mixed document can still move between grid points through an animation
+  // the sampler leaves alone, so only wholly sampled documents may follow it.
+  return sampleable.length === animations.length ? sampleable[0].animation : null;
 }
 
 /**
@@ -2142,7 +2208,8 @@ function applyDiscreteSampling(objectEl, file) {
       }
     };
 
-    alignDiscreteSamplingAnimations(animations, contentWindow, rate, isSameDocument);
+    const animation = alignDiscreteSamplingAnimations(animations, contentWindow, rate, isSameDocument);
+    if (animation) discreteSamplingFollowByDocument.set(contentDocument, { animation, stepMs: 1000 / rate });
   };
 
   trySample(0);
@@ -2729,6 +2796,14 @@ function applyEyeMove(dx, dy) {
       const shiftX = Math.round(bdx * _shadowShift * 2) / 2;
       shadowTarget.setAttribute("transform", `translate(${shiftX}, 0) scale(${scaleX}, 1)`);
     }
+  }
+  for (const slotName of ACCESSORY_SLOT_NAMES) {
+    const slot = getAccessorySlot(slotName);
+    if (slot.followTimer == null) continue;
+    clearTimeout(slot.followTimer);
+    slot.followTimer = null;
+    const key = slot.followKey;
+    slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, key));
   }
 }
 
