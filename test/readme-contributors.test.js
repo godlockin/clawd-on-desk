@@ -90,6 +90,13 @@ const VERIFIED_GITHUB_CONTRIBUTORS = [
   "jin-codes",
   "LetitiaChan",
   "sanzanazaman",
+  "zero-or-one",
+  "integrasoft-c",
+  "yunho09",
+  "tianxingjian2406",
+  "Aminorsh",
+  "daijx-ai",
+  "XYZliang",
 ];
 
 const MAINTAINERS_SVG = path.join("assets", "readme", "maintainers.svg");
