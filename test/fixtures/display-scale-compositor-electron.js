@@ -122,6 +122,9 @@ async function main() {
     show: false,
     width: 220,
     height: 220,
+    // A Windows frame takes a different share of the window at each scale, which
+    // would change the viewport's shape and with it the fitted SVG.
+    useContentSize: true,
     webPreferences: {
       preload: path.join(ROOT, "src", "preload.js"),
       contextIsolation: true,
