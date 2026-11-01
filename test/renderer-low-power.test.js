@@ -103,6 +103,7 @@ function loadPreloadWithElectron({
 class FakeElement {
   constructor(tagName) {
     this.tagName = tagName.toUpperCase();
+    this.localName = tagName.toLowerCase();
     this.style = {
       setProperty(name, value) { this[name] = String(value); },
       removeProperty(name) { delete this[name]; },
@@ -168,6 +169,14 @@ class FakeElement {
     if (name === "data") return this.data || this.attributes.get(name) || "";
     if (name === "src") return this.src || this.attributes.get(name) || "";
     return this.attributes.get(name) || "";
+  }
+
+  hasAttribute(name) {
+    return this.attributes.has(name);
+  }
+
+  getBoundingClientRect() {
+    return { x: this.offsetLeft, y: this.offsetTop, width: this.offsetWidth, height: this.offsetHeight };
   }
 
   appendChild(child) {
@@ -310,6 +319,7 @@ function createRendererHarness(options = {}) {
     },
   });
   const windowListeners = new Map();
+  const mediaQueries = [];
   const context = {
     document,
     window: {
@@ -323,6 +333,17 @@ function createRendererHarness(options = {}) {
         ...(options.themeConfig || {}),
       },
       electronAPI,
+      devicePixelRatio: options.devicePixelRatio ?? 1,
+      matchMedia: options.withoutMatchMedia ? undefined : (query) => {
+        const mediaQuery = { query, listeners: [] };
+        mediaQueries.push(mediaQuery);
+        return {
+          addEventListener(event, callback, listenerOptions) {
+            assert.strictEqual(event, "change");
+            mediaQuery.listeners.push({ callback, once: listenerOptions && listenerOptions.once });
+          },
+        };
+      },
       getComputedStyle: (el) => ({ opacity: el.style.opacity || "1" }),
       addEventListener(event, callback) {
         windowListeners.set(event, callback);
@@ -395,6 +416,7 @@ globalThis.__rendererTest = {
   applyPetTintToAllMedia,
   normalizeAccessoryPayload,
   refreshAccessoryLayout,
+  setPendingSystemWakeId(value) { pendingSystemWakeId = value; },
   get pendingNext() { return pendingNext; },
   get pendingSvgFile() { return pendingSvgFile; },
   get activeSwapToken() { return activeSwapToken; },
@@ -435,6 +457,18 @@ globalThis.__rendererTest = {
     activeTimers: () => timers.filter((timer) => !timer.cleared),
     documentListeners,
     windowListeners,
+    mediaQueries,
+    changeDisplayScale(scale) {
+      context.window.devicePixelRatio = scale;
+      // Only queries whose old resolution stopped matching emit a change.
+      for (const mediaQuery of [...mediaQueries]) {
+        if (mediaQuery.query === `(resolution: ${scale}dppx)`) continue;
+        for (const listener of [...mediaQuery.listeners]) {
+          if (listener.once) mediaQuery.listeners.splice(mediaQuery.listeners.indexOf(listener), 1);
+          listener.callback();
+        }
+      }
+    },
   };
 }
 
@@ -927,10 +961,10 @@ describe("renderer discrete animation sampling", () => {
     );
   }
 
-  function attachAnimationDocument(objectEl, animations) {
+  function attachAnimationDocument(objectEl, animations, options = {}) {
     objectEl.contentWindow.CSSAnimation = FakeCSSAnimation;
     objectEl.contentWindow.CSSTransition = FakeCSSTransition;
-    attachFakeSvgDocument(objectEl, { animations });
+    return attachFakeSvgDocument(objectEl, { animations, ...options });
   }
 
   function commitObject(harness, file, animations) {
@@ -952,14 +986,16 @@ describe("renderer discrete animation sampling", () => {
     return pending;
   }
 
-  function samplingHarness(files, transitions) {
+  function samplingHarness(files, transitions, options = {}) {
     return createRendererHarness({
+      ...options,
       themeConfig: {
         rendering: {
           objectChannelFiles: files,
           discreteSampling: Object.fromEntries(files.map((file) => [file, 24])),
         },
         ...(transitions ? { transitions } : {}),
+        ...options.themeConfig,
       },
     });
   }
@@ -1343,6 +1379,426 @@ describe("renderer discrete animation sampling", () => {
     assert.deepStrictEqual(retiredAnimation.calls, []);
     assert.deepStrictEqual(freshAnimation.calls.map((call) => call.easing), ["steps(288, end)"]);
     assert.strictEqual(objectEl.isConnected, true, "the 500ms fade timer was not advanced");
+  });
+
+  describe("display scale compositor", () => {
+    const FILE = "sweeping.svg";
+
+    function scaleHarness(scale = 1.5, themeConfig = {}) {
+      return samplingHarness([FILE, "other.svg"], null, {
+        devicePixelRatio: scale,
+        themeConfig: { idleFollowSvg: FILE, eyeTrackingStates: ["idle", "dozing"], ...themeConfig },
+      });
+    }
+
+    function attachScaleDocument(objectEl, options = {}) {
+      const animation = makeAnimation(12000);
+      const retiredAnimation = makeAnimation(12000);
+      const attached = attachAnimationDocument(objectEl, [retiredAnimation], { withEyes: true });
+      const { root, svgDoc, elements } = attached;
+      root.localName = options.localName || "svg";
+      if (options.viewBox !== false) root.setAttribute("viewBox", "0 0 100 100");
+      root.style.zoom = "";
+      root.style.display = options.display || "";
+      const calls = [];
+      root.style = new Proxy(root.style, {
+        set(target, key, value) {
+          if (key === "zoom" || key === "display") calls.push(`${key}:${value}`);
+          target[key] = value;
+          return true;
+        },
+      });
+      let animations = [retiredAnimation];
+      root.getBoundingClientRect = () => {
+        calls.push("geometry");
+        // Rebuilding layout replaces the animation objects; sampling the old
+        // list would leave the animations actually on screen untouched.
+        animations = [animation];
+        return { width: 220, height: 220 };
+      };
+      svgDoc.getAnimations = () => { calls.push("animations"); return animations; };
+      const pageMatrix = { a: 2, b: 0.2, c: -0.1, d: 2, e: 10, f: 12 };
+      elements.set("body", {
+        getCTM() {
+          const zoom = Number(root.style.zoom) || 1;
+          return Object.fromEntries(Object.entries(pageMatrix).map(([key, value]) => [key, value / zoom]));
+        },
+      });
+      return { ...attached, calls, animation, retiredAnimation };
+    }
+
+    function commitScaleObject(harness, file = FILE, state = "idle", options = {}) {
+      harness.api.setCurrentState(state);
+      harness.api.swapToFile(file, state, true);
+      const objectEl = harness.api.pendingNext;
+      const attached = attachScaleDocument(objectEl, options);
+      objectEl.listeners.get("load")();
+      return { objectEl, ...attached };
+    }
+
+    function fireTimer(harness, ms) {
+      const timer = harness.activeTimers().find((entry) => entry.ms === ms);
+      assert.ok(timer, `expected an active ${ms}ms timer`);
+      timer.cleared = true;
+      timer.callback();
+      return timer;
+    }
+
+    function finishReload(harness) {
+      const objectEl = harness.api.pendingNext;
+      assert.ok(objectEl, "a new document is loading");
+      const attached = attachScaleDocument(objectEl);
+      objectEl.listeners.get("load")();
+      return { objectEl, ...attached };
+    }
+
+    function followConfig() {
+      return {
+        viewBox: { x: 0, y: 0, width: 100, height: 100 },
+        accessorySupported: true,
+        accessoryPayload: { id: "cowboy-hat", assetFile: "cowboy-hat.svg", aspect: 16 / 7, widthScale: 1, offsetY: 0 },
+        accessoryAttachments: {
+          files: {
+            [FILE]: {
+              staticFrame: { cx: 50, baseY: 40, width: 20 },
+              followTarget: { id: "body", frame: { cx: 8, baseY: 6, width: 4 } },
+            },
+          },
+        },
+      };
+    }
+
+    it("leaves a 100% document's zoom and layout untouched", () => {
+      const harness = scaleHarness(1);
+      const attached = commitScaleObject(harness);
+      assert.strictEqual(attached.root.style.zoom, "");
+      assert.deepStrictEqual(attached.calls, ["animations"]);
+      assert.strictEqual(attached.retiredAnimation.calls.length, 1);
+    });
+
+    it("rebuilds layout before reading and sampling fresh animations at 150%", () => {
+      const harness = scaleHarness();
+      const attached = commitScaleObject(harness);
+      assert.strictEqual(attached.root.style.zoom, String(1 / 1.5));
+      assert.deepStrictEqual(attached.calls, [
+        `zoom:${1 / 1.5}`, "display:none", "geometry", "display:", "animations",
+      ]);
+      assert.deepStrictEqual(attached.animation.calls.map((timing) => timing.easing), ["steps(288, end)"]);
+      assert.deepStrictEqual(attached.retiredAnimation.calls, []);
+      harness.api.applyDiscreteSampling(attached.objectEl, FILE);
+      assert.strictEqual(attached.calls.length, 5, "a document is rebuilt and sampled only once");
+    });
+
+    it("restores an existing inline display value", () => {
+      const attached = commitScaleObject(scaleHarness(), FILE, "idle", { display: "inline" });
+      assert.strictEqual(attached.root.style.display, "inline");
+      assert.deepStrictEqual(attached.calls.slice(1, 4), ["display:none", "geometry", "display:inline"]);
+    });
+
+    it("skips unlisted objects, missing viewBox, non-SVG roots and images", () => {
+      const harness = scaleHarness();
+      const unlisted = commitScaleObject(harness, "unlisted.svg");
+      assert.deepStrictEqual(unlisted.calls, []);
+      for (const options of [{ viewBox: false }, { localName: "html" }]) {
+        const attached = commitScaleObject(harness, FILE, "idle", options);
+        assert.strictEqual(attached.root.style.zoom, "");
+        assert.deepStrictEqual(attached.calls, ["animations"]);
+        assert.strictEqual(attached.retiredAnimation.calls.length, 1, "sampling still runs without scale cancellation");
+      }
+      harness.api.swapToFile(FILE, "working", false);
+      const img = harness.api.pendingNext;
+      const imageDoc = attachScaleDocument(img);
+      img.listeners.get("load")();
+      assert.strictEqual(harness.api.clawdEl.tagName, "IMG");
+      assert.deepStrictEqual(imageDoc.calls, []);
+    });
+
+    it("waits for a late contentDocument and writes zoom once", () => {
+      const harness = scaleHarness();
+      const objectEl = commitObjectWithoutDocument(harness, FILE);
+      const attached = attachScaleDocument(objectEl);
+      fireTimer(harness, 16);
+      harness.api.applyDiscreteSampling(objectEl, FILE);
+      assert.deepStrictEqual(attached.calls, [
+        `zoom:${1 / 1.5}`, "display:none", "geometry", "display:", "animations",
+      ]);
+      assert.strictEqual(attached.animation.calls.length, 1);
+    });
+
+    it("applies zoom, rebuilds layout and samples on the three-second no-load fallback", () => {
+      const harness = scaleHarness();
+      harness.api.swapToFile(FILE, "idle", true);
+      const pending = harness.api.pendingNext;
+      const attached = attachScaleDocument(pending);
+      assert.deepStrictEqual(attached.calls, []);
+      fireTimer(harness, 3000);
+      assert.strictEqual(harness.api.pendingNext, null);
+      assert.strictEqual(harness.api.clawdEl, pending);
+      assert.strictEqual(harness.api.currentDisplayedSvg, FILE);
+      assert.strictEqual(attached.root.style.zoom, String(1 / 1.5));
+      assert.deepStrictEqual(attached.calls, [
+        `zoom:${1 / 1.5}`, "display:none", "geometry", "display:", "animations",
+      ]);
+      assert.deepStrictEqual(attached.animation.calls.map((timing) => timing.easing), ["steps(288, end)"]);
+      assert.deepStrictEqual(attached.retiredAnimation.calls, []);
+    });
+
+    it("preserves all accessory matrix components before and after zoom", () => {
+      for (const scale of [1, 1.5]) {
+        const harness = scaleHarness(scale, followConfig());
+        harness.accessory.onload();
+        const attached = commitScaleObject(harness);
+        const committedMatrix = { ...harness.api.accessorySlots.head.lastLayout.matrix };
+        fireTimer(harness, 16);
+        assert.deepStrictEqual({ ...harness.api.accessorySlots.head.lastLayout.matrix }, committedMatrix);
+        // A display change before reload must keep using this document's zoom.
+        harness.context.window.devicePixelRatio = 2;
+        fireTimer(harness, 16);
+        assert.deepStrictEqual({ ...harness.api.accessorySlots.head.lastLayout.matrix }, committedMatrix);
+        assert.strictEqual(attached.root.style.zoom, scale === 1 ? "" : String(1 / scale));
+      }
+      const harness = scaleHarness(1.5, followConfig());
+      harness.accessory.onload();
+      const attached = commitScaleObject(harness, FILE, "idle", { viewBox: false });
+      const matrix = { ...harness.api.accessorySlots.head.lastLayout.matrix };
+      fireTimer(harness, 16);
+      assert.deepStrictEqual({ ...harness.api.accessorySlots.head.lastLayout.matrix }, matrix);
+      assert.strictEqual(attached.root.style.zoom, "", "a document without a zoom entry keeps its CTM");
+    });
+
+    it("reloads the same file and non-idle displayed state after settling, detaching eyes first", () => {
+      const harness = scaleHarness(1.5, { eyeTrackingStates: ["mini-idle"] });
+      const old = commitScaleObject(harness, FILE, "mini-idle");
+      harness.api.setCurrentState("working");
+      assert.ok(harness.api.eyeTarget);
+      harness.changeDisplayScale(2);
+      assert.strictEqual(harness.api.pendingNext, null, "wait for display changes to settle");
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.eyeTarget, null, "the old document's eyes are detached before loading");
+      assert.strictEqual(harness.api.pendingSvgFile, FILE);
+      assert.strictEqual(harness.api.pendingNext.tagName, "OBJECT");
+      assert.strictEqual(harness.api.pendingNext.__clawdPendingState, "mini-idle");
+      assert.notStrictEqual(harness.api.pendingNext, old.objectEl);
+      const fresh = finishReload(harness);
+      assert.strictEqual(fresh.root.style.zoom, "0.5");
+      assert.strictEqual(harness.api.currentDisplayedState, "mini-idle");
+      harness.changeDisplayScale(1);
+      fireTimer(harness, 400);
+      const unscaled = finishReload(harness);
+      assert.strictEqual(unscaled.root.style.zoom, "");
+      assert.deepStrictEqual(unscaled.calls, ["animations"]);
+    });
+
+    it("reloads hidden documents without clearing the hidden class", () => {
+      const harness = scaleHarness();
+      const old = commitScaleObject(harness);
+      harness.electronHandlers.onPetHiddenChange(true);
+      assert.ok(harness.context.document.documentElement.classList.contains("pet-hidden"));
+      harness.changeDisplayScale(2);
+      fireTimer(harness, 400);
+      const fresh = finishReload(harness);
+      assert.notStrictEqual(fresh.objectEl, old.objectEl);
+      assert.strictEqual(fresh.root.style.zoom, "0.5");
+      assert.ok(harness.context.document.documentElement.classList.contains("pet-hidden"));
+    });
+
+    it("debounces bursts and skips a scale that returns to the document's zoom", () => {
+      const harness = scaleHarness();
+      commitScaleObject(harness);
+      const token = harness.api.activeSwapToken;
+      harness.changeDisplayScale(1.25);
+      harness.changeDisplayScale(2);
+      harness.changeDisplayScale(1.75);
+      assert.strictEqual(harness.api.pendingNext, null);
+      assert.strictEqual(harness.activeTimers().filter((timer) => timer.ms === 400).length, 1);
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.activeSwapToken, token + 1);
+      const fresh = finishReload(harness);
+      harness.changeDisplayScale(2);
+      harness.changeDisplayScale(1.75);
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.clawdEl, fresh.objectEl);
+      assert.strictEqual(harness.api.pendingNext, null);
+      assert.strictEqual(harness.api.activeSwapToken, token + 1);
+    });
+
+    it("does not reload images, unlisted files or already matching documents", () => {
+      for (const channel of ["image", "unlisted", "matching", "100%"]) {
+        const harness = scaleHarness(channel === "100%" ? 1 : 1.5);
+        if (channel === "image") {
+          harness.api.swapToFile(FILE, "idle", false);
+          harness.api.pendingNext.listeners.get("load")();
+        } else {
+          commitScaleObject(harness, channel === "unlisted" ? "unlisted.svg" : FILE);
+        }
+        const token = harness.api.activeSwapToken;
+        // One change away and back still produces a change notification.
+        harness.changeDisplayScale(2);
+        if (channel === "matching") harness.changeDisplayScale(1.5);
+        if (channel === "100%") harness.changeDisplayScale(1);
+        fireTimer(harness, 400);
+        assert.strictEqual(harness.api.pendingNext, null, channel);
+        assert.strictEqual(harness.api.activeSwapToken, token, channel);
+      }
+    });
+
+    it("rechecks a pending swap after it commits or is cancelled", () => {
+      for (const cancelled of [false, true]) {
+        const harness = scaleHarness();
+        commitScaleObject(harness);
+        harness.api.swapToFile("other.svg", "idle", true);
+        const pending = harness.api.pendingNext;
+        harness.changeDisplayScale(2);
+        fireTimer(harness, 400);
+        assert.strictEqual(harness.api.pendingNext, pending, "a pending swap owns the next document");
+        if (cancelled) {
+          harness.electronHandlers.onStateChange("idle", FILE);
+          assert.strictEqual(harness.api.pendingNext, null);
+          fireTimer(harness, 400);
+          assert.strictEqual(harness.api.pendingSvgFile, FILE, "the unchanged old document still needs a reload");
+        } else {
+          attachScaleDocument(pending);
+          pending.listeners.get("load")();
+          const token = harness.api.activeSwapToken;
+          fireTimer(harness, 400);
+          assert.strictEqual(harness.api.pendingNext, null, "the committed document already has the new zoom");
+          assert.strictEqual(harness.api.activeSwapToken, token);
+        }
+      }
+    });
+
+    it("uses the latest scale when an accessory waiter commits without another reload", () => {
+      const harness = scaleHarness(1.5, followConfig());
+      harness.api.swapToFile(FILE, "idle", true);
+      const pending = harness.api.pendingNext;
+      const attached = attachScaleDocument(pending);
+      pending.listeners.get("load")();
+      assert.strictEqual(harness.api.pendingNext, pending);
+      assert.strictEqual(pending.__clawdWaitingForAccessory, true);
+      assert.deepStrictEqual(attached.calls, [], "the waiting document has not been sampled");
+      harness.changeDisplayScale(2);
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.pendingNext, pending);
+      harness.accessory.onload();
+      assert.strictEqual(harness.api.pendingNext, null);
+      assert.strictEqual(harness.api.clawdEl, pending);
+      assert.strictEqual(attached.root.style.zoom, "0.5");
+      assert.strictEqual(attached.animation.calls.length, 1);
+      const token = harness.api.activeSwapToken;
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.pendingNext, null);
+      assert.strictEqual(harness.api.clawdEl, pending);
+      assert.strictEqual(harness.api.activeSwapToken, token, "the committed zoom already matches the scale");
+    });
+
+    it("waits for system wake completion even after its object committed", () => {
+      const harness = scaleHarness();
+      commitScaleObject(harness);
+      // Wake readiness can still be pending after pendingNext has been cleared.
+      harness.api.setPendingSystemWakeId("wake");
+      harness.changeDisplayScale(2);
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.pendingNext, null);
+      harness.api.setPendingSystemWakeId(null);
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.pendingSvgFile, FILE);
+    });
+
+    it("resumes low-power documents and accessory following before pausing the fresh document", () => {
+      const harness = scaleHarness(1.5, followConfig());
+      harness.accessory.onload();
+      const old = commitScaleObject(harness);
+      harness.api.setLowPowerIdleMode(true);
+      fireTimer(harness, 5000);
+      assert.strictEqual(harness.api.lowPowerSvgPaused, true);
+      assert.ok(old.svgDoc.getElementById("clawd-low-power-pause-svg"));
+      assert.strictEqual(harness.api.accessorySlots.head.raf, null);
+      harness.changeDisplayScale(2);
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.lowPowerSvgPaused, false);
+      assert.strictEqual(old.svgDoc.getElementById("clawd-low-power-pause-svg"), null);
+      assert.ok(harness.api.accessorySlots.head.raf, "following resumes while loading");
+      const fresh = finishReload(harness);
+      assert.strictEqual(fresh.svgDoc.getElementById("clawd-low-power-pause-svg"), null);
+      assert.ok(harness.api.accessorySlots.head.raf);
+      fireTimer(harness, 5000);
+      assert.ok(fresh.svgDoc.getElementById("clawd-low-power-pause-svg"));
+      assert.strictEqual(harness.api.accessorySlots.head.raf, null);
+      assert.deepStrictEqual(
+        harness.electronCalls.filter((call) => call.name === "setLowPowerIdlePaused").map((call) => call.args[0]),
+        [true, false, true],
+      );
+    });
+
+    it("keeps the old object, eyes and a fresh low-power timer when reload fails", () => {
+      const harness = scaleHarness();
+      const old = commitScaleObject(harness);
+      harness.api.setLowPowerIdleMode(true);
+      const oldTimer = harness.activeTimers().find((timer) => timer.ms === 5000);
+      harness.changeDisplayScale(2);
+      fireTimer(harness, 400);
+      const pending = harness.api.pendingNext;
+      pending.listeners.get("error")();
+      assert.strictEqual(harness.api.pendingNext, null, "failed scale reload never falls back to an image");
+      assert.strictEqual(harness.api.clawdEl, old.objectEl);
+      assert.strictEqual(harness.api.eyeTarget, old.elements.get("eyes-js"));
+      assert.strictEqual(oldTimer.cleared, true);
+      fireTimer(harness, 5000);
+      assert.strictEqual(harness.api.lowPowerSvgPaused, true);
+      assert.ok(old.svgDoc.getElementById("clawd-low-power-pause-svg"));
+    });
+
+    it("superseded reloads leave eyes detached and recheck the winning document", () => {
+      const harness = scaleHarness();
+      const old = commitScaleObject(harness);
+      harness.changeDisplayScale(2);
+      fireTimer(harness, 400);
+      harness.api.swapToFile("other.svg", "dozing", true);
+      assert.strictEqual(harness.api.eyeTarget, null, "superseding does not reattach the old eyes");
+      const fresh = finishReload(harness);
+      assert.notStrictEqual(fresh.objectEl, old.objectEl);
+      assert.strictEqual(harness.api.eyeTarget, fresh.elements.get("eyes-js"));
+      const token = harness.api.activeSwapToken;
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.pendingNext, null);
+      assert.strictEqual(harness.api.activeSwapToken, token);
+    });
+
+    it("retries a superseded reload when state returns to the displayed file", () => {
+      const harness = scaleHarness();
+      const old = commitScaleObject(harness);
+      harness.changeDisplayScale(2);
+      fireTimer(harness, 400);
+      harness.api.swapToFile("other.svg", "idle", true);
+      assert.strictEqual(harness.api.eyeTarget, null);
+      harness.electronHandlers.onStateChange("idle", FILE);
+      assert.strictEqual(harness.api.clawdEl, old.objectEl);
+      assert.strictEqual(harness.api.pendingNext, null);
+      fireTimer(harness, 400);
+      assert.strictEqual(harness.api.pendingSvgFile, FILE);
+      assert.strictEqual(finishReload(harness).root.style.zoom, "0.5");
+    });
+
+    it("rebuilds resolution queries and responds to a second change", () => {
+      const harness = scaleHarness(1);
+      commitScaleObject(harness);
+      assert.deepStrictEqual(harness.mediaQueries.map((query) => query.query), ["(resolution: 1dppx)"]);
+      harness.changeDisplayScale(1.5);
+      assert.strictEqual(harness.mediaQueries.at(-1).query, "(resolution: 1.5dppx)");
+      fireTimer(harness, 400);
+      finishReload(harness);
+      harness.changeDisplayScale(2);
+      assert.strictEqual(harness.mediaQueries.at(-1).query, "(resolution: 2dppx)");
+      fireTimer(harness, 400);
+      assert.strictEqual(finishReload(harness).root.style.zoom, "0.5");
+    });
+
+    it("boots without matchMedia", () => {
+      const harness = samplingHarness([FILE], null, { withoutMatchMedia: true });
+      const attached = commitScaleObject(harness);
+      assert.strictEqual(harness.api.clawdEl, attached.objectEl);
+      assert.strictEqual(harness.mediaQueries.length, 0);
+    });
   });
 });
 
