@@ -62,6 +62,13 @@ describe("prefs.getDefaults", () => {
     assert.strictEqual(d.version, prefs.CURRENT_VERSION);
   });
 
+  it("defaults the pet always-on-top master switch on and coerces non-booleans (#1275)", () => {
+    const defaults = prefs.getDefaults();
+    assert.strictEqual(defaults.petAlwaysOnTop, true);
+    assert.strictEqual(prefs.validate({ petAlwaysOnTop: false }).petAlwaysOnTop, false);
+    assert.strictEqual(prefs.validate({ petAlwaysOnTop: "off" }).petAlwaysOnTop, true);
+  });
+
   it("defaults mobile permission summaries off independently of session preview", () => {
     const defaults = prefs.getDefaults();
     assert.strictEqual(defaults.mobilePreviewEnabled, false);
@@ -2622,5 +2629,25 @@ describe("prefs.mapLocaleToLang (device locale → UI language)", () => {
     for (const probe of ["xx", "ZH-tw", "JA", "en-GB", "pt-BR", "PT-br", "es-MX", ""]) {
       assert.ok(enumVals.has(prefs.mapLocaleToLang(probe)), `${probe} mapped outside enum`);
     }
+  });
+});
+
+describe("prefs.disableHardwareAcceleration (#1183)", () => {
+  it("defaults to off and round-trips through load", () => {
+    assert.strictEqual(prefs.getDefaults().disableHardwareAcceleration, false);
+    const p = makeTempPath();
+    fs.writeFileSync(p, JSON.stringify({ disableHardwareAcceleration: true }));
+    assert.strictEqual(prefs.load(p).snapshot.disableHardwareAcceleration, true);
+  });
+
+  it("is applied before app ready on Windows only", () => {
+    const mainSource = fs.readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+    const call = mainSource.indexOf("app.disableHardwareAcceleration()");
+    assert.ok(call > 0, "main.js must call app.disableHardwareAcceleration()");
+    assert.ok(call < mainSource.indexOf("app.whenReady()"), "the call must precede app.whenReady()");
+    assert.match(
+      mainSource,
+      /const _hardwareAccelerationDisabledAtStartup = isWin\s*&& !!_initialPrefsLoad\.snapshot\s*&& _initialPrefsLoad\.snapshot\.disableHardwareAcceleration === true;\s*if \(_hardwareAccelerationDisabledAtStartup\) \{\s*app\.disableHardwareAcceleration\(\);/
+    );
   });
 });

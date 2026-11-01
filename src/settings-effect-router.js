@@ -100,6 +100,7 @@ function createSettingsEffectRouter(options = {}) {
   const syncHitWin = options.syncHitWin || noop;
   const refreshIdleVisual = options.refreshIdleVisual || noop;
   const refreshDisplayedVisual = options.refreshDisplayedVisual || noop;
+  const refreshPetPresentation = options.refreshPetPresentation || noop;
   const rebuildAllMenus = options.rebuildAllMenus || noop;
   const reconcilePowerSaveBlocker = options.reconcilePowerSaveBlocker || noop;
   const disableMobilePermissionObservation = options.disableMobilePermissionObservation || noop;
@@ -209,10 +210,12 @@ function createSettingsEffectRouter(options = {}) {
       safeCall(logWarn, "Clawd: session HUD lang broadcast failed:", sendSessionHudI18n);
       safeCall(logWarn, "Clawd: window title sync failed:", syncWindowTitles);
     }
-    if ("sessionAliases" in changes) {
+    // Localized display labels live in snapshots. Refresh after mirrors and
+    // dictionaries, also coalescing a simultaneous alias change into one send.
+    if ("lang" in changes || "sessionAliases" in changes) {
       safeCall(
         logWarn,
-        "Clawd: session alias snapshot broadcast failed:",
+        "Clawd: session title snapshot broadcast failed:",
         emitSessionSnapshot,
         { force: true }
       );
@@ -352,6 +355,15 @@ function createSettingsEffectRouter(options = {}) {
         emitSessionSnapshot({ force: true });
       } catch (err) {
         warn(logWarn, "Clawd: quota merge mode re-emit failed:", err);
+      }
+    }
+    if ("sessionHudHideCompletedCodexEphemeral" in changes || "sessionHudHideActiveCodexEphemeral" in changes) {
+      // Rebuild the snapshot immediately;
+      // never run lifecycle cleanup, acknowledge completion or touch approvals.
+      safeCall(logWarn, "Clawd: Codex ephemeral HUD preference refresh failed:",
+        emitSessionSnapshot, { force: true });
+      if ("sessionHudHideActiveCodexEphemeral" in changes) {
+        safeCall(logWarn, "Clawd: Codex ephemeral pet preference refresh failed:", refreshPetPresentation);
       }
     }
     if ("sessionHudCleanupDetached" in changes && changes.sessionHudCleanupDetached === true) {
