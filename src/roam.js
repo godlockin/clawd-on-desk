@@ -14,6 +14,7 @@
 //     working" regression.
 //   • Settings size preview holds roaming so anchored walk frames cannot
 //     overwrite the size currently chosen by the slider.
+//   • Hidden pets do not roam; showing the pet restarts the full 8s idle delay.
 //   • The first roam after entering idle uses ROAM_IDLE_DELAY_MS (8s); subsequent
 //     roams use ROAM_BETWEEN_DELAY_MS (4s).
 //   • When the state changes away from idle/roam (detected in tick or step),
@@ -101,6 +102,12 @@ module.exports = function initRoam(ctx) {
     if (
       typeof ctx.isScreenCaptureOverlayForeground === "function" &&
       ctx.isScreenCaptureOverlayForeground()
+    )
+      return false;
+    // Walking while hidden only relocates the pet and wastes window writes.
+    if (
+      typeof ctx.isPetHidden === "function" &&
+      ctx.isPetHidden()
     )
       return false;
     return true;

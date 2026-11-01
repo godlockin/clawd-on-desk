@@ -37,6 +37,7 @@ Windows 的 hit window 在原生 activation controller 可用时按前台全屏�
 - DND 模式：跳过 dozing，直接 yawning → collapsing → sleeping；同时屏蔽 hook 事件
 - 隐藏桌宠（petHidden，入口：托盘 / 右键菜单 / 快捷键）：语义是「看不见宠物」而非免打扰——隐藏时收起宠物、Session HUD、update bubble 和当时 pending 的权限气泡（恢复显示时回来），但隐藏期间新到的权限请求仍照常弹气泡，这是有意设计、不要当 bug 修；要连权限气泡都静默是 DND 的职责（它有回终端确认的 fallback）。Allow/Deny 全局快捷键跟随「可见气泡」：隐藏期间只要有可见气泡就保持注册，但只作用于可见的请求，收起的旧气泡不会被盲操作（#601）。petHidden 不持久化，重启恢复显示
 - Windows / macOS 显式开启的全屏自动隐藏（#935/#1275）会同时收起桌宠与浮层，并压住全屏期间新到的本地权限请求；退出全屏只恢复仍 pending 且未被其他隐藏条件排除的请求。它不同于手动 petHidden 的新请求例外。隐藏本身不产生决定，远程审批通道与用户配置的 auto-close 仍按原合同运行。
+- 桌宠隐藏期间（手动隐藏、macOS 应用隐藏、全屏自动隐藏，包括 macOS 用透明度隐藏的分支）自由漫步暂停：走到一半在下一帧取消，桌宠停在最后写入的位置，恢复显示后重新等待完整 8 秒。闲置和睡眠计时不受影响。
 - macOS 全屏检测只认活动原生 Space（type 4，分屏也算），不识别播放器自行铺满窗口；多屏按活动 Space 判断。默认置顶且自动隐藏关闭时不加载或调用探针。手动「显示桌宠」覆盖当前全屏隐藏，下一次全屏 Space 恢复隐藏。
 - working 子动画：Clawd 主题为 1 个会话 → typing，2 个 → headphones groove，3+ → building；Calico / Cloudling 仍为 typing / juggling / building；官方可下载主题 Hash Sage（可选安装）为执笔制符 / 御剑哈希符文 / 纸灵忙碌协作，Whale-chan（鲸鱼娘，可选安装）为今天也在努力呀 / 魔法添饭 / 雨天踩水
 - juggling 子动画：1 个 subagent → juggling，2+ → conducting（Hash Sage：1 → 御剑哈希符文，2+ → 纸灵忙碌协作；Whale-chan：1+ → 魔法添饭）
