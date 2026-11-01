@@ -64,6 +64,7 @@ let lowPowerIdleMode = false;
 let lowPowerIdlePauseTimer = null;
 let displayScaleReloadTimer = null;
 let lowPowerSvgPaused = false;
+let petHidden = false;
 let lastSystemWakeId = null;
 let lastSystemWakeStatus = null;
 let pendingSystemWakeId = null;
@@ -291,7 +292,7 @@ function syncAccessorySvgLowPowerPaused(paused) {
   for (const slotName of ACCESSORY_SLOT_NAMES) {
     const slot = getAccessorySlot(slotName);
     const hidden = !!(slot && slot.element && slot.element.style.display === "none");
-    setAccessorySvgLowPowerPaused(slotName, paused || hidden);
+    setAccessorySvgLowPowerPaused(slotName, paused || petHidden || hidden);
   }
 }
 
@@ -923,7 +924,7 @@ function ensureAccessoryAsset(slotName) {
     clearAccessoryAssetLoadTimer(slotName);
     slot.assetReady = true;
     slot.assetSettled = true;
-    if (lowPowerSvgPaused) setAccessorySvgLowPowerPaused(slotName, true);
+    if (lowPowerSvgPaused || petHidden) setAccessorySvgLowPowerPaused(slotName, true);
     refreshAccessoryLayout(slotName);
     flushAccessoryAssetWaiters(slotName);
   };
@@ -1090,8 +1091,8 @@ function applyAccessoryLayout(context, layout) {
   }
   slot.element.style.filter = "none";
   // hideAccessory() pauses object-backed assets. Restore this document to the
-  // global low-power state before making it visible again.
-  setAccessorySvgLowPowerPaused(context.slotName, lowPowerSvgPaused);
+  // page's pause state before making it visible again.
+  setAccessorySvgLowPowerPaused(context.slotName, lowPowerSvgPaused || petHidden);
   slot.element.style.visibility = "visible";
   slot.element.style.display = "block";
   return true;
@@ -1129,7 +1130,7 @@ function accessoryFollowTick(slotName, expectedKey) {
 function startAccessoryFollow(context) {
   const { slotName, slot } = context;
   const follow = context.descriptor.followTarget;
-  if (!follow || shouldSuppressPassiveTrackingForLowPower()) return;
+  if (!follow || petHidden || shouldSuppressPassiveTrackingForLowPower()) return;
   const key = `${context.file}|${slot.payload.id}|${follow.id}`;
   cancelAccessoryFollow(slotName);
   slot.followKey = key;
@@ -1330,7 +1331,16 @@ if (window.electronAPI && typeof window.electronAPI.onLowPowerIdleModeChange ===
 }
 if (window.electronAPI && typeof window.electronAPI.onPetHiddenChange === "function") {
   window.electronAPI.onPetHiddenChange((hidden) => {
-    document.documentElement.classList.toggle("pet-hidden", !!hidden);
+    const next = !!hidden;
+    document.documentElement.classList.toggle("pet-hidden", next);
+    if (petHidden === next) return;
+    petHidden = next;
+    if (next) {
+      for (const slotName of ACCESSORY_SLOT_NAMES) cancelAccessoryFollow(slotName);
+    } else {
+      refreshAccessoryLayout();
+    }
+    syncAccessorySvgLowPowerPaused(lowPowerSvgPaused);
   });
 }
 
