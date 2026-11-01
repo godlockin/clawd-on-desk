@@ -1307,6 +1307,11 @@ let miniLeftFlip = false;
 if (window.electronAPI && typeof window.electronAPI.onLowPowerIdleModeChange === "function") {
   window.electronAPI.onLowPowerIdleModeChange(setLowPowerIdleMode);
 }
+if (window.electronAPI && typeof window.electronAPI.onPetHiddenChange === "function") {
+  window.electronAPI.onPetHiddenChange((hidden) => {
+    document.documentElement.classList.toggle("pet-hidden", !!hidden);
+  });
+}
 
 window.electronAPI.onDndChange((enabled) => {
   dndEnabled = enabled;
