@@ -289,6 +289,7 @@ function createRendererHarness(options = {}) {
 
   const document = {
     hidden: false,
+    documentElement: new FakeElement("html"),
     getElementById(id) {
       return elementsById.get(id) || null;
     },
@@ -1634,6 +1635,48 @@ describe("renderer test-result reactions", () => {
   });
 });
 
+describe("hidden pet page", () => {
+  it("hidden pet page: sets the html class idempotently from hidden notifications", () => {
+    const harness = createRendererHarness();
+    const root = harness.context.document.documentElement;
+    for (const hidden of [true, true, false, false]) {
+      harness.electronHandlers.onPetHiddenChange(hidden);
+      assert.strictEqual(root.classList.contains("pet-hidden"), hidden);
+    }
+  });
+
+  it("hidden pet page: leaves low-power pause feedback and SVG styles alone", () => {
+    const harness = createRendererHarness();
+    const svg = attachFakeSvgDocument(harness.clawd);
+    harness.api.setCurrentState("idle");
+
+    harness.electronHandlers.onPetHiddenChange(true);
+
+    assert.strictEqual(harness.electronCalls.some((call) => call.name === "setLowPowerIdlePaused"), false);
+    assert.strictEqual(svg.svgDoc.getElementById("clawd-low-power-pause-svg"), null);
+  });
+
+  it("hidden pet page: preload forwards pet-hidden-change to the callback", () => {
+    const harness = loadPreloadWithElectron();
+    try {
+      const seen = [];
+      harness.electronAPI.onPetHiddenChange((hidden) => seen.push(hidden));
+      harness.emitFromMain("pet-hidden-change", true);
+      harness.emitFromMain("pet-hidden-change", false);
+      assert.deepStrictEqual(seen, [true, false]);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  it("hidden pet page: loaded CSS hides the html root and all descendants with important priority", () => {
+    const css = readNormalized(path.join(__dirname, "..", "src", "styles.css"));
+    assert.match(css, /html\.pet-hidden\s*,\s*html\.pet-hidden\s+\*\s*\{\s*visibility:\s*hidden\s*!important\s*;\s*\}/);
+    const html = readNormalized(path.join(__dirname, "..", "src", "index.html"));
+    assert.match(html, /<link\b[^>]*rel="stylesheet"[^>]*href="styles\.css"[^>]*>/);
+  });
+});
+
 describe("renderer low-power idle mode", () => {
   it("keeps collapsing and sleeping in the renderer pause policy and tick pause set", () => {
     const rendererSource = readNormalized(RENDERER);
@@ -1642,8 +1685,7 @@ describe("renderer low-power idle mode", () => {
 
     assert.ok(rendererSource.includes('DEEP_SLEEP_PAUSE_STATES = new Set(["collapsing", "sleeping"])'));
     assert.ok(rendererSource.includes('LOW_POWER_OPTIONAL_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"])'));
-    assert.ok(rendererSource.includes("...LOW_POWER_OPTIONAL_PAUSE_STATES"));
-    assert.ok(rendererSource.includes("...DEEP_SLEEP_PAUSE_STATES"));
+    assert.doesNotMatch(rendererSource, /LOW_POWER_PAUSE_STATES\s*=\s*new Set/);
     assert.ok(tickSource.includes(`LOW_POWER_PAUSE_STATES = new Set(${expected})`));
   });
 
