@@ -20,7 +20,11 @@ const {
   __test,
 } = require("../hooks/install");
 const { buildPermissionUrl, SERVER_PORTS } = require("../hooks/server-config");
-const { classifyManagedClaudeStateHookCommand } = require("../hooks/json-utils");
+const {
+  classifyManagedClaudeStateHookCommand,
+  getClaudeHookCommand,
+  claudeHookHasMarker,
+} = require("../hooks/json-utils");
 const {
   PLAIN_OWNER_FILE,
   PLAIN_OWNER,
@@ -61,7 +65,7 @@ describe("Claude batch phase version gate", () => {
     it(`${register.name} installs the batch hook only at the supported baseline`, async () => {
       for (const version of ["2.1.279", "2.1.280", null]) {
         const settingsPath = makeTempSettings({});
-        await register({ silent: true, settingsPath, claudeVersionInfo: {
+        await register({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, claudeVersionInfo: {
           version, source: "test", status: version ? "known" : "unknown",
         } });
         assert.equal(getClawdCommands(readSettings(settingsPath), "PostToolBatch").length,
@@ -73,9 +77,9 @@ describe("Claude batch phase version gate", () => {
   it("removes only an owned batch hook on downgrade and preserves foreign hooks", () => {
     const foreign = { hooks: [{ type: "command", command: 'node "/foreign/batch.js"' }] };
     const settingsPath = makeTempSettings({ hooks: { PostToolBatch: [foreign] } });
-    registerHooks({ silent: true, settingsPath,
+    registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath,
       claudeVersionInfo: { version: "2.1.280", source: "test", status: "known" } });
-    registerHooks({ silent: true, settingsPath,
+    registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath,
       claudeVersionInfo: { version: "2.1.279", source: "test", status: "known" } });
     assert.deepStrictEqual(readSettings(settingsPath).hooks.PostToolBatch, [foreign]);
   });
@@ -115,12 +119,12 @@ function getCommandHookEntries(settings, event, marker) {
   const hooks = [];
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
-    if (typeof entry.command === "string" && (!marker || entry.command.includes(marker))) {
+    if (typeof entry.command === "string" && (!marker || claudeHookHasMarker(entry, marker))) {
       hooks.push(entry);
     }
     if (!Array.isArray(entry.hooks)) continue;
     for (const hook of entry.hooks) {
-      if (hook && typeof hook.command === "string" && (!marker || hook.command.includes(marker))) {
+      if (hook && typeof hook.command === "string" && (!marker || claudeHookHasMarker(hook, marker))) {
         hooks.push(hook);
       }
     }
@@ -130,12 +134,12 @@ function getCommandHookEntries(settings, event, marker) {
 
 function getManagedStateHookEntries(settings, event) {
   return getCommandHookEntries(settings, event).filter((hook) => (
-    classifyManagedClaudeStateHookCommand(hook.command, settings, event) !== null
+    classifyManagedClaudeStateHookCommand(getClaudeHookCommand(hook, "clawd-hook.js"), settings, event) !== null
   ));
 }
 
 function getClawdCommands(settings, event) {
-  return getCommandHookEntries(settings, event, "clawd-hook.js").map((hook) => hook.command);
+  return getCommandHookEntries(settings, event, "clawd-hook.js").map((hook) => getClaudeHookCommand(hook, "clawd-hook.js"));
 }
 
 function getHttpUrls(settings, event) {
@@ -635,6 +639,8 @@ describe("Hook installer version compatibility", () => {
   it("uses PowerShell-safe command hooks on Windows", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "win32",
@@ -706,6 +712,8 @@ describe("Hook installer version compatibility", () => {
   it("registers remote hooks as async with reverse-tunnel headroom", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       remote: true,
@@ -728,6 +736,8 @@ describe("Hook installer version compatibility", () => {
   it("does not add a shell field for non-Windows hook registration", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "linux",
@@ -747,6 +757,8 @@ describe("Hook installer version compatibility", () => {
   it("registers StopFailure when Claude Code is >= 2.1.78", () => {
     const settingsPath = makeTempSettings({});
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
@@ -762,6 +774,8 @@ describe("Hook installer version compatibility", () => {
   it("registers design expansion on Claude Code 2.1.265 and newer", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.265", source: "test", status: "known" },
@@ -773,6 +787,8 @@ describe("Hook installer version compatibility", () => {
   it("does not register design expansion below Claude Code 2.1.265 but keeps earlier versioned hooks", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.264", source: "test", status: "known" },
@@ -810,6 +826,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.264", source: "test", status: "known" },
@@ -843,6 +861,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: null, source: null, status: "unknown" },
@@ -858,6 +878,8 @@ describe("Hook installer version compatibility", () => {
     // displaces the Done badge and the last-event row. Both stay unclaimed.
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.251", source: "test", status: "known" },
@@ -871,6 +893,8 @@ describe("Hook installer version compatibility", () => {
   it("keeps PreCompact/PostCompact but skips StopFailure below 2.1.78", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.76", source: "test", status: "known" },
@@ -885,6 +909,8 @@ describe("Hook installer version compatibility", () => {
   it("fails closed when Claude Code version is unknown", () => {
     const settingsPath = makeTempSettings({});
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: null, source: null, status: "unknown" },
@@ -918,6 +944,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.75", source: "test", status: "known" },
@@ -944,6 +972,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: null, source: null, status: "unknown" },
@@ -968,6 +998,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
@@ -994,6 +1026,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "win32",
@@ -1027,6 +1061,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "linux",
@@ -1045,12 +1081,16 @@ describe("Hook installer version compatibility", () => {
   it("is idempotent on repeated registration", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
@@ -1063,6 +1103,8 @@ describe("Hook installer version compatibility", () => {
   it("is idempotent on repeated Windows registration", () => {
     const settingsPath = makeTempSettings({});
     const first = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "win32",
@@ -1072,6 +1114,8 @@ describe("Hook installer version compatibility", () => {
     assert.ok(first.added > 0, "first run should add hooks");
 
     const second = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "win32",
@@ -1103,6 +1147,8 @@ describe("Hook installer version compatibility", () => {
 
     // nodeBin: null simulates resolveNodeBin() failing in Electron
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       nodeBin: null,
@@ -1139,6 +1185,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "win32",
@@ -1156,6 +1204,8 @@ describe("Hook installer version compatibility", () => {
   it("uses PowerShell-safe auto-start hooks on Windows", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       autoStart: true,
@@ -1176,6 +1226,8 @@ describe("Hook installer version compatibility", () => {
   it("uses async auto-start hooks on non-Windows", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       autoStart: true,
@@ -1206,6 +1258,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       autoStart: true,
@@ -1239,6 +1293,8 @@ describe("Hook installer version compatibility", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       nodeBin: null,
@@ -1407,6 +1463,8 @@ describe("Claude permission hook ownership", () => {
     const identity = secureRemoteIdentity();
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       remote: true,
@@ -1421,6 +1479,8 @@ describe("Claude permission hook ownership", () => {
     ]);
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       remote: true,
@@ -1456,6 +1516,8 @@ describe("Claude permission hook ownership", () => {
     });
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       port: SERVER_PORTS[0],
@@ -1485,6 +1547,8 @@ describe("Claude permission hook ownership", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       port: SERVER_PORTS[0],
@@ -1572,6 +1636,8 @@ describe("Hook installer deprecated hook cleanup", () => {
   it("does not register WorktreeCreate on fresh install (issue #127)", () => {
     const settingsPath = makeTempSettings({});
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
@@ -1601,6 +1667,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
@@ -1630,6 +1698,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     });
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       claudeVersionInfo: { version: "2.1.112", source: "test", status: "known" },
@@ -1670,6 +1740,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     });
 
     const result = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -1719,6 +1791,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     });
 
     const first = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       autoStart: true,
@@ -1741,6 +1815,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     assert.ok(first.removed >= 1);
 
     const second = registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       autoStart: true,
@@ -1783,6 +1859,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     });
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -1809,6 +1887,8 @@ describe("Hook installer deprecated hook cleanup", () => {
       },
     });
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "linux",
@@ -1846,6 +1926,8 @@ describe("Hook installer deprecated hook cleanup", () => {
       });
 
       registerHooks({
+        homeDir: path.dirname(settingsPath),
+        env: {},
         silent: true,
         settingsPath,
         platform,
@@ -1900,6 +1982,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     assert.strictEqual(buildClaudeRepairSignature(before.issues), "v1:env-state-hook");
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "win32",
@@ -1925,6 +2009,8 @@ describe("Hook installer deprecated hook cleanup", () => {
       },
     });
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -1956,6 +2042,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     const checked = [];
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -1989,6 +2077,8 @@ describe("Hook installer deprecated hook cleanup", () => {
     let accessCalls = 0;
 
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2020,6 +2110,8 @@ describe("Hook installer deprecated hook cleanup", () => {
       },
     });
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2053,6 +2145,8 @@ describe("Hook installer deprecated hook cleanup", () => {
       },
     });
     registerHooks({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2486,6 +2580,7 @@ describe("async hook installer parity", () => {
     let accessCalls = 0;
     let execFileCalls = 0;
     await registerHooksAsync({
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2535,6 +2630,8 @@ describe("async hook installer parity", () => {
 
     let accessMode = null;
     await registerHooksAsync({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "win32",
@@ -2568,6 +2665,7 @@ describe("async hook installer parity", () => {
     });
 
     await registerHooksAsync({
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2594,6 +2692,8 @@ describe("async hook installer parity", () => {
     const settingsPath = makeTempSettings({});
 
     await registerHooksAsync({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       nodeBin: explicitNodeBin,
@@ -2625,6 +2725,8 @@ describe("async hook installer parity", () => {
     });
 
     await registerHooksAsync({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       nodeBin: "/usr/bin/node",
@@ -2644,6 +2746,7 @@ describe("async hook installer parity", () => {
     const nodeBin = "/opt/homebrew/bin/node";
 
     await registerHooksAsync({
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2685,6 +2788,7 @@ describe("async hook installer parity", () => {
     });
 
     await registerHooksAsync({
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2722,6 +2826,7 @@ describe("async hook installer parity", () => {
     const checked = [];
 
     await registerHooksAsync({
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2757,6 +2862,7 @@ describe("async hook installer parity", () => {
     });
 
     await registerHooksAsync({
+      env: {},
       silent: true,
       settingsPath,
       platform: "darwin",
@@ -2778,11 +2884,15 @@ describe("async hook installer parity", () => {
     const asyncSettingsPath = makeTempSettings({});
 
     const syncResult = registerHooks({
+      homeDir: path.dirname(syncSettingsPath),
+      env: {},
       silent: true,
       settingsPath: syncSettingsPath,
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
     });
     const asyncResult = await registerHooksAsync({
+      homeDir: path.dirname(asyncSettingsPath),
+      env: {},
       silent: true,
       settingsPath: asyncSettingsPath,
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
@@ -2824,8 +2934,8 @@ describe("async hook installer parity", () => {
       claudeVersionInfo: { version: "2.1.78", source: "test", status: "known" },
     };
 
-    const syncResult = registerHooks({ ...options, settingsPath: syncSettingsPath });
-    const asyncResult = await registerHooksAsync({ ...options, settingsPath: asyncSettingsPath });
+    const syncResult = registerHooks({ homeDir: path.dirname(syncSettingsPath), env: {}, ...options, settingsPath: syncSettingsPath });
+    const asyncResult = await registerHooksAsync({ homeDir: path.dirname(asyncSettingsPath), env: {}, ...options, settingsPath: asyncSettingsPath });
     assert.deepStrictEqual(readSettings(asyncSettingsPath), readSettings(syncSettingsPath));
     const { backupPath: syncBackup, ...syncRest } = syncResult;
     const { backupPath: asyncBackup, ...asyncRest } = asyncResult;
@@ -2833,7 +2943,7 @@ describe("async hook installer parity", () => {
     assert.ok(syncBackup && asyncBackup);
 
     const beforeSecond = fs.readFileSync(syncSettingsPath, "utf8");
-    const second = await registerHooksAsync({ ...options, settingsPath: syncSettingsPath });
+    const second = await registerHooksAsync({ homeDir: path.dirname(syncSettingsPath), env: {}, ...options, settingsPath: syncSettingsPath });
     assert.strictEqual(fs.readFileSync(syncSettingsPath, "utf8"), beforeSecond);
     assert.strictEqual(second.added, 0);
     assert.strictEqual(second.updated, 0);
@@ -2881,6 +2991,8 @@ describe("async hook installer parity", () => {
   it("registerHooksAsync gates design expansion on the detected Claude Code version", async () => {
     const oldSettingsPath = makeTempSettings({});
     await registerHooksAsync({
+      homeDir: path.dirname(oldSettingsPath),
+      env: {},
       silent: true,
       settingsPath: oldSettingsPath,
       platform: "linux",
@@ -2893,6 +3005,8 @@ describe("async hook installer parity", () => {
 
     const newSettingsPath = makeTempSettings({});
     await registerHooksAsync({
+      homeDir: path.dirname(newSettingsPath),
+      env: {},
       silent: true,
       settingsPath: newSettingsPath,
       platform: "linux",
@@ -2928,6 +3042,8 @@ describe("async hook installer parity", () => {
     });
 
     const result = await registerHooksAsync({
+      homeDir: path.dirname(settingsPath),
+      env: {},
       silent: true,
       settingsPath,
       platform: "linux",
@@ -2957,7 +3073,7 @@ describe("Hook installer settings backup", () => {
     const original = { hooks: { Stop: [{ matcher: "", hooks: [{ type: "command", command: "user-own-hook" }] }] } };
     const settingsPath = makeTempSettings(original);
 
-    const result = registerHooks({ silent: true, settingsPath, claudeVersionInfo: versionInfo });
+    const result = registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, claudeVersionInfo: versionInfo });
 
     assert.ok(result.backupPath, "should return a backupPath");
     assert.ok(fs.existsSync(result.backupPath), "backup file should exist on disk");
@@ -2972,7 +3088,7 @@ describe("Hook installer settings backup", () => {
     tempDirs.push(tmpDir);
     const settingsPath = path.join(tmpDir, "settings.json"); // intentionally absent
 
-    const result = registerHooks({ silent: true, settingsPath, claudeVersionInfo: versionInfo });
+    const result = registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, claudeVersionInfo: versionInfo });
 
     assert.strictEqual(result.backupPath, null, "no backup for a freshly created file");
     assert.deepStrictEqual(bakFiles(settingsPath), [], "no .bak files written");
@@ -2982,7 +3098,7 @@ describe("Hook installer settings backup", () => {
   it("respects backup: false (opt out)", () => {
     const settingsPath = makeTempSettings({ hooks: {} });
 
-    const result = registerHooks({ silent: true, settingsPath, backup: false, claudeVersionInfo: versionInfo });
+    const result = registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, backup: false, claudeVersionInfo: versionInfo });
 
     assert.strictEqual(result.backupPath, null);
     assert.deepStrictEqual(bakFiles(settingsPath), []);
@@ -2991,7 +3107,7 @@ describe("Hook installer settings backup", () => {
   it("backs up on the async path too", async () => {
     const settingsPath = makeTempSettings({ hooks: {} });
 
-    const result = await registerHooksAsync({ silent: true, settingsPath, claudeVersionInfo: versionInfo });
+    const result = await registerHooksAsync({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, claudeVersionInfo: versionInfo });
 
     assert.ok(result.backupPath && fs.existsSync(result.backupPath), "async install should back up");
   });
@@ -3008,7 +3124,7 @@ describe("Hook installer settings backup", () => {
     for (let i = 0; i < 8; i++) {
       // External tool overwrites settings.json back to third-party-only (drops Clawd hooks).
       fs.writeFileSync(settingsPath, JSON.stringify(thirdParty, null, 2), "utf-8");
-      const result = registerHooks({ silent: true, settingsPath, claudeVersionInfo: versionInfo, backupKeep: 3 });
+      const result = registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, claudeVersionInfo: versionInfo, backupKeep: 3 });
       assert.ok(result.backupPath, "each re-register over an existing file should back up");
       // The returned path must actually exist — i.e. the fresh backup is never
       // the one pruned away (regression: copyFileSync inherits the source mtime).
@@ -3801,6 +3917,8 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
       const originalBytes = fs.readFileSync(settingsPath);
 
       const result = await register({
+        homeDir: path.dirname(settingsPath),
+        env: {},
         silent: true,
         settingsPath,
         autoStart: true,
@@ -3868,6 +3986,8 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
       const afterFirstText = fs.readFileSync(settingsPath, "utf8");
       const beforeSecondDir = listDir(path.dirname(settingsPath));
       const second = await register({
+        homeDir: path.dirname(settingsPath),
+        env: {},
         silent: true,
         settingsPath,
         autoStart: true,
@@ -3888,7 +4008,7 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
   for (const [label, register] of SYNC_AND_ASYNC) {
     it(`${label} no-ops on an already-canonical BOM config without rewriting it`, async () => {
       const settingsPath = makeTempSettings({});
-      await register({ silent: true, settingsPath, platform: "darwin", nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION });
+      await register({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, platform: "darwin", nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION });
 
       const canonical = fs.readFileSync(settingsPath, "utf8");
       const bomBytes = Buffer.from(BOM + canonical.replace(/\n/g, "\r\n"), "utf8");
@@ -3896,7 +4016,7 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
       const beforeDir = listDir(path.dirname(settingsPath));
       const beforeBytes = fs.readFileSync(settingsPath);
 
-      const result = await register({ silent: true, settingsPath, platform: "darwin", nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION });
+      const result = await register({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, platform: "darwin", nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION });
 
       assert.strictEqual(result.added, 0);
       assert.strictEqual(result.updated, 0);
@@ -3927,7 +4047,7 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
         const beforeDir = listDir(path.dirname(settingsPath));
 
         await assert.rejects(
-          async () => register({ silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
+          async () => register({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
           /Failed to read settings\.json/,
           `${kind} (bom=${withBom}) must be rejected`
         );
@@ -3950,7 +4070,7 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
         const beforeDir = listDir(path.dirname(settingsPath));
 
         await assert.rejects(
-          async () => register({ silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
+          async () => register({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
           /Failed to read settings\.json/,
           `${kind} must be rejected`
         );
@@ -3972,7 +4092,7 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
     });
 
     assert.throws(
-      () => registerHooks({ silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
+      () => registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
       /Failed to read settings\.json/
     );
 
@@ -3991,7 +4111,7 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
     });
 
     await assert.rejects(
-      registerHooksAsync({ silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
+      registerHooksAsync({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION }),
       /Failed to read settings\.json/
     );
 
@@ -4009,6 +4129,8 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
           : JSON.stringify({ hooks: { SessionStart: [{ matcher: "mixed", wrapperCustom: "keep", hooks: [legacy, thirdParty] }] } })
         );
         const result = await register({
+          homeDir: path.dirname(settingsPath),
+          env: {},
           silent: true,
           settingsPath,
           autoStart: true,
@@ -4067,7 +4189,7 @@ describe("Hook installer UTF-8 BOM compatibility (#657)", () => {
   it("preserves a U+FEFF inside a JSON string value while stripping only the leading BOM", () => {
     const settingsPath = makeTempRawSettings(bomJson({ model: "opus", note: "keep\uFEFFmid" }));
 
-    registerHooks({ silent: true, settingsPath, platform: "darwin", nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION });
+    registerHooks({ homeDir: path.dirname(settingsPath), env: {}, silent: true, settingsPath, platform: "darwin", nodeBin: NODE_BIN, claudeVersionInfo: KNOWN_VERSION });
 
     const after = readSettings(settingsPath);
     assert.strictEqual(after.model, "opus");
