@@ -14,6 +14,8 @@ const {
   buildPortableStatuslineCommand,
   decodeWindowsEncodedCommand,
   extractFirstQuotedToken,
+  quotePowerShellSingleArg,
+  unescapePowerShellSingleQuoted,
   windowsPowerShellBin,
 } = require("./json-utils");
 
@@ -53,10 +55,6 @@ function fallbackStdoutForEvent(event) {
 
 function quoteShellSingleArg(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
-}
-
-function quotePowerShellSingleArg(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
 }
 
 function normalizeFailOpenTimeoutSeconds(options = {}) {
@@ -288,7 +286,7 @@ function extractNodeBinFromCommand(command) {
   const quotedRe = /'((?:''|[^'])*)'|"((?:\\"|[^"])*)"/g;
   let match;
   while ((match = quotedRe.exec(text))) {
-    if (match[1] !== undefined) quotedTokens.push(match[1].replace(/''/g, "'"));
+    if (match[1] !== undefined) quotedTokens.push(unescapePowerShellSingleQuoted(match[1]));
     else quotedTokens.push(match[2].replace(/\\"/g, "\"").replace(/\\\\/g, "\\"));
   }
   for (let i = 1; i < quotedTokens.length; i++) {

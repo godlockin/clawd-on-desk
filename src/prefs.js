@@ -198,6 +198,12 @@ const SCHEMA = {
   sessionHudShowStateLabels: { type: "boolean", default: true },
   sessionHudShowElapsed: { type: "boolean", default: false },
   sessionHudShowContextUsage: { type: "boolean", default: true },
+  // Display-only and opt-in: completed ordinary ephemeral side chats are also
+  // collapsed; the Dashboard remains the complete session list.
+  sessionHudHideCompletedCodexEphemeral: { type: "boolean", default: false },
+  // Independent opt-in: active temporary side chats are also collapsed, without
+  // changing execution, canonical sessions or pending-attention visibility.
+  sessionHudHideActiveCodexEphemeral: { type: "boolean", default: false },
   sessionHudShowQuota: { type: "boolean", default: true },
   // Preserve the historical used-percentage presentation for existing users;
   // remaining is a display-only choice and never changes stored quota data.
@@ -367,16 +373,27 @@ const SCHEMA = {
   // the pet entirely the user hides it (Hide Pet). No settings UI as of #562
   // (the toggle was a non-choice for borderless games — see
   // settings-tab-general.js); this pref persists as an escape hatch and can be
-  // re-exposed.
+  // re-exposed. #1282: recognized screen capture overlays always stand down.
   fullscreenOverlay: { type: "boolean", default: true },
   // #935: opt-in auto-hide — when a real fullscreen app owns the foreground
-  // (win-fullscreen-detect probe), hide the pet + its floating surfaces
+  // (Windows or macOS native Space probe, #1275), hide the pet + floating surfaces
   // entirely and restore them when fullscreen ends. Takes precedence over
   // fullscreenOverlay while active (a hidden pet has nothing to overlay).
-  // Windows-only in effect: the probe is constant false elsewhere. Default OFF
-  // so existing behavior — overlay by default, #538 stand-down as the escape
-  // hatch — is untouched.
+  // Windows and macOS only. Default OFF preserves the existing overlay;
+  // a non-topmost Mac pet also auto-hides, but leaves approvals visible.
   fullscreenAutoHide: { type: "boolean", default: false },
+  // #1275: controls the pet body (render + hit windows). Default ON keeps
+  // it above normal windows and macOS fullscreen apps. OFF lets windows cover
+  // it; Mac also hides it and adjacent surfaces in native fullscreen while
+  // keeping permission bubbles visible. Mac applies the launch value because
+  // private-Space membership cannot be undone across all Spaces at runtime.
+  petAlwaysOnTop: { type: "boolean", default: true },
+  // #1183: escape hatch for machines whose GPU compositor draws the
+  // transparent pet window as an opaque black square once part of it leaves
+  // the virtual desktop (edge snap / mini mode). Read once at startup, before
+  // app ready, because Electron can only turn GPU acceleration off then — a
+  // change takes effect on the next launch. Windows-only in effect.
+  disableHardwareAcceleration: { type: "boolean", default: false },
   // Text-window zoom (bubbles, HUD, dashboard, settings, resume input). The
   // pet itself scales via `size` and is never zoomed. `textScale` is the
   // global default; `textScaleByDisplay` overrides it per display id (the
