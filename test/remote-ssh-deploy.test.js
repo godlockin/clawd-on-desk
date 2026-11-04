@@ -374,6 +374,7 @@ test("secure deploy lock contention exits before every live mutation", async () 
 test("known lock contention restores the managed stage, while an ambiguous acquire quarantines", async () => {
   const fixture = secureFixture();
   const layout = {
+    platform: "posix",
     deployLockDir: "/home/remote/.clawd/deploy.lock",
     runtimeKey: fixture.profile.runtimeKey,
     layoutVersion: fixture.profile.layoutVersion,
@@ -461,6 +462,7 @@ test("verified deploy-lock release resets the managed lock stage", async () => {
   const pending = __test.releaseDeployLock({
     profile: secureFixture().profile,
     layout: {
+      platform: "posix",
       deployLockDir: "/home/remote/.clawd/deploy.lock",
       runtimeKey: "account-default",
       layoutVersion: 1,
@@ -493,6 +495,7 @@ test("deploy-lock release close 255 is a recovery error, never success", async (
   const pending = __test.releaseDeployLock({
     profile: secureFixture().profile,
     layout: {
+      platform: "posix",
       deployLockDir: "/home/remote/.clawd/deploy.lock",
       runtimeKey: "account-default",
       layoutVersion: 1,
@@ -900,6 +903,58 @@ function deployDeps(extra = {}) {
     ...extra,
   };
 }
+
+test("issue #1316: secure deployment with a Windows snapshot starts a framed native lock operation", async () => {
+  const runtime = makeRuntimeStub();
+  const recorder = makeRecordingSpawn([{ code: 0, stdout: '{"ok":false,"reason":"lock_busy"}\n' }]);
+  const remoteNode = { ok: true, nodeBin: "C:\\Node\\node.exe", version: "v20.0.0", source: "platform-probe" };
+  const result = await __test.secureDeploy({ ...secureFixture(), runtime, platformSnapshot: {
+    ok: true, remotePlatform: "win32", shell: { shell: "windows-cmd", os: "windows" },
+    node: { platform: "win32", homedir: "C:\\Users\\remote", execPath: remoteNode.nodeBin, version: remoteNode.version },
+    remoteNode,
+  }, deps: deployDeps({ spawn: recorder.spawn, detectRemoteShell: () => assert.fail("snapshot must be reused") }) });
+  assert.equal(recorder.calls.length, 1);
+  assert.equal(recorder.calls[0].command, "ssh");
+  assert.equal(lastArg(recorder.calls[0]), require("../src/remote-ssh-node-launch").REMOTE_NODE_LAUNCH_COMMAND);
+  const frame = JSON.parse(recorder.calls[0].child._stdin);
+  assert.equal(frame.args.operation, "acquireLock");
+  assert.equal(frame.args.layout.platform, "win32");
+  assert.equal(frame.args.layout.remoteHome, "C:\\Users\\remote");
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "lock_busy");
+});
+
+test("issue #1316: direct unknown-shell Windows deployment requires a platform snapshot before taking a lock", async () => {
+  const recorder = secureHappySpawn({ responses: { 2: { code: 0, stdout: "win32\n" } } });
+  const result = await __test.secureDeploy({ ...secureFixture(), runtime: makeRuntimeStub(), deps: deployDeps({
+    spawn: recorder.spawn, detectRemoteShell: async () => ({ shell: "unknown" }),
+  }) });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "windows_platform_snapshot_required");
+  assert.equal(recorder.calls.length, 3);
+  assert.equal(recorder.calls.some((call) => lastArg(call).startsWith("umask")), false);
+  assert.deepEqual(recorder.calls.map((call) => call.command), ["ssh", "ssh", "ssh"]);
+  assert.ok(lastArg(recorder.calls[0]).startsWith("printf"));
+  assert.ok(lastArg(recorder.calls[1]).startsWith("sh -c"));
+  assert.ok(lastArg(recorder.calls[2]).includes("console.log(process.platform)"));
+});
+
+test("issue #1316: ambiguous-shell deployment uses the Node from its trusted platform snapshot", async () => {
+  const recorder = makeRecordingSpawn((child, meta) => {
+    const command = String(meta.args.at(-1));
+    const response = command.startsWith("printf")
+      ? { code: 0, stdout: "CLAWD_REMOTE_HOME=/home/remote\n" }
+      : { code: 73, stdout: "other-owner" };
+    queueMicrotask(() => { child.stdout.emit("data", Buffer.from(response.stdout)); child.emit("close", response.code, null); });
+  });
+  const result = await __test.secureDeploy({ ...secureFixture(), runtime: makeRuntimeStub(), platformSnapshot: {
+    ok: true, remotePlatform: "posix", shell: { shell: "unknown" },
+    remoteNode: { ok: true, nodeBin: "/opt/probed/node", version: "v20.0.0", source: "platform-probe" },
+  }, deps: deployDeps({ spawn: recorder.spawn, detectRemoteShell: () => assert.fail("snapshot must be reused") }) });
+  assert.equal(result.reason, "lock_busy");
+  assert.equal(recorder.calls.length, 2);
+  assert.equal(recorder.calls.some((call) => lastArg(call).startsWith("sh -c")), false);
+});
 
 function lastArg(call) {
   return String(call.args.at(-1));
@@ -1750,6 +1805,7 @@ function localEnableHarness({ agents = { hermes: { integrationInstalled: false, 
     commandCalls,
     agents: () => state.agents,
     register: (deployResult) => require("../src/remote-ssh-ipc").registerRemoteSshIpc({
+      probeRemotePlatformFn: async () => ({ ok: true, remotePlatform: "posix", shell: { shell: "posix", os: "Linux" } }),
       ipcMain,
       settingsController,
       remoteSshRuntime: runtime,
@@ -3221,3 +3277,76 @@ test("deploy: unknown remote shell does not block deploy", async () => {
   });
   assert.equal(result.ok, true);
 });
+
+test("issue #1316: POSIX platform snapshot overrides a previously deployed Windows Node resolver", async () => {
+  const f = secureFixture({ profile: { remotePlatform: "win32", detectedRemoteNodeBin: "C:\\Node\\node.exe", detectedRemoteNodeVersion: "v22.0.0" } });
+  const recorded = secureHappySpawn();
+  const result = await __test.secureDeploy({ ...f, runtime: makeRuntimeStub(),
+    platformSnapshot: { ok: true, remotePlatform: "posix", shell: { shell: "posix", os: "Linux" } },
+    deps: deployDeps({ spawn: recorded.spawn }),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.layout.platform, "posix");
+  assert.ok(recorded.calls[1].args.at(-1).startsWith("sh -c"));
+});
+
+test("issue #1316: POSIX node_unavailable failure never acquires a Windows hint", async () => {
+  const recorded = secureHappySpawn({ preflightFailure: { code: 1, stdout: JSON.stringify({ ok: false, reason: "node_unavailable" }) } });
+  const runtime = makeRuntimeStub();
+  const result = await __test.secureDeploy({ ...secureFixture(), runtime, deps: deployDeps({ spawn: recorded.spawn }) });
+  assert.equal(result.reason, "node_unavailable");
+  assert.equal(result.hint, undefined);
+  assert.equal(runtime.events.find(({ payload }) => payload.status === "fail").payload.hint, null);
+});
+
+for (const mode of ["error event", "synchronous throw"]) {
+  for (const mutation of [false, true]) {
+    test(`issue #1316: deployment stdin ${mode} is contained for ${mutation ? "mutation" : "read-only"} input`, async () => {
+      const { Writable } = require("node:stream");
+      const child = makeFakeChild(); let killed = 0;
+      child.stdin = new Writable({ write(_data, _encoding, callback) {
+        callback(Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+      } });
+      if (mode === "synchronous throw") child.stdin.end = () => { throw Object.assign(new Error("stream destroyed"), { code: "ERR_STREAM_DESTROYED" }); };
+      child.kill = () => { killed++; queueMicrotask(() => child.emit("close", 0, null)); };
+      const pending = __test.spawnAndWait(() => child, "ssh", ["host", "program"], { stdin: "input", mutation });
+      if (mutation) await assert.rejects(pending, { code: "transport_unknown_result", recoveryCode: "manual_lock_inspection_required", drainVerified: true });
+      else {
+        const result = await pending;
+        assert.equal(result.code, -1);
+        assert.equal(result.stdinError, true);
+        assert.match(result.stderr, /EPIPE|ERR_STREAM_DESTROYED/);
+      }
+      assert.equal(killed, 1);
+    });
+  }
+}
+
+test("issue #1316: managed deployment stdin errors retain the mutation until close", async () => {
+  const { Writable } = require("node:stream");
+  const child = makeFakeChild(); let killed = 0, invalidated = 0;
+  child.stdin = new Writable({ write(_data, _encoding, callback) {
+    callback(Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+  } });
+  child.kill = () => { killed++; };
+  const pending = __test.spawnAndWait(null, "ssh", ["host", "mutate"], { stdin: "input", mutation: true,
+    runtime: { spawnManagedTransportChild: () => child, invalidateManagedOperation: () => { invalidated++; } } });
+  let settled = false; pending.catch(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emit("exit", 255, null);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(killed, 0);
+  child.emit("close", 255, null);
+  await assert.rejects(pending, { code: "transport_unknown_result", recoveryCode: "manual_lock_inspection_required", drainVerified: true });
+  assert.equal(invalidated, 1);
+});
+
+for (const present of [false, true]) {
+  test(`issue #1316: successful POSIX deployment reports actual Codex installer run ${present}`, async () => {
+    const recorded = secureHappySpawn({ preflight: { ok: true, identity: true, claudePresent: false, codexPresent: present, copilotPresent: false } });
+    const result = await __test.secureDeploy({ ...secureFixture(), runtime: makeRuntimeStub(), deps: deployDeps({ spawn: recorded.spawn }) });
+    assert.equal(result.ok, true);
+    assert.equal(result.codexHooksInstalled, present);
+  });
+}
