@@ -5,7 +5,8 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
-const { postStateToRunningServer, readHostPrefix, resolveWslDistro } = require("./server-config");
+const os = require("os");
+const { postStateToRunningServer, readHostPrefix, resolveWslDistro, applySshRemoteFlag, isRemoteHookRuntime } = require("./server-config");
 const { fitStateBodyToByteBudget } = require("./state-payload-size");
 const { extractClaudeContextUsageFromEntries } = require("./context-usage");
 const { createPidResolver, readStdinJsonDetailed, getPlatformConfig, applyOrcaPaneKey } = require("./shared-process");
@@ -18,11 +19,11 @@ const { normalizeClaudePhaseId, extractClaudeBatchToolUseIds } = require("./clau
 // processAlive, or isWin directly.
 
 const TRANSCRIPT_TAIL_BYTES = 262144; // 256 KB
-// #583: claude-code registers this hook with async:true and a 5s timeout
-// (hooks/install.js), so a 2s stdin window never stalls the agent. Do NOT
-// raise the shared default in shared-process.js instead — other agent hooks
-// run ~800ms stdout safety timers that must win against a slow stdin read.
-const STDIN_READ_TIMEOUT_MS = 2000;
+// #1293: Exec form starts Node earlier; without a preceding process snapshot,
+// SessionStart can wait ~0.7s for stdin on a fast machine. 4.5s is a local
+// fallback limit; EOF ends normal reads immediately. Keep the shared 400ms
+// default unchanged because other agents have shorter stdout safety timers (#583).
+const STDIN_READ_TIMEOUT_MS = 4500;
 const ASSISTANT_OUTPUT_MAX = 2200;
 // Observed in Claude Code 2.1.150 StopFailure hook schema (tyq enum).
 // Unknown values from future versions fall back to "unknown".
@@ -789,7 +790,7 @@ function buildStateBody(event, payload, resolve) {
     body.stop_hook_active = true;
   }
   const wslDistro = resolveWslDistro();
-  if (process.env.CLAWD_REMOTE) {
+  if (isRemoteHookRuntime()) {
     // Remote session: preserve existing host prefix, add WSL distro as
     // separate metadata. Do NOT override the SSH host.
     body.host = readHostPrefix();
@@ -863,6 +864,7 @@ function launchedByGrok(env = process.env) {
 }
 
 function main() {
+  applySshRemoteFlag({ argv: process.argv, env: process.env, scriptDir: __dirname, homedir: os.homedir() });
   // Grok scans ~/.claude/settings.json by default. Those Claude hooks must not
   // report a phantom claude-code session; Grok events go through grok-hook.js.
   if (launchedByGrok()) {
@@ -886,7 +888,7 @@ function main() {
 
   // Pre-resolve on SessionStart (runs during stdin buffering, not after)
   // Remote mode: skip PID collection — remote PIDs are meaningless on the local machine
-  if (event === "SessionStart" && !process.env.CLAWD_REMOTE) resolve();
+  if (event === "SessionStart" && !isRemoteHookRuntime()) resolve();
 
   readStdinJsonDetailed({ timeoutMs: STDIN_READ_TIMEOUT_MS })
     .then((stdinRead) => {
@@ -910,11 +912,12 @@ function main() {
       // the HTTP request may fail but the next process can still recover the
       // same session id and last sustained state. This is best-effort and never
       // changes the hook's stdout or exit contract.
-      updateRecoveryLeaseFromStateBody(body, { eventAt });
+      const persistenceOptions = isRemoteHookRuntime() ? { eventAt, remote: true } : { eventAt };
+      updateRecoveryLeaseFromStateBody(body, persistenceOptions);
       // The lease above is liveness-scoped and is erased once its PID dies,
       // which is every PID after a reboot. Keep a separate durable row so a
       // session interrupted by a restart can still be found and resumed.
-      recordSessionHistoryFromStateBody(body, { eventAt });
+      recordSessionHistoryFromStateBody(body, persistenceOptions);
       postStateToRunningServer(
         JSON.stringify(fitted.body),
         { timeoutMs: statePostTimeoutMs },
