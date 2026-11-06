@@ -14,7 +14,7 @@ const CODEX_LOCAL_WORKING_STALE_FLOOR_MS = 20 * 60 * 1000;
 const OPENCODE_LOCAL_WORKING_STALE_FLOOR_MS = 20 * 60 * 1000;
 
 function isWorkingLikeState(state) {
-  return state === "working" || state === "juggling" || state === "thinking";
+  return state === "working" || state === "executing" || state === "juggling" || state === "thinking";
 }
 
 function isLocalCodexWorkingLikeSession(session) {
@@ -71,6 +71,14 @@ function isLocalZcodeDesktopIdleSession(session) {
 function isLocalTraeDesktopIdleSession(session) {
   return !!session
     && session.agentId === "traecode"
+    && !session.host
+    && !session.headless
+    && session.state === "idle";
+}
+
+function isLocalKiroDesktopIdleSession(session) {
+  return !!session
+    && session.agentId === "kiro-desktop"
     && !session.host
     && !session.headless
     && session.state === "idle";
@@ -144,6 +152,15 @@ function getStaleSessionDecision(session, options = {}) {
     return { action: "delete", reason: "agent-exit" };
   }
 
+  // A confirmed pending interaction can wait indefinitely. Keep process-exit
+  // cleanup above and source-exit cleanup here, without aging the session out.
+  if (options.hasPendingApprovalReminder === true) {
+    if (pidReachable && session.sourcePid && !agentAlive && !isProcessAliveOnce(session.sourcePid)) {
+      return { action: "delete", reason: "source-exit" };
+    }
+    return { action: null };
+  }
+
   // GLOBAL reference time: the stale branches consume Math.max(updatedAt,
   // ackedAt) so a freshly-acked session restarts its idle countdown from the
   // ack instant instead of its (possibly ancient) last updatedAt.
@@ -201,6 +218,15 @@ function getStaleSessionDecision(session, options = {}) {
     return { action: "delete", reason: "traecode-desktop-idle-timeout" };
   }
 
+  // Kiro IDE conversations share the long-lived IDE process and have no SessionEnd.
+  if (
+    sessionStaleMs > 0
+    && age > sessionStaleMs
+    && isLocalKiroDesktopIdleSession(session)
+  ) {
+    return { action: "delete", reason: "kiro-desktop-idle-timeout" };
+  }
+
   // WorkBuddy emits Stop when a turn finishes (stored as idle) but never emits
   // SessionEnd, and archiving or deleting a conversation sends no event either.
   // On Windows agent_pid is the long-lived main process, so a live process
@@ -244,8 +270,8 @@ function getStaleSessionDecision(session, options = {}) {
   //
   // With an age window enabled, only check source liveness after it elapses. A
   // source_pid frequently belongs to a per-event launcher rather than to the
-  // session host — Windows Claude Code runs every hook through a throwaway
-  // pwsh wrapper, so the pid shipped with an event is already gone when the
+  // session host — Windows Claude Code's PowerShell hook form uses a throwaway
+  // pwsh wrapper, so the pid shipped with that event can be gone when the
   // next sweep reads it. Probing it while the turn is still reporting deletes
   // the live session between events, and the following event recreates it.
   if (isWorkingLikeState(session.state)) {

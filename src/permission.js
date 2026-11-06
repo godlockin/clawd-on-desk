@@ -17,7 +17,6 @@ const { redactSecrets } = require("./secret-redact");
 const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
-const { timingSafeEqual } = crypto;
 const {
   CLAWD_SERVER_HEADER,
   CLAWD_SERVER_ID,
@@ -25,6 +24,7 @@ const {
 const { isOpencodeFamilyEntry, getFamilyConfig } = require("../agents/opencode-family");
 const { getAgent } = require("../agents/registry");
 const { isPassiveNotifyEntry } = require("./passive-notify-entry");
+const { isCodexRemoteFallbackSuppressed } = require("./codex-remote-fallback-notice");
 const { validateQuestionAnswers } = require("./agent-question-wire");
 const { reminderHolds } = require("./permission-reminder");
 const { isPermissionReviewEnabled } = require("./permission-review");
@@ -33,6 +33,10 @@ const {
   normalizeOpencodeFamilyBridgeUrl,
   isValidOpencodeFamilyBridgeToken,
 } = require("./opencode-family-bridge-url");
+const {
+  normalizeExternalFamilyPermissionIdentity,
+  opencodeFamilyBridgeTokensEqual,
+} = require("./opencode-family-permission-identity");
 const {
   PERMISSION_AUTOMATION_MODE,
   INTERACTION_INTENT,
@@ -242,11 +246,63 @@ function buildQwenCodePermissionResponseBody(decisionOrBehavior, message) {
   return buildCodexPermissionResponseBody(decisionOrBehavior, message);
 }
 
-// ZCode's 3.5.x PermissionRequest schema accepts the same minimal union the
-// codex builder emits ({ behavior } allow / { behavior, message } deny).
-// End-to-end Allow/Deny is verified on macOS ZCode 3.8.1.
+// ZCode's PermissionRequest output schema (3.5.x through 3.16.3) is a strict
+// union: allow may carry optional permissionUpdates/updatedPermissions/
+// updatedInput, deny may carry interrupt/message. Clawd still never rewrites
+// tool input or permission rules — the ONLY updatedInput it ever sends is the
+// elicitation answer object built by buildElicitationUpdatedInput: the
+// upstream input echoed plus an answers record whose keys are exactly the
+// question texts. This shape check gates the wire (#1264); everything else
+// stays omitted.
+const ZCODE_ELICITATION_INPUT_MAX_QUESTIONS = 16;
+const ZCODE_ELICITATION_INPUT_MAX_ANSWERS = 16;
+const ZCODE_ELICITATION_INPUT_MAX_BYTES = 65536;
+
+function isZcodeElicitationUpdatedInput(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const questions = value.questions;
+  if (!Array.isArray(questions) || questions.length === 0
+    || questions.length > ZCODE_ELICITATION_INPUT_MAX_QUESTIONS) return false;
+  const questionTexts = new Set();
+  for (const question of questions) {
+    if (!question || typeof question !== "object" || Array.isArray(question)) return false;
+    const text = typeof question.question === "string" ? question.question : "";
+    if (!text) return false;
+    questionTexts.add(text);
+  }
+  const answers = value.answers;
+  if (!answers || typeof answers !== "object" || Array.isArray(answers)) return false;
+  const keys = Object.keys(answers);
+  if (keys.length === 0 || keys.length > ZCODE_ELICITATION_INPUT_MAX_ANSWERS) return false;
+  if (!keys.every((key) => typeof key === "string" && key.length > 0
+    && questionTexts.has(key)
+    && typeof answers[key] === "string" && answers[key].length > 0)) return false;
+  try {
+    return Buffer.byteLength(JSON.stringify(value)) <= ZCODE_ELICITATION_INPUT_MAX_BYTES;
+  } catch {
+    return false;
+  }
+}
+
 function buildZcodePermissionResponseBody(decisionOrBehavior, message) {
-  return buildCodexPermissionResponseBody(decisionOrBehavior, message);
+  const source = typeof decisionOrBehavior === "string"
+    ? { behavior: decisionOrBehavior, message }
+    : (decisionOrBehavior && typeof decisionOrBehavior === "object" ? decisionOrBehavior : null);
+  const decision = sanitizeCodexPermissionDecision(source, message);
+  if (!decision) return "{}";
+  if (
+    decision.behavior === "allow"
+    && source
+    && isZcodeElicitationUpdatedInput(source.updatedInput)
+  ) {
+    decision.updatedInput = source.updatedInput;
+  }
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PermissionRequest",
+      decision,
+    },
+  });
 }
 
 function sanitizeAntigravityPermissionDecision(decisionOrBehavior, message) {
@@ -734,6 +790,7 @@ function buildPermissionFocusEntry(perm) {
   if (perm.model) focusEntry.model = perm.model;
   if (perm.codexOriginator) focusEntry.codexOriginator = perm.codexOriginator;
   if (perm.codexSource) focusEntry.codexSource = perm.codexSource;
+  if (typeof perm.codexClientEphemeral === "boolean") focusEntry.codexClientEphemeral = perm.codexClientEphemeral;
   // An approval can arrive before the session lifecycle event, so the fallback
   // entry needs the carrier to remain jumpable to the desktop app window.
   if (perm.dshCarrier) focusEntry.dshCarrier = perm.dshCarrier;
@@ -2781,6 +2838,7 @@ function handlePermissionBubbleFailure(permEntry, reason) {
     return true;
   }
   permLog(`permission bubble failed; returning no-decision: ${reason} tool=${permEntry.toolName} session=${permEntry.sessionId} agent=${permEntry.agentId || "unknown"}`);
+  queueCodexRemoteFallbackForEntry(permEntry);
   resolvePermissionEntry(
     permEntry,
     "no-decision",
@@ -2797,6 +2855,7 @@ function showPermissionBubble(permEntry) {
   // changed since the route asked, give the request back to Codex.
   if (permEntry.codexAutomationClaim === true) {
     permLog(`codex automation claim no longer applies -> no decision, native prompt fallback (tool=${permEntry.toolName})`);
+    queueCodexRemoteFallbackForEntry(permEntry);
     resolvePermissionEntry(
       permEntry,
       "no-decision",
@@ -3107,7 +3166,7 @@ function notifyPermissionsChanged(reason) {
   }
 }
 
-function notifyPermissionResolved(permEntry, reason) {
+function notifyPermissionResolved(permEntry, reason, behavior = "no-decision") {
   if (!permEntry || isPassiveNotifyEntry(permEntry)) return;
   if (typeof ctx.onPermissionResolved !== "function") return;
   const hasPendingForSession = pendingPermissions.some((entry) =>
@@ -3119,6 +3178,7 @@ function notifyPermissionResolved(permEntry, reason) {
     ctx.onPermissionResolved(permEntry, {
       reason: reason || "resolved",
       hasPendingForSession,
+      behavior: behavior === "allow" || behavior === "deny" ? behavior : "no-decision",
     });
   } catch (err) {
     permLog(`onPermissionResolved failed: ${err && err.message ? err.message : err}`);
@@ -3224,6 +3284,7 @@ function buildPermissionBubblePayload(permEntry) {
     isCodexSubagent: permEntry.isCodex === true && permEntry.codexSessionRole === "subagent",
     codexAgentNickname: permEntry.codexAgentNickname || null,
     isCodexUserInputNotify: permEntry.isCodexUserInputNotify || false,
+    isKiroDesktopNotify: permEntry.isKiroDesktopNotify === true,
     codexUserInputCallId: permEntry.codexUserInputCallId || null,
     isRemote: !!permEntry.host,
     // Hermes must NOT get the regular go-to-terminal fallback: its opt-in
@@ -3231,6 +3292,10 @@ function buildPermissionBubblePayload(permEntry) {
     // converted into a retryable block by the plugin. Clarify elicitation is
     // different and can hand control to Hermes' native clarification UI.
     isHermes: permEntry.isHermes || false,
+    // ZCode question cards map "Go to terminal" to deny-and-focus too: the
+    // bubble action must hand the question back to ZCode's native prompt
+    // (no-decision), never wire an explicit deny for a question (#1264).
+    isZcode: permEntry.isZcode || false,
     // DSH has a downstream native web answerer. Its first-release bubble must
     // not render Go to Terminal because that action has no decision meaning.
     isDsh: permEntry.isDsh || false,
@@ -3239,6 +3304,11 @@ function buildPermissionBubblePayload(permEntry) {
     // standard cue path (formatDetail) while the card stays dismiss-only.
     kimiToolName: permEntry.kimiToolName || null,
     kimiToolInput: permEntry.kimiToolInput || null,
+    // Display-only fields for the remote Codex fallback notice. toolName stays
+    // "CodexExec" so this card remains outside the Allow/Deny path.
+    displayToolName: permEntry.displayToolName || null,
+    displayToolInput: permEntry.displayToolInput || null,
+    displayHost: permEntry.host || null,
     familyAlways: permEntry.familyAlwaysCandidates || [],
     familyPatterns: permEntry.familyPatterns || [],
     sessionFolder,
@@ -4284,6 +4354,21 @@ function applyPermissionSuggestion(perm, index, options = {}) {
   let focusPlanReviewFallback = false;
   if (
     behavior === "allow"
+    && permEntry.isZcode
+    && permEntry.isElicitation === true
+    && !isZcodeElicitationUpdatedInput(permEntry.resolvedUpdatedInput)
+  ) {
+    // #1264: an elicitation answer that fails the wire shape check must not
+    // degrade to a bare allow — the question tool would run with no answers
+    // (e.g. a wire input over the 64 KiB answer budget passes the ingress
+    // budgets but not this one). Hand the question back to ZCode's native
+    // prompt instead, exactly like the Claude plan-review guard below.
+    permLog("zcode elicitation allow without a wire-shaped answer -> no-decision native fallback");
+    behavior = "no-decision";
+    message = "ZCode question answer did not fit the wire contract";
+  }
+  if (
+    behavior === "allow"
     && permEntry.agentId === "claude-code"
     && isValidInteraction(permEntry.interaction)
     && permEntry.interaction.intent === INTERACTION_INTENT.PLAN_REVIEW
@@ -4331,7 +4416,7 @@ function applyPermissionSuggestion(perm, index, options = {}) {
     permEntry,
     observationDisposition(disposition.reason, disposition.decided, "resolved")
   )) return;
-  notifyPermissionResolved(permEntry, "resolved");
+  notifyPermissionResolved(permEntry, "resolved", behavior);
 
   if (permEntry.autoCloseTimer) {
     clearTimeout(permEntry.autoCloseTimer);
@@ -4422,9 +4507,16 @@ function applyPermissionSuggestion(perm, index, options = {}) {
     if (behavior === "no-decision") {
       sendZcodeNoDecisionResponse(res, message || "fallback");
     } else {
+      // #1264: an AskUserQuestion answer travels as updatedInput
+      // ({questions, answers}); buildZcodePermissionResponseBody only puts
+      // shapes it can vouch for on the wire, so a stale or malformed field
+      // degrades to a plain allow.
       sendZcodePermissionResponse(res, {
         behavior: behavior === "deny" ? "deny" : "allow",
         message,
+        ...(behavior === "allow" && permEntry.resolvedUpdatedInput
+          ? { updatedInput: permEntry.resolvedUpdatedInput }
+          : {}),
       });
     }
     return;
@@ -4850,6 +4942,7 @@ function handleBubbleExpanded(event, expanded) {
   // Expanding a copy of the options implies that they are actionable here.
   // Treat any stale/old renderer expansion request as the card's real action:
   // dismiss it and return to the native Codex UI.
+  if (perm.isKiroDesktopNotify) return false;
   if (perm.isCodexUserInputNotify) {
     if (expanded === true) {
       dismissPassiveNotify(perm, "expand-focus");
@@ -5161,6 +5254,13 @@ function handleDecide(event, behavior) {
   const unsupportedActionOptions = behavior === "deny-and-focus"
     ? resolutionOptions("handed_to_terminal", false)
     : resolutionOptions("cancelled", false);
+  if (perm.isKiroDesktopNotify) {
+    dismissPassiveNotify(perm, "ipc-decide");
+    if (behavior === "kiro-desktop-focus") {
+      ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
+    }
+    return;
+  }
   if (perm.isCodexUserInputNotify) {
     dismissPassiveNotify(perm, "ipc-decide");
     if (behavior === "codex-user-input-focus" && !perm.host) {
@@ -5242,6 +5342,40 @@ function handleDecide(event, behavior) {
   if (perm.isZcode) {
     if (behavior === "allow" || behavior === "deny") {
       resolvePermissionEntry(perm, behavior);
+      return;
+    }
+    // ZCode's AskUserQuestion answer contract (#1264): the bubble/remote
+    // submit indexed answers, and the wire allow carries them as updatedInput
+    // ({questions, answers}) — ZCode 3.16.3 applies that as a modify, exactly
+    // like the Claude Code elicitation path.
+    if (
+      isValidInteraction(perm.interaction)
+      && perm.interaction.intent === INTERACTION_INTENT.HUMAN_QUESTION
+      && perm.interaction.capabilities.answerQuestions
+      && behavior
+      && typeof behavior === "object"
+      && behavior.type === "elicitation-submit"
+    ) {
+      const wireInput = perm.elicitationWireInput || perm.toolInput;
+      const validatedAnswers = validateAndRemapIndexedElicitationAnswers(
+        wireInput,
+        behavior.answers
+      );
+      if (!validatedAnswers.ok) {
+        permLog(`desktop zcode elicitation rejected: ${validatedAnswers.reason}`);
+        resolvePermissionEntry(
+          perm,
+          "no-decision",
+          validatedAnswers.reason,
+          resolutionOptions("cancelled", false)
+        );
+        return;
+      }
+      perm.resolvedUpdatedInput = buildElicitationUpdatedInput(
+        wireInput,
+        validatedAnswers.answers
+      );
+      resolvePermissionEntry(perm, "allow", undefined, resolvedDecisionOptions);
       return;
     }
     resolvePermissionEntry(perm, "no-decision", `Unsupported ZCode bubble action: ${String(behavior)}`);
@@ -5477,6 +5611,119 @@ function showCodexNotifyBubble({ sessionId, command }) {
   schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs);
 }
 
+// Remote Codex handed a permission request back to its native prompt. The
+// Mac cannot answer it, so this is a heads-up only: it keeps the passive
+// Codex identity (no decision channel, no remote approval) and carries the
+// real tool name/input as display-only fields for the renderer.
+function applyCodexRemoteFallbackContent(permEntry, { host, toolName, toolInput }) {
+  const displayInput = toolInput && typeof toolInput === "object" ? toolInput : {};
+  permEntry.toolInput = displayInput;
+  permEntry.displayToolName = typeof toolName === "string" && toolName ? toolName : null;
+  permEntry.displayToolInput = displayInput;
+  permEntry.host = typeof host === "string" && host ? host : permEntry.host;
+  permEntry.createdAt = Date.now();
+}
+
+function showCodexRemoteFallbackNotice({ sessionId, rawSessionId, profileId, host, toolName, toolInput }) {
+  if (!sessionId) return null;
+  if (isCodexRemoteFallbackSuppressed(ctx)) {
+    permLog(`codex remote fallback suppressed: session=${sessionId} dnd=${ctx.doNotDisturb}`);
+    return null;
+  }
+  const policy = getPolicy(ctx, "notification");
+  const existing = findCodexRemoteFallbackEntryBySession(sessionId);
+  if (existing) {
+    applyCodexRemoteFallbackContent(existing, { host, toolName, toolInput });
+    permLog(`codex remote fallback refresh: session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
+    syncPermissionBubbleContent(existing);
+    schedulePassiveNotifyAutoExpire(existing, policy.autoCloseMs);
+    return existing;
+  }
+  const permEntry = {
+    res: null,
+    abortHandler: null, suggestions: [],
+    sessionId,
+    rawSessionId: typeof rawSessionId === "string" && rawSessionId ? rawSessionId : null,
+    profileId: typeof profileId === "string" && profileId ? profileId : null,
+    bubble: null, hideTimer: null,
+    toolName: "CodexExec",
+    host: null,
+    resolvedSuggestion: null, createdAt: Date.now(),
+    interaction: classifyPermissionInteraction({
+      agentId: "codex",
+      eventKind: "notification",
+      toolName: "CodexExec",
+    }),
+    isElicitation: false,
+    isCodexNotify: true,
+    isCodexRemoteFallbackNotice: true,
+    agentId: "codex",
+    autoExpireTimer: null,
+  };
+  applyCodexRemoteFallbackContent(permEntry, { host, toolName, toolInput });
+  permEntry.onCodexRemoteFallbackDismissed = (entry) => {
+    if (typeof ctx.onCodexRemoteFallbackCardDismissed === "function") {
+      ctx.onCodexRemoteFallbackCardDismissed(entry && entry.sessionId, entry);
+    }
+  };
+  addPendingPermission(permEntry, "passive-added");
+  try {
+    showPermissionBubble(permEntry);
+  } catch (err) {
+    permLog(`codex remote fallback bubble failed: ${err && err.message ? err.message : err}`);
+    removePendingPermission(permEntry, "codex-remote-fallback-failed");
+    return null;
+  }
+  permLog(`codex remote fallback show: session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
+  schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs);
+  return permEntry;
+}
+
+// Refresh is deliberately update-only: a card that vanished (user dismiss,
+// TTL, renderer failure, legacy clear) must not be recreated here or the next
+// event would skip the grace period and resurrect old content.
+function refreshCodexRemoteFallbackNotice(permEntry, payload) {
+  if (!permEntry || !permEntry.isCodexRemoteFallbackNotice
+    || !pendingPermissions.includes(permEntry)) return false;
+  if (isCodexRemoteFallbackSuppressed(ctx)) return false;
+  const policy = getPolicy(ctx, "notification");
+  applyCodexRemoteFallbackContent(permEntry, payload || {});
+  syncPermissionBubbleContent(permEntry);
+  schedulePassiveNotifyAutoExpire(permEntry, policy.autoCloseMs);
+  return permEntry;
+}
+
+function dismissCodexRemoteFallbackNotice(permEntry, reason = "codex-remote-fallback-dismiss") {
+  if (!permEntry || !pendingPermissions.includes(permEntry)) return false;
+  dismissPassiveNotify(permEntry, reason);
+  return true;
+}
+
+// Single entry point for a remote Codex request that is really going back to
+// Codex's native prompt. Passive notices are excluded so a failed reminder can
+// never enqueue itself. Every agent's entry carries profileId, and the shared
+// handlePermissionBubbleFailure calls here for any agent, so agentId must also
+// identify Codex.
+function queueCodexRemoteFallbackForEntry(permEntry) {
+  if (!permEntry || isPassiveNotifyEntry(permEntry)) return false;
+  if (permEntry.agentId !== "codex") return false;
+  // "local" covers this machine and WSL. Only Remote SSH uses an
+  // ingress-assigned profile id. Revisit this gate if WSL gains its own ids.
+  if (!permEntry.profileId || permEntry.profileId === "local") return false;
+  if (typeof ctx.notifyCodexRemoteFallback !== "function") return false;
+  return ctx.notifyCodexRemoteFallback({
+    sessionId: permEntry.sessionId,
+    rawSessionId: permEntry.rawSessionId,
+    profileId: permEntry.profileId,
+    host: permEntry.codexRemoteDisplayHost || permEntry.host,
+    toolName: permEntry.toolName,
+    toolInput: permEntry.toolInput,
+    turnId: permEntry.codexTurnId || permEntry.turnId || null,
+    toolUseId: permEntry.toolUseId,
+    toolInputFingerprint: permEntry.toolInputFingerprint,
+  }) === true;
+}
+
 function showCodexUserInputBubble({
   sessionId,
   callId,
@@ -5540,6 +5787,46 @@ function showCodexUserInputBubble({
   showPermissionBubble(permEntry);
   permLog(`passive user-input show: agent=codex session=${sessionId} call=${callId}`);
   return true;
+}
+
+function showKiroDesktopReminder({ sessionId, question, interactionType, interactionKey, cwd, onDismiss }) {
+  const existing = pendingPermissions.find(entry => entry.isKiroDesktopNotify && entry.sessionId === sessionId);
+  if (existing) {
+    existing.toolInput = { question, interactionType };
+    existing.kiroInteractionKey = interactionKey;
+    syncPermissionBubbleContent(existing);
+    return true;
+  }
+  const session = ctx.sessions?.get(sessionId);
+  const entry = {
+    res: null,
+    abortHandler: null,
+    suggestions: [],
+    resolvedSuggestion: null,
+    sessionId,
+    agentId: "kiro-desktop",
+    bubble: null,
+    hideTimer: null,
+    autoExpireTimer: null,
+    toolName: "KiroDesktopApproval",
+    toolInput: { question, interactionType },
+    createdAt: Date.now(),
+    isKiroDesktopNotify: true,
+    isElicitation: false,
+    kiroInteractionKey: interactionKey,
+    onKiroDesktopDismissed: onDismiss,
+    sourcePid: session?.sourcePid || null,
+    agentPid: session?.agentPid || null,
+    cwd: session?.cwd || cwd || "",
+  };
+  addPendingPermission(entry, "passive-added");
+  showPermissionBubble(entry);
+  return true;
+}
+
+function removeKiroDesktopReminder(sessionId, reason) {
+  const entry = pendingPermissions.find(entry => entry.isKiroDesktopNotify && entry.sessionId === sessionId);
+  if (entry) dismissPassiveNotify(entry, reason);
 }
 
 function showKimiNotifyBubble({ sessionId, command, toolName, permissionAction, permissionCommand, permissionToolInput }) {
@@ -5623,6 +5910,15 @@ function findCodexNotifyEntryBySession(sessionId) {
   return pendingPermissions.find((permEntry) => permEntry && permEntry.isCodexNotify && permEntry.sessionId === sessionId) || null;
 }
 
+function findCodexRemoteFallbackEntryBySession(sessionId) {
+  if (!sessionId) return null;
+  return pendingPermissions.find((permEntry) => (
+    permEntry
+    && permEntry.isCodexRemoteFallbackNotice
+    && permEntry.sessionId === sessionId
+  )) || null;
+}
+
 function findKimiNotifyEntryBySession(sessionId) {
   if (!sessionId) return null;
   return pendingPermissions.find((permEntry) => permEntry && permEntry.isKimiNotify && permEntry.sessionId === sessionId) || null;
@@ -5640,6 +5936,12 @@ function dismissPassiveNotify(permEntry, reason = "unknown") {
   if (permEntry.autoExpireTimer) clearTimeout(permEntry.autoExpireTimer);
   if (permEntry.hideTimer) clearTimeout(permEntry.hideTimer);
   hidePermissionBubbleSafely(permEntry);
+  if (typeof permEntry.onKiroDesktopDismissed === "function") {
+    permEntry.onKiroDesktopDismissed(permEntry, reason);
+  }
+  if (typeof permEntry.onCodexRemoteFallbackDismissed === "function") {
+    try { permEntry.onCodexRemoteFallbackDismissed(permEntry, reason); } catch {}
+  }
   repositionBubbles();
   repositionDependentBubbles();
   syncPermissionShortcuts();
@@ -5655,7 +5957,7 @@ function schedulePassiveNotifyAutoExpire(permEntry, autoCloseMs, now = Date.now(
   // Keep it visible until Codex records the matching function_call_output (or
   // the user explicitly dismisses/focuses it), even if notification policy is
   // refreshed while the card is open.
-  if (permEntry.isCodexUserInputNotify) return false;
+  if (permEntry.isCodexUserInputNotify || permEntry.isKiroDesktopNotify) return false;
   const remainingMs = computePassiveNotifyRemainingMs(permEntry.createdAt, autoCloseMs, now);
   permLog(
     `passive notify schedule: agent=${getPassiveNotifyAgentId(permEntry)} session=${permEntry.sessionId || "(none)"} autoCloseMs=${autoCloseMs} remainingMs=${remainingMs}`
@@ -5672,7 +5974,7 @@ function schedulePassiveNotifyAutoExpire(permEntry, autoCloseMs, now = Date.now(
 
 function refreshPassiveNotifyAutoClose() {
   const passiveEntries = pendingPermissions.filter(
-    (entry) => isPassiveNotifyEntry(entry) && !entry.isCodexUserInputNotify
+    (entry) => isPassiveNotifyEntry(entry) && !entry.isCodexUserInputNotify && !entry.isKiroDesktopNotify
   );
   if (passiveEntries.length === 0) return 0;
   const policy = getPolicy(ctx, "notification");
@@ -5724,39 +6026,6 @@ function dismissInteractivePermissionWithoutDecision(perm, reason) {
   } else if (!isOpencodeFamilyEntry(perm) && perm.res && !perm.res.destroyed) {
     try { perm.res.destroy(); } catch {}
   }
-}
-
-function opencodeFamilyBridgeTokensEqual(expected, candidate) {
-  if (
-    !isValidOpencodeFamilyBridgeToken(expected)
-    || !isValidOpencodeFamilyBridgeToken(candidate)
-  ) return false;
-  const expectedBytes = Buffer.from(expected, "utf8");
-  const candidateBytes = Buffer.from(candidate, "utf8");
-  if (expectedBytes.length !== candidateBytes.length) return false;
-  try {
-    return timingSafeEqual(expectedBytes, candidateBytes);
-  } catch {
-    return false;
-  }
-}
-
-function normalizeExternalFamilyPermissionIdentity(identity) {
-  if (!identity || typeof identity !== "object") return null;
-  const agentId = typeof identity.agentId === "string" ? identity.agentId : "";
-  if (!getFamilyConfig(agentId)) return null;
-  const requestId = typeof identity.requestId === "string" && identity.requestId
-    ? identity.requestId
-    : null;
-  const sessionId = typeof identity.sessionId === "string" && identity.sessionId
-    ? identity.sessionId
-    : null;
-  const bridgeUrl = normalizeOpencodeFamilyBridgeUrl(identity.bridgeUrl);
-  const bridgeToken = isValidOpencodeFamilyBridgeToken(identity.bridgeToken)
-    ? identity.bridgeToken
-    : null;
-  if (!requestId || !sessionId || !bridgeUrl || !bridgeToken) return null;
-  return { agentId, requestId, sessionId, bridgeUrl, bridgeToken };
 }
 
 function boundedPermissionIdentityForLog(value) {
@@ -5984,8 +6253,11 @@ return {
   handleQueueSelect, handleQueuePresentationAck,
   handleDecide, handleImeEditing, handleBubbleRendererGone, cleanup,
   showCodexNotifyBubble, clearCodexNotifyBubbles,
+  showCodexRemoteFallbackNotice, refreshCodexRemoteFallbackNotice,
+  dismissCodexRemoteFallbackNotice, queueCodexRemoteFallbackForEntry,
   showCodexUserInputBubble, clearCodexUserInputBubbles,
   showKimiNotifyBubble, clearKimiNotifyBubbles,
+  showKiroDesktopReminder, removeKiroDesktopReminder,
   refreshPassiveNotifyAutoClose,
   refreshPermissionAutoCloseForPolicy,
   dismissPermissionsByAgent, dismissInteractivePermissionBubbles,
