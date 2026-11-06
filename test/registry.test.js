@@ -17,6 +17,7 @@ describe("Agent Registry", () => {
       "codebuddy",
       "kiro-cli",
       "kirocrew",
+      "kiro-desktop",
       "kimi-cli",
       "qwen-code",
       "zcode",
@@ -308,7 +309,7 @@ describe("Agent Registry", () => {
     assert.strictEqual(codex.capabilities.httpHook, false);
     assert.strictEqual(codex.capabilities.permissionApproval, true);
     assert.strictEqual(codex.capabilities.sessionEnd, true);
-    assert.strictEqual(codex.capabilities.subagent, false);
+    assert.strictEqual(codex.capabilities.subagent, true);
 
     const zcode = registry.getAgent("zcode");
     assert.strictEqual(zcode.capabilities.httpHook, false);
