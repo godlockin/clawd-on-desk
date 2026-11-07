@@ -1,7 +1,9 @@
 "use strict";
+const { readCodexClientEphemeral } = require("./codex-session-persistence");
 
 const path = require("path");
 const { resolveSessionIdentity } = require("./session-key");
+const { normalizeOpencodeAttachUrl } = require("./opencode-attach-target");
 const {
   assessSessionAutomationIdentity,
 } = require("./session-automation-identity");
@@ -14,7 +16,7 @@ const {
 } = require("../hooks/server-config");
 const { isCodexDesktopOriginator } = require("../hooks/codex-originator");
 const {
-  CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS,
+  isCodexInternalThread,
 } = require("../hooks/codex-internal-worker");
 const {
   assessWindowsProcessChainRequest,
@@ -47,6 +49,7 @@ const { CLAUDE_QUOTA_FIELDS } = require("../hooks/claude-rate-limits");
 const { CODEX_QUOTA_FIELDS } = require("../hooks/codex-rate-limits");
 const { extractPermissionToolInput } = require("../hooks/kimi-hook");
 const { normalizeCodexUserInputWire } = require("../hooks/codex-user-input");
+const { isCodexPlanTool, normalizePlanProgress } = require("../hooks/codex-plan-progress");
 const { sanitizeShadowRecord } = require("./windows-process-chain-shadow-log");
 
 const NATIVE_TERMINAL_ANSWER_OPTIONS = Object.freeze({
@@ -446,6 +449,14 @@ function handleStatePost(req, res, options) {
       const toolInputFingerprint = typeof data.tool_input_fingerprint === "string" && data.tool_input_fingerprint
         ? data.tool_input_fingerprint
         : null;
+      const isCopilotWaitKey = value => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+      const copilotWaitKey = agentId === "copilot-cli" && isCopilotWaitKey(data.copilot_wait_key)
+        ? data.copilot_wait_key : null;
+      const copilotToolKeys = agentId === "copilot-cli" && Array.isArray(data.copilot_tool_keys)
+        && data.copilot_tool_keys.length <= 4 && data.copilot_tool_keys.every(isCopilotWaitKey)
+        ? [...new Set(data.copilot_tool_keys)] : null;
+      const copilotEventTs = agentId === "copilot-cli" && Number.isFinite(data.copilot_event_ts)
+        && data.copilot_event_ts > 0 ? data.copilot_event_ts : null;
       const claudePromptId = agentId === "claude-code" ? normalizeClaudePhaseId(data.prompt_id) : null;
       const batchToolUseIds = event === "PostToolBatch" ? normalizeClaudeBatchToolUseIds(data.tool_use_ids) : null;
       if (event === "PostToolBatch" && (agentId !== "claude-code" || !claudePromptId
@@ -509,17 +520,25 @@ function handleStatePost(req, res, options) {
       // around the full updateSession lifecycle machine.
       const metadataOnly = data.metadata_only === true;
       const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
-      // The hook tags a recognized Codex Desktop ambient-suggestion thread.
+      const codexClientEphemeral = readCodexClientEphemeral(data,
+        agentId === "codex" && hookSource === "codex-official"
+        && trustedProfileId === "local" && !host && !wslDistro);
+      const attachMetadata = agentId === "opencode" && hookSource === "opencode-plugin"
+        && trustedProfileId === "local" && !host && !wslDistro && !headless
+        && Object.hasOwn(data, "opencode_attach_url")
+        ? { opencodeAttachUrl: normalizeOpencodeAttachUrl(data.opencode_attach_url) }
+        : {};
+      // The hook tags recognized Codex Desktop ambient/title-refresh threads.
       // Only a local, official Codex state event may carry it — remote/WSL and
       // other agents never do — and the value is re-validated at this trust
       // boundary rather than trusted from the hook.
-      const codexInternalThread = data.codex_internal_thread === CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS
+      const codexInternalThread = isCodexInternalThread(data.codex_internal_thread)
         && agentId === "codex"
         && hookSource === "codex-official"
         && trustedProfileId === "local"
         && !host
         && !wslDistro
-        ? CODEX_INTERNAL_THREAD_AMBIENT_SUGGESTIONS
+        ? data.codex_internal_thread
         : null;
       const clearDshContextUsage = metadataOnly
         && agentId === "deepseek-harness"
@@ -575,13 +594,16 @@ function handleStatePost(req, res, options) {
         const sequenceResult = dshStateSequenceFence
           && typeof dshStateSequenceFence.accept === "function"
           ? dshStateSequenceFence.accept({
-              // The fence is upstream-protocol scoped. Keep it on DSH's raw
-              // canonical id; the local/remote profile key is a separate
-              // Clawd storage concern applied by resolveSessionIdentity.
+              // The fence keeps DSH's raw canonical id. A remote session also
+              // needs its own namespace: profile ids are only unique per
+              // upstream profile, so two machines may legitimately use the
+              // same raw id. Local sessions pass no remoteProfile and keep
+              // their existing key and capacity.
               sessionId: sessionIdentity.rawSessionId,
               event,
               eventSeq: data.event_seq,
               sessionSeq: data.session_seq,
+              remoteProfile,
             })
           : { accepted: false, reason: "sequence-fence-unavailable" };
         if (!sequenceResult.accepted) {
@@ -708,6 +730,9 @@ function handleStatePost(req, res, options) {
           // session_title_from_prompt, and neither sends it on a metadata-only
           // request, so any marker here is ignored.
           if (sessionTitle) metaUpdate.sessionTitle = sessionTitle;
+          if (Object.hasOwn(attachMetadata, "opencodeAttachUrl")) {
+            Object.assign(metaUpdate, attachMetadata, { expectedAgentId: "opencode", opencodeAttachSource: hookSource });
+          }
           // DSH metadata bypasses the lifecycle sequence fence, so it must
           // only ever annotate DSH's own session. Pass the expected owner so
           // updateSessionMetadata drops a colliding raw id owned by another
@@ -747,6 +772,9 @@ function handleStatePost(req, res, options) {
           return;
         }
       }
+      // executing is a server-derived Claude hint, never an inbound claim.
+      // Keep this independent of whether the current theme supplies its art.
+      if (state === "executing") state = "working";
       if (ctx.STATE_SVGS[state]) {
         const sid = session_id || "default";
         const codexHookState = resolveCodexOfficialHookState(
@@ -756,6 +784,24 @@ function handleStatePost(req, res, options) {
           ctx.codexSubagentClassifier,
           sid,
         );
+        // Remote Codex fallback notices are cleared by the same lifecycle
+        // events that finish a native request. This runs after the identity
+        // gates (metadata-only returned above) and before state-machine drops,
+        // so a turn's Stop still releases its notice even when the visual
+        // state is dropped as a continuation.
+        if (remoteProfile && agentId === "codex"
+          && typeof ctx.onCodexRemoteStateEvent === "function") {
+          ctx.onCodexRemoteStateEvent({
+            sessionId: sessionIdentity.sessionId,
+            rawSessionId: sessionIdentity.rawSessionId,
+            profileId: trustedProfileId,
+            event,
+            toolName,
+            toolUseId,
+            toolInputFingerprint,
+            turnId: codexHookState.turnId || null,
+          });
+        }
         if (codexHookState.drop) {
           res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
           res.end();
@@ -1103,7 +1149,7 @@ function handleStatePost(req, res, options) {
         let sessionUpdateApplied = true;
         if (svg && !(claudeToolPhaseDecision && claudeToolPhaseDecision.preservePhase)) {
           const safeSvg = pathApi.basename(svg);
-          ctx.setState(state, safeSvg);
+          ctx.setState(state, safeSvg, { notificationCue: state === "notification" });
         } else {
           sessionUpdateApplied = ctx.updateSession(sid, state, event, {
             sourcePid: effectiveProcessMetadata.sourcePid,
@@ -1139,12 +1185,24 @@ function handleStatePost(req, res, options) {
             displayHint: display_svg,
             sessionTitle,
             sessionTitleFromPrompt,
+            ...attachMetadata,
+            ...(agentId === "codex" && hookSource === "codex-official"
+              && event === "PostToolUse" && isCodexPlanTool(toolName) && codexHookState.turnId
+              && trustedProfileId === "local" && !effHost && !effWslDistro && data.wsl_sourced !== true && !effHeadless
+              && (!existingSession || existingSession.agentId === "codex")
+              && Object.hasOwn(data, "plan_progress")
+              ? { planProgress: normalizePlanProgress(data.plan_progress),
+                planProgressTurnId: codexHookState.turnId, planProgressSource: "codex-official" }
+              : {}),
             contextUsage,
             contextUsageOrigin: resolveStateContextUsageOrigin(agentId, contextUsage),
             assistantLastOutput,
             assistantLastOutputTruncated,
             toolName,
             ...(toolUseId ? { toolUseId } : {}),
+            ...(copilotWaitKey ? { copilotWaitKey } : {}),
+            ...(copilotToolKeys ? { copilotToolKeys } : {}),
+            ...(copilotEventTs ? { copilotEventTs } : {}),
             ...(claudePromptId ? { claudePromptId } : {}),
             ...(batchToolUseIds ? { batchToolUseIds } : {}),
             ...(claudeToolPhaseDecision ? { claudeToolPhaseDecision } : {}),
@@ -1158,6 +1216,7 @@ function handleStatePost(req, res, options) {
             permissionGateId,
             preserveState,
             hookSource,
+            ...(typeof codexClientEphemeral === "boolean" ? { codexClientEphemeral } : {}),
             ...(codexInternalThread ? { codexInternalThread } : {}),
             ...(codexHookState.turnId ? { turnId: codexHookState.turnId } : {}),
             ...(codexHookState.turnId ? { recapDedupeId: codexHookState.turnId } : {}),

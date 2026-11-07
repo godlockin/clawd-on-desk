@@ -45,12 +45,19 @@ function readApprovalRecord(buffer, start, end) {
   return JSON.parse(buffer.subarray(start, end).toString("utf8"));
 }
 
+// Wire-level source classification, not authentication: a local sender that
+// includes `host` looks remote here too, exactly like the pre-existing
+// Bash/apply_patch routing. Remote SSH identity still comes from ingress.
+function isNonlocalCodexRequest(data) {
+  return !!(data && (data.host || data.wsl_distro || data.wsl_sourced === true));
+}
+
 // The transcript is advisory evidence for shell/file approval only. MCP and
 // app invocations can override the turn's reviewer; they always stay native.
 // Unknown evidence delegates without deciding, so detection cannot grant access.
 function resolveCodexApprovalRoute(data = {}, options = {}) {
   if (!HUMAN_TOOLS.has(data.tool_name)) return delegate("request-reviewer-unavailable");
-  if (data.host || data.wsl_distro || data.wsl_sourced === true) return delegate("nonlocal");
+  if (isNonlocalCodexRequest(data)) return delegate("nonlocal");
   if (data.permission_mode !== "default") return delegate("noninteractive-or-unknown-mode");
   const session = typeof data.session_id === "string"
     ? data.session_id.replace(/^codex:/, "") : "";
@@ -63,10 +70,13 @@ function resolveCodexApprovalRoute(data = {}, options = {}) {
   try {
     const configuredHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
     if (!path.isAbsolute(configuredHome)) return delegate("nonabsolute-codex-home");
-    const home = fs.realpathSync(configuredHome);
-    const file = fs.realpathSync(data.transcript_path);
+    // Windows Codex supplies \\?\ paths. Node's JS realpath walker can
+    // fail on their drive root (EISDIR on "C:"); the native API resolves the
+    // same file/junction identity without weakening the containment checks.
+    const home = fs.realpathSync.native(configuredHome);
+    const file = fs.realpathSync.native(data.transcript_path);
     const roots = ["sessions", "archived_sessions"].flatMap((name) => {
-      try { return [fs.realpathSync(path.join(home, name))]; } catch { return []; }
+      try { return [fs.realpathSync.native(path.join(home, name))]; } catch { return []; }
     });
     if (!roots.some((root) => inside(root, file))) return delegate("foreign-transcript");
     fd = fs.openSync(file, "r");
@@ -154,4 +164,4 @@ function resolveCodexApprovalRoute(data = {}, options = {}) {
   }
 }
 
-module.exports = { resolveCodexApprovalRoute };
+module.exports = { isNonlocalCodexRequest, resolveCodexApprovalRoute };

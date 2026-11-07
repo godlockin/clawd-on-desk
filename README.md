@@ -40,7 +40,7 @@ Download the latest installer from **[GitHub Releases](https://github.com/ruller
 |---|---|
 | Windows | `Clawd-on-Desk-Setup-<version>-x64.exe` or `-arm64.exe` |
 | macOS | `.dmg`, or `brew install --cask clawd-on-desk` |
-| Linux | `.AppImage` or `.deb` (Homebrew also works on x86_64) |
+| Linux | `.AppImage` (in-app updates), or `.deb` with [APT setup / migration](docs/guides/apt-setup.md) (Homebrew also works on x86_64) |
 
 Launch Clawd and it starts reacting right away: Claude Code and Codex are connected on first launch. Every other agent is one click away in **Settings → AI Coding Tools**.
 
@@ -68,7 +68,7 @@ Prerequisites, Remote SSH, WSL, and macOS / Linux notes: **[setup guide](docs/gu
 
 ## Supported Agents
 
-> **Claude Code** · **Codex CLI** · **Copilot CLI** · **Gemini CLI** · **Antigravity CLI (agy)** · **Cursor Agent** · **CodeBuddy** · **WorkBuddy** · **Grok Build** · **Kiro CLI** · **KiroCrew** · **Kimi Code CLI (Kimi-CLI)** · **Qwen Code** · **ZCode** · **CodeWhale** · **opencode** · **MiMo Code** · **Pi** · **OMP** · **OpenClaw** · **Hermes Agent** · **Qoder** · **QoderWork** · **QwenWork (千问办公)** · **Reasonix CLI** · **DeepSeek Harness** · **TraeCode (Trae CN)** · **MiniMax Code**
+> **Claude Code** · **Codex CLI** · **Copilot CLI** · **Gemini CLI** · **Antigravity CLI (agy)** · **Cursor Agent** · **CodeBuddy** · **WorkBuddy** · **Grok Build** · **Kiro CLI** · **KiroCrew** · **Kiro IDE** · **Kimi Code CLI (Kimi-CLI)** · **Qwen Code** · **ZCode** · **CodeWhale** · **opencode** · **MiMo Code** · **Pi** · **OMP** · **OpenClaw** · **Hermes Agent** · **Qoder** · **QoderWork** · **QwenWork (千问办公)** · **Reasonix CLI** · **DeepSeek Harness** · **TraeCode (Trae CN)** · **MiniMax Code**
 
 Claude Code and Codex CLI are set up on first launch; install any other integration from **Settings → AI Coding Tools** and Clawd keeps it synced. Other local tools can report through the [custom HTTP agent](docs/guides/custom-agent-http.md) endpoint. Per-agent details are in **[supported agents](docs/guides/supported-agents.md)**, and gaps such as agents without permission bubbles are in **[known limitations](docs/guides/known-limitations.md)**.
 
@@ -119,6 +119,7 @@ Community tool: [Live2Pet](https://github.com/receyuki/live2pet) by @receyuki tu
 | [Custom HTTP agents](docs/guides/custom-agent-http.md) | Connect a tool Clawd doesn't integrate with yet |
 | [Known limitations](docs/guides/known-limitations.md) | Per-agent feature gaps |
 | [Theme creation](docs/guides/guide-theme-creation.md) | Build and validate your own theme |
+| [Contributing themes](docs/guides/contributing-themes.md) | Submissions, licenses, catalog review, and updates |
 
 ## Community
 
