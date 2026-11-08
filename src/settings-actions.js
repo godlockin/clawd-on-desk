@@ -122,6 +122,11 @@ const {
   repairAgentIntegration,
 } = require("./settings-actions-agents");
 const {
+  addClaudeConfigDir,
+  removeClaudeConfigDir,
+  setClaudeConfigDirLabel,
+} = require("./settings-actions-claude-config-dirs");
+const {
   ANIMATION_OVERRIDES_EXPORT_VERSION,
   ONESHOT_OVERRIDE_STATES,
   importAnimationOverrides,
@@ -139,6 +144,7 @@ const {
   manageClaudeHooksAutomatically,
   openAtLogin,
   repairLocalServer,
+  restartClawd,
   uninstallHooks,
 } = require("./settings-actions-system");
 const {
@@ -208,6 +214,7 @@ const MANAGED_CLEANUP_AGENT_IDS = Object.freeze([
   "grok-build",
   "kiro-cli",
   "kirocrew",
+  "kiro-desktop",
   "kimi-cli",
   "qwen-code",
   "zcode",
@@ -336,6 +343,8 @@ const updateRegistry = {
   flashTaskbarOnComplete: requireBoolean("flashTaskbarOnComplete"),
   flashIntervalMs: requireNumberInRange("flashIntervalMs", 200, 2000),
   flashDurationMs: requireNumberInRange("flashDurationMs", 0, 60000),
+  claudeTurnAskReminder: requireBoolean("claudeTurnAskReminder"),
+  claudeTurnAskReminderMinutes: requireIntegerInRange("claudeTurnAskReminderMinutes", 1, 120),
   testReactionsEnabled: requireBoolean("testReactionsEnabled"),
   codexHookHealthNotifyEnabled: requireBoolean("codexHookHealthNotifyEnabled"),
   codexHookHealthLastNotified: requireString("codexHookHealthLastNotified", { allowEmpty: true }),
@@ -426,6 +435,8 @@ const updateRegistry = {
   sessionHudShowStateLabels: requireBoolean("sessionHudShowStateLabels"),
   sessionHudShowElapsed: requireBoolean("sessionHudShowElapsed"),
   sessionHudShowContextUsage: requireBoolean("sessionHudShowContextUsage"),
+  sessionHudHideCompletedCodexEphemeral: requireBoolean("sessionHudHideCompletedCodexEphemeral"),
+  sessionHudHideActiveCodexEphemeral: requireBoolean("sessionHudHideActiveCodexEphemeral"),
   sessionHudShowQuota: requireBoolean("sessionHudShowQuota"),
   quotaRingDisplayMode: requireEnum("quotaRingDisplayMode", ["used", "remaining"]),
   quotaAlertsEnabled: requireBoolean("quotaAlertsEnabled"),
@@ -575,8 +586,25 @@ const updateRegistry = {
   detachedIdleStaleMs: requireIntegerInRange("detachedIdleStaleMs", 5_000, 300_000),
   allowEdgePinning: requireBoolean("allowEdgePinning"),
   disableMiniMode: requireBoolean("disableMiniMode"),
-  freeRoam: requireBoolean("freeRoam"),
+  eyeTrackingEnabled: requireBoolean("eyeTrackingEnabled"),
+  freeRoam(value, deps = {}) {
+    const base = requireBoolean("freeRoam")(value);
+    if (base.status !== "ok") return base;
+    if (value && deps.snapshot && deps.snapshot.idleActivities === true) {
+      return { status: "error", message: "freeRoam and idleActivities are mutually exclusive; use setIdleBehavior to switch." };
+    }
+    return { status: "ok" };
+  },
   roamConstrainAxis: requireBoolean("roamConstrainAxis"),
+  idleActivities(value, deps = {}) {
+    const base = requireBoolean("idleActivities")(value);
+    if (base.status !== "ok") return base;
+    if (value && deps.snapshot && deps.snapshot.freeRoam === true) {
+      return { status: "error", message: "freeRoam and idleActivities are mutually exclusive; use setIdleBehavior to switch." };
+    }
+    return { status: "ok" };
+  },
+  idleActivityFrequency: requireEnum("idleActivityFrequency", ["low", "medium", "high"]),
   keepSizeAcrossDisplays: {
     validate: requireBoolean("keepSizeAcrossDisplays"),
     effect(value, deps = {}) {
@@ -590,6 +618,8 @@ const updateRegistry = {
   },
   fullscreenOverlay: requireBoolean("fullscreenOverlay"),
   fullscreenAutoHide: requireBoolean("fullscreenAutoHide"),
+  petAlwaysOnTop: requireBoolean("petAlwaysOnTop"),
+  disableHardwareAcceleration: requireBoolean("disableHardwareAcceleration"),
   mobilePreviewEnabled: {
     validate: requireBoolean("mobilePreviewEnabled"),
     lockKey: "mobilePreview",
@@ -970,7 +1000,7 @@ function setMobilePermissionPreviewEnabled(payload, deps = {}) {
 
   const snapshot = deps.snapshot || {};
   if (snapshot.mobilePermissionPreviewEnabled === enabled) {
-    // Check before rotating so a double click cannot invalidate the token twice.
+    // Check before resetting so a double click cannot revoke access twice.
     return { status: "ok", noop: true };
   }
   if (!enabled) {
@@ -996,7 +1026,10 @@ function setMobilePermissionPreviewEnabled(payload, deps = {}) {
     // Reset is deliberately before the Settings commit: a reset failure must
     // leave disclosure disabled. The controller preserves these phase fields
     // if the later preference persistence fails.
-    deps.resetMobileAccess();
+    try { deps.resetMobileAccess(); }
+    catch (err) {
+      return { status: "error", message: err.message, partialReset: err.legacyRevoked === true };
+    }
     return {
       status: "ok",
       tokenReset: true,
@@ -1007,7 +1040,7 @@ function setMobilePermissionPreviewEnabled(payload, deps = {}) {
   if (typeof deps.disconnectMobilePreviewClients !== "function") {
     return { status: "error", message: "mobile client reconnect is unavailable" };
   }
-  // Keeping the token authorizes all existing holders, but currently-open
+  // Keeping access authorizes paired devices and legacy holders; currently-open
   // sockets must still cross an explicit reconnect boundary before the broader
   // projection can begin flowing.
   deps.disconnectMobilePreviewClients();
@@ -1019,23 +1052,54 @@ function setMobilePermissionPreviewEnabled(payload, deps = {}) {
   };
 }
 
-function regenerateMobileToken(_payload, deps = {}) {
-  if (typeof deps.regenerateMobileToken !== "function") {
-    return { status: "error", message: "mobile token regeneration is unavailable" };
+function refreshMobilePairCode(_payload, deps = {}) {
+  if (typeof deps.refreshMobilePairCode !== "function") {
+    return { status: "error", message: "mobile pairing is unavailable" };
   }
-  return { status: "ok", token: deps.regenerateMobileToken() };
+  try { deps.refreshMobilePairCode(); return { status: "ok" }; }
+  catch (err) { return { status: "error", message: err.message }; }
 }
 
 function resetMobileAccess(_payload, deps = {}) {
   if (typeof deps.resetMobileAccess !== "function") {
     return { status: "error", message: "mobile access reset is unavailable" };
   }
-  return { status: "ok", token: deps.resetMobileAccess() };
+  try { deps.resetMobileAccess(); return { status: "ok" }; }
+  catch (err) { return { status: "error", message: err.message, partialReset: err.legacyRevoked === true }; }
+}
+
+function revokeMobileDevice(payload, deps = {}) {
+  if (!payload || typeof payload.id !== "string" || payload.id.length !== 18 || !/^d_[a-f0-9]{16}$/.test(payload.id)) {
+    return { status: "error", message: "Invalid mobile device ID" };
+  }
+  if (typeof deps.revokeMobileDevice !== "function") {
+    return { status: "error", message: "mobile device revocation is unavailable" };
+  }
+  try {
+    const result = deps.revokeMobileDevice(payload.id);
+    return { status: "ok", mayHoldLegacy: result.mayHoldLegacy === true };
+  } catch (err) {
+    return { status: "error", message: err.message };
+  }
+}
+
+function revokeMobileLegacy(_payload, deps = {}) {
+  if (typeof deps.revokeMobileLegacy !== "function") {
+    return { status: "error", message: "mobile legacy revocation is unavailable" };
+  }
+  try {
+    deps.revokeMobileLegacy();
+    return { status: "ok" };
+  } catch (err) {
+    return { status: "error", message: err.message, partialRevoke: err.legacyRevoked === true };
+  }
 }
 
 setMobilePermissionPreviewEnabled.lockKey = "mobilePreview";
-regenerateMobileToken.lockKey = "mobilePreview";
+refreshMobilePairCode.lockKey = "mobilePreview";
 resetMobileAccess.lockKey = "mobilePreview";
+revokeMobileDevice.lockKey = "mobilePreview";
+revokeMobileLegacy.lockKey = "mobilePreview";
 
 function setBubbleCategoryEnabled(payload, deps) {
   if (!payload || typeof payload !== "object") {
@@ -1376,6 +1440,19 @@ function setThemeSelection(payload, deps) {
   };
 }
 
+function setIdleBehavior(payload, deps = {}) {
+  const mode = typeof payload === "string" ? payload : payload && payload.mode;
+  if (!["none", "roam", "activities"].includes(mode)) {
+    return { status: "error", message: "setIdleBehavior.mode must be none, roam, or activities" };
+  }
+  const commit = { freeRoam: mode === "roam", idleActivities: mode === "activities" };
+  const snapshot = deps.snapshot || {};
+  if (snapshot.freeRoam === commit.freeRoam && snapshot.idleActivities === commit.idleActivities) {
+    return { status: "ok", noop: true };
+  }
+  return { status: "ok", commit };
+}
+
 // #509: default idle visual picker.
 //   payload: { themeId: string, file: string|null }  (null = back to theme default)
 // Validates against the LOADED active theme (only it knows the real file list
@@ -1519,6 +1596,7 @@ const REMOTE_SSH_TRUSTED_PROFILE_FIELDS = Object.freeze([
   "isolatedRuntime",
 ]);
 const REMOTE_SSH_DEPLOYMENT_METADATA_FIELDS = Object.freeze([
+  "remotePlatform",
   "lastDeployedAt",
   "managedDeployTargets",
   "detectedRemoteNodeBin",
@@ -1540,10 +1618,10 @@ function preserveTrustedRemoteProfileFields(target, source) {
   }
 }
 
-function normalizeRemoteNodeDetection(input, detectedAtFallback = Date.now()) {
+function normalizeRemoteNodeDetection(input, detectedAtFallback = Date.now(), remotePlatform = "posix") {
   if (!input || typeof input !== "object") return null;
   const nodeBin = input.nodeBin || input.detectedRemoteNodeBin;
-  if (!isValidDetectedRemoteNodeBin(nodeBin)) return null;
+  if (!isValidDetectedRemoteNodeBin(nodeBin, remotePlatform)) return null;
 
   const out = {
     detectedRemoteNodeBin: nodeBin,
@@ -1566,7 +1644,7 @@ function normalizeRemoteNodeDetection(input, detectedAtFallback = Date.now()) {
 }
 
 function copyRemoteNodeDetection(target, source) {
-  if (!target || !source || !isValidDetectedRemoteNodeBin(source.detectedRemoteNodeBin)) return;
+  if (!target || !source || !isValidDetectedRemoteNodeBin(source.detectedRemoteNodeBin, target.remotePlatform || "posix")) return;
   target.detectedRemoteNodeBin = source.detectedRemoteNodeBin;
   if (isValidDetectedRemoteNodeVersion(source.detectedRemoteNodeVersion)) {
     target.detectedRemoteNodeVersion = source.detectedRemoteNodeVersion;
@@ -1669,6 +1747,7 @@ function remoteSshUpdateProfile(payload, deps) {
   const managedDeployTargets = normalizeManagedDeployTargets(prev.managedDeployTargets);
   if (managedDeployTargets.length) profile.managedDeployTargets = managedDeployTargets;
   if (drift === null) {
+    if (prev.remotePlatform !== undefined) profile.remotePlatform = prev.remotePlatform;
     if (Number.isFinite(prev.lastDeployedAt)) {
       profile.lastDeployedAt = prev.lastDeployedAt;
     }
@@ -1706,13 +1785,39 @@ function remoteSshBeginIdentityRotation(payload, deps) {
   const idx = next.profiles.findIndex((profile) => profile.id === id);
   if (idx === -1) return { status: "error", message: "remoteSsh.beginIdentityRotation: profile not found" };
   const current = next.profiles[idx];
+  const remotePlatform = payload.remotePlatform || "posix";
+  if (payload.expectedTarget && (
+    deployTargetDrift(deployTargetFingerprint(current), deployTargetFingerprint(payload.expectedTarget))
+    || (current.sshTransportMode || "auto") !== (payload.expectedTarget.sshTransportMode || "auto")
+  )) {
+    return { status: "error", reason: "profile_changed", message: "SSH target changed during platform discovery; retry deployment." };
+  }
+  if (remotePlatform !== "posix" && remotePlatform !== "win32") {
+    return { status: "error", message: "remoteSsh.beginIdentityRotation: invalid remote platform" };
+  }
   if (current.identityTxn && current.identityTxn.phase !== "committed") {
+    if ((current.identityTxn.remotePlatform || "posix") !== remotePlatform) {
+      if (Object.values(current.identityTxn.steps || {}).some((step) => step.status === "done" || step.status === "failed")) {
+        return { status: "error", reason: "identity_txn_platform_mismatch", message: "The pending identity transaction belongs to another remote platform; resolve it before deploying." };
+      }
+      const previousTxn = current.identityTxn;
+      // A platform retry continues the original rotation and its grace period.
+      // A null source stays revoked; the 1ms expiry is only a schema placeholder.
+      const txn = createIdentityTxn({ ...current, identityTxn: null, routingNonce: previousTxn.fromNonce }, {
+        remotePlatform,
+        now: () => previousTxn.startedAt,
+        previousNonceTtlMs: 1,
+      });
+      if (previousTxn.fromNonce) txn.previousExpiresAt = previousTxn.previousExpiresAt;
+      next.profiles[idx] = { ...current, identityTxn: txn };
+      return { status: "ok", commit: { remoteSsh: next }, identityTxn: txn };
+    }
     return { status: "ok", noop: true, identityTxn: current.identityTxn };
   }
   // Randomness and time sources are main-process authority. Never accept
   // renderer-supplied options here, even though the IPC boundary also blocks
   // this internal command.
-  const txn = createIdentityTxn(current);
+  const txn = createIdentityTxn(current, { remotePlatform });
   next.profiles[idx] = { ...current, identityTxn: txn };
   return { status: "ok", commit: { remoteSsh: next }, identityTxn: txn };
 }
@@ -1775,6 +1880,9 @@ function remoteSshBeginRuntimeModeSwitch(payload, deps) {
     return { status: "error", message: "remoteSsh.beginRuntimeModeSwitch.runtimeMode is invalid" };
   }
   const current = next.profiles[idx];
+  if (current.remotePlatform === "win32" && runtimeMode === REMOTE_RUNTIME_MODE_PROFILE_ISOLATED) {
+    return { status: "error", reason: "windows_profile_isolated_unsupported" };
+  }
   if (current.identityTxn && current.identityTxn.phase !== "committed") {
     return {
       status: "error",
@@ -1934,12 +2042,17 @@ function remoteSshMarkDeployed(payload, deps) {
     return { status: "ok", noop: true, reason: "profile_deleted" };
   }
   const current = next.profiles[idx];
-  const remoteNode = normalizeRemoteNodeDetection(payload.remoteNode || payload, deployedAt);
+  const remotePlatform = payload.remotePlatform || "posix";
+  if (remotePlatform !== "posix" && remotePlatform !== "win32") {
+    return { status: "error", message: "remoteSsh.markDeployed: invalid remote platform" };
+  }
+  const remoteNode = normalizeRemoteNodeDetection(payload.remoteNode || payload, deployedAt, remotePlatform);
   const targetAtDeployStart = expectedTarget && typeof expectedTarget === "object"
     ? expectedTarget
     : current;
   const ownedTarget = sanitizeManagedDeployTarget({
     ...deployTargetFingerprint(targetAtDeployStart),
+    ...(payload.remotePlatform !== undefined ? { remotePlatform } : {}),
     ...(payload.sshTransportHint ? { sshTransportHint: payload.sshTransportHint } : {}),
     ...(remoteNode || {}),
     ...(isValidInstallId(payload.installId) && typeof payload.remoteHome === "string"
@@ -1988,6 +2101,7 @@ function remoteSshMarkDeployed(payload, deps) {
   // survive.
   const updatedProfile = {
     ...current,
+    ...(payload.remotePlatform !== undefined ? { remotePlatform } : {}),
     lastDeployedAt: deployedAt,
     managedDeployTargets: ownedTargets,
   };
@@ -2027,16 +2141,16 @@ function remoteSshMarkRemoteNode(payload, deps) {
   if (typeof id !== "string" || !id) {
     return { status: "error", message: "remoteSsh.markRemoteNode.id must be a non-empty string" };
   }
-  const remoteNode = normalizeRemoteNodeDetection(payload);
-  if (!remoteNode) {
-    return { status: "error", message: "remoteSsh.markRemoteNode.nodeBin must be an absolute POSIX path" };
-  }
   const next = _remoteSshSnapshot(deps);
   const idx = next.profiles.findIndex((p) => p.id === id);
+  const current = idx === -1 ? null : next.profiles[idx];
+  const remoteNode = normalizeRemoteNodeDetection(payload, Date.now(), (current && current.remotePlatform) || "posix");
+  if (!remoteNode) {
+    return { status: "error", message: `remoteSsh.markRemoteNode.nodeBin must be an absolute ${current && current.remotePlatform === "win32" ? "Windows" : "POSIX"} path` };
+  }
   if (idx === -1) {
     return { status: "ok", noop: true, reason: "profile_deleted" };
   }
-  const current = next.profiles[idx];
   if (expectedTarget && typeof expectedTarget === "object") {
     const drift = deployTargetDrift(
       deployTargetFingerprint(current),
@@ -2744,10 +2858,14 @@ const commandRegistry = {
   removeCustomApplication,
   repairAgentIntegration,
   setAgentCustomDiscoveryPaths,
+  addClaudeConfigDir,
+  removeClaudeConfigDir,
+  setClaudeConfigDirLabel,
   setAgentCustomPermissionUrl,
   uninstallAgentIntegration,
   repairLocalServer,
   repairDoctorIssue,
+  restartClawd,
   resizePet,
   registerShortcut,
   resetShortcut,
@@ -2758,8 +2876,10 @@ const commandRegistry = {
   setKimiQuotaCollectionEnabled,
   setPermissionAutomationMode,
   setMobilePermissionPreviewEnabled,
-  "mobilePreview.regenerateToken": regenerateMobileToken,
+  "mobilePreview.refreshPairCode": refreshMobilePairCode,
   "mobilePreview.resetAccess": resetMobileAccess,
+  "mobilePreview.revokeDevice": revokeMobileDevice,
+  "mobilePreview.revokeLegacy": revokeMobileLegacy,
   setBubbleCategoryEnabled,
   "sessionCleanup.setTriple": setSessionCleanupTriple,
   setSessionAlias,
@@ -2772,6 +2892,7 @@ const commandRegistry = {
   setWideHitboxOverride,
   setThemeSelection,
   setIdleVisual,
+  setIdleBehavior,
   "officialTheme.commitInstall": officialThemeCommitInstall,
   "officialTheme.uninstall": officialThemeUninstall,
   "remoteSsh.add": remoteSshAddProfile,
