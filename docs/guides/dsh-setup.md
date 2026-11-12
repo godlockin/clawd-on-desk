@@ -89,9 +89,12 @@ session.
 | turn ended | `Stop` / `attention` (or `StopFailure` / `error`) |
 | session disposed | `SessionEnd` / `sleeping` |
 
-DSH's `session/title` event supplies the Session HUD and Dashboard title. When
-the public session projection service is present, the plugin also follows
-`contextPressure` changes and reads its current value when a session is
+DSH's `session/title` event supplies the Session HUD and Dashboard title, and
+the plugin also re-reads the folded `title` projection on every lifecycle event
+it reports. A title set or renamed while Clawd was not listening therefore
+arrives with the next event instead of leaving the row on the workspace folder
+name. When the public session projection service is present, the plugin also
+follows `contextPressure` changes and reads its current value when a session is
 created. Clawd displays the same reference occupancy as DSH's ContextMeter:
 `(projectedTokens ?? pressureTokens) / contextWindow`, rounded and capped at
 100%. It appears only after DSH has reported both usage and model capacity.
@@ -100,6 +103,20 @@ model switch. Projection updates annotate an existing Clawd session without
 creating a card or changing its activity time. If DSH no longer reports both
 operands, Clawd clears the old percentage instead of displaying a stale one.
 The standard completion bell appears when a finished DSH session is unread.
+
+Clicking a DSH session can also switch the conversation, not just raise the
+window. The bridge ships a browser half (`lib/client.js`, declared through
+`exports["./client"]` and `dsh.client`) that runs inside the DSH page, because
+only page-side code can call the public client service
+`uiWorkspace.openSession()`. Clawd publishes the clicked session id on a loopback
+SSE endpoint (`GET /dsh/focus-stream`) and opens `dsh://open`; the page half
+subscribes, switches, and the window then arrives already on that conversation.
+The id is the bridge's own session id with the `deepseek-harness:` namespace
+removed. Everything degrades: an older DSH that never loads the browser half, a
+page that cannot reach Clawd, or a session deleted in the meantime all leave the
+click as a plain window focus. The stream accepts only a `dsh web` loopback page
+or the desktop app's `dsh-app://app` window; it grants no other origin CORS and
+carries no permission or write authority.
 
 The quota coin is separate account telemetry. DSH does not currently expose
 a five-hour usage bucket through this plugin's public session APIs, so Clawd
@@ -140,8 +157,8 @@ For the DeepSeek Harness desktop app (macOS, Windows):
 
 - macOS: DeepSeek Harness installed in `/Applications` or `~/Applications`.
 - Windows: a per-user install found through the `HKCU` uninstall entry (display
-  name starting with "DeepSeek Harness ") or
-  `%LOCALAPPDATA%\Programs\DeepSeek Harness`.
+  name "DeepSeek Harness" since 0.2.2-alpha.2, "DeepSeek Harness <version>"
+  before that) or `%LOCALAPPDATA%\Programs\DeepSeek Harness`.
 - Windows 11: run Clawd without elevation (not as administrator). An elevated
   process cannot traverse a junction that a non-admin process created, so an
   elevated Clawd may read a plugin installed without elevation as missing. This
@@ -280,7 +297,7 @@ leftover link before it adds the plugin again. Startup sync only reports
 
 ## Uninstall and ownership safety
 
-Use Settings → AI Coding Tools → Uninstall, or:
+Use Settings → AI Coding Tools → expand DeepSeek Harness → Disconnect… → Uninstall, or:
 
 ```bash
 npm run uninstall:dsh
