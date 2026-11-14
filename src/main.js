@@ -123,12 +123,14 @@ const {
   selectSessionAutomationDialogParent,
 } = require("./session-automation-dialog-parent");
 const { createSessionFolderOpener } = require("./session-open-folder");
+const { createOpencodeSessionAttacher } = require("./opencode-session-attach");
 const { isTrustedMainFrameEvent, registerPetInteractionIpc } = require("./pet-interaction-ipc");
 const { createSystemWakeRecovery } = require("./system-wake-recovery");
 const { formatLocalTimestamp } = require("./log-timestamp");
 const { launchClaudeSession, openTerminalAt } = require("./launch-claude");
 const { dialog: electronDialog } = require("electron");
 const initPermission = require("./permission");
+const { createClaudeTurnAskReminder, reminderDelayMsFromMinutes } = require("./claude-turn-ask-reminder");
 const { isPassiveNotifyEntry } = require("./passive-notify-entry");
 const { registerPermissionIpc } = initPermission;
 const telegramApprovalSettings = require("./telegram-approval-settings");
@@ -203,8 +205,10 @@ const createMacHideController = require("./mac-hide");
 const {
   getFocusableLocalHudSessionIds: selectFocusableLocalHudSessionIds,
   getSessionFocusTarget,
+  mergeSessionFocusEntry,
 } = require("./session-focus");
 const { focusCodexThreadTarget, focusDshDesktopTarget } = require("./session-focus-handoff");
+const { publishDshFocus } = require("./dsh-focus-stream");
 const { isSessionInProgress } = require("./state-session-snapshot");
 const { restoreSessionsFromRecoveryLeases } = require("./session-recovery-loader");
 const { createSessionHistoryRuntime } = require("./session-history-runtime");
@@ -237,14 +241,20 @@ if (isWin) {
   }
 }
 
-// ── Windows: foreground-fullscreen probe (suppress topmost over games) ──
-// Best-effort; degrades to "never fullscreen" if koffi/user32 is unavailable,
-// so a broken probe can never hide the pet.
+// ── Foreground fullscreen: Windows windows / macOS active native Space ──
+// #1275: both probes degrade to "never fullscreen" if native loading fails,
+// so a broken probe cannot hide the pet.
 const { createForegroundFullscreenProbe } = require("./win-fullscreen-detect");
-const _isForegroundFullscreen = createForegroundFullscreenProbe({
-  isWin,
-  onError: (err) => console.warn("Clawd: win-fullscreen-detect not available:", err && err.message),
-});
+const { createMacFullscreenProbe } = require("./mac-fullscreen-detect");
+const _isForegroundFullscreen = isMac
+  ? createMacFullscreenProbe({
+    isMac,
+    onError: (err) => console.warn("Clawd: mac-fullscreen-detect not available:", err && err.message),
+  })
+  : createForegroundFullscreenProbe({
+    isWin,
+    onError: (err) => console.warn("Clawd: win-fullscreen-detect not available:", err && err.message),
+  });
 const _hitWindowActivationRuntime = createHitWindowActivationRuntime({
   isWin,
   getHitWindow: () => hitWin,
@@ -350,6 +360,7 @@ const {
 } = require("./bubble-policy");
 const loginItemHelpers = require("./login-item");
 const { writeCodexAutoStartGate } = require("../hooks/server-config");
+const { effectiveClaudeConfigDirs, claudeConfigDirKey } = require("../hooks/claude-config-dirs");
 const { createCodexAutoStartGateEvaluator } = require("./agent-gate");
 const PREFS_PATH = path.join(app.getPath("userData"), "clawd-prefs.json");
 const _initialPrefsLoad = prefsModule.load(PREFS_PATH);
@@ -358,6 +369,15 @@ const _initialPrefsLoad = prefsModule.load(PREFS_PATH);
 // process, and a backup failure locks persistence as well. Runtime gates stay
 // closed until restart in either case.
 const _initialPrefsRecovered = _initialPrefsLoad.recovered === true;
+// #1183: must run before app ready, so it reads the startup snapshot directly
+// instead of waiting for the settings controller. Kept as a constant so
+// Settings can tell when the saved switch no longer matches this process.
+const _hardwareAccelerationDisabledAtStartup = isWin
+  && !!_initialPrefsLoad.snapshot
+  && _initialPrefsLoad.snapshot.disableHardwareAcceleration === true;
+if (_hardwareAccelerationDisabledAtStartup) {
+  app.disableHardwareAcceleration();
+}
 const _initialPrefsRecoveryBackupFailed = _initialPrefsLoad.recoveryBackupFailed === true;
 const _recapStartupAuthorityLost = (
   _initialPrefsLoad.locked === true
@@ -446,6 +466,12 @@ function _getAgentIntegrationOptions(agentId) {
   return options;
 }
 
+function _getClaudeConfigDirEntries() {
+  const agents = _settingsController && _settingsController.get("agents");
+  const entry = agents && agents["claude-code"];
+  return entry && Array.isArray(entry.configDirs) ? entry.configDirs : [];
+}
+
 function _resolveAgentDisplayName(agentId) {
   return resolveAgentDisplayName(agentId, _settingsController.get("customApplications"));
 }
@@ -463,8 +489,9 @@ let _restartScheduled = false;
 function _restartClawdNow() {
   if (_restartScheduled) return;
   _restartScheduled = true;
-  // Triggered by Doctor's restart-clawd repair. relaunch() queues a fresh
-  // process; quit() then follows the normal shutdown path so before-quit
+  // Triggered by Doctor's restart-clawd repair and by the restartClawd command
+  // behind the #1183 GPU switch. relaunch() queues a fresh process; quit()
+  // then follows the normal shutdown path so before-quit
   // still flushes prefs and cleans up server/monitor resources.
   // setImmediate so the IPC reply for repairDoctorIssue lands in the
   // renderer before the main process starts closing windows.
@@ -477,6 +504,7 @@ function _restartClawdNow() {
 
 let shortcutRuntime = null;
 let themeRuntime = null;
+let systemThemeAppearanceHandler = null;
 // Official downloadable theme owner (created after the settings controller).
 let officialThemeMain = null;
 let agentRuntime = null;
@@ -546,10 +574,12 @@ const _settingsController = createSettingsController({
       },
     }),
     uninstallClaudeHooksNow: _uninstallClaudeHooksNow,
+    installClaudeConfigDir: (dir) => _server.installClaudeConfigDir(dir),
+    uninstallClaudeConfigDir: (dir) => _server.uninstallClaudeConfigDir(dir),
     startClaudeSettingsWatcher: () => _server.startClaudeSettingsWatcher(),
     stopClaudeSettingsWatcher: () => _server.stopClaudeSettingsWatcher(),
     setOpenAtLogin: _writeSystemOpenAtLogin,
-    startMonitorForAgent: (id) => agentRuntime && agentRuntime.startMonitorForAgent(id),
+    startMonitorForAgent: (id, intent) => agentRuntime && agentRuntime.startMonitorForAgent(id, intent),
     stopMonitorForAgent: (id) => agentRuntime && agentRuntime.stopMonitorForAgent(id),
     syncIntegrationForAgent: (id, options) =>
       agentRuntime ? agentRuntime.syncIntegrationForAgent(id, options) : false,
@@ -560,7 +590,8 @@ const _settingsController = createSettingsController({
     writeCodexAutoStartGate: _persistCodexAutoStartGate,
     deployHooksToWsl: async (distro, agentId) => {
       const { deployToWsl } = require("./wsl-deploy");
-      return deployToWsl(distro, { agentId, isPackaged: app.isPackaged, resourcesPath: process.resourcesPath });
+      return deployToWsl(distro, { agentId, isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
+        localServerPort: _server.getRuntimeStatus().port });
     },
     removeHooksFromWsl: async (distro, agentId) => {
       const { removeFromWsl } = require("./wsl-deploy");
@@ -582,7 +613,12 @@ const _settingsController = createSettingsController({
     clearSessionsByAgent: (id) => agentRuntime ? agentRuntime.clearSessionsByAgent(id) : 0,
     clearSessionAutomationByAgent: (id) =>
       sessionAutomationCoordinator ? sessionAutomationCoordinator.clearAgent(id) : [],
-    dismissPermissionsByAgent: (id, options) => agentRuntime ? agentRuntime.dismissPermissionsByAgent(id, options) : 0,
+    dismissPermissionsByAgent: (id, options) => {
+      if (id === "codex" && !(options && options.subagentOnly) && _codexRemoteFallbackNotice) {
+        _codexRemoteFallbackNotice.clearAll("codex-permissions-disabled");
+      }
+      return agentRuntime ? agentRuntime.dismissPermissionsByAgent(id, options) : 0;
+    },
     clearRecentHookEvents: (id) => _server.clearRecentHookEvents(id),
     identifyCustomApplication: (sourcePath) => require("./custom-applications").identifyCustomApplication(sourcePath),
     resizePet: _deferredResizePet,
@@ -602,8 +638,10 @@ const _settingsController = createSettingsController({
     getFeishuApprovalStatus: () => getFeishuApprovalStatus(),
     getFeishuApprovalSecretInfo: () => getFeishuApprovalSecretInfo(),
     sendFeishuApprovalTest: (persisted) => sendFeishuApprovalTest(persisted),
-    regenerateMobileToken: () => ensureMobilePreviewServer().regenerateToken(),
     resetMobileAccess: () => ensureMobilePreviewServer().resetMobileAccess(),
+    refreshMobilePairCode: () => ensureMobilePreviewServer().refreshPairCode(),
+    revokeMobileDevice: (id) => ensureMobilePreviewServer().revokeDevice(id),
+    revokeMobileLegacy: () => ensureMobilePreviewServer().revokeLegacy(),
     disconnectMobilePreviewClients: () => ensureMobilePreviewServer().disconnectClients({
       code: 4001,
       reason: "Permission preview consent changed",
@@ -665,6 +703,21 @@ _settingsController.subscribeKey("agents", (_agents, snapshot) => {
 _settingsController.subscribeKey("autoStartWithCodex", (_enabled, snapshot) => {
   if (_settingsController.isLocked()) return;
   _syncCodexAutoStartGate(snapshot, "settings");
+});
+
+function _claudeConfigDirWatcherKey(agents) {
+  const entries = agents && agents["claude-code"] && agents["claude-code"].configDirs;
+  const dirs = effectiveClaudeConfigDirs(entries).map(({ dir }) => claudeConfigDirKey(dir));
+  return JSON.stringify(dirs.sort());
+}
+let _lastClaudeConfigDirWatcherKey = _claudeConfigDirWatcherKey(_settingsController.get("agents"));
+_settingsController.subscribeKey("agents", (agents) => {
+  if (_settingsController.isLocked()) return;
+  const key = _claudeConfigDirWatcherKey(agents);
+  if (key === _lastClaudeConfigDirWatcherKey) return;
+  // Advance the baseline only after sync succeeds so a failure can be retried.
+  _server.syncClaudeConfigDirWatchers();
+  _lastClaudeConfigDirWatcherKey = key;
 });
 let _remoteSshInstallationIdentity = null;
 let _remoteSshInstallationIdentityPromise = null;
@@ -862,6 +915,7 @@ themeRuntime = createThemeRuntime({
   getMiniRuntime: () => _mini,
   getAnimationOverridesRuntime: () => animationOverridesMain,
   getFadeSequencer: () => themeFadeSequencer,
+  getSystemPrefersDark: () => nativeTheme.shouldUseDarkColors === true,
   getPetWindowBounds,
   applyPetWindowBounds,
   computeFinalDragBounds,
@@ -1059,9 +1113,16 @@ if (codexPetMain.summaryHasActiveOrphan(_startupCodexPetSyncSummary, _requestedT
   );
   codexPetMain.setLastSyncSummary(_startupCodexPetSyncSummary);
 }
+// Theme files can be briefly unreadable on the first launch after an update
+// (#1295, exact trigger unconfirmed): give the startup read a small bounded
+// retry before the fatal "Default theme 'clawd' not found".
+const THEME_STARTUP_READ_ATTEMPTS = 5;
+const THEME_STARTUP_RETRY_DELAYS_MS = [100, 250, 500, 1000];
 const _loadedStartupTheme = themeRuntime.loadInitialTheme(_requestedThemeId, {
   variant: _requestedVariantId,
   overrides: _requestedThemeOverrides,
+  readAttempts: THEME_STARTUP_READ_ATTEMPTS,
+  retryDelaysMs: THEME_STARTUP_RETRY_DELAYS_MS,
 });
 if (_loadedStartupTheme._id !== _requestedThemeId || _loadedStartupTheme._variantId !== _requestedVariantId) {
   const nextVariantMap = { ...(_settingsController.get("themeVariant") || {}) };
@@ -1178,6 +1239,9 @@ const petWindowRuntime = createPetWindowRuntime({
   getCurrentPixelSize: () => getCurrentPixelSize(),
   getEffectiveCurrentPixelSize: (workArea) => getEffectiveCurrentPixelSize(workArea),
   getAllowEdgePinning: () => allowEdgePinningCached,
+  // #1275: gates creation-time and size-preview topmost writes; runtime-level
+  // reassert paths gate themselves inside topmost-runtime.
+  getAlwaysOnTop: () => getPetAlwaysOnTopEffective(),
   getPrimaryWorkAreaSafe: () => getPrimaryWorkAreaSafe(),
   getNearestWorkArea,
   sendToRenderer,
@@ -1191,7 +1255,9 @@ const petWindowRuntime = createPetWindowRuntime({
   showFloatingSurfacesForPet: () => floatingWindowRuntime.showFloatingSurfacesForPet(),
   hideFloatingSurfacesForPet: () => floatingWindowRuntime.hideFloatingSurfacesForPet(),
   setFloatingSurfacesFullscreenSuppressed: (suppressed) => (
-    floatingWindowRuntime.setFullscreenSuppressedForPet(suppressed)
+    floatingWindowRuntime.setFullscreenSuppressedForPet(suppressed, {
+      includePermissionSurfaces: fullscreenAutoHideCached,
+    })
   ),
   // Lazy-bound like isMiniAnimating below — topmostRuntime is constructed
   // after petWindowRuntime, but this closure only fires on a user gesture,
@@ -1376,6 +1442,8 @@ let claudeQuotaCollectionEnabled = _settingsController.get("claudeQuotaCollectio
 let kimiQuotaCollectionEnabled = _settingsController.get("kimiQuotaCollectionEnabled");
 let quotaMergeSources = _settingsController.get("quotaMergeSources");
 let sessionHudCleanupDetached = _settingsController.get("sessionHudCleanupDetached");
+let sessionHudHideCompletedCodexEphemeral = _settingsController.get("sessionHudHideCompletedCodexEphemeral");
+let sessionHudHideActiveCodexEphemeral = _settingsController.get("sessionHudHideActiveCodexEphemeral");
 let sessionHudPinned = _settingsController.get("sessionHudPinned");
 let sessionStaleMs = _settingsController.get("sessionStaleMs");
 let workingStaleMs = _settingsController.get("workingStaleMs");
@@ -1388,9 +1456,16 @@ let keepAwakeWhileWorking = _settingsController.get("keepAwakeWhileWorking");
 let petTint = _settingsController.get("petTint");
 let allowEdgePinningCached = _settingsController.get("allowEdgePinning");
 let disableMiniModeCached = _settingsController.get("disableMiniMode");
+let eyeTrackingEnabledCached = _settingsController.get("eyeTrackingEnabled");
 let keepSizeAcrossDisplaysCached = _settingsController.get("keepSizeAcrossDisplays");
 let fullscreenOverlayCached = _settingsController.get("fullscreenOverlay");
 let fullscreenAutoHideCached = _settingsController.get("fullscreenAutoHide");
+// #1275: master always-on-top preference for the pet body.
+let petAlwaysOnTopCached = _settingsController.get("petAlwaysOnTop");
+const petAlwaysOnTopAtStartup = petAlwaysOnTopCached;
+function getPetAlwaysOnTopEffective() {
+  return isMac ? petAlwaysOnTopAtStartup : petAlwaysOnTopCached;
+}
 let textScale = _settingsController.get("textScale");
 let textScaleByDisplay = _settingsController.get("textScaleByDisplay");
 // Transient slider-drag override for ONE display — the one the settings
@@ -1747,6 +1822,7 @@ function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
   sendToRenderer("pet-tint-change", resolvePetTintPayload(tintId, activeTheme));
   deliverAccessorySlotsSnapshot(activeTheme);
   sendToRenderer("low-power-idle-mode-change", lowPowerIdleMode);
+  sendToRenderer("pet-hidden-change", petWindowRuntime.isPetEffectivelyHidden());
   if (_mini.getMiniMode()) {
     sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
     // mini-clip is a renderer inline style — a renderer/theme reload (and
@@ -1973,7 +2049,13 @@ const themeFadeSequencer = createThemeFadeSequencer({
   // #640: while the pet dodges an editing bubble its baseline opacity is the
   // faded value, not 1 — restoring to 1 mid-edit would plant an opaque pet on
   // top of the box being typed into. (Lazy: topmostRuntime is defined below.)
-  getRestoreOpacity: () => topmostRuntime.getPetTargetOpacity(),
+  // #1275: a hidden non-topmost Mac pet stays shown at opacity 0 to retain
+  // its Space membership; finishing a theme fade must preserve that hiding.
+  getRestoreOpacity: () => (
+    isMac && !getPetAlwaysOnTopEffective() && petWindowRuntime.isPetEffectivelyHidden()
+      ? 0
+      : topmostRuntime.getPetTargetOpacity()
+  ),
   fadeOutMs: THEME_SWITCH_FADE_OUT_MS,
   fadeInMs: THEME_SWITCH_FADE_IN_MS,
   fallbackMs: THEME_SWITCH_FADE_FALLBACK_MS,
@@ -2041,9 +2123,12 @@ const topmostRuntime = createTopmostRuntime({
   getForegroundFullscreenObservation: () => _isForegroundFullscreen.getLastObservation(),
   isFullscreenWindowAlive: (windowId) => _isForegroundFullscreen.isWindowIdAlive(windowId),
   getFullscreenOverlay: () => fullscreenOverlayCached,
+  // #1275: Mac uses the launch value to preserve all-Space membership;
+  // Windows and Linux demote the render + hit windows immediately.
+  getAlwaysOnTop: () => getPetAlwaysOnTopEffective(),
   // #935 fullscreen auto-hide: the pref gate plus pet-window-runtime's
   // dedicated visibility layer (stacked on the user's manual hide).
-  getFullscreenAutoHide: () => fullscreenAutoHideCached,
+  getFullscreenAutoHide: () => fullscreenAutoHideCached || (isMac && !getPetAlwaysOnTopEffective()),
   setFullscreenAutoHidden: (...args) => petWindowRuntime.setFullscreenAutoHidden(...args),
   isFullscreenAutoHidden: () => petWindowRuntime.isFullscreenAutoHidden(),
   setHitWinFocusable,
@@ -2077,7 +2162,18 @@ const _runtimeAgentGate = createRuntimeAgentGate({
   // but only a clean load after restart can re-open agent paths.
   isAuthoritative: () => !_initialPrefsRecovered && !_settingsController.hasReadFailure(),
 });
+const refreshPermissionPresentation = require("./permission-presentation-refresh")({
+  getStateRuntime: () => _state,
+  isDisposed: () => isQuitting,
+});
+const createCodexRemoteFallbackNotice = require("./codex-remote-fallback-notice");
+const {
+  isCodexRemoteFallbackSuppressed: isRemoteFallbackSuppressed,
+} = createCodexRemoteFallbackNotice;
+let _codexRemoteFallbackNotice = null;
 const _permCtx = {
+  getClaudeConfigDirs: () => effectiveClaudeConfigDirs(_getClaudeConfigDirEntries()),
+  onPermissionsChanged: refreshPermissionPresentation,
   get win() { return win; },
   get lang() { return lang; },
   get sessions() { return sessions; },
@@ -2181,7 +2277,14 @@ const _permCtx = {
   },
   onPermissionResolved: (permEntry, options = {}) => {
     if (!_state || typeof _state.clearPermissionNotification !== "function") return;
-    _state.clearPermissionNotification(permEntry && permEntry.sessionId, options);
+    _state.clearPermissionNotification(permEntry && permEntry.sessionId, {
+      ...options,
+      permissionSource: permEntry && {
+        agentId: permEntry.agentId, profileId: permEntry.profileId,
+        host: permEntry.host, wslDistro: permEntry.wslDistro,
+        headless: permEntry.headless, subagentId: permEntry.subagentId,
+      },
+    });
   },
   // Best-effort, read-only "permission needed" heads-up to Slack. Slack cannot
   // resolve the approval in this build (webhook is one-way), so this only
@@ -2192,16 +2295,50 @@ const _permCtx = {
       try { client.notifyPermissionRequest(payload, options); } catch {}
     }
   },
+  notifyCodexRemoteFallback: (payload) => (
+    _codexRemoteFallbackNotice ? _codexRemoteFallbackNotice.notify(payload) : false
+  ),
+  onCodexRemoteFallbackCardDismissed: (sessionId, entry) => (
+    _codexRemoteFallbackNotice
+      ? _codexRemoteFallbackNotice.noteCardDismissed(sessionId, entry)
+      : false
+  ),
 };
 const _perm = initPermission(_permCtx);
 permissionPresentationRuntime = _perm;
-const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, isPermissionEntryLive, canAutoResolvePendingPermission, wouldAutoAllowPermission, beginSessionTrustConfirmation, endSessionTrustConfirmation, syncPermissionBubbleContent, maybeStartRemoteApproval, clearCodexNotifyBubbles, showCodexUserInputBubble, clearCodexUserInputBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodeFamilyPermission, dismissOpencodeFamilyPermissionResolvedExternally } = _perm;
+const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, isPermissionEntryLive, canAutoResolvePendingPermission, wouldAutoAllowPermission, beginSessionTrustConfirmation, endSessionTrustConfirmation, syncPermissionBubbleContent, maybeStartRemoteApproval, clearCodexNotifyBubbles, showCodexUserInputBubble, clearCodexUserInputBubbles, showClaudeTurnAskBubble, clearClaudeTurnAskBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodeFamilyPermission, dismissOpencodeFamilyPermissionResolvedExternally } = _perm;
+
+_codexRemoteFallbackNotice = createCodexRemoteFallbackNotice({
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (handle) => clearTimeout(handle),
+  isSuppressed: () => isQuitting || isRemoteFallbackSuppressed(_permCtx),
+  show: (payload) => callRuntimeMethod(_perm, "showCodexRemoteFallbackNotice", payload),
+  refresh: (entry, payload) => callRuntimeMethod(_perm, "refreshCodexRemoteFallbackNotice", entry, payload),
+  dismiss: (entry, reason) => callRuntimeMethod(_perm, "dismissCodexRemoteFallbackNotice", entry, reason),
+  log: (message) => permLog(message),
+});
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
 let sessionDebugLog = null; // set after app.whenReady()
 let focusDebugLog = null; // set after app.whenReady()
 let recordWindowsProcessChainShadow = () => false;
+
+// #1326 follow-up: re-show an unanswered Claude Desktop wrap_up question (with
+// a sound) once it has waited the configured minutes, if the user opted in.
+// Created before _stateCtx so onSessionDeleted can resolve it. The minutes are
+// read when a question starts waiting; the switch, the agent gate and the
+// live-session check are read again when the timer fires.
+const claudeTurnAskReminder = createClaudeTurnAskReminder({
+  isEnabled: () => _settingsController.get("claudeTurnAskReminder") === true,
+  canRemind: (payload) => _runtimeAgentGate.isAgentEnabled("claude-code")
+    && sessions.has(payload.sessionId),
+  getDelayMs: () => reminderDelayMsFromMinutes(_settingsController.get("claudeTurnAskReminderMinutes")),
+  onRemind: (payload) => {
+    if (showClaudeTurnAskBubble(payload)) playSound("confirm");
+  },
+});
+app.on("will-quit", () => claudeTurnAskReminder.dispose());
 
 function getPendingPermissionFocusEntry(sessionId) {
   const id = String(sessionId || "");
@@ -2398,7 +2535,10 @@ const _stateCtx = {
   t: (key) => t(key),
   focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   resolvePermissionEntry: (...args) => resolvePermissionEntry(...args),
-  dismissPermissionsForDnd: (...args) => _perm.dismissPermissionsForDnd(...args),
+  dismissPermissionsForDnd: (...args) => {
+    if (_codexRemoteFallbackNotice) _codexRemoteFallbackNotice.invalidateAll("dnd-enabled");
+    return _perm.dismissPermissionsForDnd(...args);
+  },
   showKimiNotifyBubble: (...args) => showKimiNotifyBubble(...args),
   clearKimiNotifyBubbles: (...args) => clearKimiNotifyBubbles(...args),
   // state.js needs this to gate startKimiPermissionPoll symmetrically with
@@ -2465,6 +2605,8 @@ const _stateCtx = {
     return !!(entry && entry.disabled === true);
   },
   get sessionHudCleanupDetached() { return sessionHudCleanupDetached; },
+  get sessionHudHideCompletedCodexEphemeral() { return sessionHudHideCompletedCodexEphemeral; },
+  get sessionHudHideActiveCodexEphemeral() { return sessionHudHideActiveCodexEphemeral; },
   getStaleConfig: () => ({
     sessionStaleMs,
     workingStaleMs,
@@ -2477,10 +2619,20 @@ const _stateCtx = {
     && telegramDirectSend.hasReplyableCompletionMapping(sessionId, session)
   ),
   getSessionAliases: () => _settingsController.get("sessionAliases"),
+  getClaudeConfigDirs: () => effectiveClaudeConfigDirs(_getClaudeConfigDirEntries()),
   getSessionAutomationRecords: () =>
     sessionAutomationStore ? sessionAutomationStore.list() : [],
   getPermissionAutomationMode: () =>
     _settingsController.get("permissionAutomationMode") || "off",
+  getKiroDesktopPendingSessionIds: () => agentRuntime?.getKiroDesktopPendingSessionIds() || new Set(),
+  getCopilotTerminalWaitSessionIds: () => agentRuntime?.getCopilotTerminalWaitSessionIds() || new Set(),
+  hasPendingClaudeTurnAskReminder: (sessionId) => claudeTurnAskReminder.isPending(sessionId),
+  onSessionDeleted: (sessionId) => {
+    agentRuntime?.clearKiroDesktopSession(sessionId);
+    agentRuntime?.clearCopilotTerminalWaitSession(sessionId);
+    claudeTurnAskReminder.resolve(sessionId);
+  },
+  resyncKiroDesktopReminderCards: () => agentRuntime?.resyncKiroDesktopReminderCards(),
   onSessionAutomationLifecycleEnd: (payload) => {
     if (sessionAutomationCoordinator) sessionAutomationCoordinator.onSessionLifecycleEnd(payload);
   },
@@ -2612,6 +2764,7 @@ sessionAutomationCoordinator = createSessionAutomationCoordinator({
 // (kept as a pure helper so the semantics are unit-tested).
 let powerSaveBlockerId = null;
 function anySessionInProgress() {
+  if (_state.hasActiveCodexSubagents()) return true;
   for (const [, s] of sessions) {
     if (isSessionInProgress(s)) return true;
   }
@@ -2659,6 +2812,7 @@ const _tickCtx = {
   get idlePaused() { return idlePaused; },
   get lowPowerIdleMode() { return lowPowerIdleMode; },
   get lowPowerIdlePaused() { return lowPowerIdlePaused; },
+  get eyeTrackingEnabled() { return eyeTrackingEnabledCached; },
   get isAnimating() { return _mini.getIsAnimating(); },
   get miniSleepPeeked() { return _mini.getMiniSleepPeeked(); },
   set miniSleepPeeked(v) { _mini.setMiniSleepPeeked(v); },
@@ -2684,6 +2838,7 @@ const _tickCtx = {
   getHitRectScreen,
   getAssetPointerPayload,
   get roam() { return _roam; },
+  get idleActivity() { return _idleActivity; },
 };
 const _tick = require("./tick")(_tickCtx);
 requestFastTick = (maxDelay) => _tick.scheduleSoon(maxDelay);
@@ -2695,6 +2850,7 @@ const {
   initFocusHelper,
   killFocusHelper,
   focusTerminalWindow,
+  focusProcessAppWindow,
   captureGhosttyTerminalId,
   clearMacFocusCooldownTimer,
 } = _focus;
@@ -2737,8 +2893,15 @@ function focusDashboardSession(sessionId, options = {}) {
     return false;
   }
 
-  const focusEntry = { ...(session || {}), ...(fallbackEntry || {}), id };
+  const focusEntry = mergeSessionFocusEntry(session, fallbackEntry, id);
   const focusTarget = getSessionFocusTarget(focusEntry, { osPlatform: process.platform });
+  if (focusTarget.type === "codex-app") {
+    // Existing local process activation only: no protocol, resume or launcher.
+    Promise.resolve(focusProcessAppWindow({ sourcePid: focusEntry.sourcePid, agentPid: focusEntry.agentPid }))
+      .then(result => focusLog(`focus result branch=codex-app reason=${result.reason || "unknown"} source=${requestSource} sid=${id}`))
+      .catch(() => focusLog(`focus result branch=codex-app reason=process-focus-failed source=${requestSource} sid=${id}`));
+    return true;
+  }
   if (focusTarget.type === "codex-thread" && focusTarget.url) {
     focusCodexThreadTarget({
       shell,
@@ -2760,6 +2923,7 @@ function focusDashboardSession(sessionId, options = {}) {
       requestSource,
       url: focusTarget.url,
       focusLog,
+      publishDshFocus,
     });
     return true;
   }
@@ -2992,6 +3156,7 @@ agentRuntime = createAgentRuntimeMain({
   getServer: () => _server,
   getStateRuntime: () => _state,
   getPermissionRuntime: () => _perm,
+  getKiroDesktopReminderContext: () => _permCtx,
   isAgentEnabled: (agentId) => _runtimeAgentGate.isAgentEnabled(agentId),
   updateSession: (sessionId, state, event, opts) => updateSession(sessionId, state, event, opts),
   debugLog: (msg) => sessionLog(msg),
@@ -3042,7 +3207,19 @@ const _serverCtx = {
   shouldSyncAgentIntegration: (agentId) =>
     _runtimeAgentGate.shouldSyncAgentIntegration(agentId),
   getAgentIntegrationOptions: _getAgentIntegrationOptions,
+  // Extra Claude config folders (prefs.agents["claude-code"].configDirs),
+  // read live so every queued hook task sees the current list.
+  getClaudeConfigDirs: _getClaudeConfigDirEntries,
   isAgentPermissionsEnabled: (agentId) => _runtimeAgentGate.isAgentPermissionsEnabled(agentId),
+  notifyCodexRemoteFallback: (payload) => (
+    _codexRemoteFallbackNotice ? _codexRemoteFallbackNotice.notify(payload) : false
+  ),
+  queueCodexRemoteFallbackForEntry: (entry) => (
+    callRuntimeMethod(_perm, "queueCodexRemoteFallbackForEntry", entry)
+  ),
+  onCodexRemoteStateEvent: (payload) => (
+    _codexRemoteFallbackNotice ? _codexRemoteFallbackNotice.handleStateEvent(payload) : false
+  ),
   // External review (#995): the route derives the review verdict at accept
   // time, so it needs the same effective-mode and reminder gates the
   // permission runtime uses. Values are read from the shared controller and
@@ -3090,6 +3267,10 @@ const _serverCtx = {
   showCodexUserInputBubble,
   syncPermissionBubbleContent,
   clearCodexUserInputBubbles,
+  showClaudeTurnAskBubble,
+  clearClaudeTurnAskBubbles,
+  trackClaudeTurnAskReminder: (payload) => claudeTurnAskReminder.track(payload),
+  resolveClaudeTurnAskReminder: (sessionId) => claudeTurnAskReminder.resolve(sessionId),
   handleTestResult: (result, context) => handleTestResult(result, context),
   maybeStartRemoteApproval,
   replyOpencodeFamilyPermission,
@@ -3115,6 +3296,7 @@ const _serverCtx = {
     }
   },
 };
+Object.assign(_serverCtx, require("./local-server-port-hint"));
 const _server = require("./server")(_serverCtx);
 const { startHttpServer, getHookServerPort } = _server;
 
@@ -3135,7 +3317,9 @@ function ensureMobilePreviewServer() {
   const { initMobilePreviewServer } = require("./network/mobile-preview-server");
   _lanWss = initMobilePreviewServer({
     sessions,
+    rotationMs: !app.isPackaged ? Number(process.env.CLAWD_MOBILE_ROTATION_MS) : undefined,
     permissionObservation: _perm && _perm.permissionObservation,
+    getLang: () => lang,
     log: (message) => sessionLog(message),
   });
   return _lanWss;
@@ -4562,12 +4746,16 @@ function showResumeInput(t) {
 
 const _menuCtx = {
   get win() { return win; },
+  get petAlwaysOnTop() { return getPetAlwaysOnTopEffective(); },
   get sessions() { return sessions; },
   cancelRoam: () => _roam.cancelRoam(),
   resetKeepSizeFrozen: () => resetKeepSizeFrozen(),
   // Recovery actions must defeat a stranded drag lock (syncHitWin defers while
   // it is held); see pet-window-runtime releaseStrandedDragLock.
   releaseStrandedDragLock: () => petWindowRuntime.releaseStrandedDragLock(),
+  // #1260: the context menu close callback releases a lock the menu's modal
+  // loop stranded (renderer normally ends the drag before the menu opens).
+  get dragLocked() { return petWindowRuntime.isDragLocked(); },
   get currentSize() { return currentSize; },
   set currentSize(v) { _settingsController.applyUpdate("size", v); },
   get doNotDisturb() { return doNotDisturb; },
@@ -4736,6 +4924,7 @@ const _menuCtx = {
   clampToScreenVisual,
   getNearestWorkArea,
   reapplyMacVisibility,
+  raisePetWindows: () => topmostRuntime.raisePetWindows(),
   getSettingsWindow,
   getSystemVersion: () => process.getSystemVersion(),
   discoverThemes: () => themeLoader.discoverThemes(),
@@ -4771,6 +4960,8 @@ const SETTINGS_MIRROR_SETTERS = {
   kimiQuotaCollectionEnabled: (v) => { kimiQuotaCollectionEnabled = v; },
   quotaMergeSources: (v) => { quotaMergeSources = v; },
   sessionHudCleanupDetached: (v) => { sessionHudCleanupDetached = v; },
+  sessionHudHideCompletedCodexEphemeral: (v) => { sessionHudHideCompletedCodexEphemeral = v; },
+  sessionHudHideActiveCodexEphemeral: (v) => { sessionHudHideActiveCodexEphemeral = v; },
   sessionHudPinned: (v) => { sessionHudPinned = v; },
   sessionStaleMs: (v) => { sessionStaleMs = v; }, workingStaleMs: (v) => { workingStaleMs = v; },
   codexWorkingStaleMs: (v) => { codexWorkingStaleMs = v; },
@@ -4778,7 +4969,7 @@ const SETTINGS_MIRROR_SETTERS = {
   soundMuted: (v) => { soundMuted = v; }, soundVolume: (v) => { soundVolume = v; }, lowPowerIdleMode: (v) => { lowPowerIdleMode = v; },
   keepAwakeWhileWorking: (v) => { keepAwakeWhileWorking = v; },
   petTint: (v) => { petTint = v; },
-  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, disableMiniMode: (v) => { disableMiniModeCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; resetKeepSizeFrozen(); },
+  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, disableMiniMode: (v) => { disableMiniModeCached = v; }, eyeTrackingEnabled: (v) => { eyeTrackingEnabledCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; resetKeepSizeFrozen(); },
   fullscreenOverlay: (v) => { fullscreenOverlayCached = v; },
   fullscreenAutoHide: (v) => {
     fullscreenAutoHideCached = v;
@@ -4786,6 +4977,12 @@ const SETTINGS_MIRROR_SETTERS = {
       topmostRuntime.clearFullscreenAutoHideOverride();
       petWindowRuntime.setFullscreenAutoHidden(false);
     }
+  },
+  // #1275: Mac needs a restart: once delegated into the private Space, the
+  // pet cannot return to all ordinary Spaces. Other platforms apply now.
+  petAlwaysOnTop: (v) => {
+    petAlwaysOnTopCached = v;
+    if (!isMac) topmostRuntime.applyPetAlwaysOnTopPreference();
   },
   freeRoam: (v) => { _roam.setEnabled(v); },
   textScale: (v) => { textScale = v; textScalePreview = null; },
@@ -4833,11 +5030,18 @@ const settingsEffectRouter = createSettingsEffectRouter({
   },
   emitSessionSnapshot: (options) => _state.emitSessionSnapshot(options),
   cleanStaleSessions: () => _state.cleanStaleSessions(),
+  refreshPendingAttention: () => _state.refreshPendingAttention(),
   syncPermissionShortcuts,
   dismissInteractivePermissionBubbles: () => callRuntimeMethod(_perm, "dismissInteractivePermissionBubbles"),
   clearCodexNotifyBubbles,
+  clearCodexRemoteFallbackNotices: (reason) => (
+    _codexRemoteFallbackNotice ? _codexRemoteFallbackNotice.clearAll(reason) : 0
+  ),
   clearCodexUserInputBubbles,
+  clearClaudeTurnAskBubbles,
   clearKimiNotifyBubbles,
+  clearKiroDesktopReminderCards: (reason) => agentRuntime?.clearKiroDesktopReminderCards(reason),
+  resyncKiroDesktopReminderCards: () => agentRuntime?.resyncKiroDesktopReminderCards(),
   refreshPassiveNotifyAutoClose: () => callRuntimeMethod(_perm, "refreshPassiveNotifyAutoClose"),
   refreshPermissionAutoCloseForPolicy: () => callRuntimeMethod(_perm, "refreshPermissionAutoCloseForPolicy"),
   hideUpdateBubbleForPolicy: () => callRuntimeMethod(_updateBubble, "hideForPolicy"),
@@ -4851,9 +5055,14 @@ const settingsEffectRouter = createSettingsEffectRouter({
     }
   },
   reclampPetAfterEdgePinningChange,
+  // #1276: the tick owns gaze dedup state, so it also owns the enable/disable
+  // transition (resend on enable, park-at-center + pointer-bridge reset on
+  // disable). Runs after the mirror above already updated eyeTrackingEnabledCached.
+  applyEyeTrackingEnabledChange: (enabled) => _tick.handleEyeTrackingPreferenceChange(enabled === true),
   exitMiniMode: () => exitMiniMode(),
   getMiniMode: () => _mini.getMiniMode(),
   getActiveTheme: () => getActiveTheme(),
+  syncActiveThemeAppearance: () => themeRuntime.syncActiveThemeAppearance(),
   syncHitWin,
   // #509: re-rest the pet on the newly selected idle visual right away, but
   // only while actually idle — task/sleep/mini states pick it up on their
@@ -4863,6 +5072,7 @@ const settingsEffectRouter = createSettingsEffectRouter({
     _state.applyState("idle", _state.getSvgOverride("idle"));
   },
   refreshDisplayedVisual: refreshDisplayedVisualForLowPowerMode,
+  refreshPetPresentation: () => _state.refreshPetPresentation(),
   rebuildAllMenus,
   reconcilePowerSaveBlocker,
   disableMobilePermissionObservation: () => setMobilePermissionObservationEnabled(false),
@@ -5165,6 +5375,8 @@ const settingsIpcRuntime = registerSettingsIpc({
     ),
   }),
   getSizeContext: getSizeSliderContext,
+  getHardwareAccelerationDisabledAtStartup: () => _hardwareAccelerationDisabledAtStartup,
+  getPetAlwaysOnTopAtStartup: () => petAlwaysOnTopAtStartup,
   sendToRenderer,
   getDoNotDisturb: () => doNotDisturb,
   getSoundMuted: () => soundMuted,
@@ -5212,6 +5424,11 @@ const sessionHistoryRuntime = createSessionHistoryRuntime({
   ),
 });
 
+const openOpencodeSessionInTerminal = createOpencodeSessionAttacher({
+  getSession: (sessionId) => _state.sessions.get(sessionId),
+  isAgentEnabled: (agentId) => _runtimeAgentGate.isAgentEnabled(agentId),
+});
+
 registerSessionIpc({
   ipcMain,
   getSessionSnapshot: () => _state.buildSessionSnapshot(),
@@ -5223,6 +5440,7 @@ registerSessionIpc({
   focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
   hideSession: (sessionId) => hideDashboardSession(sessionId),
   openSessionFolder: (sessionId) => openDashboardSessionFolder(sessionId),
+  ...(process.platform === "win32" ? { openSessionInTerminal: openOpencodeSessionInTerminal } : {}),
   ackSessionCompletion: (sessionId) => _state.ackSessionCompletion(sessionId),
   setSessionAlias: (payload) => _settingsController.applyCommand("setSessionAlias", payload),
   setSessionAutomationOverride: (payload, context) => {
@@ -5339,6 +5557,7 @@ function createWindow() {
     loadFilePath: path.join(__dirname, "hit.html"),
     hitThemeConfig: themeRuntime.getHitRendererConfig(),
     rendererConfigChannel,
+    isQuitting: () => isQuitting,
     guardAlwaysOnTop,
     prepareActivation: (createdHitWin) => (
       _hitWindowActivationRuntime.controller.prepare(createdHitWin)
@@ -5405,7 +5624,10 @@ function createWindow() {
       petWindowRuntime.recoverVisiblePetAfterRendererLoad();
     },
     setDragLocked: (value) => {
-      if (value) _mini.cancelPendingMiniPeek(true);
+      if (value) {
+        _mini.cancelPendingMiniPeek(true);
+        topmostRuntime.raisePetWindows();
+      }
       petWindowRuntime.setDragLocked(value);
     },
     setMouseOverPet: (value) => { mouseOverPet = !!value; },
@@ -5634,6 +5856,8 @@ function computeFinalDragBounds(bounds, size, clampPosition = clampToScreenVisua
 
 // ── Mini Mode — initialized here after state module ──
 const _miniCtx = {
+  hasPendingReminderAttention: () => _state.hasPendingReminderAttention(),
+  getReminderReselectionOptions: (state) => _state.getReminderReselectionOptions(state),
   get theme() { return getActiveTheme(); },
   get win() { return win; },
   get currentSize() { return currentSize; },
@@ -5726,6 +5950,9 @@ const _roamCtx = {
   },
   getSleepTimeoutMs: () => getActiveTheme().timings.mouseSleepTimeout,
   isSizePreviewActive: () => petWindowRuntime.isSettingsSizePreviewActive(),
+  isScreenCaptureOverlayForeground: () => _isForegroundFullscreen.getLastObservation().captureOverlay === true,
+  isPetHidden: () => petWindowRuntime.isPetEffectivelyHidden(),
+  isIdleActivityPlaying: () => _idleActivity.isAnimating(),
   get miniTransitioning() { return _mini.getMiniTransitioning(); },
   applyState: (state, svgOverride, opts) => _state.applyState(state, svgOverride, opts),
   setState: (state, svgOverride, opts) => _state.setState(state, svgOverride, opts),
@@ -5773,6 +6000,58 @@ try {
   });
 } catch (err) {
   console.warn("Clawd: freeRoam subscribeKey failed:", err && err.message);
+}
+
+// ── Idle activities — decorative state beats while no agent is active (#1252) ──
+// The controller keeps the logical state at "idle" and only swaps the visual,
+// so every normal event path still wins. These gates mirror Free roam's plus
+// the ones that make a passive animation inappropriate (sleep, low power,
+// settings previews, hidden windows).
+function canPlayIdleActivity() {
+  if (!win || win.isDestroyed()) return false;
+  if (doNotDisturb || lowPowerIdlePaused || idlePaused || menuOpen) return false;
+  if (petWindowRuntime.isDragLocked()) return false;
+  if (_mini.getMiniMode() || _mini.getMiniTransitioning()) return false;
+  if (anySessionInProgress()) return false;
+  if (_perm.hasVisiblePermissionBubbles()) return false;
+  if (petWindowRuntime.isSettingsSizePreviewActive()) return false;
+  if (petWindowRuntime.isPetEffectivelyHidden()) return false;
+  if (typeof win.isVisible === "function" && !win.isVisible()) return false;
+  if (_state.isSettingsPreviewVisual()) return false;
+  // #640: hold still while the user types into a bubble text field (macOS IME).
+  if (pendingPermissions.some((entry) => entry
+    && entry.bubble
+    && !entry.bubble.isDestroyed()
+    && entry.bubble.isVisible()
+    && entry.bubble.__clawdMacImeEditing)) return false;
+  // Same sleep guard as Free roam: do not start a beat that the sleep
+  // sequence is about to interrupt.
+  const theme = getActiveTheme();
+  const sleepTimeoutMs = theme && theme.timings ? theme.timings.mouseSleepTimeout : null;
+  if (Number.isFinite(sleepTimeoutMs) && _tick
+    && Date.now() - _tick._mouseStillSince >= sleepTimeoutMs) return false;
+  return true;
+}
+
+const _idleActivity = require("./idle-activity").createIdleActivityController({
+  getTheme: () => getActiveTheme(),
+  getCurrentState: () => _state.getCurrentState(),
+  canPlay: canPlayIdleActivity,
+  restoreIdleVisual: () => _tick.restoreIdleVisual(),
+  isVisualGenerationCurrent,
+  sendToRenderer,
+});
+_idleActivity.setEnabled(_settingsController.get("idleActivities") === true);
+_idleActivity.setFrequency(_settingsController.get("idleActivityFrequency"));
+try {
+  _settingsController.subscribeKey("idleActivities", (value) => {
+    _idleActivity.setEnabled(value === true);
+  });
+  _settingsController.subscribeKey("idleActivityFrequency", (value) => {
+    _idleActivity.setFrequency(value);
+  });
+} catch (err) {
+  console.warn("Clawd: idleActivity subscribeKey failed:", err && err.message);
 }
 
 // Convenience getters for mini state (used throughout main.js)
@@ -5864,7 +6143,7 @@ if (!gotTheLock) {
       prepManualPetVisibility();
       petWindowRuntime.setPetHidden(false);
     } else {
-      if (win) {
+      if (win && !win.isDestroyed()) {
         win.showInactive();
         keepOutOfTaskbar(win);
       }
@@ -5973,6 +6252,16 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(async () => {
+    // Linux X11: Electron's getCursorScreenPoint() freezes once the cursor
+    // leaves our windows; replace it with a live xcb_query_pointer for every
+    // caller. Same backend check as linux-x11-input-hint. The screen module is
+    // only usable after ready.
+    require("./linux-x11-cursor").installLinuxX11CursorFallback(screen, {
+      isLinuxX11: isLinux && app.commandLine.getSwitchValue("ozone-platform") === "x11",
+      displayName: app.commandLine.getSwitchValue("display"),
+      onError: (err) => console.warn("Clawd: linux-x11-cursor failed:", err && err.message),
+    });
+
     // Older macOS and development builds retain the padded runtime icon from
     // #416. Packaged Tahoe+ leaves the Dock untouched so macOS can apply the
     // user's Default/Dark/Clear/Tinted treatment to the bundle icon (#941).
@@ -6025,6 +6314,15 @@ if (!gotTheLock) {
     createWindow();
     try { recapRuntime.start(); }
     catch (err) { console.warn("Clawd: local recap startup failed:", err && err.code ? err.code : "storage-error"); }
+    // nativeTheme reads are only used to pick an appearance, so subscribing
+    // after the pet window exists keeps startup free of extra reloads. The
+    // first did-finish-load repeats the resolution once because the value
+    // read before app.whenReady is not guaranteed on every platform.
+    systemThemeAppearanceHandler = () => themeRuntime.syncActiveThemeAppearance();
+    nativeTheme.on("updated", systemThemeAppearanceHandler);
+    if (win && !win.isDestroyed()) {
+      win.webContents.once("did-finish-load", () => themeRuntime.syncActiveThemeAppearance());
+    }
     // Reconcile the local quota binding only after the app has visible UI.
     // initialize() reads opaque credential metadata but never decrypts the key
     // or performs a network request, so ordinary startup cannot be held behind
@@ -6116,6 +6414,9 @@ if (!gotTheLock) {
     // agent-gate snapshot — a user who disabled Codex at last shutdown
     // shouldn't see its file watcher spin up on the next launch.
     agentRuntime.startCodexLogMonitor();
+    if (_runtimeAgentGate.isAgentEnabled("kiro-desktop") && _runtimeAgentGate.isAgentIntegrationInstalled("kiro-desktop")) {
+      agentRuntime.startMonitorForAgent("kiro-desktop", { integrationInstalled: true });
+    }
 
     // Auto-install VS Code/Cursor terminal-focus extension
     try { installTerminalFocusExtension(); } catch (err) {
@@ -6178,6 +6479,8 @@ if (!gotTheLock) {
     }
     if (discordPresenceBridge) discordPresenceBridge.stop();
     stopFeishuApprovalClient();
+    if (_codexRemoteFallbackNotice) _codexRemoteFallbackNotice.dispose();
+    claudeTurnAskReminder.dispose();
     _perm.cleanup();
     _server.cleanup();
     if (_lanWss) _lanWss.cleanup();
@@ -6192,6 +6495,10 @@ if (!gotTheLock) {
     agentRuntime.cleanup();
     topmostRuntime.cleanup();
     themeRuntime.cleanup();
+    if (systemThemeAppearanceHandler) {
+      nativeTheme.removeListener("updated", systemThemeAppearanceHandler);
+      systemThemeAppearanceHandler = null;
+    }
     _focus.cleanup();
     if (animationOverridesMain) animationOverridesMain.cleanup();
     try { _remoteSshIpc.dispose(); } catch {}
