@@ -3,6 +3,9 @@
 
 let screen;
 try { ({ screen } = require("electron")); } catch { screen = null; }
+const { isLocalApprovalReminderSession, isTerminalWaitSession } = require("./approval-reminder-session");
+const { mergeCodexClientEphemeral } = require("./codex-session-persistence");
+const { normalizePlanProgress } = require("../hooks/codex-plan-progress");
 const {
   createStatePriorityConstants,
   getStatePriority,
@@ -12,6 +15,7 @@ const {
 const {
   buildStateBindings,
   createStableVisualPicker,
+  getVisualState,
   hasOwnVisualFiles: hasOwnVisualFilesWithBindings,
   resolveVisualBinding: resolveVisualBindingWithBindings,
   getSvgOverride: getSvgOverrideWithDeps,
@@ -36,10 +40,12 @@ const {
   buildSessionSnapshot: buildSessionSnapshotFromSessions,
   getActiveSessionAliasKeys: getActiveSessionAliasKeysFromSessions,
   sessionSnapshotSignature,
+  shouldHideActiveCodexEphemeral,
   AWAITING_ACTIVITY_AGENTS,
 } = require("./state-session-snapshot");
 const { getAgentIconUrl } = require("./state-agent-icons");
 const { resolveSessionIdentity } = require("./session-key");
+const { normalizeOpencodeAttachUrl } = require("./opencode-attach-target");
 const { normalizeTranscriptPath } = require("./transcript-path");
 const { createAccountQuotaStore } = require("./state-account-quota");
 const { normalizeQuotaGroup } = require("../hooks/quota-bucket");
@@ -47,6 +53,7 @@ const { ANTIGRAVITY_QUOTA_FIELDS } = require("../hooks/antigravity-context-usage
 const { CLAUDE_QUOTA_FIELDS } = require("../hooks/claude-rate-limits");
 const { getClaudeStopDisposition } = require("../hooks/claude-stop-disposition");
 const { createClaudeToolPhaseLedger } = require("./claude-tool-phase");
+const { classifyPermissionInteraction, INTERACTION_INTENT } = require("./permission-automation-policy");
 const { getStartupRecoveryProcessNames } = require("../agents/registry");
 const { normalizeCodexTurnId } = require("./codex-turn-id");
 const { TERMINAL_EVENTS: CODEX_TERMINAL_EVENTS } = require("./codex-turn-fence");
@@ -208,6 +215,13 @@ function hasCodexCompactionVisual() {
 }
 
 const sessions = new Map();
+const codexSubagentPresentation = require("./codex-subagent-presentation")(sessions, () => Date.now());
+// A parent's Stop can settle its turn while delegated children still own the visual.
+const deferredCodexCompletionCues = new Set();
+let lastPendingAttentionIds = new Set();
+// The owner of a Codex plan belongs to the state runtime, not a session or
+// its snapshot. Clearing an evicted session also discards its turn ownership.
+const codexSessionTurnIds = new Map();
 const claudeToolPhases = createClaudeToolPhaseLedger();
 // Account-wide rate-limit quota, keyed by reporting source — deliberately
 // NOT session state (see src/state-account-quota.js). Persistence is
@@ -635,7 +649,8 @@ function refreshTheme() {
   if (theme.miniMode && theme.miniMode.states) {
     Object.assign(STATE_SVGS, theme.miniMode.states);
   }
-  MIN_DISPLAY_MS = theme.timings.minDisplay;
+  MIN_DISPLAY_MS = { ...theme.timings.minDisplay,
+    executing: theme.timings.minDisplay.executing ?? theme.timings.minDisplay.working ?? 0 };
   AUTO_RETURN_MS = theme.timings.autoReturn;
   DEEP_SLEEP_TIMEOUT = theme.timings.deepSleepTimeout;
   YAWN_DURATION = theme.timings.yawnDuration;
@@ -677,6 +692,10 @@ function scheduleAutoReturn(state) {
   autoReturnTimer = setTimeout(() => {
     autoReturnTimer = null;
     if (ctx.miniMode) {
+      if (!ctx.doNotDisturb && hasPendingReminderAttention() && resolveDisplayState() === "notification") {
+        applyResolvedDisplayState();
+        return;
+      }
       if (ctx.mouseOverPet && !ctx.doNotDisturb) {
         if (state === "mini-peek") {
           // Peek animation done — stay peeked but show idle (don't re-trigger peek)
@@ -725,8 +744,10 @@ function setState(newState, svgOverride, options = {}) {
 
   if (newState === "yawning" && SLEEP_SEQUENCE.has(currentState)) return;
 
-  const sameState = newState === currentState;
-  const sameSvg = !svgOverride || svgOverride === currentSvg;
+  const sameMiniAlert = ctx.miniMode && logicalReminderState(newState) === "notification"
+    && logicalReminderState(currentState) === "notification";
+  const sameState = newState === currentState || sameMiniAlert;
+  const sameSvg = sameMiniAlert || !svgOverride || svgOverride === currentSvg;
   // A Settings animation preview can hold the current visual under the same
   // state name a real event wants. The name+svg dedupe below would swallow the
   // real event, leaving the preview asset up, the display revision frozen, and
@@ -737,6 +758,14 @@ function setState(newState, svgOverride, options = {}) {
   const realEventTakingOverPreview = currentVisualSource === VISUAL_SOURCE_SETTINGS_PREVIEW
     && options.settingsPreview !== true;
   if (sameState && sameSvg && !realEventTakingOverPreview) {
+    // A fresh request still needs a bell while an earlier wait owns the pose.
+    if (logicalReminderState(newState) === "notification" && options.notificationCue === true
+      && hasPendingReminderAttention()) {
+      const soundOptions = normalizeApplyStateOptions(newState, options);
+      if (!isOneshotDisabled("notification") && !soundOptions.muteStateSounds && !soundOptions.muteNotificationSound) {
+        ctx.playSound("confirm");
+      }
+    }
     // Compaction start and completion are distinct cues with the same visual.
     // Restart the SVG and its minimum hold at completion, while preserving a
     // queued higher-priority alert and ordinary repeated-event deduplication.
@@ -768,6 +797,9 @@ function setState(newState, svgOverride, options = {}) {
   }
 
   if (pendingTimer) {
+    // A display refresh must preserve the first real notification's queued bell.
+    if (logicalReminderState(newState) === "notification" && logicalReminderState(pendingState) === "notification"
+      && options.notificationCue !== true && options.settingsPreview !== true) return;
     if (pendingState && getStatePriority(newState, STATE_PRIORITY) < getStatePriority(pendingState, STATE_PRIORITY)) {
       return;
     }
@@ -818,12 +850,16 @@ function hasOwnVisualFiles(state) {
 }
 
 function resolveVisualBinding(state) {
+  if (state === "executing") return getSvgOverride(state);
   return resolveVisualBindingWithBindings(state, STATE_BINDINGS);
 }
 
-function applyResolvedDisplayState() {
+// Display re-selection only. Default getReminderReselectionOptions(resolved) keeps existing Kiro/Copilot waits quiet.
+// New reminders go through setState/updateSession with notificationCue: true.
+function applyResolvedDisplayState(options) {
   const resolved = resolveDisplayState();
-  applyState(resolved, getSvgOverride(resolved), resolveSoundOptionsForState(resolved));
+  const applyOptions = options ?? getReminderReselectionOptions(resolved);
+  applyState(resolved, getSvgOverride(resolved), applyOptions);
   // Kimi CLI permission hold: while notification is pinned, re-trigger the
   // renderer animation so non-looping GIF/APNG assets replay instead of
   // freezing on their last frame. Throttled so concurrent agents flooding
@@ -857,8 +893,18 @@ function applyDndSleepState() {
   applyState(DND_SKIP_YAWN ? "collapsing" : "yawning");
 }
 
+function logicalReminderState(state) {
+  return state === "mini-alert" ? "notification" : state;
+}
+
+// Re-selecting an existing reminder pose stays quiet until another request arrives.
+function getReminderReselectionOptions(state = resolveDisplayState()) {
+  return logicalReminderState(state) === "notification" && hasPendingReminderAttention()
+    ? { muteNotificationSound: true } : {};
+}
+
 function resolveSoundOptionsForState(state) {
-  const logicalState = state === "mini-alert" ? "notification" : state;
+  const logicalState = logicalReminderState(state);
   if (logicalState !== "notification") return {};
   let sawNotificationSession = false;
   for (const [, session] of sessions) {
@@ -908,7 +954,7 @@ function applyState(state, svgOverride, options = {}) {
     // and later perform the hand-back.
     if (state === "notification") return applyState("mini-alert", undefined, applyOptions);
     if (state === "attention") return applyState("mini-happy", undefined, applyOptions);
-    if (state === "working" || state === "thinking" || state === "juggling") {
+    if (state === "working" || state === "executing" || state === "thinking" || state === "juggling") {
       if (hasOwnVisualFiles("mini-working")) return applyState("mini-working", undefined, applyOptions);
       return;
     }
@@ -920,7 +966,7 @@ function applyState(state, svgOverride, options = {}) {
 
   previousState = currentState;
   currentState = state;
-  stableVisualPicker.retainOnly(state);
+  stableVisualPicker.retainOnly(getVisualState(state, STATE_SVGS));
   displayRevision += 1;
   currentVisualSource = applyOptions.settingsPreview === true
     ? VISUAL_SOURCE_SETTINGS_PREVIEW
@@ -1240,12 +1286,28 @@ function getSessionAliases() {
 }
 
 function buildSessionSnapshot() {
+  const pendingAttentionIds = getPendingAttentionIds();
+  // HUD rows include the HUD-only Claude card; the pet projection stays on the
+  // Codex/Kiro/Copilot set.
+  const hudPendingAttentionIds = getHudPendingAttentionIds();
+  const projected = projectPendingAttention(pendingAttentionIds);
   return buildSessionSnapshotFromSessions(sessions, {
+    getSessionPresentation: (id) => ({
+      effectiveState: projected.get(id)?.state,
+      activeSubagentCount: codexSubagentPresentation.count(id),
+      pendingAttention: hudPendingAttentionIds.has(id),
+    }),
+    t: ctx.t,
     sessionAliases: getSessionAliases(),
+    claudeConfigDirs: typeof ctx.getClaudeConfigDirs === "function" ? ctx.getClaudeConfigDirs() : [],
     getAgentIconUrl,
     resolveAgentDisplayName: ctx.resolveAgentDisplayName,
     statePriority: STATE_PRIORITY,
     sessionHudCleanupDetached: ctx.sessionHudCleanupDetached === true,
+    sessionHudHideCompletedCodexEphemeral: ctx.sessionHudHideCompletedCodexEphemeral === true,
+    sessionHudHideActiveCodexEphemeral: ctx.sessionHudHideActiveCodexEphemeral === true,
+    pendingPermissionSessionIds: new Set((ctx.pendingPermissions || [])
+      .filter(Boolean).map((entry) => entry.sessionId)),
     focusHostPlatform: ctx.focusHostPlatform || process.platform,
     isProcessAlive,
     accountQuota: accountQuota.snapshot({ mergeSources: ctx.quotaMergeSources === true }),
@@ -1688,16 +1750,10 @@ function touchSessionActivity(sessionId, opts = {}) {
   return true;
 }
 
-// Statusline refresh POSTs (metadata_only: true) annotate a session that real
-// hook traffic already created — they are telemetry, not lifecycle. Hence:
-// never create a session (a statusline for a dead/unknown session id would
-// resurrect it as a ghost card), never touch recentEvents (no hook event
-// happened, and the badge derivation reads that tail), and never bump
-// updatedAt (a statusline refreshing every ~300ms would keep any session
-// eternally "fresh", defeating staleness sweeps and resurrecting completed
-// cards as idle). Context usage is the only per-session field a statusline
-// owns — account quota is not a session property and lives in the
-// session-independent store (updateAccountQuota below).
+// Metadata refreshes annotate a session that lifecycle traffic already
+// created; they never create a ghost session, touch recentEvents, or bump
+// updatedAt. Context usage and Codex plan progress are session fields. Account
+// quota is not; it lives in the session-independent store below.
 // Broadcast goes through emitSessionSnapshot, whose signature dedup already
 // swallows no-op refreshes.
 function updateSessionMetadata(sessionId, opts = {}) {
@@ -1719,13 +1775,50 @@ function updateSessionMetadata(sessionId, opts = {}) {
     return false;
   }
   const incomingContextUsage = normalizeContextUsage(opts.contextUsage);
+  const hasPlanProgress = Object.prototype.hasOwnProperty.call(opts, "planProgress");
+  const incomingPlanProgress = hasPlanProgress ? normalizePlanProgress(opts.planProgress) : undefined;
+  const hasPlanProgressTurnId = Object.prototype.hasOwnProperty.call(opts, "planProgressTurnId");
+  const incomingPlanProgressTurnId = hasPlanProgressTurnId
+    ? normalizeCodexTurnId(opts.planProgressTurnId)
+    : null;
   const incomingTitle = typeof opts.sessionTitle === "string"
     ? normalizeTitle(opts.sessionTitle)
     : null;
   const incomingModel = typeof opts.model === "string" ? opts.model.trim() : "";
   const clearContextUsage = opts.clearContextUsage === true;
-  if (!incomingContextUsage && !clearContextUsage && !incomingTitle && !incomingModel) return false;
+  const hasAttachUpdate = Object.hasOwn(opts, "opencodeAttachUrl")
+    && opts.opencodeAttachSource === "opencode-plugin" && session.agentId === "opencode"
+    && (session.profileId || "local") === "local" && !session.host && !session.wslDistro && !session.headless;
+  if (!incomingContextUsage && !clearContextUsage && !incomingTitle && !incomingModel
+    && !hasPlanProgress && !hasAttachUpdate) return false;
   let applied = false;
+  const currentCodexTurnId = codexSessionTurnIds.get(id) || null;
+  const planTurnMatches = !!incomingPlanProgressTurnId
+    && (!currentCodexTurnId || currentCodexTurnId === incomingPlanProgressTurnId);
+  const incomingPlanSource = opts.planProgressSource === "codex-official" ? "codex-official" : "jsonl";
+  if (hasPlanProgress && hasPlanProgressTurnId && session.agentId === "codex" && planTurnMatches
+    && (incomingPlanSource === "codex-official" || session.planProgressSource !== "codex-official")) {
+    if (!currentCodexTurnId && incomingPlanProgressTurnId) {
+      codexSessionTurnIds.set(id, incomingPlanProgressTurnId);
+      applied = true;
+    }
+    if (session.planProgressSource !== incomingPlanSource) {
+      session.planProgressSource = incomingPlanSource;
+      applied = true;
+    }
+    if (JSON.stringify(session.planProgress || null) !== JSON.stringify(incomingPlanProgress)) {
+      session.planProgress = incomingPlanProgress;
+      applied = true;
+    }
+  }
+  if (hasAttachUpdate) {
+    const url = normalizeOpencodeAttachUrl(opts.opencodeAttachUrl);
+    if (session.opencodeAttachUrl !== url || session.opencodeAttachSource !== opts.opencodeAttachSource) {
+      session.opencodeAttachUrl = url;
+      session.opencodeAttachSource = opts.opencodeAttachSource;
+      applied = true;
+    }
+  }
   if (clearContextUsage) {
     if (session.contextUsage || session.contextUsageOrigin) {
       session.contextUsage = null;
@@ -1812,6 +1905,7 @@ function updateCodexInitializationMetadata(sessionId, opts = {}) {
     provider: opts.provider || session.provider || null,
     codexOriginator: opts.codexOriginator || session.codexOriginator || null,
     codexSource: opts.codexSource || session.codexSource || null,
+    codexClientEphemeral: mergeCodexClientEphemeral(session, opts),
     ghosttyTerminalId: normalizeGhosttyTerminalId(opts.ghosttyTerminalId) || session.ghosttyTerminalId || null,
     transcriptPath: normalizeTranscriptPath(opts.transcriptPath) || session.transcriptPath || null,
     sessionAutomationIdentity: normalizeSessionAutomationIdentity(opts.sessionAutomationIdentity)
@@ -1960,11 +2054,16 @@ function clearAllClaudeTranscriptCompletionProbes() {
 }
 
 function deleteSessionWithCompletionCleanup(sessionId, reason) {
+  deferredCodexCompletionCues.delete(sessionId);
+  codexSubagentPresentation.delete(sessionId);
   releaseCodexCompaction(sessionId);
   codexCompactionCompletions.delete(sessionId);
+  codexSessionTurnIds.delete(sessionId);
   cancelCompletionDebounce(sessionId, reason);
   cancelClaudeTranscriptCompletionProbe(sessionId, reason);
-  return sessions.delete(sessionId);
+  const removed = sessions.delete(sessionId);
+  if (removed && typeof ctx.onSessionDeleted === "function") ctx.onSessionDeleted(sessionId, reason);
+  return removed;
 }
 
 function isClaudeElicitationCompletionTool(toolName) {
@@ -2193,8 +2292,8 @@ function mergeSessionProcessMetadata(existing, incoming = {}, options = {}) {
 // whose POST fails is not permanently claimed, and follow-up prompts never
 // overwrite the first one (matching Trae's constant session title).
 // MiniMax Code carries no session title in its hook payload either, so its
-// prompt-derived titles follow the same first-wins rule.
-const FIRST_WINS_TITLE_AGENT_IDS = new Set(["traecode", "minimax"]);
+// prompt-derived titles follow the same first-wins rule, as do Kiro IDE titles.
+const FIRST_WINS_TITLE_AGENT_IDS = new Set(["traecode", "minimax", "kiro-desktop"]);
 
 function resolveIncomingSessionTitle(existing, agentId, incomingTitle, incomingFromPrompt = false) {
   const normalized = normalizeTitle(incomingTitle);
@@ -2241,6 +2340,15 @@ function observeClaudeToolPhase(sessionId, event, opts = {}) {
     confirmedNativeChildEnd });
 }
 
+function isLocalClaudeExecutionSource(existing, opts) {
+  return opts.agentId === "claude-code" && opts.agentIdDefaulted !== true
+    && (!existing || existing.agentId === "claude-code")
+    && (opts.profileId || (existing && existing.profileId) || "local") === "local"
+    && !(opts.host || (existing && existing.host))
+    && !(opts.wslDistro || (existing && existing.wslDistro))
+    && !(opts.headless || (existing && existing.headless)) && !opts.subagentId;
+}
+
 function updateSession(sessionId, state, event, opts = {}) {
   // The ledger gates the new batch hint, not ordinary message/lifecycle work.
   // Proven old tools may annotate existing metadata without changing phase,
@@ -2280,6 +2388,12 @@ function updateSession(sessionId, state, event, opts = {}) {
   // Keep the model phase as the logical resume state while the error cue runs.
   if (phase.errorCue) opts = { ...opts, preserveState: true };
   if (phase.thinking && !phase.errorCue && event !== "SubagentStart") state = "thinking";
+  if (state === "working" && event === "PreToolUse" && phase.freshStart === true
+    && !ctx.doNotDisturb && isLocalClaudeExecutionSource(sessions.get(sessionId), opts)
+    && classifyPermissionInteraction({ agentId: "claude-code", toolName: opts.toolName }).intent
+      === INTERACTION_INTENT.TOOL_APPROVAL) {
+    state = "executing";
+  }
   const suppliedRecapOccurredAt = opts && opts.recapOccurredAt;
   const recapTimestampTrusted = Number.isSafeInteger(suppliedRecapOccurredAt) && suppliedRecapOccurredAt >= 0;
   const recapOccurredAt = recapTimestampTrusted
@@ -2304,6 +2418,8 @@ function updateSession(sessionId, state, event, opts = {}) {
     rawSessionId = null,
     host = null,
     wslDistro = null,
+    claudeConfigDir = null,
+    claudeEntrypoint = null,
     headless = false,
     platform = null,
     model = null,
@@ -2315,8 +2431,13 @@ function updateSession(sessionId, state, event, opts = {}) {
     displayHint = undefined,
     sessionTitle = null,
     sessionTitleFromPrompt = false,
+    opencodeAttachUrl = undefined,
     contextUsage = null,
     contextUsageOrigin = null,
+    planProgress = undefined,
+    planProgressTurnId = undefined,
+    planProgressSource = null,
+    turnId = null,
     assistantLastOutput = null,
     assistantLastOutputTruncated = false,
     toolName = null,
@@ -2352,10 +2473,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     recapSuppressed = false,
     replaceProcessMetadata = false,
   } = opts;
-  if (startupRecoveryActive) {
-    startupRecoveryActive = false;
-    if (startupRecoveryTimer) { clearTimeout(startupRecoveryTimer); startupRecoveryTimer = null; }
-  }
+  endStartupRecovery();
 
   // #406: forward progress cancels a pending debounced completion. Runs before
   // the PermissionRequest early-return so a permission prompt cancels too.
@@ -2444,7 +2562,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     ) return;
     const hasCodexPermissionMetadata = !!(
       sourcePid || wtHwnd || agentPid || (pidChain && pidChain.length) || cwd || host || wslDistro ||
-      model || provider || codexOriginator || codexSource || platform || ghosttyTerminalId ||
+      model || provider || codexOriginator || codexSource || Object.hasOwn(opts, "codexClientEphemeral") || platform || ghosttyTerminalId ||
       tmuxSocket || tmuxClient || orcaPaneKey || herdrPaneId
     );
     const shouldPersistCodexPermissionFocus = permAgentId === "codex" && (
@@ -2476,6 +2594,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       const srcAgentId = resolveIncomingAgentId(existing, agentId, agentIdDefaulted);
       const srcHost = host || (existing && existing.host) || null;
       const srcWslDistro = wslDistro || (existing && existing.wslDistro) || null;
+      const srcClaudeConfigDir = claudeConfigDir || (existing && existing.claudeConfigDir) || null;
       const srcHeadless = headless || (existing && existing.headless) || false;
       const srcPlatform = platform || (existing && existing.platform) || null;
       const srcModel = model || (existing && existing.model) || null;
@@ -2526,17 +2645,27 @@ function updateSession(sessionId, state, event, opts = {}) {
           || null,
         host: srcHost,
         wslDistro: srcWslDistro,
+        claudeConfigDir: srcClaudeConfigDir,
         headless: srcHeadless,
         platform: srcPlatform,
         model: srcModel,
         provider: srcProvider,
         codexOriginator: srcCodexOriginator,
         codexSource: srcCodexSource,
+        codexClientEphemeral: mergeCodexClientEphemeral(existing, opts),
         ghosttyTerminalId: srcGhosttyTerminalId,
         sessionTitle: srcSessionTitle,
         sessionTitleFromPrompt: srcSessionTitleFromPrompt,
         contextUsage: srcContextUsage,
         contextUsageOrigin: srcContextUsageOrigin,
+        // Permission focus refreshes do not own a turn or a checklist.
+        // Keep the accepted plan while rebuilding an existing Codex row.
+        planProgress: srcAgentId === "codex" && existing && existing.agentId === "codex"
+          ? existing.planProgress || null
+          : null,
+        planProgressSource: srcAgentId === "codex" && existing && existing.agentId === "codex"
+          ? existing.planProgressSource || null
+          : null,
         recentEvents,
         pidReachable: resolvePidReachable(
           replaceProcessMetadata === true ? null : existing,
@@ -2553,7 +2682,7 @@ function updateSession(sessionId, state, event, opts = {}) {
           : null,
       });
     }
-    setState("notification", undefined, { muteNotificationSound: muteNotificationSound === true });
+    setState("notification", undefined, { muteNotificationSound: muteNotificationSound === true, notificationCue: true });
     if (event === "PermissionRequest" && permAgentId === "kimi-cli") {
       // Synthesized PermissionRequest (rewritten gated PreToolUse) carries a
       // gate marker — record it so the Post that settles it can re-arm the
@@ -2621,6 +2750,8 @@ function updateSession(sessionId, state, event, opts = {}) {
     || null;
   const srcHost = host || (existing && existing.host) || null;
   const srcWslDistro = wslDistro || (existing && existing.wslDistro) || null;
+  const srcClaudeConfigDir = claudeConfigDir || (existing && existing.claudeConfigDir) || null;
+  const srcClaudeEntrypoint = claudeEntrypoint || (existing && existing.claudeEntrypoint) || null;
   const srcHeadless = headless || (existing && existing.headless) || false;
   const srcPlatform = platform || (existing && existing.platform) || null;
   if (observeCodexCompaction(sessionId, state, event, srcAgentId, srcHeadless, opts) === false) return false;
@@ -2659,6 +2790,40 @@ function updateSession(sessionId, state, event, opts = {}) {
   );
   const srcContextUsage = resolvedContextUsage.contextUsage;
   const srcContextUsageOrigin = resolvedContextUsage.contextUsageOrigin;
+  const normalizedPlanProgress = planProgress === undefined ? undefined : normalizePlanProgress(planProgress);
+  const startsNewCodexTurn = srcAgentId === "codex"
+    && (event === "UserPromptSubmit" || event === "event_msg:task_started");
+  const normalizedCodexTurnId = srcAgentId === "codex" ? normalizeCodexTurnId(turnId) : null;
+  const srcCodexTurnId = srcAgentId !== "codex"
+    ? null
+    : (startsNewCodexTurn
+      ? normalizedCodexTurnId
+      : (codexSessionTurnIds.get(sessionId) || normalizedCodexTurnId));
+  const normalizedPlanProgressTurnId = planProgressTurnId === undefined
+    ? normalizedCodexTurnId
+    : normalizeCodexTurnId(planProgressTurnId);
+  const planProgressTurnMatches = !!normalizedPlanProgressTurnId
+    && normalizedPlanProgressTurnId === srcCodexTurnId;
+  const incomingPlanSource = planProgressSource === "codex-official" ? "codex-official" : "jsonl";
+  const acceptPlanProgress = normalizedPlanProgress !== undefined && planProgressTurnMatches
+    && (incomingPlanSource === "codex-official" || !existing || existing.planProgressSource !== "codex-official");
+  const srcPlanProgressSource = srcAgentId !== "codex" || startsNewCodexTurn
+    ? null
+    : (acceptPlanProgress ? incomingPlanSource : (existing && existing.planProgressSource) || null);
+  const srcPlanProgress = srcAgentId !== "codex"
+    ? null
+    : (startsNewCodexTurn
+      ? null
+      : (normalizedPlanProgress === undefined
+        ? (existing && existing.planProgress) || null
+        : (acceptPlanProgress ? normalizedPlanProgress : (existing && existing.planProgress) || null)));
+  // Only accepted lifecycle traffic may change the private turn owner.
+  // An id-less new turn clears the old checklist and its ownership.
+  if (srcAgentId === "codex" && srcCodexTurnId) {
+    codexSessionTurnIds.set(sessionId, srcCodexTurnId);
+  } else if (srcAgentId !== "codex" || startsNewCodexTurn) {
+    codexSessionTurnIds.delete(sessionId);
+  }
   const incomingAssistantLastOutput = normalizeAssistantOutput(assistantLastOutput);
   const srcAssistantLastOutput = incomingAssistantLastOutput;
   const srcAssistantLastOutputTruncated = !!(
@@ -2668,7 +2833,8 @@ function updateSession(sessionId, state, event, opts = {}) {
   const incomingToolName = normalizeToolName(toolName);
   const srcToolName = incomingToolName || (existing && existing.lastToolName) || null;
   const srcTranscriptPath = normalizeTranscriptPath(transcriptPath) || (existing && existing.transcriptPath) || null;
-  const srcResumeState = (existing && existing.resumeState) || null;
+  const srcResumeState = existing && existing.resumeState === "executing"
+    ? "working" : (existing && existing.resumeState) || null;
   const isSubagentStart = event === "SubagentStart" || event === "subagentStart";
   const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
   const normalizedSubagentId = normalizeChildId(subagentId);
@@ -2879,6 +3045,11 @@ function updateSession(sessionId, state, event, opts = {}) {
   // `existing` must not silently reset the freshness stamp.
   const srcMetadataUpdatedAt = existing && Number.isFinite(existing.metadataUpdatedAt) ? existing.metadataUpdatedAt : null;
   const subagentTracker = cloneSubagentTracker(existing);
+  if (srcAgentId === "codex" && !srcHeadless
+    && ["UserPromptSubmit", "event_msg:task_started", "SessionStart"].includes(event)) {
+    codexSubagentPresentation.resume(sessionId);
+    deferredCodexCompletionCues.delete(sessionId);
+  }
   const hadSubagentHoldBefore = hasSubagentHoldEvidence(subagentTracker);
 
   // A restored lease is only an initial visual guess. The first real lifecycle
@@ -2953,7 +3124,13 @@ function updateSession(sessionId, state, event, opts = {}) {
     clearSubagentTracker(subagentTracker);
   }
 
-  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, orcaPaneKey: srcOrcaPaneKey, herdrPaneId: srcHerdr.herdrPaneId, herdrSocket: srcHerdr.herdrSocket, agentPid: srcAgentPid, agentId: srcAgentId, profileId: (existing && existing.profileId) || profileId || "local", rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId, sessionAutomationIdentity: srcSessionAutomationIdentity, host: srcHost, wslDistro: srcWslDistro, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, dshCarrier: srcDshCarrier, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, sessionTitleFromPrompt: srcSessionTitleFromPrompt, contextUsage: srcContextUsage, contextUsageOrigin: srcContextUsageOrigin, metadataUpdatedAt: srcMetadataUpdatedAt, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true, claudeBackgroundSubagentHoldAt };
+  const attachSource = srcAgentId === "opencode" && hookSource === "opencode-plugin"
+    && !srcHost && !srcWslDistro && !srcHeadless && profileId === "local" ? hookSource : null;
+  const attachUrl = attachSource ? normalizeOpencodeAttachUrl(
+    opencodeAttachUrl === undefined && existing && existing.opencodeAttachSource === attachSource
+      ? existing.opencodeAttachUrl : opencodeAttachUrl
+  ) : null;
+  const base = { opencodeAttachUrl: attachUrl, opencodeAttachSource: attachSource, sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, orcaPaneKey: srcOrcaPaneKey, herdrPaneId: srcHerdr.herdrPaneId, herdrSocket: srcHerdr.herdrSocket, agentPid: srcAgentPid, agentId: srcAgentId, profileId: (existing && existing.profileId) || profileId || "local", rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId, sessionAutomationIdentity: srcSessionAutomationIdentity, host: srcHost, wslDistro: srcWslDistro, claudeConfigDir: srcClaudeConfigDir, claudeEntrypoint: srcClaudeEntrypoint, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, codexClientEphemeral: mergeCodexClientEphemeral(existing, opts), dshCarrier: srcDshCarrier, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, sessionTitleFromPrompt: srcSessionTitleFromPrompt, contextUsage: srcContextUsage, contextUsageOrigin: srcContextUsageOrigin, planProgress: srcPlanProgress, planProgressSource: srcPlanProgressSource, metadataUpdatedAt: srcMetadataUpdatedAt, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true, claudeBackgroundSubagentHoldAt };
   // Desktop apps can reopen a previous conversation on launch, so SessionStart
   // only means "opened" — not "used". Any other lifecycle event is a real action
   // and clears the marker. Only the listed agents carry the field; others are
@@ -3006,7 +3183,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       // #862: one stop does not mean the work is over. Restoring on the first
       // stop dropped the pet back to typing while other subagents were still
       // running; hold juggling until the last one reports in.
-      const resumeState = existing.resumeState || null;
+      const resumeState = srcResumeState;
       if (resumeState) {
         const dh = pickDisplayHint(resumeState, existing, displayHint);
         sessions.set(sessionId, { state: resumeState, updatedAt: Date.now(), displayHint: dh, ...base, resumeState: null });
@@ -3049,12 +3226,30 @@ function updateSession(sessionId, state, event, opts = {}) {
 
   if (event === "SessionEnd") {
     const endingSession = sessions.get(sessionId);
+    const deferredCueSessions = [];
+    if (srcAgentId === "codex" && srcHeadless) {
+      // Only children present before this SessionEnd can settle a deferred cue;
+      // an unrelated child must not settle a parent whose evidence expired.
+      const activeParents = [...deferredCodexCompletionCues].filter(id => codexSubagentPresentation.has(id));
+      codexSubagentPresentation.endChild(rawSessionId || endingSession?.rawSessionId || sessionId);
+      for (const id of activeParents) {
+        if (codexSubagentPresentation.has(id)) continue;
+        deferredCodexCompletionCues.delete(id);
+        deferredCueSessions.push(sessions.get(id));
+      }
+    }
+    if (srcAgentId === "codex" && !srcHeadless && deferredCodexCompletionCues.has(sessionId)) {
+      deferredCueSessions.push(endingSession);
+    }
+    deferredCodexCompletionCues.delete(sessionId);
+    const endedDelegatedChildren = srcAgentId === "codex" && !srcHeadless
+      ? codexSubagentPresentation.end(sessionId) : false;
     // Codex Desktop unloads an idle thread hours after its last turn, and that
     // SessionEnd must not retire a local Codex session the user can still reply
     // to through Telegram: a direct reply needs the live row
     // (src/telegram-direct-send.js returns session_not_live otherwise) and the
-    // completion mapping stays valid for 24h. Treat it as a no-op — no delete,
-    // no completion, no state change — and let stale cleanup retire it later.
+    // completion mapping stays valid for 24h. Keep the canonical row unchanged
+    // for stale cleanup; a deferred presentation cue can still settle below.
     if (
       endingSession
       && endingSession.agentId === "codex"
@@ -3065,6 +3260,11 @@ function updateSession(sessionId, state, event, opts = {}) {
       && ctx.hasReplyableCompletionMapping(sessionId, endingSession) === true
     ) {
       debugSession(`session-end keep replyable ${describeSession(sessionId, endingSession)}`);
+      if (endedDelegatedChildren) {
+        const resolved = resolveDisplayState();
+        setState(resolved, getSvgOverride(resolved));
+      }
+      deferredCueSessions.some(playDeferredCodexCompletionCue);
       return;
     }
     cancelCodexExitProbe(sessionId, "SessionEnd");
@@ -3093,6 +3293,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     }
     const displayState = resolveDisplayState();
     setState(displayState, getSvgOverride(displayState));
+    deferredCueSessions.some(playDeferredCodexCompletionCue);
     return;
   } else if (preservedState) {
     const dh = pickDisplayHint(preservedState, existing, displayHint);
@@ -3153,13 +3354,13 @@ function updateSession(sessionId, state, event, opts = {}) {
     if (isSubagentStart) {
       const dh = pickDisplayHint(state, existing, displayHint);
       const resumeState = !hadSubagentHoldBefore && existing && existing.state !== "juggling"
-        ? existing.state
+        ? (existing.state === "executing" ? "working" : existing.state)
         : srcResumeState;
       sessions.set(sessionId, { state, updatedAt: Date.now(), displayHint: dh, ...base, resumeState });
       debugSession(`subagent-start store ${describeSession(sessionId, sessions.get(sessionId))}`);
     } else if (
       hasSubagentHoldEvidence(subagentTracker)
-      && (state === "working" || state === "thinking" || state === "idle" || state === "juggling")
+      && (state === "working" || state === "executing" || state === "thinking" || state === "idle" || state === "juggling")
     ) {
       sessions.set(sessionId, {
         state: "juggling",
@@ -3289,6 +3490,19 @@ function updateSession(sessionId, state, event, opts = {}) {
     duplicateCompletionVisualAtEntry || shouldSuppressDuplicateCompletionVisual(existing, state, event);
 
   if (ONESHOT_STATES.has(state)) {
+    // Recoverable errors and compaction do not prove a terminal wait ended.
+    if (isTerminalWaitSession(sessions.get(sessionId)) && state !== "notification"
+      && event !== "agentStop" && event !== "sessionEnd" && getPendingAttentionIds().has(sessionId)) {
+      const displayState = resolveDisplayState();
+      setState(displayState, getSvgOverride(displayState));
+      return;
+    }
+    if (srcAgentId === "codex" && state === "attention" && codexSubagentPresentation.has(sessionId)) {
+      if (!suppressDuplicateCompletionVisual) deferredCodexCompletionCues.add(sessionId);
+      const displayState = resolveDisplayState();
+      setState(displayState, getSvgOverride(displayState));
+      return;
+    }
     if (srcAgentId === "codex" && srcHeadless && state === "sweeping") {
       const displayState = resolveDisplayState();
       setState(displayState, getSvgOverride(displayState));
@@ -3334,6 +3548,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       return;
     }
     setState(state, state === "attention" && event === "Stop" ? completionVisual : null, {
+      notificationCue: state === "notification",
       codexCompactionCue: srcAgentId === "codex" && state === "sweeping"
         && (event === "PreCompact" || event === "PostCompact" || event === "event_msg:context_compacted"),
       restartAnimation: srcAgentId === "codex"
@@ -3343,6 +3558,17 @@ function updateSession(sessionId, state, event, opts = {}) {
     return;
   }
 
+  // Headless child metadata/state bookkeeping is valid, but cannot interrupt
+  // a stronger foreground one-shot while its delegated work is projected.
+  if (srcAgentId === "codex" && srcHeadless && codexSubagentPresentation.hasAny()
+    && (isSettingsPreviewVisual() || (ONESHOT_STATES.has(currentState)
+      && getStatePriority(currentState, STATE_PRIORITY) > getStatePriority("juggling", STATE_PRIORITY)))) return;
+  // A hidden temporary request must not reset an existing sleep/idle animation
+  // merely by resolving to idle. Canonical lifecycle and the snapshot below
+  // still advance, including keep-awake and recap consumers.
+  if (shouldHideActiveCodexEphemeral(sessionId, sessions.get(sessionId), getPetPresentationOptions())
+    && isPassivePetPresentation()
+    && resolveDisplayState() === "idle") return;
   const displayState = resolveDisplayState();
   setState(displayState, getSvgOverride(displayState));
   } finally {
@@ -3402,6 +3628,7 @@ function restoreSessionFromLease(lease) {
     rawSessionId: sessionIdentity.rawSessionId,
     host: null,
     wslDistro: null,
+    claudeConfigDir: typeof lease.claudeConfigDir === "string" ? lease.claudeConfigDir : null,
     headless: false,
     platform: null,
     model: null,
@@ -3450,14 +3677,31 @@ function cleanStaleSessions() {
   // arriving. The existing 10-second lifecycle sweep must therefore retire
   // dead buckets too and force a snapshot refresh when it does.
   let snapshotRefreshNeeded = accountQuota.prune();
+  codexSubagentPresentation.prune();
+  if (codexSubagentPresentation.consumeExpirationChange()) changed = true;
+  for (const id of deferredCodexCompletionCues) {
+    if (!codexSubagentPresentation.has(id)) deferredCodexCompletionCues.delete(id);
+  }
   const staleConfig = typeof ctx.getStaleConfig === "function" ? ctx.getStaleConfig() : null;
+  const pendingApprovalSessionIds = ctx.getKiroDesktopPendingSessionIds?.() || new Set();
+  const terminalWaitSessionIds = ctx.getCopilotTerminalWaitSessionIds?.() || new Set();
   for (const [id, s] of sessions) {
-    const decision = getStaleSessionDecision(s, {
+    const childActivityAt = codexSubagentPresentation.lastActivity(id);
+    const staleSession = childActivityAt === null ? s : {
+      ...s, state: "working", updatedAt: Math.max(s.updatedAt || 0, childActivityAt),
+    };
+    const hasPendingClaudeInteraction = hasPendingClaudeInteractionForSession(id)
+      || (typeof ctx.hasPendingClaudeTurnAskReminder === "function"
+        && ctx.hasPendingClaudeTurnAskReminder(id) === true);
+    const decision = getStaleSessionDecision(staleSession, {
       now,
       isProcessAlive,
       deriveSessionBadge,
       shouldAutoClearDetachedSession,
       staleConfig,
+      hasPendingClaudeInteraction,
+      hasPendingApprovalReminder: (isLocalApprovalReminderSession(s) && pendingApprovalSessionIds.has(id))
+        || (isTerminalWaitSession(s) && terminalWaitSessionIds.has(id)),
       hasReplyableCompletionMapping: typeof ctx.hasReplyableCompletionMapping === "function"
         ? (session) => ctx.hasReplyableCompletionMapping(id, session)
         : null,
@@ -3508,8 +3752,7 @@ function cleanStaleSessions() {
   if (startupRecoveryActive && sessions.size === 0) {
     detectRunningAgentProcesses((found) => {
       if (!found) {
-        startupRecoveryActive = false;
-        if (startupRecoveryTimer) { clearTimeout(startupRecoveryTimer); startupRecoveryTimer = null; }
+        endStartupRecovery();
       }
     });
   }
@@ -3558,10 +3801,31 @@ function takeTrailingPermissionRequest(session) {
 
 function clearPermissionNotification(sessionId, options = {}) {
   const id = typeof sessionId === "string" ? sessionId : "";
-  if (!id || options.hasPendingForSession === true) return false;
+  if (!id) return false;
 
   let changed = false;
   const session = sessions.get(id);
+  // PermissionRequest has no reliable Claude tool id. A non-allow can only
+  // invalidate the session's presentation hint, not settle a specific tool.
+  // Record the suppression even before the first async Pre has arrived.
+  if (options.permissionSource && isLocalClaudeExecutionSource(session, options.permissionSource)
+    && options.behavior !== "allow") {
+    claudeToolPhases.suppressExecution(id);
+    if (session && session.state === "executing") {
+      session.state = "working";
+      changed = true;
+    }
+  }
+  if (options.hasPendingForSession === true) {
+    if (changed) {
+      // Invalidate the logical hint immediately, but keep the remaining
+      // approval's ordinary notification hold instead of cutting it short.
+      const resolved = resolveDisplayState();
+      setState(resolved, getSvgOverride(resolved), resolveSoundOptionsForState(resolved));
+      emitSessionSnapshot({ force: true });
+    }
+    return changed;
+  }
   if (session) {
     const trailingPermission = takeTrailingPermissionRequest(session);
     if (session.state === "notification") {
@@ -3577,7 +3841,7 @@ function clearPermissionNotification(sessionId, options = {}) {
       // A stale sweep may downgrade a Codex session while the approval is
       // still pending. Once the permission resolves, restore the work state
       // recorded at request time so long commands do not stay visually idle.
-      session.state = trailingPermission.state;
+      session.state = trailingPermission.state === "executing" ? "working" : trailingPermission.state;
       changed = true;
     }
     if (trailingPermission) {
@@ -3839,7 +4103,7 @@ function schedulePermissionSuspect(sessionId, permissionDetail = null) {
     // legacy suspect) makes the promoted cue name the tool that actually
     // blocks the terminal; null degrades to the generic copy.
     startKimiPermissionPoll(sessionId, permissionDetail, "heuristic");
-    setState("notification");
+    setState("notification", undefined, { notificationCue: true });
   }, delay);
   kimiPermissionSuspectTimers.set(sessionId, { timer, scheduledAt: Date.now() });
 }
@@ -3889,8 +4153,186 @@ function disposeKimiPermissionSession(sessionId) {
   stopKimiPermissionPoll(sessionId);
 }
 
+// Sessions with a pending attention wait: local Codex question/approval cards,
+// the Kiro IDE approval ledger, and the Copilot terminal-wait ledger. This set
+// drives both the pet projection and the notification cue, so HUD-only Claude
+// turn-ask cards are added separately in getHudPendingAttentionIds().
+function getPendingAttentionIds() {
+  const ids = new Set();
+  for (const entry of ctx.pendingPermissions || []) {
+    if (entry?.agentId !== "codex" || !entry.sessionId || entry.headless || entry.host || entry.wslDistro
+      || entry.platform === "wsl" || (entry.profileId && entry.profileId !== "local")
+      || (entry.res && (entry.res.destroyed || entry.res.writableEnded))) continue;
+    if (entry.isCodex === true || entry.isCodexNotify === true || entry.isCodexUserInputNotify === true) ids.add(entry.sessionId);
+  }
+  for (const id of ctx.getKiroDesktopPendingSessionIds?.() || []) {
+    if (isLocalApprovalReminderSession(sessions.get(id))) ids.add(id);
+  }
+  for (const id of ctx.getCopilotTerminalWaitSessionIds?.() || []) {
+    if (isTerminalWaitSession(sessions.get(id)) && ctx.isAgentNotificationHookEnabled?.("copilot-cli") !== false) ids.add(id);
+  }
+  return ids;
+}
+
+// A Claude card is still waiting only while its connection (if any) is open.
+// Turn-ask cards carry res:null and have no connection to watch; they stay
+// live until removed from the pending list.
+function isClaudeInteractionConnectionLive(entry) {
+  return !(entry.res && (entry.res.destroyed || entry.res.writableEnded));
+}
+
+// Pending Claude interactions (permission, elicitation, or turn-ask card) for
+// one session. Stale cleanup holds that session so a live card never loses its
+// row; the HUD applies its own visibility filters on top.
+function hasPendingClaudeInteractionForSession(sessionId) {
+  return (ctx.pendingPermissions || []).some((entry) => (
+    entry
+    && entry.agentId === "claude-code"
+    && entry.sessionId === sessionId
+    && isClaudeInteractionConnectionLive(entry)
+  ));
+}
+
+// HUD-only view of the same set plus Claude Desktop's wrap_up question card
+// (#1326). The Claude card has no decision channel and must not drive the pet
+// projection or notification sound, so it stays out of getPendingAttentionIds().
+function getHudPendingAttentionIds() {
+  const ids = getPendingAttentionIds();
+  for (const entry of ctx.pendingPermissions || []) {
+    if (!entry || entry.agentId !== "claude-code" || entry.isClaudeTurnAskNotify !== true) continue;
+    if (!entry.sessionId || entry.headless || entry.host || entry.wslDistro
+      || entry.platform === "wsl" || (entry.profileId && entry.profileId !== "local")
+      || !isClaudeInteractionConnectionLive(entry)) continue;
+    ids.add(entry.sessionId);
+  }
+  return ids;
+}
+
+// Only Kiro/Copilot waits without a decision channel count here, excluding Codex pending attention.
+function hasPendingReminderAttention() {
+  return [...getPendingAttentionIds()].some(id =>
+    isLocalApprovalReminderSession(sessions.get(id)) || isTerminalWaitSession(sessions.get(id)));
+}
+
+function projectPendingAttention(ids = getPendingAttentionIds()) {
+  const projected = codexSubagentPresentation.project(ids);
+  const reminders = [...ids].filter(id =>
+    isLocalApprovalReminderSession(sessions.get(id)) || isTerminalWaitSession(sessions.get(id)));
+  if (!reminders.length) return projected;
+  const result = new Map(projected);
+  // Reminder waits keep their underlying phase until the terminal resolves them.
+  for (const id of reminders) result.set(id, { ...sessions.get(id), state: "notification", displayHint: null });
+  return result;
+}
+
+function isBlockingPermissionEntry(entry) {
+  // Kiro reminders and Claude turn-ask cards have no decision channel. They
+  // must not prevent the pet from returning to its underlying state when
+  // pending attention clears.
+  return !!entry
+    && entry.agentId !== "codex"
+    && !entry.isKiroDesktopNotify
+    && !entry.isClaudeTurnAskNotify
+    && !entry.headless
+    && !(entry.res && (entry.res.destroyed || entry.res.writableEnded));
+}
+
+function refreshPendingAttention() {
+  const ids = getPendingAttentionIds();
+  const addedIds = [...ids].filter(id => !lastPendingAttentionIds.has(id));
+  const changed = ids.size !== lastPendingAttentionIds.size
+    || addedIds.length > 0;
+  const notificationCue = addedIds.some(id => !isTerminalWaitSession(sessions.get(id)));
+  lastPendingAttentionIds = ids;
+  // Ordinary permission changes only refresh snapshots. Re-select the pet
+  // when pending attention itself changed, preserving other permission waits.
+  const otherPending = (ctx.pendingPermissions || []).some(isBlockingPermissionEntry);
+  if (changed && !otherPending && !isSettingsPreviewVisual()
+    && (!ONESHOT_STATES.has(currentState) || currentState === "notification" || currentState === "attention")) {
+    const resolved = resolveDisplayState();
+    // Copilot already rang through its hook. Kiro and Codex arrive through this ledger refresh.
+    const options = notificationCue ? { notificationCue: true } : getReminderReselectionOptions(resolved);
+    setState(resolved, getSvgOverride(resolved), options);
+  }
+  return emitSessionSnapshot();
+}
+
+function refreshCodexSubagentPresentation() {
+  // Strong one-shot/permission presentation retains its ordinary return timer.
+  // This channel only changes the visual projection and never emits lifecycle.
+  if (!isSettingsPreviewVisual() && (!ONESHOT_STATES.has(currentState) || currentState === "attention")) {
+    const resolved = resolveDisplayState();
+    setState(resolved, getSvgOverride(resolved));
+  }
+  emitSessionSnapshot();
+}
+
+// Stop already recorded completion, so duplicate-event suppression would
+// swallow this first visual too. Only the deferred cue is consumed here.
+function playDeferredCodexCompletionCue(session) {
+  if (session?.state !== "idle" || session.awaitingInputSinceStop !== true) return false;
+  if (hasConfirmedPermissionAnimationLock()) return false;
+  setState("attention", null);
+  return true;
+}
+
+function updateCodexSubagentActivity(parentId, input) {
+  if (!codexSubagentPresentation.update(parentId, input)) return false;
+  if (input.phase === "stop" && !codexSubagentPresentation.has(parentId)) {
+    const deferred = deferredCodexCompletionCues.delete(parentId);
+    if (deferred && input.terminal === true && playDeferredCodexCompletionCue(sessions.get(parentId))) {
+      emitSessionSnapshot();
+      return true;
+    }
+  }
+  refreshCodexSubagentPresentation();
+  return true;
+}
+
+function clearCodexSubagentActivities() {
+  deferredCodexCompletionCues.clear();
+  const changed = codexSubagentPresentation.hasAny();
+  codexSubagentPresentation.resetActivity();
+  if (changed) refreshCodexSubagentPresentation();
+  return changed;
+}
+
+function getPetPresentationOptions() {
+  return {
+    sessionHudHideActiveCodexEphemeral: ctx.sessionHudHideActiveCodexEphemeral === true,
+    pendingPermissionSessionIds: new Set((ctx.pendingPermissions || []).filter(Boolean).map(entry => entry.sessionId)),
+  };
+}
+
+// Accept a prior projection so child/pending-attention overlays can be applied
+// first. Neither this map nor its entries are written back to canonical state.
+function getPetPresentationSessions(source = sessions) {
+  const options = getPetPresentationOptions();
+  if (!options.sessionHudHideActiveCodexEphemeral) return source;
+  let projected = source;
+  for (const [id, session] of source) {
+    if (!shouldHideActiveCodexEphemeral(id, session, options)) continue;
+    if (projected === source) projected = new Map(source);
+    projected.delete(id);
+  }
+  return projected;
+}
+
+function isPassivePetPresentation() {
+  return SLEEP_SEQUENCE.has(currentState)
+    || ["mini-idle", "mini-sleep", "mini-peek", "mini-peek-hold", "mini-sleep-peek"].includes(currentState);
+}
+
+function refreshPetPresentation() {
+  const resolved = resolveDisplayState();
+  if (resolved === "idle" && isPassivePetPresentation()) return;
+  setState(resolved, getSvgOverride(resolved));
+}
+
+// Child/pending-attention projection first, then the strict temporary-chat
+// filter, so a parent kept juggling or waiting is never collapsed off the pet.
 function resolveDisplayState() {
-  return resolveDisplayStateFromSessions(sessions, {
+  return resolveDisplayStateFromSessions(getPetPresentationSessions(projectPendingAttention()), {
     statePriority: STATE_PRIORITY,
     compacting: hasCodexCompactionVisual(),
     permissionLocked: hasPermissionAnimationLock(),
@@ -3920,7 +4362,7 @@ function getSvgOverride(state) {
     updateVisualSvgOverride,
     idleFollowSvg: SVG_IDLE_FOLLOW,
     idleDefaultVisual: typeof ctx.getIdleVisualChoice === "function" ? ctx.getIdleVisualChoice() : null,
-    sessions,
+    sessions: getPetPresentationSessions(projectPendingAttention()),
     displayHintMap: DISPLAY_HINT_MAP,
     theme,
     stateSvgs: STATE_SVGS,
@@ -3996,10 +4438,15 @@ function disableDoNotDisturb() {
   if (ctx.miniMode) {
     if (ctx.miniSleepPeeked) { ctx.miniPeekOut(); ctx.miniSleepPeeked = false; }
     ctx.miniPeeked = false;
-    applyState("mini-idle");
+    if (hasPendingReminderAttention() && resolveDisplayState() === "notification") {
+      applyResolvedDisplayState();
+    } else {
+      applyState("mini-idle");
+    }
   } else {
     playWakeTransitionOrResolve();
   }
+  ctx.resyncKiroDesktopReminderCards?.();
   // #329: a deferred update bubble may be waiting on DND exit.
   if (typeof ctx.notifyUpdaterSilentExit === "function") {
     try { ctx.notifyUpdaterSilentExit(); } catch {}
@@ -4016,6 +4463,12 @@ function startStartupRecovery() {
   }, STARTUP_RECOVERY_MAX_MS);
 }
 
+function endStartupRecovery() {
+  if (!startupRecoveryActive) return;
+  startupRecoveryActive = false;
+  if (startupRecoveryTimer) { clearTimeout(startupRecoveryTimer); startupRecoveryTimer = null; }
+}
+
 function getCurrentState() { return currentState; }
 function getDisplayRevision() { return displayRevision; }
 function getCurrentSvg() { return currentSvg; }
@@ -4028,8 +4481,12 @@ function getCurrentHitBox() { return currentHitBox; }
 function getStartupRecoveryActive() { return startupRecoveryActive; }
 
 function cleanup() {
+  deferredCodexCompletionCues.clear();
+  lastPendingAttentionIds.clear();
+  codexSubagentPresentation.clear();
   for (const id of codexCompactionHolds.keys()) releaseCodexCompaction(id);
   codexCompactionCompletions.clear();
+  codexSessionTurnIds.clear();
   // The persist debounce timer is unref'd, so a quota update inside the
   // final debounce window before quit would otherwise never reach disk
   // (main.js before-quit calls this cleanup).
@@ -4056,13 +4513,21 @@ function cleanup() {
 }
 
 return {
+  refreshPendingAttention,
+  // Preserve the existing permission refresh API while callers migrate.
+  refreshCodexPendingAttention: refreshPendingAttention,
+  hasPendingReminderAttention,
+  getReminderReselectionOptions,
+  updateCodexSubagentActivity,
+  clearCodexSubagentActivities,
+  hasActiveCodexSubagents: codexSubagentPresentation.hasAny,
   setState, applyState, updateSession, observeClaudeToolPhase, recordRecapEventOnly, restoreSessionFromLease, resolveDisplayState, resolveVisualBinding, setUpdateVisualState,
   shouldDropForDnd,
   enableDoNotDisturb, disableDoNotDisturb,
   // Read-only, unmerged account windows for source-specific alert deduplication.
   getAccountQuotaSnapshot: () => accountQuota.snapshot({ mergeSources: false }),
   startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
-  getSvgOverride, cleanStaleSessions, startStartupRecovery, refreshTheme,
+  getSvgOverride, getPetPresentationSessions, refreshPetPresentation, cleanStaleSessions, startStartupRecovery, endStartupRecovery, refreshTheme,
   detectRunningAgentProcesses, buildSessionSnapshot,
   emitSessionSnapshot, broadcastSessionSnapshot, getLastSessionSnapshot,
   getActiveSessionAliasKeys,
