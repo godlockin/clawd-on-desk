@@ -27,6 +27,7 @@ let activeEdit = null;
 
 const SESSION_FOLDER_FEEDBACK_MS = 4000;
 const sessionFolderActionState = new Map();
+const sessionTerminalActionState = new Map();
 const sessionAutomationActionState = new Map();
 let sessionAutomationPickers = [];
 
@@ -1248,6 +1249,18 @@ function appendMeta(main, session, now) {
   badge.appendChild(document.createTextNode(badgeLabel(session.badge)));
 
   meta.appendChild(document.createTextNode(agentLabel(session.agentId, session.agentName)));
+  // Claude profile chip ("work"), right after the agent so the clipped end of
+  // this single-line row never hides it.
+  if (session.claudeProfileLabel) {
+    meta.appendChild(document.createTextNode(" "));
+    const profileBadge = document.createElement("span");
+    profileBadge.className = "profile-badge";
+    profileBadge.textContent = session.claudeProfileLabel;
+    profileBadge.title = session.claudeConfigDir
+      ? `${t("sessionClaudeProfile")}: ${session.claudeConfigDir}`
+      : t("sessionClaudeProfile");
+    meta.appendChild(profileBadge);
+  }
   meta.appendChild(document.createTextNode(" · "));
   meta.appendChild(badge);
   meta.appendChild(document.createTextNode(` · ${formatElapsed(now - session.updatedAt)}`));
@@ -1301,6 +1314,16 @@ function appendModel(main, session) {
   const row = createText("div", "model-row", `${t("dashboardModel")}: ${session.model}`);
   row.title = session.model;
   main.appendChild(row);
+}
+
+function appendPlanProgress(main, session) {
+  if (!session.planProgress) return;
+  const plan = session.planProgress;
+  const text = t("codexPlanProgress")
+    .replace("{completed}", plan.completed)
+    .replace("{total}", plan.total)
+    .replace("{percent}", plan.percent);
+  main.appendChild(createText("div", "plan-progress-row", text));
 }
 
 function appendContextUsage(main, session) {
@@ -1420,6 +1443,7 @@ function createCard(session, now) {
   main.className = "main";
   main.appendChild(createTitle(session));
   appendMeta(main, session, now);
+  appendPlanProgress(main, session);
   appendPath(main, session);
   appendModel(main, session);
   appendEvent(main, session, now);
@@ -1435,7 +1459,9 @@ function createCard(session, now) {
     const button = document.createElement("button");
     button.type = "button";
     const focusTargetType = session.focusTarget && session.focusTarget.type;
-    button.textContent = focusTargetType === "codex-thread"
+    button.textContent = focusTargetType === "codex-app"
+      ? t("dashboardOpenCodexApp")
+      : focusTargetType === "codex-thread"
       ? t("dashboardOpenCodexSession")
       : focusTargetType === "dsh-desktop"
         ? t("dashboardOpenDshDesktop")
@@ -1502,6 +1528,37 @@ function createCard(session, now) {
       });
       actions.appendChild(openFolder);
     }
+  }
+
+  if (session.canOpenInTerminal === true && typeof window.dashboardAPI.openSessionInTerminal === "function") {
+    const terminalState = sessionTerminalActionState.get(session.id) || {};
+    const openTerminal = document.createElement("button");
+    openTerminal.type = "button";
+    openTerminal.className = "open-terminal-button";
+    openTerminal.textContent = t("dashboardOpenInTerminal");
+    openTerminal.disabled = terminalState.pending === true;
+    const feedback = createText("span", "session-action-feedback", terminalState.feedback || "");
+    feedback.setAttribute("aria-live", "polite");
+    openTerminal.addEventListener("click", async () => {
+      if (sessionTerminalActionState.get(session.id)?.pending) return;
+      sessionTerminalActionState.set(session.id, { pending: true });
+      render();
+      let feedbackText = "";
+      try {
+        const result = await window.dashboardAPI.openSessionInTerminal(session.id);
+        if (!result || result.status !== "ok") {
+          const key = result?.reason === "directory" ? "dashboardOpenTerminalDirectory"
+            : result?.reason === "opencode" ? "dashboardOpenTerminalOpencode"
+            : result?.status === "unavailable" ? "dashboardOpenTerminalUnavailable"
+            : "dashboardOpenTerminalFailed";
+          feedbackText = t(key);
+        }
+      } catch { feedbackText = t("dashboardOpenTerminalFailed"); }
+      sessionTerminalActionState.set(session.id, { pending: false, feedback: feedbackText });
+      render();
+    });
+    actions.appendChild(openTerminal);
+    actions.appendChild(feedback);
   }
 
   if (session.requiresCompletionAck === true) {
