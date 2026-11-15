@@ -98,6 +98,13 @@ describe("i18n locales", () => {
     }
   });
 
+  it("localizes structured Codex plan progress in every runtime locale", () => {
+    for (const lang of SUPPORTED_LANGS) {
+      assert.deepStrictEqual(placeholders(i18n[lang].codexPlanProgress), ["{completed}", "{percent}", "{total}"], lang);
+      assert.ok(i18n[lang].codexPlanProgress.trim(), lang);
+    }
+  });
+
   it("localizes the DSH desktop open action in every supported language", () => {
     assert.deepStrictEqual(
       Object.fromEntries(SUPPORTED_LANGS.map((lang) => [lang, i18n[lang].dashboardOpenDshDesktop])),
@@ -134,8 +141,61 @@ describe("i18n locales", () => {
     assert.strictEqual(i18n.zh.bringPetToPrimaryDisplay, "将桌宠拉回主屏");
   });
 
+  it("localizes idle behavior choices and descriptions in every Settings locale", () => {
+    const strings = loadSettingsI18nStrings();
+    const keys = ["rowIdleBehavior", "idleBehaviorNone", "idleBehaviorRoam", "idleBehaviorActivities",
+      "idleBehaviorNoneDesc", "idleBehaviorRoamDesc", "idleBehaviorActivitiesDesc"];
+    for (const lang of SUPPORTED_LANGS) {
+      for (const key of keys) {
+        assert.strictEqual(typeof strings[lang][key], "string", `${lang}.${key}`);
+        assert.ok(strings[lang][key].trim(), `${lang}.${key}`);
+      }
+      for (const key of ["rowFreeRoam", "rowFreeRoamDesc", "rowIdleActivities", "rowIdleActivitiesDesc"]) {
+        assert.strictEqual(Object.hasOwn(strings[lang], key), false, `${lang}.${key} is obsolete`);
+      }
+    }
+    assert.deepStrictEqual(keys.map((key) => strings.zh[key]), [
+      "空闲时", "原地待机", "自由漫步", "小动作", "只在原地待机、东张西望和打盹。",
+      "空闲时在桌面上自由走动，移动鼠标即停止。", "没有 Agent 在运行时，偶尔播放主题里的其他动画。",
+    ]);
+    assert.deepStrictEqual(keys.slice(0, 4).map((key) => strings.en[key]),
+      ["When idle", "Stay put", "Free roam", "Idle activities"]);
+  });
+
   it("keeps Settings locale keysets aligned with English", () => {
     assertLocaleObjectParity(loadSettingsI18nStrings(), "settings");
+  });
+
+  it("DSH remote: every Settings locale explains deployment errors and next steps", () => {
+    const strings = loadSettingsI18nStrings();
+    const keys = [
+      "remoteSshErrDshAssetUploadFailed", "remoteSshErrDshBridgeOwnershipConflict",
+      "remoteSshErrDshDesktopAmbiguous", "remoteSshErrDshDesktopUnreadable",
+      "remoteSshErrDshHomeAmbiguous", "remoteSshErrDshHomeChanged",
+      "remoteSshErrDshInspectionRequired", "remoteSshErrDshInstallFailed",
+      "remoteSshErrDshInstallerResultUnknown", "remoteSshErrDshLocalMigrationRequired",
+      "remoteSshErrDshProfileUnreadable", "remoteSshErrDshReadbackFailed",
+      "remoteSshErrDshVersionUnsupported", "remoteSshErrWindowsDshCleanupIncomplete",
+      "remoteSshErrWindowsDshDesktopSessionRequired", "remoteSshWarnDshDiscoveryIncomplete",
+      "remoteSshDshBridgeInstalled", "remoteSshDshRestartRequired",
+      "remoteSshDshBridgeInstalledRestartRequired",
+    ];
+    for (const key of keys) {
+      assert.strictEqual(new Set(SUPPORTED_LANGS.map((lang) => strings[lang][key])).size,
+        SUPPORTED_LANGS.length, key);
+      for (const lang of SUPPORTED_LANGS) {
+        const locale = strings[lang];
+        assert.strictEqual(typeof locale[key], "string", `${lang}.${key}`);
+        assert.ok(locale[key].trim(), `${lang}.${key}`);
+        assert.doesNotMatch(locale[key], /generation|manifest|junction/i, `${lang}.${key}`);
+      }
+    }
+    for (const lang of SUPPORTED_LANGS) {
+      const locale = strings[lang];
+      assert.ok(locale.remoteSshErrWindowsDshCleanupIncomplete.includes(locale.remoteSshDeploy), lang);
+      assert.ok(locale.remoteSshErrDshInspectionRequired.includes(locale.remoteSshDeploy), lang);
+      assert.match(locale.remoteSshErrDshInspectionRequired, /--remote-clear-latch/, lang);
+    }
   });
 
   it("localizes DSH generation changes using the visible integration action names", () => {
@@ -329,31 +389,31 @@ describe("i18n locales", () => {
     const expected = {
       en: {
         label: "{brand} approver email or user ID",
-        hint: "Enter an email to resolve and save open_id automatically, or choose an ID type and paste an existing ID.",
+        hint: "Enter an email to look up open_id automatically; or pick a type and paste an ID.",
       },
       zh: {
-        label: "{brand}审批人邮箱或用户 ID",
-        hint: "输入邮箱可自动查询并保存 open_id；也可以选择 ID 类型并粘贴已有 ID。",
+        label: "审批人（{brand}邮箱或用户 ID）",
+        hint: "填邮箱会自动查 open_id；也可以选类型直接贴 ID。",
       },
       "zh-TW": {
-        label: "{brand}審批人電子郵件或使用者 ID",
-        hint: "輸入電子郵件可自動查詢並儲存 open_id；也可以選擇 ID 類型並貼上現有 ID。",
+        label: "審批人（{brand}電子郵件或使用者 ID）",
+        hint: "填電子郵件會自動查詢 open_id；也可以選類型直接貼上 ID。",
       },
       ko: {
-        label: "{brand} 승인자 이메일 또는 사용자 ID",
-        hint: "이메일을 입력하면 open_id를 자동으로 조회해 저장합니다. 또는 ID 유형을 선택하고 기존 ID를 붙여 넣으세요.",
+        label: "승인자 ({brand} 이메일 또는 사용자 ID)",
+        hint: "이메일을 입력하면 open_id를 자동으로 조회합니다. 또는 유형을 선택해 ID를 바로 붙여넣으세요.",
       },
       ja: {
-        label: "{brand} 承認者のメールアドレスまたはユーザー ID",
-        hint: "メールアドレスを入力すると open_id を自動検索して保存できます。または ID 種別を選び、既存の ID を貼り付けてください。",
+        label: "承認者（{brand} のメールアドレスまたはユーザー ID）",
+        hint: "メールアドレスを入力すると open_id を自動検索します。または種類を選んで ID を貼り付けてください。",
       },
       "pt-BR": {
-        label: "E-mail ou user ID do aprovador no {brand}",
-        hint: "Digite um e-mail para resolver e salvar o open_id automaticamente, ou escolha um tipo de ID e cole um ID existente.",
+        label: "Aprovador ({brand} e-mail ou user ID)",
+        hint: "Digite um e-mail para consultar o open_id automaticamente; ou escolha um tipo e cole um ID.",
       },
       es: {
-        label: "Correo electrónico o ID de usuario del aprobador en {brand}",
-        hint: "Introduce un correo electrónico para resolver y guardar automáticamente el open_id, o elige un tipo de ID y pega un ID existente.",
+        label: "Aprobador (correo o ID de usuario de {brand})",
+        hint: "Introduce un correo para buscar el open_id automáticamente; o elige un tipo y pega un ID.",
       },
     };
 
@@ -540,19 +600,19 @@ describe("i18n locales", () => {
     const expected = {
       sidebarAnimOverrides: "Animación y sonido",
       sidebarRemoteSsh: "Hosts SSH",
-      permissionsChannelsIntro: "Redirige las solicitudes de permiso locales a un canal remoto. Los secretos se mantienen fuera de las preferencias y el globo de escritorio sigue siendo la alternativa local.",
+      permissionsChannelsIntro: "Los globos locales de permiso siguen apareciendo; al conectar un canal, la misma solicitud también se envía allí y gana la primera respuesta. Los secretos se guardan en este equipo, fuera de las preferencias.",
       telegramApprovalCardStarting: "Conectando con la aprobación nativa de Telegram…",
       telegramApprovalCardFailed: "La verificación nativa de Telegram falló. Corrige la configuración o vuelve a intentarlo.",
-      telegramApprovalCompletionOutput: "Contenido de la notificación de finalización",
-      telegramApprovalCompletionOutputDesc: "Elige si las notificaciones de finalización de Telegram incluyen la respuesta final del asistente.",
-      telegramApprovalCompletionOutput_off: "Solo aviso de finalización",
+      telegramApprovalCompletionOutput: "Notificación de finalización",
+      telegramApprovalCompletionOutputDesc: "Envía un mensaje a Telegram cuando termine una tarea. «Incluir respuesta completa» también envía la última respuesta del asistente, que puede contener código, rutas u otra información sensible.",
+      telegramApprovalCompletionOutput_off: "Solo aviso",
       telegramApprovalCompletionOutput_full: "Incluir respuesta completa",
       telegramApprovalCompletionOutputFullConfirm: "Clawd incluirá la respuesta final completa del asistente en las notificaciones de finalización de Telegram. Las respuestas pueden contener código, contenido de archivos, rutas u otra información sensible.",
       remoteSshTitle: "Hosts SSH",
       remoteSshFieldAutoStartCodex: "Iniciar la supervisión de respaldo de Codex al conectar",
       remoteSshErrForwardFailed: "El puerto remoto no está disponible. Inténtalo de nuevo más tarde. Si cambias el puerto de reenvío remoto (23333-23337), ejecuta Desplegar / Reparar hooks antes de conectarte.",
       remoteSshConnectWarnNoDeploy: "Los hooks no están desplegados para este destino. Ejecuta primero Desplegar / Reparar hooks; Conectar permanecerá desactivado hasta que el despliegue esté listo.",
-      agentsSubtitle: "Descubre automáticamente herramientas de IA en este equipo y en WSL, o añade manualmente una IA que Clawd aún no incluya. Una vez conectada, gestiona aquí su estado, sus solicitudes de permiso y sus notificaciones.",
+      agentsSubtitle: "Una vez conectada, la mascota sigue el trabajo de la herramienta y muestra sus aprobaciones. Expande una tarjeta para ajustarla.",
       shortcutLabelPetReveal: "Clic en la mascota: Mostrar superposiciones de la mascota",
       bubbleNotificationDesc: "El interruptor controla los avisos pasivos de Codex / Kimi Code. Los segundos fijan el límite máximo de cierre automático; estados de sesión posteriores pueden descartarlo antes. 0 los oculta.",
       langChinese: "简体中文",

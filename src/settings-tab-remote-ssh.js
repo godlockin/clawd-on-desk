@@ -704,11 +704,20 @@
                 { ttl: 10000, error: true }
               );
             } else {
-              // Append codex /hooks reminder — Deploy installs the hooks but the
-              // user still has to review them once in codex TUI before they go
-              // live (sha256 trusted_hash gate in ~/.codex/config.toml).
-              ops.showToast(`${t("remoteSshDeploySuccess")} ${t("codexHookReviewReminder")}`,
-                { ttl: 8000 });
+              // Only a verified Codex installer run needs the native /hooks review.
+              const messages = [t("remoteSshDeploySuccess")];
+              if (r.codexHooksInstalled === true) messages.push(t("codexHookReviewReminder"));
+              if (r.dshBridgeInstalled === true && r.dshRestartRequired === true) {
+                messages.push(t("remoteSshDshBridgeInstalledRestartRequired"));
+              } else if (r.dshBridgeInstalled === true) {
+                messages.push(t("remoteSshDshBridgeInstalled"));
+              } else if (r.dshRestartRequired === true) {
+                messages.push(t("remoteSshDshRestartRequired"));
+              }
+              if (r.dshDiscoveryWarning && r.dshDiscoveryWarning.hint === "remoteSshWarnDshDiscoveryIncomplete") {
+                messages.push(t("remoteSshWarnDshDiscoveryIncomplete"));
+              }
+              ops.showToast(messages.join(" "), { ttl: 8000 });
             }
           } else {
             // Same hint preference as the progress log line — `remote-shell`

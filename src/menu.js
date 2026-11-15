@@ -11,6 +11,8 @@ const platform = process.platform;
 const isMac = platform === "darwin";
 const isWin = platform === "win32";
 const isLinux = platform === "linux";
+const MENU_FOCUS_WAIT_MS = 200;
+const MENU_OWNER_HIDE_DELAY_MS = 500;
 
 // Login-item / autostart helpers and the openAtLogin write path live in
 // src/login-item.js + main.js's settings-actions effect. menu.js used to
@@ -407,8 +409,59 @@ module.exports = function initMenu(ctx) {
     return ctx.contextMenuOwner;
   }
 
+  let ownerHideTimer = null;
+
+  // A menu opened before the owner window has focus closes within milliseconds
+  // under XWayland, so every other right-click looked like nothing happened.
+  // Wait for the focus just requested; the timeout keeps the menu working if
+  // it never arrives.
+  function whenOwnerFocused(owner, open) {
+    if (!isLinux || typeof owner.isFocused !== "function" || owner.isFocused()) {
+      open();
+      return;
+    }
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      owner.removeListener("focus", settle);
+      if (owner.isDestroyed() || ctx.isQuitting) {
+        ctx.menuOpen = false;
+        return;
+      }
+      open();
+    };
+    const timer = setTimeout(settle, MENU_FOCUS_WAIT_MS);
+    owner.once("focus", settle);
+  }
+
+  // Under XWayland, hiding the owner in the same moment a focused menu closes
+  // can block the main process for 20 s or more, until the GPU process exits.
+  // The 500 ms delay is an empirical value measured on Ubuntu GNOME 50.1
+  // under XWayland; why it freezes is still unknown (#1336 / #1350). A new
+  // menu reuses the owner that is still up.
+  function cancelOwnerHide() {
+    if (ownerHideTimer === null) return;
+    clearTimeout(ownerHideTimer);
+    ownerHideTimer = null;
+  }
+
+  function hideOwnerAfterMenu(owner) {
+    if (!isLinux) {
+      owner.hide();
+      return;
+    }
+    cancelOwnerHide();
+    ownerHideTimer = setTimeout(() => {
+      ownerHideTimer = null;
+      if (!owner.isDestroyed()) owner.hide();
+    }, MENU_OWNER_HIDE_DELAY_MS);
+  }
+
   function popupMenuAt(menu) {
     if (ctx.menuOpen) return;
+    cancelOwnerHide();
     const owner = ensureContextMenuOwner();
     if (!owner) return;
 
@@ -419,11 +472,20 @@ module.exports = function initMenu(ctx) {
     owner.focus();
 
     ctx.menuOpen = true;
-    menu.popup({
+    whenOwnerFocused(owner, () => menu.popup({
       window: owner,
       callback: () => {
         ctx.menuOpen = false;
-        if (owner && !owner.isDestroyed()) owner.hide();
+        if (owner && !owner.isDestroyed()) hideOwnerAfterMenu(owner);
+        // #1260 backstop: the normal renderer path ends any active drag
+        // before asking for this menu, so a lock still held at close time
+        // was stranded by the menu's modal loop swallowing the closing
+        // pointerup. Release through the shared recovery entry — it also
+        // pushes force-drag-release so the renderer unwinds its gesture
+        // state and the input window re-syncs.
+        if (ctx.dragLocked && typeof ctx.releaseStrandedDragLock === "function") {
+          ctx.releaseStrandedDragLock();
+        }
         // ctx.petHidden guard: the menu's own Hide item may have just hidden
         // the pet, and the click handler can fire on either side of this close
         // callback — an unconditional showInactive() would resurrect a window
@@ -437,11 +499,15 @@ module.exports = function initMenu(ctx) {
           if (isMac) {
             ctx.reapplyMacVisibility();
           } else if (isWin) {
-            ctx.win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+            if (ctx.petAlwaysOnTop === false) {
+              ctx.raisePetWindows();
+            } else {
+              ctx.win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
+            }
           }
         }
       },
-    });
+    }));
   }
 
   function buildDisplaySubmenu(displays = screen.getAllDisplays()) {
