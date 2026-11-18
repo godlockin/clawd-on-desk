@@ -22,7 +22,7 @@
 - **Global hotkeys** — `Ctrl+Shift+Y` to Allow, `Ctrl+Shift+N` to Deny the latest permission bubble (only registered while bubbles are visible)
 - **Stacking layout** — multiple permission requests stack upward from the bottom-right corner
 - **Auto-dismiss** — if you answer in the terminal first, the bubble disappears automatically
-- **Per-agent toggle** — open `Settings…` → `AI Coding Tools`, pick an agent, and turn off `Show pop-up bubbles` to keep prompts in that agent's own terminal/TUI
+- **Per-agent toggle** — open `Settings…` → `AI Coding Tools`, expand an agent card, and turn off `Permission prompts as Clawd bubbles` to keep prompts in that agent's own terminal/TUI
 
 ## Remote Notifications
 
@@ -55,6 +55,7 @@
 - **Single instance lock** — prevents duplicate Clawd windows
 - **Auto-start** — Claude Code's SessionStart hook can launch Clawd automatically if it's not running
 - **Do Not Disturb** — right-click or tray menu to enter sleep mode; the pet stops reacting until you wake Clawd. DND suppresses things that ask you to act, not status: remote **completion** notifications (Telegram/Slack) still arrive, since they are the point of walking away. Permission bubbles are suppressed during DND — Codex, opencode, and MiMo Code fall back to their native prompts, while Claude Code and CodeBuddy fall back to their built-in permission flow. WorkBuddy uses state + Notification only; Antigravity and Pi are state-only integrations.
+- **Meeting mode** — tray or right-click → `Meeting Mode` → 30 minutes / 1 hour / 2 hours, for screen sharing. Hides the pet, Session HUD and bubbles and turns on Do Not Disturb, so new permission requests fall back to the agent's own prompt. It ends on its own (also after the computer wakes from sleep), or early from `End Meeting Mode`, the show-pet shortcut or menu item, or Wake; it then restores only what it changed. Not kept across a restart. Clawd does not use content protection for this: since macOS 15, ScreenCaptureKit-based capture (Zoom, Teams, the system screenshot tools) ignores it.
 - **Sound effects** — short audio cues on task completion and permission requests (toggle via the system tray or Settings; 10s cooldown, auto-muted during DND)
 - **System tray** — DND mode, auto-start, check for updates
 - **i18n** — English, Simplified Chinese, Traditional Chinese, Korean, Japanese, Brazilian Portuguese, and Spanish UI; switch in Settings → General
