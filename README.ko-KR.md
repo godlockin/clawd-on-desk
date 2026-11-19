@@ -40,7 +40,7 @@
 |---|---|
 | Windows | `Clawd-on-Desk-Setup-<version>-x64.exe` 또는 `-arm64.exe` |
 | macOS | `.dmg` 또는 `brew install --cask clawd-on-desk` |
-| Linux | `.AppImage` 또는 `.deb` (x86_64에서는 Homebrew도 가능) |
+| Linux | `.AppImage` (앱 내 업데이트) 또는 `.deb` + [APT 설정 및 이전 안내](docs/guides/apt-setup.md) (x86_64에서는 Homebrew도 가능) |
 
 Clawd를 실행하면 바로 반응하기 시작합니다. 첫 실행 때 Claude Code와 Codex가 자동으로 연결되고, 다른 에이전트는 **Settings → AI 코딩 도구**에서 클릭 한 번으로 설치합니다.
 
@@ -68,7 +68,7 @@ npm start
 
 ## 지원 에이전트
 
-> **Claude Code** · **Codex CLI** · **Copilot CLI** · **Gemini CLI** · **Antigravity CLI (agy)** · **Cursor Agent** · **CodeBuddy** · **WorkBuddy** · **Grok Build** · **Kiro CLI** · **KiroCrew** · **Kimi Code CLI (Kimi-CLI)** · **Qwen Code** · **ZCode** · **CodeWhale** · **opencode** · **MiMo Code** · **Pi** · **OMP** · **OpenClaw** · **Hermes Agent** · **Qoder** · **QoderWork** · **QwenWork (千问办公)** · **Reasonix CLI** · **DeepSeek Harness** · **TraeCode (Trae CN)** · **MiniMax Code**
+> **Claude Code** · **Codex CLI** · **Copilot CLI** · **Gemini CLI** · **Antigravity CLI (agy)** · **Cursor Agent** · **CodeBuddy** · **WorkBuddy** · **Grok Build** · **Kiro CLI** · **KiroCrew** · **Kiro IDE** · **Kimi Code CLI (Kimi-CLI)** · **Qwen Code** · **ZCode** · **CodeWhale** · **opencode** · **MiMo Code** · **Pi** · **OMP** · **OpenClaw** · **Hermes Agent** · **Qoder** · **QoderWork** · **QwenWork (千问办公)** · **Reasonix CLI** · **DeepSeek Harness** · **TraeCode (Trae CN)** · **MiniMax Code**
 
 Claude Code와 Codex CLI는 첫 실행 때 연결됩니다. 다른 통합은 **Settings → AI 코딩 도구**에서 설치하면 Clawd가 계속 동기화합니다. 그 밖의 로컬 도구는 [커스텀 HTTP 에이전트](docs/guides/custom-agent-http.md) 엔드포인트로 상태를 보낼 수 있습니다. 에이전트별 세부 사항은 **[지원 에이전트](docs/guides/supported-agents.ko-KR.md)**, 권한 말풍선이 없는 에이전트 같은 차이는 **[알려진 제한 사항](docs/guides/known-limitations.md)**에 있습니다.
 
