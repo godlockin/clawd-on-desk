@@ -40,6 +40,23 @@ function makeCtx(overrides = {}) {
 }
 
 describe("permission session-scoped archive retirement", () => {
+  it("PR #1196 follow-up: interactive Codex focus fallback keeps the trusted profile", () => {
+    const entry = { sessionId: "codex:fixture", agentId: "codex", sourcePid: 731 };
+    const { buildPermissionFocusEntry } = initPermission.__test;
+    assert.equal(Object.hasOwn(buildPermissionFocusEntry(entry), "codexProfileId"), false);
+    assert.equal(buildPermissionFocusEntry({ ...entry, codexProfileId: "company" }).codexProfileId, "company");
+  });
+
+  it("keeps explicit ephemeral focus metadata on permission fallback entries", () => {
+    const perm = initPermission(makeCtx());
+    try {
+      const entry = { sessionId: "codex:fixture", agentId: "codex", codexOriginator: "Codex Desktop", sourcePid: 731 };
+      assert.strictEqual(initPermission.__test.buildPermissionFocusEntry({ ...entry, codexClientEphemeral: true }).codexClientEphemeral, true);
+      assert.strictEqual(initPermission.__test.buildPermissionFocusEntry({ ...entry, codexClientEphemeral: false }).codexClientEphemeral, false);
+      assert.strictEqual(initPermission.__test.buildPermissionFocusEntry(entry).codexClientEphemeral, undefined);
+    } finally { perm.cleanup(); }
+  });
+
   it("dismisses only the matching session and hands interactive prompts back with no-decision", () => {
     const perm = initPermission(makeCtx());
     const captured = [];
