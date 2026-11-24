@@ -35,6 +35,7 @@ const { normalizeQuotaGroup } = require("../hooks/quota-bucket");
 const { ANTIGRAVITY_QUOTA_FIELDS } = require("../hooks/antigravity-context-usage");
 const { CLAUDE_QUOTA_FIELDS } = require("../hooks/claude-rate-limits");
 const { CODEX_QUOTA_FIELDS } = require("../hooks/codex-rate-limits");
+const { DEEPSEEK_QUOTA_FIELDS } = require("./deepseek-balance-normalizer");
 const { KIMI_QUOTA_FIELDS } = require("./kimi-quota-normalizer");
 
 const QUOTA_PROVIDER_FIELDS = {
@@ -43,6 +44,7 @@ const QUOTA_PROVIDER_FIELDS = {
   codexQuota: CODEX_QUOTA_FIELDS,
   codexSparkQuota: CODEX_QUOTA_FIELDS,
   kimiQuota: KIMI_QUOTA_FIELDS,
+  deepseekQuota: DEEPSEEK_QUOTA_FIELDS,
 };
 const QUOTA_PROVIDER_KEYS = Object.keys(QUOTA_PROVIDER_FIELDS);
 
@@ -171,6 +173,13 @@ function createAccountQuotaStore(options = {}) {
   // options.persistPath: undefined -> default path, null -> in-memory only.
   const persistPath = options.persistPath === undefined ? DEFAULT_PERSIST_PATH : options.persistPath;
   const logWarn = typeof options.logWarn === "function" ? options.logWarn : () => {};
+  const codexProfileSources = Array.isArray(options.codexProfiles)
+    ? new Set(options.codexProfiles.map((profile) => profile.quotaSource))
+    : null;
+
+  function isQuotaSourceEnabled(sourceKey) {
+    return !codexProfileSources || !sourceKey?.startsWith("codex-profile:") || codexProfileSources.has(sourceKey);
+  }
 
   // Map<hostKey, { host, [providerKey]: { group, updatedAt, lastSeenAt } }>
   // ("" = local). updatedAt = last VALUE change (drives display of the
@@ -193,6 +202,7 @@ function createAccountQuotaStore(options = {}) {
     const persistVersion = Number(raw && raw.version);
     const preModelRoutingPersist = !Number.isFinite(persistVersion) || persistVersion < 6;
     const entries = raw && Array.isArray(raw.sources) ? raw.sources : [];
+    let droppedProfileSource = false;
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
       if (sources.size >= MAX_SOURCES) break;
@@ -200,6 +210,10 @@ function createAccountQuotaStore(options = {}) {
       const sourceKey = typeof entry.sourceKey === "string"
         ? normalizeSourceHost(entry.sourceKey)
         : host;
+      if (!isQuotaSourceEnabled(sourceKey)) {
+        droppedProfileSource = true;
+        continue;
+      }
       const record = { host };
       let hasAny = false;
       for (const providerKey of QUOTA_PROVIDER_KEYS) {
@@ -239,6 +253,7 @@ function createAccountQuotaStore(options = {}) {
       if (hasAny) sources.set(sourceKey || "", record);
     }
     pruneStale(nowMs);
+    if (droppedProfileSource) schedulePersist();
   }
 
   // Retire data nothing will ever refresh: buckets whose window reset long
@@ -323,6 +338,7 @@ function createAccountQuotaStore(options = {}) {
   function updateDetailed(source, quotas = {}) {
     const nowMs = now();
     const sourceKey = normalizeSourceHost(source);
+    if (!isQuotaSourceEnabled(sourceKey)) return { accepted: false, changed: false };
     const key = sourceKey || "";
     const requestedDisplayHost = Object.prototype.hasOwnProperty.call(quotas, "displayHost")
       ? normalizeSourceHost(quotas.displayHost)
@@ -463,13 +479,16 @@ function createAccountQuotaStore(options = {}) {
       if (!b.host) return 1;
       return a.host.localeCompare(b.host);
     });
-    if (options.mergeSources !== true || out.length <= 1) return out;
+    const localCodexProfiles = out.filter((entry) => typeof entry.sourceKey === "string"
+      && entry.sourceKey.startsWith("codex-profile:"));
+    const mergeableSources = out.filter((entry) => !localCodexProfiles.includes(entry));
+    if (options.mergeSources !== true || mergeableSources.length <= 1) return out;
 
     // The merged view is a single synthetic source; nothing can collide with it.
     const merged = { sourceKey: null, host: null };
     let hasAny = false;
     for (const providerKey of QUOTA_PROVIDER_KEYS) {
-      const providerCandidates = out
+      const providerCandidates = mergeableSources
         .map((entry) => entry[providerKey])
         .filter(Boolean);
       const hasLiveProvider = providerCandidates.some((candidate) =>
@@ -522,7 +541,7 @@ function createAccountQuotaStore(options = {}) {
         hasAny = true;
       }
     }
-    return hasAny ? [merged] : [];
+    return hasAny ? [merged, ...localCodexProfiles] : localCodexProfiles;
   }
 
   function flush() {

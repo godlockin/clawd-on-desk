@@ -40,7 +40,7 @@ Descarga el instalador más reciente desde **[GitHub Releases](https://github.co
 |---|---|
 | Windows | `Clawd-on-Desk-Setup-<version>-x64.exe` o `-arm64.exe` |
 | macOS | `.dmg`, o `brew install --cask clawd-on-desk` |
-| Linux | `.AppImage` o `.deb` (Homebrew también funciona en x86_64) |
+| Linux | `.AppImage` (actualización desde la app), o `.deb` + [configuración y migración a APT](docs/guides/apt-setup.md) (Homebrew también funciona en x86_64) |
 
 Abre Clawd y empieza a reaccionar de inmediato: Claude Code y Codex se conectan en el primer arranque. Cualquier otro agente se instala con un clic en **Ajustes → Herramientas de IA para código**.
 
@@ -68,7 +68,7 @@ Requisitos, Remote SSH, WSL y notas para macOS / Linux: **[guía de configuraci�
 
 ## Agentes compatibles
 
-> **Claude Code** · **Codex CLI** · **Copilot CLI** · **Gemini CLI** · **Antigravity CLI (agy)** · **Cursor Agent** · **CodeBuddy** · **WorkBuddy** · **Grok Build** · **Kiro CLI** · **KiroCrew** · **Kimi Code CLI (Kimi-CLI)** · **Qwen Code** · **ZCode** · **CodeWhale** · **opencode** · **MiMo Code** · **Pi** · **OMP** · **OpenClaw** · **Hermes Agent** · **Qoder** · **QoderWork** · **QwenWork (千问办公)** · **Reasonix CLI** · **DeepSeek Harness** · **TraeCode (Trae CN)** · **MiniMax Code**
+> **Claude Code** · **Codex CLI** · **Copilot CLI** · **Gemini CLI** · **Antigravity CLI (agy)** · **Cursor Agent** · **CodeBuddy** · **WorkBuddy** · **Grok Build** · **Kiro CLI** · **KiroCrew** · **Kiro IDE** · **Kimi Code CLI (Kimi-CLI)** · **Qwen Code** · **ZCode** · **CodeWhale** · **opencode** · **MiMo Code** · **Pi** · **OMP** · **OpenClaw** · **Hermes Agent** · **Qoder** · **QoderWork** · **QwenWork (千问办公)** · **Reasonix CLI** · **DeepSeek Harness** · **TraeCode (Trae CN)** · **MiniMax Code**
 
 Claude Code y Codex CLI se configuran en el primer arranque; instala cualquier otra integración desde **Ajustes → Herramientas de IA para código** y Clawd la mantiene sincronizada. Otras herramientas locales pueden informar a través del endpoint de [agentes HTTP personalizados](docs/guides/custom-agent-http.md). Los detalles de cada agente están en **[agentes compatibles](docs/guides/supported-agents.es.md)**, y las diferencias, como agentes sin globo de permisos, en **[limitaciones conocidas](docs/guides/known-limitations.md)**.
 
