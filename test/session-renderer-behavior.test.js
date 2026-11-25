@@ -144,6 +144,7 @@ function translations() {
     sessionFocusUnavailableRemote: "Remote sessions cannot focus a terminal on this computer.",
     sessionFocusUnavailableWebui: "WebUI sessions do not have a local terminal window.",
     sessionFocusUnavailableMissingTerminalInfo: "This session did not provide terminal window information.",
+    sessionFocusUnavailableCodexProfile: "Switch to this profile in Codex before opening the session.",
     sessionOpenFolderFailed: "Could not open folder: {reason}",
     sessionOpenFolderUnavailable: "This folder is no longer available.",
     sessionJustNow: "now",
@@ -170,6 +171,7 @@ function translations() {
     dashboardKimiQuotaEmpty: "No quota data yet. Click refresh to fetch it.",
     dashboardKimiQuotaRefreshShort: "Refresh",
     dashboardModel: "Model",
+    dashboardContextUsage: "Context usage",
   };
 }
 
@@ -297,6 +299,7 @@ async function loadHud(sessions, openResult = { status: "ok" }) {
     clearTimeout: () => { feedbackTimeout = null; },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "src", "session-focus-unavailable.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "src", "session-hud-tagged-fallback.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "src", "session-hud-renderer.js"), "utf8"), context);
   await flush();
   snapshotListener({ sessions, orderedIds: sessions.map((entry) => entry.id) });
@@ -336,6 +339,17 @@ test("Dashboard renders local/remote/webui reasons and only local folder action"
   assert.deepStrictEqual(jumpButtons(cards[1]), []);
   assert.deepStrictEqual(jumpButtons(cards[2]).map((button) => button.disabled), [true]);
   assert.strictEqual(byClass(root, "open-folder-button").length, 1);
+});
+
+test("HUD and Dashboard render context usage with a percentage alone", async () => {
+  const rows = [session("qoder", { agentId: "qoder", contextUsage: { percent: 37 } })];
+  const hud = await loadHud(rows);
+  const [chip] = byClass(hud.root, "usage-chip");
+  assert.equal(chip?.textContent, "37%");
+  assert.equal(chip?.title, "37%");
+
+  const dashboard = await loadDashboard(rows);
+  assert.deepEqual(byClass(dashboard.root, "context-usage-row").map((row) => row.textContent), ["Context usage: 37%"]);
 });
 
 test("Dashboard labels a DSH desktop target as opening the app, not the terminal", async () => {
@@ -700,6 +714,17 @@ test("Dashboard keeps session automation failure feedback visible after rerender
   );
 });
 
+test("completed temporary chat preference changes HUD rows while Dashboard keeps the same sessions", async () => {
+  const rows = [session("active", { state: "working" }),
+    session("completed-temporary", { badge: "done", hudHiddenByPreference: true })];
+  const hud = await loadHud(rows);
+  assert.strictEqual(byClass(hud.root, "row").length, 1);
+  const dashboard = await loadDashboard(rows);
+  assert.strictEqual(byClass(dashboard.root, "card").length, 2);
+  hud.pushSnapshot(rows.map(row => ({ ...row, hudHiddenByPreference: false })));
+  assert.strictEqual(byClass(hud.root, "row").length, 2);
+});
+
 test("HUD unfocusable click explains why and offers folder only for local non-webui", async () => {
   const { root } = await loadHud([
     session("local"),
@@ -718,6 +743,21 @@ test("HUD unfocusable click explains why and offers folder only for local non-we
     "This session did not provide terminal window information."
   );
   assert.strictEqual(byClass(root, "open-folder-button").length, 1);
+});
+
+test("HUD labels additional Codex profiles and keeps their cards display-only", async () => {
+  const { root } = await loadHud([
+    session("company-session", {
+      agentId: "codex",
+      displayTitle: "Build",
+      codexProfileId: "company",
+      codexProfileLabel: "Company",
+      canFocus: false,
+    }),
+  ]);
+  assert.strictEqual(byClass(root, "title")[0].textContent, "Company · Build");
+  assert.strictEqual(byClass(root, "row-unfocusable")[0].title,
+    "Switch to this profile in Codex before opening the session.");
 });
 
 test("HUD folder click sends only id and exposes open failure", async () => {
@@ -768,6 +808,7 @@ test("unfocusable and folder feedback copy exists in all supported languages", (
     "sessionFocusUnavailableRemote",
     "sessionFocusUnavailableWebui",
     "sessionFocusUnavailableMissingTerminalInfo",
+    "sessionFocusUnavailableCodexProfile",
   ];
   for (const lang of SUPPORTED_LANGS) {
     for (const key of keys) assert.ok(i18n[lang][key], `${lang}.${key} is required`);
