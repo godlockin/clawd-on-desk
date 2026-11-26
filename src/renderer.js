@@ -34,6 +34,11 @@ const DISCRETE_SAMPLING_MAX_RETRIES = 60;
 // sampler on the same document (a retry that raced the first pass, a duplicate
 // commit callback) would otherwise snap an already-snapped duration again.
 const discreteSampledDocuments = new WeakSet();
+const discreteSamplingFollowByDocument = new WeakMap();
+// The zoom cancelDisplayScaleForCompositor wrote into each SVG document.
+const displayScaleZoomByDocument = new WeakMap();
+// Same settle time main.js gives display-metrics-changed, which arrives in bursts too.
+const DISPLAY_SCALE_RELOAD_DEBOUNCE_MS = 400;
 const WAKE_OBJECT_RELOAD_RETRIES = 1;
 const LOW_POWER_PAUSE_STYLE_ID = "clawd-low-power-pause-svg";
 // Deep sleep can sit on screen all night, so those states always pause: the
@@ -41,13 +46,6 @@ const LOW_POWER_PAUSE_STYLE_ID = "clawd-low-power-pause-svg";
 // on a sleeping pose.
 const DEEP_SLEEP_PAUSE_STATES = new Set(["collapsing", "sleeping"]);
 const LOW_POWER_OPTIONAL_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
-// Mirrors the set in src/tick.js (the main process keeps its own copy). Keep
-// this as the union of both policies even though the renderer now consults the
-// split sets directly.
-const LOW_POWER_PAUSE_STATES = new Set([
-  ...LOW_POWER_OPTIONAL_PAUSE_STATES,
-  ...DEEP_SLEEP_PAUSE_STATES,
-]);
 const LOW_POWER_BOUNDARY_EPSILON_MS = 80;
 const CLOUDLING_POINTER_BRIDGE_STATES = new Set(["idle", "mini-idle", "mini-peek"]);
 const CODEX_PET_VISUAL_BY_FILE = Object.freeze({
@@ -65,7 +63,9 @@ const CODEX_PET_VISUAL_BY_FILE = Object.freeze({
 });
 let lowPowerIdleMode = false;
 let lowPowerIdlePauseTimer = null;
+let displayScaleReloadTimer = null;
 let lowPowerSvgPaused = false;
+let petHidden = false;
 let lastSystemWakeId = null;
 let lastSystemWakeStatus = null;
 let pendingSystemWakeId = null;
@@ -75,6 +75,7 @@ let _lowPowerStaticImageOverrides = {};
 let _petTintPayload = { id: "none", filter: "" };
 let _petTintSupported = false;
 const ACCESSORY_SLOT_NAMES = Object.freeze(["head", "mouth"]);
+const ACCESSORY_SMIL_RATE = 12;
 function createAccessorySlotRuntime(element) {
   return {
     element,
@@ -87,6 +88,8 @@ function createAccessorySlotRuntime(element) {
     assetLoadTimer: null,
     assetWaiters: [],
     raf: null,
+    followTimer: null,
+    smilTimer: null,
     lastLayout: null,
     followKey: null,
     pausedRoot: null,
@@ -276,16 +279,48 @@ function setSvgRootLowPowerPaused(root, paused) {
   }
 }
 
+function stopAccessorySmilClock(slot) {
+  if (slot.smilTimer == null) return;
+  clearInterval(slot.smilTimer);
+  slot.smilTimer = null;
+}
+
+function startAccessorySmilClock(slot, root) {
+  stopAccessorySmilClock(slot);
+  try {
+    if (!root.querySelectorAll("animate, animateTransform, animateMotion, set").length) return;
+    root.pauseAnimations();
+    // SVG time is single precision; accumulating small steps loses time as
+    // the document ages. A fresh anchor also excludes time spent hidden.
+    const anchorTime = root.getCurrentTime();
+    const anchorNow = performance.now();
+    slot.smilTimer = setInterval(() => {
+      try {
+        root.setCurrentTime(anchorTime + (performance.now() - anchorNow) / 1000);
+      } catch {
+        stopAccessorySmilClock(slot);
+      }
+    }, 1000 / ACCESSORY_SMIL_RATE);
+  } catch {
+    stopAccessorySmilClock(slot);
+  }
+}
+
 function setAccessorySvgLowPowerPaused(slotName, paused) {
   const slot = _accessorySlots[slotName];
   if (!slot || !slot.element || slot.element.tagName !== "OBJECT") return false;
   const root = getObjectSvgRoot(slot.element);
-  if (!root) return false;
+  if (!root) {
+    stopAccessorySmilClock(slot);
+    return false;
+  }
   const next = !!paused;
   if (slot.pausedRoot === root && slot.documentPaused === next) return true;
   if (!setSvgRootLowPowerPaused(root, next)) return false;
   slot.pausedRoot = root;
   slot.documentPaused = next;
+  if (next) stopAccessorySmilClock(slot);
+  else startAccessorySmilClock(slot, root);
   return true;
 }
 
@@ -293,7 +328,7 @@ function syncAccessorySvgLowPowerPaused(paused) {
   for (const slotName of ACCESSORY_SLOT_NAMES) {
     const slot = getAccessorySlot(slotName);
     const hidden = !!(slot && slot.element && slot.element.style.display === "none");
-    setAccessorySvgLowPowerPaused(slotName, paused || hidden);
+    setAccessorySvgLowPowerPaused(slotName, paused || petHidden || hidden);
   }
 }
 
@@ -327,6 +362,7 @@ function setLowPowerSvgPaused(paused) {
   if (next) {
     _cancelLayerAnimLoop();
     for (const slotName of ACCESSORY_SLOT_NAMES) cancelAccessoryFollow(slotName);
+    cancelJugglingFrontLoop();
   } else {
     refreshAccessoryLayout();
   }
@@ -750,6 +786,7 @@ function applyPetTintToElement(element) {
 
 function applyPetTintToAllMedia() {
   for (const element of getPetMediaElements()) applyPetTintToElement(element);
+  applyPetTintToJugglingFront();
 }
 
 function setPetTintPayload(payload) {
@@ -799,10 +836,14 @@ function cancelAccessoryFollow(slotName) {
     cancelAnimationFrame(slot.raf);
     slot.raf = null;
   }
+  if (slot.followTimer != null) {
+    clearTimeout(slot.followTimer);
+    slot.followTimer = null;
+  }
   slot.followKey = null;
 }
 
-function hideAccessory(slotName) {
+function hideAccessory(slotName, { syncFront = true } = {}) {
   const slot = getAccessorySlot(slotName);
   if (!slot) return;
   cancelAccessoryFollow(slotName);
@@ -819,6 +860,8 @@ function hideAccessory(slotName) {
   // Hidden document-backed accessories must not keep advancing their SMIL
   // timeline behind a sprite that declares the slot hidden.
   setAccessorySvgLowPowerPaused(slotName, true);
+  // A layout refresh already syncs after visiting its requested slots.
+  if (slotName === "head" && syncFront) syncJugglingFrontLayer();
 }
 
 function clearAccessoryAssetLoadTimer(slotName) {
@@ -847,7 +890,7 @@ function clearAccessoryRuntime(slotName, options = {}) {
   if (!options.clearAsset) return;
   clearAccessoryAssetLoadTimer(slotName);
   if (slot.element) {
-    setAccessorySvgLowPowerPaused(slotName, false);
+    // Clearing data on a hidden object can retain its document, so leave it paused.
     slot.element.onload = null;
     slot.element.onerror = null;
     try {
@@ -925,7 +968,7 @@ function ensureAccessoryAsset(slotName) {
     clearAccessoryAssetLoadTimer(slotName);
     slot.assetReady = true;
     slot.assetSettled = true;
-    if (lowPowerSvgPaused) setAccessorySvgLowPowerPaused(slotName, true);
+    if (lowPowerSvgPaused || petHidden) setAccessorySvgLowPowerPaused(slotName, true);
     refreshAccessoryLayout(slotName);
     flushAccessoryAssetWaiters(slotName);
   };
@@ -1031,6 +1074,21 @@ function computeStaticAccessoryLayout(context) {
   });
 }
 
+// getCTM() answers in the nested document's CSS pixels, and the root zoom makes
+// those 1 / zoom times as many as the page's.
+function scaleCtmToPagePixels(matrix, svgDoc) {
+  const zoom = displayScaleZoomByDocument.get(svgDoc);
+  if (!zoom) return matrix;
+  return {
+    a: matrix.a * zoom,
+    b: matrix.b * zoom,
+    c: matrix.c * zoom,
+    d: matrix.d * zoom,
+    e: matrix.e * zoom,
+    f: matrix.f * zoom,
+  };
+}
+
 function computeFollowAccessoryLayout(context) {
   if (!accessoryLayout || typeof accessoryLayout.computeDynamicAccessoryLayout !== "function") return null;
   const followTarget = context.descriptor.followTarget;
@@ -1043,6 +1101,7 @@ function computeFollowAccessoryLayout(context) {
     const doc = context.media.contentDocument;
     target = doc && doc.getElementById(followTarget.id);
     matrix = target && typeof target.getCTM === "function" ? target.getCTM() : null;
+    if (matrix) matrix = scaleCtmToPagePixels(matrix, doc);
   } catch {
     return null;
   }
@@ -1076,11 +1135,33 @@ function applyAccessoryLayout(context, layout) {
   }
   slot.element.style.filter = "none";
   // hideAccessory() pauses object-backed assets. Restore this document to the
-  // global low-power state before making it visible again.
-  setAccessorySvgLowPowerPaused(context.slotName, lowPowerSvgPaused);
+  // page's pause state before making it visible again.
+  setAccessorySvgLowPowerPaused(context.slotName, lowPowerSvgPaused || petHidden);
   slot.element.style.visibility = "visible";
   slot.element.style.display = "block";
   return true;
+}
+
+function getSampledMediaDelayMs(media) {
+  try {
+    const doc = media.contentDocument;
+    const sampled = doc && discreteSamplingFollowByDocument.get(doc);
+    if (!sampled || _useLayeredTracking) return null;
+    // Cursor tracking moves the body through a transition between grid points.
+    // A one-shot that stays in the list after it finished no longer moves it.
+    const bodyAnimations = bodyTarget && bodyTarget.ownerDocument === doc
+      ? bodyTarget.getAnimations()
+      : [];
+    if (bodyAnimations.some((entry) => entry.playState !== "finished")) return null;
+    const { animation, oneShots, stepMs } = sampled;
+    // One-shot entrances move the document until they land; afterwards the
+    // grid is the only thing still changing the picture.
+    if (oneShots.some((oneShot) => oneShot.playState !== "finished")) return null;
+    if (animation.playState !== "running" || !Number.isFinite(animation.startTime)) return null;
+    return stepMs - (animation.currentTime % stepMs);
+  } catch {
+    return null;
+  }
 }
 
 function accessoryFollowTick(slotName, expectedKey) {
@@ -1109,35 +1190,303 @@ function accessoryFollowTick(slotName, expectedKey) {
     return;
   }
   applyAccessoryLayout(context, layout);
-  slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, expectedKey));
+  const delayMs = getSampledMediaDelayMs(context.media);
+  if (delayMs != null) {
+    slot.followTimer = setTimeout(() => {
+      slot.followTimer = null;
+      slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, expectedKey));
+    }, delayMs);
+  } else {
+    slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, expectedKey));
+  }
 }
 
 function startAccessoryFollow(context) {
   const { slotName, slot } = context;
   const follow = context.descriptor.followTarget;
-  if (!follow || shouldSuppressPassiveTrackingForLowPower()) return;
+  if (!follow || petHidden || shouldSuppressPassiveTrackingForLowPower()) return;
   const key = `${context.file}|${slot.payload.id}|${follow.id}`;
   cancelAccessoryFollow(slotName);
   slot.followKey = key;
   slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, key));
 }
 
-function refreshAccessoryLayout(slotName = null) {
-  if (!slotName) {
-    for (const name of ACCESSORY_SLOT_NAMES) refreshAccessoryLayout(name);
+// ── Juggling front layer ─────────────────────────────────────────────────
+// Only the built-in Clawd scene shares its ball geometry with this copy.
+// Clawd uses no media fades here, so one committed document drives the layer.
+const JUGGLING_SOURCE_URL = "../assets/svg/clawd-working-juggling.svg";
+const JUGGLING_FRONT_URL = "../assets/juggling/clawd-juggling-front.svg";
+// Allow a slow cold load. On timeout, the original balls keep playing behind
+// the hat until a new media commit can try the copy again.
+const JUGGLING_FRONT_LOAD_TIMEOUT_MS = 3000;
+const jugglingFront = {
+  media: null,
+  sourceDocument: null,
+  targetLoaded: false,
+  target: null,
+  visible: false,
+  failed: null,
+  token: 0,
+  loadToken: null,
+  timer: null,
+  raf: null,
+  waitStartedAt: null,
+  transforms: [],
+};
+
+function getJugglingFrontLayer() {
+  return document.getElementById("pet-balls-layer");
+}
+
+function getJugglingFrontObject() {
+  return document.getElementById("clawd-balls");
+}
+
+function headAccessoryVisibleNow() {
+  const slot = getAccessorySlot("head");
+  if (!slot || !slot.supported || !slot.element || !slot.assetReady) return false;
+  if (!slot.payload || slot.payload.id === "none" || !slot.payload.assetFile) return false;
+  // The page hides descendants via CSS. Keep the binding while the hat itself
+  // is still laid out, so resizing a hidden pet doesn't reload the copy.
+  const { visibility, display } = slot.element.style;
+  return visibility !== "hidden" && display !== "none";
+}
+
+function getJugglingFrontMedia() {
+  if (!clawdEl || clawdEl.tagName !== "OBJECT" || !clawdEl.isConnected) return null;
+  if (currentDisplayedAssetUrl !== JUGGLING_SOURCE_URL || jugglingFront.failed === clawdEl) return null;
+  return headAccessoryVisibleNow() ? clawdEl : null;
+}
+
+function shouldPauseJugglingFront() {
+  return petHidden || document.hidden === true || shouldSuppressPassiveTrackingForLowPower();
+}
+
+function applyPetTintToJugglingFront(front = getJugglingFrontObject()) {
+  if (front) front.style.filter = _petTintSupported ? _petTintPayload.filter : "";
+}
+
+function alignJugglingFrontObject(media, front) {
+  if (!media.style.width) return false;
+  // The layers share a local origin and size. Copy the CSS values so that
+  // both inherit the same ancestor flips and transforms.
+  for (const property of ["left", "top", "bottom", "width", "height"]) {
+    const value = media.style[property];
+    if (front.style[property] !== value) front.style[property] = value;
+  }
+  return true;
+}
+
+function hideJugglingFrontObject(front) {
+  if (front.style.visibility !== "hidden") front.style.visibility = "hidden";
+  jugglingFront.visible = false;
+}
+
+function cancelJugglingFrontLoop() {
+  jugglingFront.token++;
+  if (jugglingFront.timer != null) clearTimeout(jugglingFront.timer);
+  if (jugglingFront.raf != null) cancelAnimationFrame(jugglingFront.raf);
+  jugglingFront.timer = null;
+  jugglingFront.raf = null;
+}
+
+function stopJugglingFrontLayer() {
+  if (!jugglingFront.media) return;
+  cancelJugglingFrontLoop();
+  jugglingFront.media = null;
+  jugglingFront.sourceDocument = null;
+  jugglingFront.targetLoaded = false;
+  jugglingFront.target = null;
+  jugglingFront.loadToken = null;
+  jugglingFront.transforms = [];
+  const layer = getJugglingFrontLayer();
+  const front = getJugglingFrontObject();
+  if (layer) layer.style.display = "none";
+  if (front) {
+    hideJugglingFrontObject(front);
+    front.onload = null;
+    front.onerror = null;
+    try { front.data = ""; } catch {}
+  }
+}
+
+function failJugglingFrontLayer() {
+  jugglingFront.failed = jugglingFront.media;
+  stopJugglingFrontLayer();
+}
+
+function bindJugglingFrontLayer(media, layer, front) {
+  stopJugglingFrontLayer();
+  jugglingFront.media = media;
+  jugglingFront.waitStartedAt = null;
+  // The loop may pause while the object loads. Its events stay current until
+  // the binding itself is retired.
+  const loadToken = ++jugglingFront.token;
+  jugglingFront.loadToken = loadToken;
+  hideJugglingFrontObject(front);
+  front.onload = () => {
+    if (jugglingFront.loadToken !== loadToken) return;
+    hideJugglingFrontObject(front);
+    jugglingFront.targetLoaded = true;
+    jugglingFront.target = null;
+    jugglingFront.transforms = [];
+  };
+  front.onerror = () => {
+    if (jugglingFront.loadToken !== loadToken) return;
+    failJugglingFrontLayer();
+  };
+  // Chromium needs a mounted object to create its document. Hide the object
+  // itself until all three positions have been copied.
+  layer.style.display = "block";
+  try { front.data = JUGGLING_FRONT_URL + "?_t=" + loadToken; } catch { failJugglingFrontLayer(); }
+}
+
+function getJugglingDocument(object) {
+  try { return object.contentDocument; } catch { return null; }
+}
+
+function getJugglingFrontPackets(front) {
+  if (!jugglingFront.targetLoaded) return null;
+  const doc = getJugglingDocument(front);
+  if (!doc) return null;
+  const target = jugglingFront.target;
+  if (target) return doc === target.document ? target.packets : null;
+  try {
+    // The current load handler can run before contentDocument stops returning
+    // the previous binding's SVG. Only cache the document for this URL.
+    if (doc.URL !== new URL(front.data, document.baseURI).href) return null;
+    const packets = doc.querySelectorAll(".packet");
+    if (packets.length !== 3) return null;
+    jugglingFront.target = { document: doc, packets };
+    return packets;
+  } catch {
+    return null;
+  }
+}
+
+function copyJugglingPackets(sourceDocument, targetPackets) {
+  try {
+    const packets = sourceDocument.querySelectorAll(".packet");
+    if (packets.length !== 3) return false;
+    const transforms = Array.from(packets, (packet) => {
+      const { transform } = window.getComputedStyle(packet);
+      return transform === "none" ? "" : transform;
+    });
+    transforms.forEach((transform, index) => {
+      if (jugglingFront.transforms[index] !== transform) {
+        targetPackets[index].setAttribute("transform", transform);
+      }
+    });
+    jugglingFront.transforms = transforms;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function jugglingFrontTick(front, token) {
+  if (jugglingFront.token !== token) return;
+  jugglingFront.raf = null;
+  if (shouldPauseJugglingFront()) {
+    cancelJugglingFrontLoop();
     return;
   }
+  const media = getJugglingFrontMedia();
+  // A commit can retire the source before a scheduled callback gets to run.
+  if (!media || media !== jugglingFront.media) {
+    syncJugglingFrontLayer();
+    return;
+  }
+  const sourceDocument = getJugglingDocument(media);
+  if (sourceDocument && sourceDocument !== jugglingFront.sourceDocument) {
+    hideJugglingFrontObject(front);
+    // A missing document can be transient. Only a replacement starts a new wait.
+    if (jugglingFront.sourceDocument) jugglingFront.waitStartedAt = null;
+    jugglingFront.sourceDocument = sourceDocument;
+    jugglingFront.transforms = [];
+  }
+
+  const targetPackets = getJugglingFrontPackets(front);
+  const copied = sourceDocument && targetPackets && copyJugglingPackets(sourceDocument, targetPackets);
+  if (!copied) {
+    hideJugglingFrontObject(front);
+    // A committed object may expose its SVG document after the commit, just
+    // as it can for discrete sampling. Give both documents time to arrive.
+    const now = performance.now();
+    jugglingFront.waitStartedAt ??= now;
+    if (now - jugglingFront.waitStartedAt >= JUGGLING_FRONT_LOAD_TIMEOUT_MS) {
+      failJugglingFrontLayer();
+      return;
+    }
+  } else {
+    jugglingFront.waitStartedAt = null;
+    if (!jugglingFront.visible) {
+      front.style.visibility = "visible";
+      jugglingFront.visible = true;
+    }
+  }
+
+  const tick = () => jugglingFrontTick(front, token);
+  const delayMs = copied ? getSampledMediaDelayMs(media) : null;
+  if (delayMs != null) {
+    jugglingFront.timer = setTimeout(() => {
+      if (jugglingFront.token !== token) return;
+      jugglingFront.timer = null;
+      jugglingFront.raf = requestAnimationFrame(tick);
+    }, delayMs);
+  } else {
+    jugglingFront.raf = requestAnimationFrame(tick);
+  }
+}
+
+function syncJugglingFrontLayer() {
+  if (jugglingFront.failed !== clawdEl) jugglingFront.failed = null;
+  const layer = getJugglingFrontLayer();
+  const front = getJugglingFrontObject();
+  const media = getJugglingFrontMedia();
+  if (!layer || !front || !media) {
+    stopJugglingFrontLayer();
+    return;
+  }
+  if (jugglingFront.media !== media) bindJugglingFrontLayer(media, layer, front);
+  if (jugglingFront.media !== media) return;
+  applyPetTintToJugglingFront(front);
+  if (!alignJugglingFrontObject(media, front)) {
+    hideJugglingFrontObject(front);
+    cancelJugglingFrontLoop();
+    return;
+  }
+  if (shouldPauseJugglingFront()) {
+    if (jugglingFront.timer != null || jugglingFront.raf != null) cancelJugglingFrontLoop();
+    return;
+  }
+  if (jugglingFront.timer == null && jugglingFront.raf == null) {
+    const { token } = jugglingFront;
+    jugglingFront.raf = requestAnimationFrame(() => jugglingFrontTick(front, token));
+  }
+}
+
+function refreshAccessoryLayout(slotName = null) {
+  try {
+    if (slotName) refreshAccessorySlotLayout(slotName);
+    else for (const name of ACCESSORY_SLOT_NAMES) refreshAccessorySlotLayout(name);
+  } finally {
+    syncJugglingFrontLayer();
+  }
+}
+
+function refreshAccessorySlotLayout(slotName) {
   cancelAccessoryFollow(slotName);
   const context = getCurrentAccessoryContext(slotName);
   if (!context || context.descriptor.visibility === "hidden") {
-    hideAccessory(slotName);
+    hideAccessory(slotName, { syncFront: false });
     return;
   }
   if (!ensureAccessoryAsset(slotName)) {
     // A pending <object> must remain mounted for Chromium to load its nested
     // document. It is already visibility:hidden, so there is no pre-layout
     // flash. Failed/timed-out assets are settled and stay fully hidden.
-    if (context.slot.assetSettled) hideAccessory(slotName);
+    if (context.slot.assetSettled) hideAccessory(slotName, { syncFront: false });
     return;
   }
 
@@ -1153,7 +1502,7 @@ function refreshAccessoryLayout(slotName = null) {
   }
   const staticLayout = computeStaticAccessoryLayout(context);
   if (!applyAccessoryLayout(context, staticLayout)) {
-    hideAccessory(slotName);
+    hideAccessory(slotName, { syncFront: false });
     noteAccessoryDiagnostic(slotName, context.file, "static-layout-unavailable");
   }
 }
@@ -1200,8 +1549,10 @@ if (document && typeof document.addEventListener === "function") {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden === true) {
       for (const slotName of ACCESSORY_SLOT_NAMES) cancelAccessoryFollow(slotName);
+      cancelJugglingFrontLoop();
+    } else {
+      refreshAccessoryLayout();
     }
-    else refreshAccessoryLayout();
   });
 }
 
@@ -1313,6 +1664,21 @@ let miniLeftFlip = false;
 
 if (window.electronAPI && typeof window.electronAPI.onLowPowerIdleModeChange === "function") {
   window.electronAPI.onLowPowerIdleModeChange(setLowPowerIdleMode);
+}
+if (window.electronAPI && typeof window.electronAPI.onPetHiddenChange === "function") {
+  window.electronAPI.onPetHiddenChange((hidden) => {
+    const next = !!hidden;
+    document.documentElement.classList.toggle("pet-hidden", next);
+    if (petHidden === next) return;
+    petHidden = next;
+    if (next) {
+      for (const slotName of ACCESSORY_SLOT_NAMES) cancelAccessoryFollow(slotName);
+      cancelJugglingFrontLoop();
+    } else {
+      refreshAccessoryLayout();
+    }
+    syncAccessorySvgLowPowerPaused(lowPowerSvgPaused);
+  });
 }
 
 window.electronAPI.onDndChange((enabled) => {
@@ -1899,6 +2265,11 @@ function computeDiscreteSamplingTiming({ durationMs, delayMs }, rate) {
   };
 }
 
+function isCssAnimation(animation, contentWindow) {
+  const CSSAnimationCtor = contentWindow && contentWindow.CSSAnimation;
+  return typeof CSSAnimationCtor === "function" && animation instanceof CSSAnimationCtor;
+}
+
 /**
  * A CSSAnimation that loops forever is the only thing worth sampling. One-shot
  * animations (sleep-collapse, transitions) finish long before the cap pays off,
@@ -1915,10 +2286,7 @@ function readSampleableAnimation(animation, contentWindow) {
   ) {
     return null;
   }
-  const CSSAnimationCtor = contentWindow && contentWindow.CSSAnimation;
-  if (typeof CSSAnimationCtor !== "function" || !(animation instanceof CSSAnimationCtor)) {
-    return null;
-  }
+  if (!isCssAnimation(animation, contentWindow)) return null;
   if (animation.playState !== "running") return null;
   if (animation.playbackRate !== 1) return null;
 
@@ -1944,6 +2312,26 @@ function readSampleableAnimation(animation, contentWindow) {
 }
 
 /**
+ * A one-shot CSS animation cannot join the shared grid: snapping its duration
+ * would move the moment it lands. It still moves the picture, so accessory
+ * following stays on every frame until it reports `finished`. Initially paused
+ * animations are excluded because they may be started later.
+ */
+function readOneShotAnimation(animation, contentWindow) {
+  if (!animation || !animation.effect) return null;
+  if (!isCssAnimation(animation, contentWindow)) return null;
+  if (animation.playState !== "running" && animation.playState !== "finished") return null;
+  let timing = null;
+  try {
+    timing = animation.effect.getComputedTiming();
+  } catch {
+    return null;
+  }
+  if (!timing || !Number.isFinite(timing.iterations)) return null;
+  return animation;
+}
+
+/**
  * Rewrite every sampleable animation onto one grid and one start time.
  * Pending animations have no startTime yet; their ready promise is awaited and
  * the identity check runs again before touching them, because the document may
@@ -1951,9 +2339,15 @@ function readSampleableAnimation(animation, contentWindow) {
  */
 function alignDiscreteSamplingAnimations(animations, contentWindow, rate, isStillCurrent) {
   const sampleable = [];
+  const oneShots = [];
   for (const animation of animations) {
     const entry = readSampleableAnimation(animation, contentWindow);
-    if (entry) sampleable.push(entry);
+    if (entry) {
+      sampleable.push(entry);
+      continue;
+    }
+    const oneShot = readOneShotAnimation(animation, contentWindow);
+    if (oneShot) oneShots.push(oneShot);
   }
   if (!sampleable.length) return;
 
@@ -2004,6 +2398,38 @@ function alignDiscreteSamplingAnimations(animations, contentWindow, rate, isStil
       ready.then(applyStartTime, () => {});
     }
   }
+  // A document whose remaining animations are all one-shot may still follow the
+  // grid once they finish. Anything else the sampler leaves alone can move
+  // between grid points at any time, so it keeps the document on every frame.
+  if (sampleable.length + oneShots.length !== animations.length) return null;
+  return { animation: sampleable[0].animation, oneShots };
+}
+
+/**
+ * Chromium only runs an SVG child's transform animation on the compositor when
+ * its effective zoom is exactly 1 (crbug.com/1186312), and the display scale
+ * counts towards that zoom. On any screen that isn't at 100% the animations
+ * fall back to the main thread, which then wakes on every display refresh no
+ * matter how few visual changes sampling leaves. A root zoom of
+ * 1 / devicePixelRatio cancels the scale, and the viewBox keeps the picture the
+ * same size. Without a viewBox the picture would shrink, so such a document
+ * stays on the main thread.
+ */
+function cancelDisplayScaleForCompositor(svgDoc) {
+  const scale = window.devicePixelRatio;
+  if (!(scale > 0) || scale === 1) return;
+  const root = svgDoc.documentElement;
+  if (!root || root.localName !== "svg" || !root.hasAttribute("viewBox")) return;
+  const zoom = 1 / scale;
+  root.style.zoom = String(zoom);
+  // Transforms that already painted keep the form the main thread uses, and
+  // would rotate about the SVG origin once composited. The document may have
+  // painted before its load event, so always rebuild its layout tree.
+  const display = root.style.display;
+  root.style.display = "none";
+  void root.getBoundingClientRect();
+  root.style.display = display;
+  displayScaleZoomByDocument.set(svgDoc, zoom);
 }
 
 /**
@@ -2015,7 +2441,8 @@ function alignDiscreteSamplingAnimations(animations, contentWindow, rate, isStil
  * Only files the theme opts into via
  * rendering.discreteSampling are touched, and only on the <object> channel (an
  * <img> playback exposes no contentDocument). SMIL animations are not CSS
- * animations and are deliberately out of scope.
+ * animations and are deliberately out of scope. Display scale is cancelled
+ * here too: sampling only saves main-thread work while animations composite.
  *
  * The contentDocument can still be transiently null at the commit point, so the
  * synchronous first attempt plus at most DISCRETE_SAMPLING_MAX_RETRIES retries
@@ -2066,6 +2493,8 @@ function applyDiscreteSampling(objectEl, file) {
 
     let animations = [];
     try {
+      // Before reading them: the rebuild replaces the document's animations.
+      cancelDisplayScaleForCompositor(contentDocument);
       animations = contentDocument.getAnimations();
     } catch {
       return;
@@ -2083,7 +2512,14 @@ function applyDiscreteSampling(objectEl, file) {
       }
     };
 
-    alignDiscreteSamplingAnimations(animations, contentWindow, rate, isSameDocument);
+    const sampled = alignDiscreteSamplingAnimations(animations, contentWindow, rate, isSameDocument);
+    if (sampled) {
+      discreteSamplingFollowByDocument.set(contentDocument, {
+        animation: sampled.animation,
+        oneShots: sampled.oneShots,
+        stepMs: 1000 / rate,
+      });
+    }
   };
 
   trySample(0);
@@ -2671,6 +3107,14 @@ function applyEyeMove(dx, dy) {
       shadowTarget.setAttribute("transform", `translate(${shiftX}, 0) scale(${scaleX}, 1)`);
     }
   }
+  for (const slotName of ACCESSORY_SLOT_NAMES) {
+    const slot = getAccessorySlot(slotName);
+    if (slot.followTimer == null) continue;
+    clearTimeout(slot.followTimer);
+    slot.followTimer = null;
+    const key = slot.followKey;
+    slot.raf = requestAnimationFrame(() => accessoryFollowTick(slotName, key));
+  }
 }
 
 // ── Layered tracking helpers ──
@@ -3083,6 +3527,9 @@ function recoverFromSystemWake(payload) {
     attachEyeTracking(clawdEl);
   }
 
+  // This idempotent sync also covers wakes when the page was already unpaused
+  // and the low-power resume path does not refresh layout.
+  syncJugglingFrontLayer();
   const status = {
     id,
     result: rootBefore ? "resumed" : "no-svg",
@@ -3094,6 +3541,57 @@ function recoverFromSystemWake(payload) {
     eyeTargetRebound: needsEyes && !eyeTargetWasCurrentDocument && isEyeTrackingReady(),
   };
   finishSystemWake(status);
+}
+
+function scheduleDisplayScaleReload() {
+  if (displayScaleReloadTimer) clearTimeout(displayScaleReloadTimer);
+  displayScaleReloadTimer = setTimeout(reloadSvgDocumentForDisplayScale, DISPLAY_SCALE_RELOAD_DEBOUNCE_MS);
+}
+
+function reloadSvgDocumentForDisplayScale() {
+  displayScaleReloadTimer = null;
+  // A swap in flight reads the scale when it commits. Look again afterwards, in
+  // case it gets cancelled and leaves this document on screen.
+  if (pendingNext || pendingSystemWakeId) {
+    scheduleDisplayScaleReload();
+    return;
+  }
+  const file = currentDisplayedSvg;
+  if (!_discreteSampling.has(file) || !clawdEl || clawdEl.tagName !== "OBJECT" || !clawdEl.isConnected) return;
+  const scale = window.devicePixelRatio;
+  try {
+    const svgDoc = clawdEl.contentDocument;
+    if (!svgDoc || displayScaleZoomByDocument.get(svgDoc) === (scale === 1 ? undefined : 1 / scale)) return;
+  } catch {
+    return;
+  }
+  // As after a system wake: a paused flag must not outlive the document it paused.
+  resumeCurrentSvgForLowPower();
+  scheduleLowPowerIdlePause();
+  detachEyeTracking();
+  swapToFile(file, currentDisplayedState, true, {
+    allowImageFallback: false,
+    forceDocumentReload: true,
+    onError: (reason) => {
+      // Whatever replaced this reload brings its own eye tracking, but it may
+      // have kept this document (a state returning to the displayed file).
+      if (reason === "superseded") {
+        scheduleDisplayScaleReload();
+        return;
+      }
+      if (clawdEl && clawdEl.tagName === "OBJECT" && clawdEl.isConnected
+        && tracksEyesForFile(currentDisplayedState, currentDisplayedSvg)) attachEyeTracking(clawdEl);
+    },
+  });
+}
+
+function watchDisplayScale() {
+  if (typeof window.matchMedia !== "function") return;
+  // The query only describes the scale it was built for, so rebuild it each time.
+  window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener("change", () => {
+    scheduleDisplayScaleReload();
+    watchDisplayScale();
+  }, { once: true });
 }
 
 window.electronAPI.onEyeMove((dx, dy) => {
@@ -3130,6 +3628,7 @@ window.electronAPI.onEyeMove((dx, dy) => {
 if (window.electronAPI && typeof window.electronAPI.onSystemWake === "function") {
   window.electronAPI.onSystemWake(recoverFromSystemWake);
 }
+watchDisplayScale();
 
 if (window.electronAPI && typeof window.electronAPI.onCloudlingPointer === "function") {
   window.electronAPI.onCloudlingPointer((payload) => {
