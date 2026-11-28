@@ -14,6 +14,7 @@
 //     working" regression.
 //   • Settings size preview holds roaming so anchored walk frames cannot
 //     overwrite the size currently chosen by the slider.
+//   • Hidden pets do not roam; showing the pet restarts the full 8s idle delay.
 //   • The first roam after entering idle uses ROAM_IDLE_DELAY_MS (8s); subsequent
 //     roams use ROAM_BETWEEN_DELAY_MS (4s).
 //   • When the state changes away from idle/roam (detected in tick or step),
@@ -57,6 +58,24 @@ module.exports = function initRoam(ctx) {
     );
   }
 
+  // A gravity fall (src/gravity.js) moves the window until the pet lands;
+  // roam holds still meanwhile, as during a drag.
+  function isGravityFalling() {
+    return !!(
+      typeof ctx.isGravityFalling === "function"
+      && ctx.isGravityFalling()
+    );
+  }
+
+  // Gravity on: walks only go sideways, at the height of the floor the pet
+  // stands on, so roam never lifts it into the air.
+  function isGroundWalkOnly() {
+    return !!(
+      typeof ctx.isGravityEnabled === "function"
+      && ctx.isGravityEnabled()
+    );
+  }
+
   // Issue #690 plan §4.3.10's roam protection-period release point. Roam's
   // per-frame applyPetWindowBounds() (ROAM_FRAME_MS=16) is a continuous
   // native-write period the reconcile state machine must not fight — every
@@ -72,6 +91,7 @@ module.exports = function initRoam(ctx) {
   function isRoamAllowed() {
     if (!enabled) return false;
     if (ctx.dragLocked) return false;
+    if (isGravityFalling()) return false;
     if (ctx.getMiniMode && ctx.getMiniMode()) return false;
     const state = ctx.getCurrentState ? ctx.getCurrentState() : "idle";
     // Allow roaming when idle (about to start) or already roaming (mid-animation)
@@ -94,6 +114,25 @@ module.exports = function initRoam(ctx) {
     if (
       typeof ctx.isImeEditingActive === "function" &&
       ctx.isImeEditingActive()
+    )
+      return false;
+    // #1282: precaution only — walking did not interrupt capture on the tested
+    // machine. The latest cached probe result can lag the foreground by ~1s.
+    if (
+      typeof ctx.isScreenCaptureOverlayForeground === "function" &&
+      ctx.isScreenCaptureOverlayForeground()
+    )
+      return false;
+    // Walking while hidden only relocates the pet and wastes window writes.
+    if (
+      typeof ctx.isPetHidden === "function" &&
+      ctx.isPetHidden()
+    )
+      return false;
+    // An idle activity borrows the visual while the pet stays still.
+    if (
+      typeof ctx.isIdleActivityPlaying === "function" &&
+      ctx.isIdleActivityPlaying()
     )
       return false;
     return true;
@@ -268,7 +307,7 @@ module.exports = function initRoam(ctx) {
      * The stationary coordinate is never clamped or adjusted — if the pet starts
      * outside the inner margin band, that position is kept as-is so the "axis-only"
      * promise holds even at screen edges. */
-    if (constrainAxis) {
+    if (constrainAxis || isGroundWalkOnly()) {
       /* #810 fence × #686 axis: a single-axis move keeps one coordinate
        * exactly, so that stationary coordinate must already satisfy the fence
        * or the final window ends up outside it (PR #810 review). Rule:
@@ -372,6 +411,12 @@ module.exports = function initRoam(ctx) {
         }
       };
 
+      // Ground walk: sideways only. A fence that leaves out the pet's height
+      // cannot be reached without leaving the ground, so roam holds.
+      if (isGroundWalkOnly()) {
+        if (forcedAxis === "vertical" || partialRecovery) return null;
+        return tryAxis("horizontal", forcedAxis === "horizontal");
+      }
       if (forcedAxis) {
         const target = tryAxis(forcedAxis, true);
         if (target && partialRecovery) target.partial = true;
@@ -553,9 +598,10 @@ module.exports = function initRoam(ctx) {
       // Re-check state on every frame: if the pet is no longer idle/roam (e.g. a
       // working/notification event arrived), stop the animation immediately.
       if (!isRoamAllowed()) {
-        // A drag only pauses the current roam phase; other gates still mean the
-        // pet left normal idle eligibility and reset the next wait to 8s.
-        if (hasPermissionBubbleHold() || !ctx.dragLocked) firstRoam = true;
+        // A drag (or a gravity fall) only pauses the current roam phase; other
+        // gates still mean the pet left normal idle eligibility and reset the
+        // next wait to 8s.
+        if (hasPermissionBubbleHold() || !(ctx.dragLocked || isGravityFalling())) firstRoam = true;
         // cancelRoam also restores "idle" when the state is still "roam" —
         // gates with no incoming state of their own (IME editing #640, mini
         // mode) would otherwise strand the pet frozen in its walk pose.
@@ -706,9 +752,10 @@ module.exports = function initRoam(ctx) {
   function tick() {
     if (!enabled) return;
     if (!isRoamAllowed()) {
-      // Preserve the already-consumed 4s/8s phase while drag owns movement.
-      // Existing non-drag gates still reset the next idle entry to 8s.
-      if (hasPermissionBubbleHold() || !ctx.dragLocked) firstRoam = true;
+      // Preserve the already-consumed 4s/8s phase while drag (or a gravity
+      // fall) owns movement. Existing non-drag gates still reset the next idle
+      // entry to 8s.
+      if (hasPermissionBubbleHold() || !(ctx.dragLocked || isGravityFalling())) firstRoam = true;
       cancelRoam();
       return;
     }
