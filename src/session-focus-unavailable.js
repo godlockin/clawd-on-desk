@@ -7,11 +7,17 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function buildSessionFocusUnavailable() {
   function focusUnavailableReasonKey(session) {
     if (session && session.platform === "webui") return "sessionFocusUnavailableWebui";
+    if (session && session.codexProfileId && session.codexProfileId !== "default") {
+      return "sessionFocusUnavailableCodexProfile";
+    }
     if (session && (
       (session.sourceType && session.sourceType !== "local")
       || (session.host && session.host !== "local")
     )) {
       return "sessionFocusUnavailableRemote";
+    }
+    if (session && session.focusUnavailableReason === "linux-wayland-window-raise") {
+      return "sessionFocusUnavailableLinuxWayland";
     }
     return "sessionFocusUnavailableMissingTerminalInfo";
   }
